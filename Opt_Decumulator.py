@@ -383,12 +383,12 @@ def Opt_ASGQ_EP(
             condition_ko[np.cumsum(ss >= H, axis=1) > 0] = 1
             flag_N[(ss[:, -1] <= K) & (np.all(condition_ko == 0, axis=1)), -1] = 1
             cashflow = (((ss - P) * condition_ko + (ss - K) * ~condition_ko) +
-                        (ss[-1] - K) * le * (flag_N * N + ~flag_N * 1 - 1)) * discount_factor
+                        (ss[:, -1] - K).reshape(nPath, 1) * le * (flag_N * N + ~flag_N * 1 - 1)) * discount_factor
         else:
             condition_ko[np.cumsum(ss <= H, axis=1) > 0] = 1
             flag_N[(ss[:, -1] >= K) & (np.all(condition_ko == 0, axis=1)), -1] = 1
             cashflow = (((P - ss) * condition_ko + (K - ss) * ~condition_ko) +
-                        (K - ss[-1]) * le * (flag_N * N + ~flag_N * 1 - 1)) * discount_factor
+                        (K - ss[:, -1]) * le * (flag_N * N + ~flag_N * 1 - 1)) * discount_factor
 
         price_ls = np.sum(cashflow, 1)
         price = np.mean(price_ls, 0)
@@ -423,7 +423,7 @@ def McGbmQ(
 
 if __name__ == "__main__":
     start = time.perf_counter()
-    price = Opt_ASGQ_EP(100, [], 90, 100, 0, 20, list(range(1, 21)), 0.03, 0.03, 0.18, 110, 2, 100000, 1)
+    price = Opt_ASGQ_EP(110, [], 90, 100, 0, 20, list(range(1, 21)), 0.03, 0.03, 0.18, 110, 2, 100000, 1)
     end = time.perf_counter()
     print('price = %.2f' % price)
     print('历时%.2f秒！' % (end - start))
