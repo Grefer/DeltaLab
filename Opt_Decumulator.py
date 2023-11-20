@@ -286,10 +286,13 @@ def Opt_ASGQ_call_put(
     if cp == 1 and any(sr >= H):
         idx = np.where(sr >= H)[0][0]
         price = (sr[idx] - K) * idx + (sr[idx] - P) * (le - idx)
+
         return price
+
     elif cp == -1 and any(sr <= H):
         idx = np.where(sr <= H)[0][0]
         price = (K - sr[idx]) * idx + (P - sr[idx]) * (le - idx)
+
         return price
 
     # 交易是否到期
@@ -297,10 +300,12 @@ def Opt_ASGQ_call_put(
 
         if cp == 1:
             flag_N = sr[-1] <= K
-            price = (sr[-1] - K) * le * (flag_N * N + ~flag_N * 1)
+            cashflow = (sr[-1] - K) * le * (flag_N * N + ~flag_N * 1)
         else:
             flag_N = sr[-1] >= K
-            price = (K - sr[-1]) * le * (flag_N * N + ~flag_N * 1)
+            cashflow = (K - sr[-1]) * le * (flag_N * N + ~flag_N * 1)
+
+        price = cashflow
 
     else:
         condition_ko = np.zeros([nPath, le], dtype=bool)
@@ -313,18 +318,19 @@ def Opt_ASGQ_call_put(
             # 现实意义：对于路径依赖的熔断累计期权，熔断日及之后都采用保障价格结算
             condition_ko[np.cumsum(ss >= H, axis=1) > 0] = 1
             flag_N[(ss[:, -1] <= K) & (np.all(condition_ko == 0, axis=1)), -1] = 1
-            cashflow = (((ss[:, -1] - P).reshape(nPath,1) * condition_ko + (ss[:, -1] - K).reshape(nPath,1) * ~condition_ko) +
-                        (ss[:, -1] - K).reshape(nPath,1) * le * (flag_N * N + ~flag_N * 1 - 1)) * discount_factor
+            cashflow = (((ss[:, -1] - P).reshape(nPath, 1) * condition_ko + (ss[:, -1] - K).reshape(nPath, 1) * ~condition_ko)
+                        + (ss[:, -1] - K).reshape(nPath, 1) * le * (flag_N * N + ~flag_N * 1 - 1)) * discount_factor
         else:
             condition_ko[np.cumsum(ss <= H, axis=1) > 0] = 1
             flag_N[(ss[:, -1] >= K) & (np.all(condition_ko == 0, axis=1)), -1] = 1
-            cashflow = (((P - ss[:, -1]).reshape(nPath,1) * condition_ko + (K - ss[:, -1]).reshape(nPath,1) * ~condition_ko) +
-                        (K - ss[:, -1]).reshape(nPath,1) * le * (flag_N * N + ~flag_N * 1 - 1)) * discount_factor
+            cashflow = (((P - ss[:, -1]).reshape(nPath, 1) * condition_ko + (K - ss[:, -1]).reshape(nPath, 1) * ~condition_ko)
+                        + (K - ss[:, -1]).reshape(nPath, 1) * le * (flag_N * N + ~flag_N * 1 - 1)) * discount_factor
 
         price_ls = np.sum(cashflow, 1)
         price = np.mean(price_ls, 0)
 
     return price
+
 
 # 到期观察熔断保障价格累计（每日结算）
 def Opt_ASGQ_EP(
@@ -354,10 +360,13 @@ def Opt_ASGQ_EP(
     if cp == 1 and any(sr >= H):
         idx = np.where(sr >= H)[0][0]
         price = np.sum((sr[:idx] - K)) + (sr[idx] - P) * (le - idx)
+
         return price
+
     elif cp == -1 and any(sr <= H):
         idx = np.where(sr <= H)[0][0]
         price = np.sum((K - sr[:idx])) + (P - sr[idx]) * (le - idx)
+
         return price
 
     # 交易是否到期
@@ -365,11 +374,12 @@ def Opt_ASGQ_EP(
 
         if cp == 1:
             flag_N = sr[-1] <= K
-            price = np.sum((sr - K)) + (sr[-1] - K) * le * (flag_N * N + ~flag_N * 1 - 1)
+            cashflow = np.sum((sr - K)) + (sr[-1] - K) * le * (flag_N * N + ~flag_N * 1 - 1)
         else:
             flag_N = sr[-1] >= K
-            price = np.sum((K - sr)) + (K - sr[-1]) * le * (flag_N * N + ~flag_N * 1 - 1)
+            cashflow = np.sum((K - sr)) + (K - sr[-1]) * le * (flag_N * N + ~flag_N * 1 - 1)
 
+        price = cashflow
 
     else:
         condition_ko = np.zeros([nPath, le], dtype=bool)
@@ -394,6 +404,7 @@ def Opt_ASGQ_EP(
         price = np.mean(price_ls, 0)
 
     return price
+
 
 # 到期观察熔断后固定赔付累计（每日结算）
 def Opt_ASGQ_EF(
@@ -439,7 +450,6 @@ def Opt_ASGQ_EF(
             flag_N = sr[-1] >= K
             price = np.sum((K - sr)) + (K - sr[-1]) * le * (flag_N * N + ~flag_N * 1 - 1)
 
-
     else:
         condition_ko = np.zeros([nPath, le], dtype=bool)
         flag_N = np.zeros([nPath, le], dtype=bool)
@@ -465,6 +475,149 @@ def Opt_ASGQ_EF(
     return price
 
 
+# 每日观察熔断后保障价格累计（每日结算）
+def Opt_ASGQ_DP(
+        s0: float,
+        sr: list,
+        K: float,
+        P: float,
+        T_over: int,
+        T_Days: int,
+        Observ: list,
+        r: float,
+        q: float,
+        sigma: float,
+        H: float,
+        N: int,
+        nPath: int,
+        cp: int
+) -> float:
+    T = T_Days / annual_days
+    nStep = T_Days
+    dt = 1 / annual_days
+    sr = np.array(sr)
+    Observ = np.array(Observ)
+    le = len(Observ)
+
+    # 是否熔断提前结束
+    if cp == 1 and any(sr >= H):
+        idx = np.where(sr >= H)[0][0]
+        flag_N = sr <= K
+        price = np.sum((sr[:idx] - K) * (flag_N[:idx] * N + ~flag_N[:idx] * 1)) + (sr[idx] - P) * (le - idx)
+        return price
+    elif cp == -1 and any(sr <= H):
+        idx = np.where(sr <= H)[0][0]
+        flag_N = sr >= K
+        price = np.sum((K - sr[:idx]) * (flag_N[:idx] * N + ~flag_N[:idx] * 1)) + (P - sr[idx]) * (le - idx)
+        return price
+
+    # 交易是否到期
+    if T_Days == 0:
+
+        if cp == 1:
+            flag_N = sr <= K
+            price = np.sum((sr - K) * (flag_N * N + ~flag_N * 1))
+        else:
+            flag_N = sr >= K
+            price = np.sum((K - sr) * (flag_N * N + ~flag_N * 1))
+
+    else:
+        condition_ko = np.zeros([nPath, le], dtype=bool)
+        flag_N = np.zeros([nPath, le], dtype=bool)
+        discount_factor = np.tile(np.exp(-r * (np.maximum(Observ - T_over, 0)) * dt), (nPath, 1))
+        S = McGbmQ(s0, r - q, sigma, T, nPath, nStep)
+        ss = np.c_[np.tile(sr, (nPath, 1)), S]
+        if cp == 1:
+            # 对逻辑值累加以实现找到第一个满足条件的值后，之后的条件全为True
+            # 现实意义：对于路径依赖的熔断累计期权，熔断日及之后都采用保障价格结算
+            condition_ko[np.cumsum(ss >= H, axis=1) > 0] = 1
+            flag_N[(ss <= K) * ~condition_ko] = 1
+            cashflow = (((ss - P) * condition_ko + (ss - K) * ~condition_ko) * (
+                    flag_N * N + ~flag_N * 1)) * discount_factor
+        else:
+            condition_ko[np.cumsum(ss <= H, axis=1) > 0] = 1
+            flag_N[(ss >= K) * ~condition_ko] = 1
+            cashflow = (((P - ss) * condition_ko + (K - ss) * ~condition_ko) * (
+                    flag_N * N + ~flag_N * 1)) * discount_factor
+
+        price_ls = np.sum(cashflow, 1)
+        price = np.mean(price_ls, 0)
+
+    return price
+
+
+# 每日观察熔断后固定赔付累计（每日结算）
+def Opt_ASGQ_DF(
+        s0: float,
+        sr: list,
+        K: float,
+        amount: float,
+        T_over: int,
+        T_Days: int,
+        Observ: list,
+        r: float,
+        q: float,
+        sigma: float,
+        H: float,
+        N: int,
+        nPath: int,
+        cp: int
+) -> float:
+    T = T_Days / annual_days
+    nStep = T_Days
+    dt = 1 / annual_days
+    sr = np.array(sr)
+    Observ = np.array(Observ)
+    le = len(Observ)
+
+    # 是否熔断提前结束
+    if cp == 1 and any(sr >= H):
+        idx = np.where(sr >= H)[0][0]
+        flag_N = sr <= K
+        price = np.sum((sr[:idx] - K) * (flag_N[:idx] * N + ~flag_N[:idx] * 1)) + amount * (le - idx)
+        return price
+    elif cp == -1 and any(sr <= H):
+        idx = np.where(sr <= H)[0][0]
+        flag_N = sr >= K
+        price = np.sum((K - sr[:idx]) * (flag_N[:idx] * N + ~flag_N[:idx] * 1)) + amount * (le - idx)
+        return price
+
+    # 交易是否到期
+    if T_Days == 0:
+
+        if cp == 1:
+            flag_N = sr <= K
+            price = np.sum((sr - K) * (flag_N * N + ~flag_N * 1))
+        else:
+            flag_N = sr >= K
+            price = np.sum((K - sr) * (flag_N * N + ~flag_N * 1))
+
+    else:
+        condition_ko = np.zeros([nPath, le], dtype=bool)
+        flag_N = np.zeros([nPath, le], dtype=bool)
+        discount_factor = np.tile(np.exp(-r * (np.maximum(Observ - T_over, 0)) * dt), (nPath, 1))
+        S = McGbmQ(s0, r - q, sigma, T, nPath, nStep)
+        ss = np.c_[np.tile(sr, (nPath, 1)), S]
+        if cp == 1:
+            # 对逻辑值累加以实现找到第一个满足条件的值后，之后的条件全为True
+            # 现实意义：对于路径依赖的熔断累计期权，熔断日及之后都采用保障价格结算
+            condition_ko[np.cumsum(ss >= H, axis=1) > 0] = 1
+            flag_N[(ss <= K) * ~condition_ko] = 1
+            cashflow = ((amount * condition_ko + (ss - K) * ~condition_ko) * (
+                    flag_N * N + ~flag_N * 1)) * discount_factor
+        else:
+            condition_ko[np.cumsum(ss <= H, axis=1) > 0] = 1
+            flag_N[(ss >= K) * ~condition_ko] = 1
+            cashflow = ((amount * condition_ko + (K - ss) * ~condition_ko) * (
+                    flag_N * N + ~flag_N * 1)) * discount_factor
+
+        price_ls = np.sum(cashflow, 1)
+        price = np.mean(price_ls, 0)
+
+    return price
+
+
+
 
 def McGbmQ(
         s0: float,
@@ -475,9 +628,9 @@ def McGbmQ(
         nStep: int
 ):
     np.random.seed(20)
-    W1 = np.random.randn(nPath//2, nStep)
-    W2 = np.random.randn(nPath//2, nStep)
-    h = T/nStep
+    W1 = np.random.randn(nPath // 2, nStep)
+    W2 = np.random.randn(nPath // 2, nStep)
+    h = T / nStep
     dlogS1 = (r - 0.5 * pow(sigma, 2)) * h + sigma * np.sqrt(h) * W1
     dlogS2 = (r - 0.5 * pow(sigma, 2)) * h - sigma * np.sqrt(h) * W2
     s1 = s0 * np.exp(np.cumsum(dlogS1, 1))
@@ -488,11 +641,9 @@ def McGbmQ(
 
 
 
-
-
 if __name__ == "__main__":
     start = time.perf_counter()
-    price = Opt_ASGQ_EF(100, [], 90, 20, 0, 20, list(range(1, 21)), 0.03, 0.03, 0.18, 110, 2, 100000, 1)
+    price = Opt_ASGQ_DF(110, [], 90, 10, 0, 20, list(range(1, 21)), 0.03, 0.03, 0.18, 110, 2, 100000, 1)
     end = time.perf_counter()
     print('price = %.2f' % price)
     print('历时%.2f秒！' % (end - start))
