@@ -30,7 +30,7 @@ def McGbmQ(
     return s
 
 
-class Option_DE:
+class Option_DE(object):
     # 累计期权大类
 
     def __init__(self,
