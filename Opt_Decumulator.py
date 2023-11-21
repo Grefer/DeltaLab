@@ -6,7 +6,6 @@ Created on Nov 08 17:23 2023
 基于NumPy的向量化期权定价
 """
 import time
-
 import numpy as np
 
 annual_days = 243.0
@@ -318,12 +317,14 @@ def Opt_ASGQ_call_put(
             # 现实意义：对于路径依赖的熔断累计期权，熔断日及之后都采用保障价格结算
             condition_ko[np.cumsum(ss >= H, axis=1) > 0] = 1
             flag_N[(ss[:, -1] <= K) & (np.all(condition_ko == 0, axis=1)), -1] = 1
-            cashflow = (((ss[:, -1] - P).reshape(nPath, 1) * condition_ko + (ss[:, -1] - K).reshape(nPath, 1) * ~condition_ko)
+            cashflow = (((ss[:, -1] - P).reshape(nPath, 1) * condition_ko + (ss[:, -1] - K).reshape(nPath,
+                                                                                                    1) * ~condition_ko)
                         + (ss[:, -1] - K).reshape(nPath, 1) * le * (flag_N * N + ~flag_N * 1 - 1)) * discount_factor
         else:
             condition_ko[np.cumsum(ss <= H, axis=1) > 0] = 1
             flag_N[(ss[:, -1] >= K) & (np.all(condition_ko == 0, axis=1)), -1] = 1
-            cashflow = (((P - ss[:, -1]).reshape(nPath, 1) * condition_ko + (K - ss[:, -1]).reshape(nPath, 1) * ~condition_ko)
+            cashflow = (((P - ss[:, -1]).reshape(nPath, 1) * condition_ko + (K - ss[:, -1]).reshape(nPath,
+                                                                                                    1) * ~condition_ko)
                         + (K - ss[:, -1]).reshape(nPath, 1) * le * (flag_N * N + ~flag_N * 1 - 1)) * discount_factor
 
         price_ls = np.sum(cashflow, 1)
@@ -617,8 +618,6 @@ def Opt_ASGQ_DF(
     return price
 
 
-
-
 def McGbmQ(
         s0: float,
         r: float,
@@ -640,10 +639,9 @@ def McGbmQ(
     return s
 
 
-
 if __name__ == "__main__":
     start = time.perf_counter()
-    price = Opt_ASGQ_DF(110, [], 90, 10, 0, 20, list(range(1, 21)), 0.03, 0.03, 0.18, 110, 2, 100000, 1)
+    price = Opt_ASGQ_DF(100, [], 90, 10, 0, 20, list(range(1, 21)), 0.03, 0.03, 0.18, 110, 2, 100000, 1)
     end = time.perf_counter()
     print('price = %.2f' % price)
     print('历时%.2f秒！' % (end - start))
