@@ -23,12 +23,10 @@ def McGbmQ(
     np.random.seed(20)
     W1 = np.random.randn(nPath // 2, nStep)
     W2 = np.random.randn(nPath // 2, nStep)
+    W = np.r_[W1, -W2]
     h = T / nStep
-    dlogS1 = (r - 0.5 * pow(sigma, 2)) * h + sigma * np.sqrt(h) * W1
-    dlogS2 = (r - 0.5 * pow(sigma, 2)) * h - sigma * np.sqrt(h) * W2
-    s1 = s0 * np.exp(np.cumsum(dlogS1, 1))
-    s2 = s0 * np.exp(np.cumsum(dlogS2, 1))
-    s = np.r_[s1, s2]
+    dlogS = (r - 0.5 * pow(sigma, 2)) * h - sigma * np.sqrt(h) * W
+    s = s0 * np.exp(np.cumsum(dlogS, 1))
     return s
 
 
@@ -77,6 +75,7 @@ class Option_DE:
 
         return price
 
+    # Greeks计算函数
     def get_greeks(self):
 
         if self.T_days <= 0:
@@ -614,9 +613,9 @@ class Option_DE:
 if __name__ == "__main__":
     start = time.perf_counter()
     option = Option_DE('Opt_ASGQ_DP', 100, [], 90, 0, 20, list(range(1, 21)), 0.18, 110, 2, 1, P=100)
-    price = option.get_price()
-    greeks = option.get_greeks()
+    p = option.get_price()
+    greeks_list = option.get_greeks()
     end = time.perf_counter()
-    print('price = %.2f' % price)
-    print("greeks = {}".format(greeks))
+    print('price = %.2f' % p)
+    print('greeks = {}'.format(greeks_list))
     print('历时%.2f秒！' % (end - start))

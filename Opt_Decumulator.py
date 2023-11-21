@@ -641,7 +641,7 @@ def McGbmQ(
 
 if __name__ == "__main__":
     start = time.perf_counter()
-    price = Opt_ASGQ_DF(100, [], 90, 10, 0, 20, list(range(1, 21)), 0.03, 0.03, 0.18, 110, 2, 100000, 1)
+    p = Opt_ASGQ_DF(100, [], 90, 10, 0, 20, list(range(1, 21)), 0.03, 0.03, 0.18, 110, 2, 100000, 1)
     end = time.perf_counter()
-    print('price = %.2f' % price)
+    print('price = %.2f' % p)
     print('历时%.2f秒！' % (end - start))
