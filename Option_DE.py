@@ -45,9 +45,9 @@ class Option_DE(object):
                  H: float,
                  N: int,
                  cp: int,
-                 r=0.03,
-                 q=0.03,
-                 nPath=100000,
+                 r: float = 0.03,
+                 q: float = 0.03,
+                 nPath: int = 100000,
                  **kwargs: float
                  ):
         self.optiontype = optiontype
