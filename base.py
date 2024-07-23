@@ -14,7 +14,7 @@ import Option_AS
 
 
 def get_trades():
-    filename = r'C:\Users\Grefer\OneDrive\Work4life\保险+期货对冲表修订版.xlsm'
+    filename = r'C:\Users\Grefer\OneDrive\Work4life\保期对冲表.xlsm'
     data = pd.read_excel(filename, sheet_name='项目台账',skiprows=1, engine='openpyxl')
 
     return data
@@ -33,5 +33,7 @@ def get_option(data):
 
 
 
+
+
 if __name__ == '__main__':
-    get_trades()
+    data = get_trades()
