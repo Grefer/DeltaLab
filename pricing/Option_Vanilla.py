@@ -5,7 +5,7 @@ Created on 12月 20 11:05 2023
 @author: Grefer
 """
 from scipy.stats import norm
-from math import *
+from math import log, sqrt, exp
 
 
 class Option_Vanilla(object):
@@ -17,7 +17,7 @@ class Option_Vanilla(object):
                  g: float,
                  t: float,
                  sigma: float,
-                 cp: bool,
+                 cp: int,
                  exe_mode: str
                  ):
         self.s = s
@@ -29,10 +29,10 @@ class Option_Vanilla(object):
         self.cp = cp
         self.exe_mode = exe_mode
 
-        def get_price(self):
-            if self.exe_mode == "Eu":
-                price = blsprice(self.s, self.k, self.r, self.g, self.t, self.sigma, self.cp)
-                return price
+    def get_price(self):
+        if self.exe_mode == "Eu":
+            price = blsprice(self.s, self.k, self.r, self.g, self.t, self.sigma, self.cp)
+            return price
 
 
 def blsprice(s, k, r, g, t, sigma, cp):
@@ -41,6 +41,6 @@ def blsprice(s, k, r, g, t, sigma, cp):
     d2 = d1 - sigma * sqrt(t)
     c = s * exp(-g * t) * norm.cdf(d1) - k * exp(-r * t) * norm.cdf(d2)
     p = k * exp(-r * t) * norm.cdf(-d2) - s * exp(-g * t) * norm.cdf(-d1)
-    price = c * cp + p * ~cp
+    price = c if cp == 1 else p
 
     return price

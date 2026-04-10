@@ -9,28 +9,17 @@ import time
 
 import numpy as np
 
-annual_days = 243.0
+try:
+    from .constants import ANNUAL_DAYS as annual_days
+    from .mc_engine import McGbmQ
+    from .option_base import OptionBase
+except ImportError:
+    from constants import ANNUAL_DAYS as annual_days
+    from mc_engine import McGbmQ
+    from option_base import OptionBase
 
 
-def McGbmQ(
-        s0: float,
-        r: float,
-        sigma: float,
-        T: float,
-        nPath: int,
-        nStep: int
-):
-    np.random.seed(20)
-    W1 = np.random.randn(nPath // 2, nStep)
-    W2 = np.random.randn(nPath // 2, nStep)
-    W = np.r_[W1, -W2]
-    h = T / nStep
-    dlogS = (r - 0.5 * pow(sigma, 2)) * h - sigma * np.sqrt(h) * W
-    s = s0 * np.exp(np.cumsum(dlogS, 1))
-    return s
-
-
-class Option_DE(object):
+class Option_DE(OptionBase):
     # 累计期权大类
 
     def __init__(self,
@@ -64,9 +53,9 @@ class Option_DE(object):
         self.N = N
         self.nPath = nPath
         self.cp = cp
-        self.fix = kwargs['fix'] if 'fix' in kwargs else None
-        self.P = kwargs['P'] if 'P' in kwargs else None
-        self.amount = kwargs['amount'] if 'amount' in kwargs else None
+        self.fix = kwargs.get('fix')
+        self.P = kwargs.get('P')
+        self.amount = kwargs.get('amount')
 
     # 定价整合函数
     def get_price(self):
@@ -75,55 +64,16 @@ class Option_DE(object):
 
         return price
 
-    # Greeks计算函数
-    def get_greeks(self):
+    @property
+    def _time_remaining(self):
+        return self.T_days
 
-        if self.T_days <= 0:
-            greeks = [0, 0, 0, 0, 0]
-        else:
-            ds = min(20., self.s0 / 100.)
-            dz = 1 / 100.
-            dt = 1
-            dr = 1 / 100.
-            # delta
-            price0 = self.get_price()
-            self.s0 += ds
-            price1 = self.get_price()
-            self.s0 -= 2 * ds
-            price2 = self.get_price()
-            delta = (price1 - price2) / (2 * ds)
-            # gamma
-            self.s0 += 3 * ds
-            price3 = self.get_price()
-            self.s0 -= 4 * ds
-            price4 = self.get_price()
-            gamma = ((price3 - price0) - (price0 - price4)) / (4 * pow(ds, 2))
-            # vega
-            self.s0 += 2 * ds
-            self.sigma += dz
-            price5 = self.get_price()
-            self.sigma -= 2 * dz
-            price6 = self.get_price()
-            vega = (price5 - price6) / (2 * dz)
-            # theta
-            self.sigma += dz
-            self.sr = np.r_[self.sr, self.s0]
-            self.T_over += dt
-            self.T_days -= dt
-            price7 = self.get_price()
-            theta = (price7 - price0) / (dt / annual_days)
-            # rho
-            self.sr = np.delete(self.sr, -1)
-            self.T_days += dt
-            self.r += dr
-            price8 = self.get_price()
-            self.r -= 2 * dr
-            price9 = self.get_price()
-            rho = (price8 - price9) / 2
-
-            greeks = [delta, gamma, vega, theta, rho]
-
-        return greeks
+    def _theta_overrides(self, dt):
+        return {
+            'sr': list(self.sr) + [self.s0],
+            'T_over': self.T_over + dt,
+            'T_days': self.T_days - dt,
+        }
 
     # 回归累计
     def Opt_Decumulator_Back(self) -> float:

@@ -8,28 +8,17 @@ Created on 11月 22 16:19 2023
 import numpy as np
 import time
 
-annual_days = 243.0
+try:
+    from .constants import ANNUAL_DAYS
+    from .mc_engine import McGbmQ
+    from .option_base import OptionBase
+except ImportError:
+    from constants import ANNUAL_DAYS
+    from mc_engine import McGbmQ
+    from option_base import OptionBase
 
 
-def McGbmQ(
-        s0: float,
-        r: float,
-        sigma: float,
-        T: float,
-        nPath: int,
-        nStep: int
-):
-    np.random.seed(20)
-    W1 = np.random.randn(nPath // 2, nStep)
-    W2 = np.random.randn(nPath // 2, nStep)
-    W = np.r_[W1, -W2]
-    h = T / nStep
-    dlogS = (r - 0.5 * pow(sigma, 2)) * h - sigma * np.sqrt(h) * W
-    s = s0 * np.exp(np.cumsum(dlogS, 1))
-    return s
-
-
-class Option_AB(object):
+class Option_AB(OptionBase):
 
     def __init__(self,
                  optiontype: str,
@@ -69,70 +58,32 @@ class Option_AB(object):
 
         return price
 
-    def get_greeks(self):
+    @property
+    def _time_remaining(self):
+        return self.T_days
 
-        if self.T_days <= 0:
-            greeks = [0, 0, 0, 0, 0]
-        else:
-            ds = min(20., self.s0 / 100.)
-            dz = 1 / 100.
-            dt = 1
-            dr = 1 / 100.
-            # delta
-            price0 = self.get_price()
-            self.s0 += ds
-            price1 = self.get_price()
-            self.s0 -= 2 * ds
-            price2 = self.get_price()
-            delta = (price1 - price2) / (2 * ds)
-            # gamma
-            self.s0 += 3 * ds
-            price3 = self.get_price()
-            self.s0 -= 4 * ds
-            price4 = self.get_price()
-            gamma = ((price3 - price0) - (price0 - price4)) / (4 * pow(ds, 2))
-            # vega
-            self.s0 += 2 * ds
-            self.sigma += dz
-            price5 = self.get_price()
-            self.sigma -= 2 * dz
-            price6 = self.get_price()
-            vega = (price5 - price6) / (2 * dz)
-            # theta
-            self.sigma += dz
-            self.sr = np.r_[self.sr, self.s0]
-            self.T_days -= dt
-            price7 = self.get_price()
-            theta = (price7 - price0) / (dt / annual_days)
-            # rho
-            self.sr = np.delete(self.sr, -1)
-            self.T_days += dt
-            self.r += dr
-            price8 = self.get_price()
-            self.r -= 2 * dr
-            price9 = self.get_price()
-            rho = (price8 - price9) / 2
-
-            greeks = [delta, gamma, vega, theta, rho]
-
-        return greeks
+    def _theta_overrides(self, dt):
+        return {
+            'sr': list(self.sr) + [self.s0],
+            'T_days': self.T_days - dt,
+        }
 
     def Opt_Airbag(self):
 
-        T = self.T_days / annual_days
+        T = self.T_days / ANNUAL_DAYS
         nStep = self.T_days
-        dt = 1 / annual_days
+        dt = 1 / ANNUAL_DAYS
         sr = np.array(self.sr)
         observ = np.array(self.observ) - 1
 
         if self.T_days == 0:
             if self.cp == 1:
                 condition_ki = np.any(sr[observ] <= self.KI)
-                price = self.pr * np.max(self.K - sr[-1], 0) * ~condition_ki + self.pr_ki * (
+                price = self.pr * np.maximum(sr[-1] - self.K, 0) * ~condition_ki + self.pr_ki * (
                         sr[-1] - self.K) * condition_ki
             else:
                 condition_ki = np.any(sr[observ] >= self.KI)
-                price = self.pr * np.max(sr[-1] - self.K, 0) * ~condition_ki + self.pr_ki * (
+                price = self.pr * np.maximum(self.K - sr[-1], 0) * ~condition_ki + self.pr_ki * (
                         self.K - sr[-1]) * condition_ki
 
         elif self.T_days >= 0:
@@ -144,7 +95,7 @@ class Option_AB(object):
                 cashflow = (self.pr * np.maximum(ss[:, -1] - self.K, 0) * ~condition_ki + self.pr_ki * (
                             ss[:, -1] - self.K) * condition_ki) * discount_factor
             else:
-                condition_ki = np.any(ss[observ] >= self.KI, axis=1)
+                condition_ki = np.any(ss[:, observ] >= self.KI, axis=1)
                 cashflow = (self.pr * np.maximum(self.K - ss[:, -1], 0) * ~condition_ki + self.pr_ki * (
                             self.K - ss[:, -1]) * condition_ki) * discount_factor
 

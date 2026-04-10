@@ -11,16 +11,12 @@ import pandas as pd
 import matplotlib.pyplot as plt
 from WindPy import w
 
+w.start() # 默认命令超时时间为120秒，如需设置超时时间可以加入waitTime参数，例如waitTime=60,即设置命令超时时间为60秒 
 
-class VolatilityCone(object):
-    def __init__(self,code):
-        self.code = code
+w.isconnected() # 判断WindPy是否已经登录成功
 
-    def get_data(self):
-        code_s = self.code.split('.')
-        optionset = w.wset("optionfuturescontractbasicinf", "exchange=%s;productcode=%s;contract=all" % (code_s[1],code_s[0]))
-
-
+data = w.wsd("000001.SH", "close", "2023-01-01", "2023-12-31", "") # 获取上证指数2023年全年的收盘价数据
+df = pd.DataFrame(data.Data, index=data.Fields, columns=data.Times).T #
 
 
 
