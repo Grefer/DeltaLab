@@ -75,6 +75,10 @@ class Option_DE(OptionBase):
             'T_days': self.T_days - dt,
         }
 
+    def _decrement_time(self):
+        self.T_days -= 1
+        self.T_over += 1
+
     # 回归累计
     def Opt_Decumulator_Back(self) -> float:
 

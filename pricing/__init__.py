@@ -6,3 +6,10 @@ from .Option_Vanilla import Option_Vanilla, blsprice
 from .Option_AB import Option_AB
 from .Option_AS import Option_AS
 from .Option_DE import Option_DE
+from .hedge_backtest import HedgeBacktest
+
+# Wind 数据接口（仅在安装了 WindPy 时可用）
+try:
+    from . import wind_data
+except ImportError:
+    pass

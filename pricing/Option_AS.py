@@ -84,6 +84,9 @@ class Option_AS(OptionBase):
             'T': self.T - dt,
         }
 
+    def _decrement_time(self):
+        self.T -= 1
+
 
 
 # if __name__ == "__main__":

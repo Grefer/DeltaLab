@@ -68,6 +68,9 @@ class Option_AB(OptionBase):
             'T_days': self.T_days - dt,
         }
 
+    def _decrement_time(self):
+        self.T_days -= 1
+
     def Opt_Airbag(self):
 
         T = self.T_days / ANNUAL_DAYS
