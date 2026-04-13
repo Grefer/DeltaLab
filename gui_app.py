@@ -217,6 +217,16 @@ class BacktestApp(tk.Tk):
         self._seed_var = tk.StringVar(value="42")
         ttk.Entry(self._sim_frame, textvariable=self._seed_var, width=8).grid(
             row=0, column=3, padx=3)
+        ttk.Label(self._sim_frame, text="已实现波动率:").grid(row=1, column=0, sticky="w")
+        self._real_vol_var = tk.StringVar(value="")
+        rv_frame = ttk.Frame(self._sim_frame)
+        rv_frame.grid(row=1, column=1, columnspan=3, sticky="w", padx=3)
+        ttk.Entry(rv_frame, textvariable=self._real_vol_var, width=8).pack(side="left")
+        ttk.Label(rv_frame, text="(空=同隐含波动率)").pack(side="left", padx=3)
+        ttk.Label(self._sim_frame, text="模拟路径数:").grid(row=2, column=0, sticky="w")
+        self._npaths_var = tk.StringVar(value="10")
+        ttk.Entry(self._sim_frame, textvariable=self._npaths_var, width=8).grid(
+            row=2, column=1, padx=3, sticky="w")
 
         # CSV 参数
         self._csv_frame = ttk.Frame(sec3)
@@ -238,11 +248,11 @@ class BacktestApp(tk.Tk):
         ttk.Entry(self._wind_frame, textvariable=self._wind_code_var, width=15).grid(
             row=0, column=1, padx=3)
         ttk.Label(self._wind_frame, text="起始日:").grid(row=1, column=0, sticky="w")
-        self._wind_start_var = tk.StringVar(value="2025-01-02")
+        self._wind_start_var = tk.StringVar(value="2026-01-02")
         ttk.Entry(self._wind_frame, textvariable=self._wind_start_var, width=15).grid(
             row=1, column=1, padx=3)
         ttk.Label(self._wind_frame, text="结束日:").grid(row=1, column=2, sticky="w")
-        self._wind_end_var = tk.StringVar(value="2025-02-07")
+        self._wind_end_var = tk.StringVar(value="2026-02-07")
         ttk.Entry(self._wind_frame, textvariable=self._wind_end_var, width=15).grid(
             row=1, column=3, padx=3)
 
@@ -271,13 +281,13 @@ class BacktestApp(tk.Tk):
 
         row_h += 1
         ttk.Label(sec3, text="交易数量:").grid(row=row_h, column=0, sticky="w")
-        self._qty_var = tk.StringVar(value="1")
+        self._qty_var = tk.StringVar(value="100")
         ttk.Entry(sec3, textvariable=self._qty_var, width=12).grid(
             row=row_h, column=1, sticky="w", padx=3)
 
         row_h += 1
         ttk.Label(sec3, text="合约乘数:").grid(row=row_h, column=0, sticky="w")
-        self._mult_var = tk.StringVar(value="0")
+        self._mult_var = tk.StringVar(value="5")
         mult_frame = ttk.Frame(sec3)
         mult_frame.grid(row=row_h, column=1, sticky="w")
         ttk.Entry(mult_frame, textvariable=self._mult_var, width=8).pack(side="left")
@@ -293,6 +303,7 @@ class BacktestApp(tk.Tk):
         self._run_btn.pack(fill="x", ipady=4)
 
         self._progress = ttk.Progressbar(btn_frame, mode="indeterminate")
+        self._progress_label = ttk.Label(btn_frame, text="", anchor="center")
 
         # ─── 右侧面板 ───
         right = ttk.Frame(body)
@@ -316,13 +327,19 @@ class BacktestApp(tk.Tk):
         self._chart_container = ttk.Frame(self._chart_tab)
         self._chart_container.pack(fill="both", expand=True)
 
-        # Tab 3: Greeks 时序
-        self._greeks_tab = ttk.Frame(self._nb)
-        self._nb.add(self._greeks_tab, text="  Greeks  ")
-        self._greeks_container = ttk.Frame(self._greeks_tab)
-        self._greeks_container.pack(fill="both", expand=True)
+        # Tab 3: 波动率分析
+        self._vol_tab = ttk.Frame(self._nb)
+        self._nb.add(self._vol_tab, text="  波动率分析  ")
+        self._vol_container = ttk.Frame(self._vol_tab)
+        self._vol_container.pack(fill="both", expand=True)
 
-        # Tab 4: 明细表
+        # Tab 4: 盈亏分布（蒙特卡洛）
+        self._dist_tab = ttk.Frame(self._nb)
+        self._nb.add(self._dist_tab, text="  盈亏分布  ")
+        self._dist_container = ttk.Frame(self._dist_tab)
+        self._dist_container.pack(fill="both", expand=True)
+
+        # Tab 5: 明细表
         self._table_tab = ttk.Frame(self._nb)
         self._nb.add(self._table_tab, text="  每日明细  ")
 
@@ -413,6 +430,8 @@ class BacktestApp(tk.Tk):
             "multiplier": float(self._mult_var.get()),
             "s0": self._s0_var.get().strip(),
             "seed": self._seed_var.get().strip(),
+            "real_vol": self._real_vol_var.get().strip(),
+            "n_paths": self._npaths_var.get().strip(),
             "csv_path": self._csv_path_var.get().strip(),
             "csv_col": self._csv_col_var.get().strip() or "close",
             "wind_code": self._wind_code_var.get().strip(),
@@ -424,7 +443,43 @@ class BacktestApp(tk.Tk):
         try:
             bt = self._build_backtest(gui_state)
             bt.run()
-            self.after(0, lambda: self._show_results(bt))
+
+            # 模拟模式下进行蒙特卡洛多路径分析
+            multi_stats = None
+            src = gui_state["source"]
+            if src == "simulate":
+                n_paths = int(gui_state.get("n_paths") or 500)
+                if n_paths > 1:
+                    params = gui_state["params"]
+                    s0 = float(gui_state["s0"])
+                    seed = int(gui_state["seed"])
+                    T_days = params.get("T_days") or params.get("T") or 20
+                    sigma_impl = params.get("sigma", 0.18)
+                    r = params.get("r", 0.03)
+                    q = params.get("q", 0.03)
+                    real_vol_str = gui_state["real_vol"]
+                    sigma_real = float(real_vol_str) if real_vol_str else sigma_impl
+                    paths = HedgeBacktest.simulate_multi_paths(
+                        s0, sigma_real, T_days, n_paths=n_paths,
+                        r=r, q=q, seed=seed)
+
+                    # 切换为确定进度条
+                    def _switch_to_determinate():
+                        self._progress.stop()
+                        self._progress.configure(mode="determinate", maximum=n_paths, value=0)
+                        self._progress_label.configure(text=f"蒙特卡洛模拟: 0/{n_paths}")
+                        self._progress_label.pack(fill="x")
+                    self.after(0, _switch_to_determinate)
+
+                    def _on_progress(done, total):
+                        self.after(0, lambda d=done, t=total: (
+                            self._progress.configure(value=d),
+                            self._progress_label.configure(text=f"蒙特卡洛模拟: {d}/{t}"),
+                        ))
+
+                    multi_stats = bt.run_multi(paths, progress_callback=_on_progress)
+
+            self.after(0, lambda: self._show_results(bt, multi_stats))
         except Exception as e:
             import traceback
             err_msg = traceback.format_exc()
@@ -435,7 +490,10 @@ class BacktestApp(tk.Tk):
 
     def _finish_run(self):
         self._progress.stop()
+        self._progress.configure(mode="indeterminate")
         self._progress.pack_forget()
+        self._progress_label.pack_forget()
+        self._progress_label.configure(text="")
         self._run_btn.configure(state="normal")
 
     def _build_backtest(self, gs):
@@ -459,10 +517,13 @@ class BacktestApp(tk.Tk):
 
             # 获取期限天数
             T_days = params.get("T_days") or params.get("T") or 20
-            sigma = params.get("sigma", 0.18)
+            sigma_impl = params.get("sigma", 0.18)
             r = params.get("r", 0.03)
             q = params.get("q", 0.03)
-            prices = HedgeBacktest.simulate_prices(s0, sigma, T_days, r=r, q=q, seed=seed)
+            # 已实现波动率：空则同隐含波动率
+            real_vol_str = gs["real_vol"]
+            sigma_real = float(real_vol_str) if real_vol_str else sigma_impl
+            prices = HedgeBacktest.simulate_prices(s0, sigma_real, T_days, r=r, q=q, seed=seed)
             bt = HedgeBacktest(option, prices, hedge_freq=hedge_freq,
                                tc_rate=tc_rate, position=position,
                                quantity=quantity, multiplier=multiplier)
@@ -501,14 +562,15 @@ class BacktestApp(tk.Tk):
         return bt
 
     # ---- 结果展示 ----
-    def _show_results(self, bt):
-        self._show_summary(bt)
+    def _show_results(self, bt, multi_stats=None):
+        self._show_summary(bt, multi_stats)
         self._show_chart(bt)
-        self._show_greeks(bt)
+        self._show_vol_chart(bt)
+        self._show_dist_chart(multi_stats)
         self._show_table(bt)
         self._nb.select(0)
 
-    def _show_summary(self, bt):
+    def _show_summary(self, bt, multi_stats=None):
         r = bt._results
         n = r['n_days']
         meta = bt._gui_meta
@@ -536,12 +598,17 @@ class BacktestApp(tk.Tk):
             f"  期权初始价值      :  {r['opt_value'][0]:>12.4f}",
             f"  期权到期价值      :  {r['opt_value'][-1]:>12.4f}",
             "─" * 54,
-            "  【盈亏分解】",
+            "  【单路径盈亏分解（种子路径）】",
             f"  标的对冲盈亏      :  {np.sum(r['hedge_daily']):>12.4f}",
             f"  期权 MtM 盈亏     :  {np.sum(r['option_daily']):>12.4f}",
             f"  利息收入          :  {np.sum(r['interest_daily']):>12.4f}",
             f"  累计交易成本      :  {r['total_tc']:>12.4f}",
             f"  对冲误差          :  {r['hedging_error']:>12.4f}",
+            "─" * 54,
+            "  【波动率分析】",
+            f"  成交隐含波动率    :  {r['implied_vol'] * 100:>11.2f}%",
+            f"  已实现波动率      :  {r['realized_vol'] * 100:>11.2f}%",
+            f"  波动率价差        :  {r['vol_spread'] * 100:>11.2f}%  (正=卖方优势)",
             "─" * 54,
             "  【Greeks 统计】",
             f"  {'':15s}  {'初始值':>10s}  {'均值':>10s}  {'最大|值|':>10s}",
@@ -554,6 +621,45 @@ class BacktestApp(tk.Tk):
             f"  调仓次数          :  {int(np.sum(np.abs(np.diff(r['shares'])) > 1e-10)):>10d}",
             "═" * 54,
         ]
+
+        # 蒙特卡洛多路径统计
+        if multi_stats is not None:
+            ms = multi_stats
+            pnl = ms['total_pnl']
+            n_p = ms['n_paths']
+            pct = lambda arr, q: np.percentile(arr, q)
+            lines += [
+                "",
+                "═" * 54,
+                f"       蒙特卡洛多路径统计 ({n_p} 条路径)",
+                "═" * 54,
+                "",
+                "  【总盈亏分布】",
+                f"  期望盈亏(均值)    :  {np.mean(pnl):>12.4f}",
+                f"  盈亏标准差        :  {np.std(pnl):>12.4f}",
+                f"  盈亏中位数        :  {np.median(pnl):>12.4f}",
+                f"  盈利概率          :  {np.mean(pnl > 0) * 100:>11.2f}%",
+                "─" * 54,
+                "  【分位数】",
+                f"  1%  分位          :  {pct(pnl, 1):>12.4f}",
+                f"  5%  分位          :  {pct(pnl, 5):>12.4f}",
+                f"  25% 分位          :  {pct(pnl, 25):>12.4f}",
+                f"  75% 分位          :  {pct(pnl, 75):>12.4f}",
+                f"  95% 分位          :  {pct(pnl, 95):>12.4f}",
+                f"  99% 分位          :  {pct(pnl, 99):>12.4f}",
+                "─" * 54,
+                f"  最大盈利          :  {np.max(pnl):>12.4f}",
+                f"  最大亏损          :  {np.min(pnl):>12.4f}",
+                "─" * 54,
+                "  【波动率】",
+                f"  隐含波动率        :  {ms['implied_vol'] * 100:>11.2f}%",
+                f"  已实现波动率均值  :  {np.mean(ms['realized_vols']) * 100:>11.2f}%",
+                f"  已实现波动率标准差:  {np.std(ms['realized_vols']) * 100:>11.2f}%",
+                "─" * 54,
+                f"  平均交易成本      :  {np.mean(ms['total_tc']):>12.4f}",
+                "═" * 54,
+            ]
+
         self._summary_text.configure(state="normal")
         self._summary_text.delete("1.0", "end")
         self._summary_text.insert("1.0", "\n".join(lines))
@@ -650,55 +756,193 @@ class BacktestApp(tk.Tk):
         canvas.draw()
         canvas.get_tk_widget().pack(fill="both", expand=True)
 
-    def _show_greeks(self, bt):
-        """专用 Greeks 时序表格"""
-        for w in self._greeks_container.winfo_children():
+    def _show_vol_chart(self, bt):
+        """波动率分析图表"""
+        for w in self._vol_container.winfo_children():
             w.destroy()
+
+        from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+        from matplotlib.figure import Figure
 
         r = bt._results
         n = len(r['prices'])
 
-        # 使用 Treeview 展示 Greeks 时序
-        greeks_cols = ["Day", "Price", "Delta", "Gamma", "Vega", "Theta", "Rho"]
-        tree_frame = ttk.Frame(self._greeks_container)
-        tree_frame.pack(fill="both", expand=True, padx=5, pady=5)
-
-        yscroll = ttk.Scrollbar(tree_frame, orient="vertical")
-        tree = ttk.Treeview(tree_frame, columns=greeks_cols, show="headings",
-                            height=20, yscrollcommand=yscroll.set)
-        yscroll.config(command=tree.yview)
-
-        col_widths = {"Day": 55, "Price": 90, "Delta": 90, "Gamma": 90,
-                      "Vega": 90, "Theta": 100, "Rho": 90}
-        for col in greeks_cols:
-            tree.heading(col, text=col)
-            tree.column(col, width=col_widths.get(col, 90), anchor="e")
-
-        # 如果有 rho 数据
-        rho_arr = r.get('rho', np.zeros(n))
-
-        # 判断日期
         if hasattr(bt, '_wind_meta') and bt._wind_meta is not None:
-            date_labels = [str(d)[:10] for d in bt._wind_meta['dates']]
+            days = bt._wind_meta['dates']
+            x_label = '日期'
         else:
-            date_labels = [str(i) for i in range(n)]
+            days = np.arange(n)
+            x_label = '交易日'
 
-        for i in range(n):
-            values = [
-                date_labels[i],
-                f"{r['prices'][i]:.4f}",
-                f"{r['delta'][i]:.6f}",
-                f"{r['gamma'][i]:.6f}",
-                f"{r['vega'][i]:.4f}",
-                f"{r['theta'][i]:.4f}",
-                f"{rho_arr[i]:.6f}",
-            ]
-            tree.insert("", "end", values=values)
+        implied = r['implied_vol']
+        rolling = r['rolling_realized']
+        cum_real = r['cumulative_realized']
 
-        tree.grid(row=0, column=0, sticky="nsew")
-        yscroll.grid(row=0, column=1, sticky="ns")
-        tree_frame.rowconfigure(0, weight=1)
-        tree_frame.columnconfigure(0, weight=1)
+        fig = Figure(figsize=(10, 7), dpi=96)
+
+        # (1) 滚动已实现波动率 vs 隐含波动率
+        ax1 = fig.add_subplot(2, 2, 1)
+        ax1.axhline(y=implied * 100, color='red', linestyle='--', linewidth=1.2,
+                     label=f'隐含波动率 {implied*100:.1f}%')
+        ax1.plot(days, rolling * 100, 'b-', linewidth=1.2,
+                 label='滚动已实现波动率(20d)')
+        ax1.fill_between(days, implied * 100, rolling * 100,
+                         where=rolling > implied, alpha=0.15, color='red',
+                         label='已实现 > 隐含')
+        ax1.fill_between(days, implied * 100, rolling * 100,
+                         where=rolling <= implied, alpha=0.15, color='green',
+                         label='已实现 ≤ 隐含')
+        ax1.set_title('滚动已实现波动率 vs 隐含波动率', fontsize=10)
+        ax1.set_xlabel(x_label, fontsize=8)
+        ax1.set_ylabel('波动率 (%)', fontsize=8)
+        ax1.legend(fontsize=7, loc='best')
+        ax1.grid(True, alpha=0.3)
+        ax1.tick_params(axis='x', rotation=30, labelsize=7)
+
+        # (2) 累计已实现波动率 vs 隐含波动率
+        ax2 = fig.add_subplot(2, 2, 2)
+        ax2.axhline(y=implied * 100, color='red', linestyle='--', linewidth=1.2,
+                     label=f'隐含波动率 {implied*100:.1f}%')
+        ax2.plot(days, cum_real * 100, 'g-', linewidth=1.2,
+                 label='累计已实现波动率')
+        ax2.set_title('累计已实现波动率收敛', fontsize=10)
+        ax2.set_xlabel(x_label, fontsize=8)
+        ax2.set_ylabel('波动率 (%)', fontsize=8)
+        ax2.legend(fontsize=7, loc='best')
+        ax2.grid(True, alpha=0.3)
+        ax2.tick_params(axis='x', rotation=30, labelsize=7)
+
+        # (3) 波动率价差 (implied - rolling realized)
+        ax3 = fig.add_subplot(2, 2, 3)
+        vol_diff = (implied - rolling) * 100
+        ax3.plot(days, vol_diff, 'k-', linewidth=1.0)
+        ax3.axhline(y=0, color='gray', linestyle='--', alpha=0.5)
+        ax3.fill_between(days, 0, vol_diff,
+                         where=vol_diff >= 0, alpha=0.2, color='green')
+        ax3.fill_between(days, 0, vol_diff,
+                         where=vol_diff < 0, alpha=0.2, color='red')
+        ax3.set_title('波动率价差 (隐含 − 滚动已实现)', fontsize=10)
+        ax3.set_xlabel(x_label, fontsize=8)
+        ax3.set_ylabel('价差 (%)', fontsize=8)
+        ax3.grid(True, alpha=0.3)
+        ax3.tick_params(axis='x', rotation=30, labelsize=7)
+
+        # (4) 日收益率分布
+        ax4 = fig.add_subplot(2, 2, 4)
+        log_ret = np.log(r['prices'][1:] / r['prices'][:-1])
+        ax4.hist(log_ret * 100, bins=max(15, r['n_days'] // 3),
+                 edgecolor='black', alpha=0.7, color='steelblue', density=True)
+        # 叠加正态分布（隐含波动率）
+        x_range = np.linspace(log_ret.min() * 100, log_ret.max() * 100, 200)
+        daily_impl = implied / np.sqrt(243.0) * 100
+        from scipy.stats import norm
+        ax4.plot(x_range, norm.pdf(x_range, 0, daily_impl), 'r--', linewidth=1.2,
+                 label=f'隐含波动率正态 σ={daily_impl:.2f}%')
+        daily_real = np.std(log_ret) * 100
+        ax4.plot(x_range, norm.pdf(x_range, np.mean(log_ret) * 100, daily_real),
+                 'b-', linewidth=1.2, alpha=0.7,
+                 label=f'已实现正态 σ={daily_real:.2f}%')
+        ax4.set_title('日收益率分布', fontsize=10)
+        ax4.set_xlabel('日收益率 (%)', fontsize=8)
+        ax4.set_ylabel('密度', fontsize=8)
+        ax4.legend(fontsize=7)
+        ax4.grid(True, alpha=0.3)
+
+        fig.tight_layout()
+
+        canvas = FigureCanvasTkAgg(fig, master=self._vol_container)
+        canvas.draw()
+        canvas.get_tk_widget().pack(fill="both", expand=True)
+
+    def _show_dist_chart(self, multi_stats):
+        """蒙特卡洛盈亏分布图表"""
+        for w in self._dist_container.winfo_children():
+            w.destroy()
+
+        if multi_stats is None:
+            lbl = ttk.Label(self._dist_container,
+                            text="盈亏分布仅在模拟数据模式下显示（需路径数 > 1）",
+                            font=("", 11))
+            lbl.pack(expand=True)
+            return
+
+        from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+        from matplotlib.figure import Figure
+
+        ms = multi_stats
+        pnl = ms['total_pnl']
+        errors = ms['errors']
+        rv = ms['realized_vols']
+        iv = ms['implied_vol']
+        n_paths = ms['n_paths']
+
+        fig = Figure(figsize=(10, 7), dpi=96)
+
+        # (1) 总盈亏分布直方图
+        ax1 = fig.add_subplot(2, 2, 1)
+        ax1.hist(pnl, bins=max(30, n_paths // 15), edgecolor='black',
+                 alpha=0.7, color='steelblue', density=False)
+        ax1.axvline(np.mean(pnl), color='red', linestyle='--', linewidth=1.5,
+                    label=f'均值={np.mean(pnl):.2f}')
+        ax1.axvline(0, color='gray', linestyle='-', alpha=0.6)
+        ax1.axvline(np.percentile(pnl, 5), color='orange', linestyle=':',
+                    linewidth=1.2, label=f'5%VaR={np.percentile(pnl, 5):.2f}')
+        ax1.set_title(f'总盈亏分布 ({n_paths}条路径)', fontsize=10)
+        ax1.set_xlabel('总盈亏', fontsize=8)
+        ax1.set_ylabel('频次', fontsize=8)
+        ax1.legend(fontsize=7)
+        ax1.grid(True, alpha=0.3)
+
+        # (2) 对冲误差分布
+        ax2 = fig.add_subplot(2, 2, 2)
+        ax2.hist(errors, bins=max(30, n_paths // 15), edgecolor='black',
+                 alpha=0.7, color='salmon', density=False)
+        ax2.axvline(np.mean(errors), color='red', linestyle='--', linewidth=1.5,
+                    label=f'均值={np.mean(errors):.2f}')
+        ax2.axvline(0, color='gray', linestyle='-', alpha=0.6)
+        ax2.set_title('对冲误差分布', fontsize=10)
+        ax2.set_xlabel('对冲误差', fontsize=8)
+        ax2.set_ylabel('频次', fontsize=8)
+        ax2.legend(fontsize=7)
+        ax2.grid(True, alpha=0.3)
+
+        # (3) 已实现波动率分布 vs 隐含波动率
+        ax3 = fig.add_subplot(2, 2, 3)
+        ax3.hist(rv * 100, bins=max(30, n_paths // 15), edgecolor='black',
+                 alpha=0.7, color='mediumpurple', density=False)
+        ax3.axvline(iv * 100, color='red', linestyle='--', linewidth=1.5,
+                    label=f'隐含波动率={iv*100:.1f}%')
+        ax3.axvline(np.mean(rv) * 100, color='blue', linestyle='--', linewidth=1.2,
+                    label=f'已实现均值={np.mean(rv)*100:.1f}%')
+        ax3.set_title('已实现波动率分布', fontsize=10)
+        ax3.set_xlabel('年化波动率 (%)', fontsize=8)
+        ax3.set_ylabel('频次', fontsize=8)
+        ax3.legend(fontsize=7)
+        ax3.grid(True, alpha=0.3)
+
+        # (4) 盈亏 vs 已实现波动率散点图
+        ax4 = fig.add_subplot(2, 2, 4)
+        vol_spread = iv - rv
+        ax4.scatter(vol_spread * 100, pnl, s=8, alpha=0.4, c='teal')
+        # 线性拟合
+        if len(vol_spread) > 2:
+            z = np.polyfit(vol_spread * 100, pnl, 1)
+            x_fit = np.linspace(np.min(vol_spread) * 100, np.max(vol_spread) * 100, 100)
+            ax4.plot(x_fit, np.polyval(z, x_fit), 'r-', linewidth=1.5,
+                     label=f'拟合斜率={z[0]:.2f}')
+        ax4.axhline(0, color='gray', linestyle='--', alpha=0.5)
+        ax4.axvline(0, color='gray', linestyle='--', alpha=0.5)
+        ax4.set_title('盈亏 vs 波动率价差', fontsize=10)
+        ax4.set_xlabel('波动率价差 (隐含−已实现) %', fontsize=8)
+        ax4.set_ylabel('总盈亏', fontsize=8)
+        ax4.legend(fontsize=7)
+        ax4.grid(True, alpha=0.3)
+
+        fig.tight_layout()
+
+        canvas = FigureCanvasTkAgg(fig, master=self._dist_container)
+        canvas.draw()
+        canvas.get_tk_widget().pack(fill="both", expand=True)
 
     def _show_table(self, bt):
         for w in self._table_tab.winfo_children():
@@ -714,23 +958,25 @@ class BacktestApp(tk.Tk):
         xscroll = ttk.Scrollbar(tree_frame, orient="horizontal")
         yscroll = ttk.Scrollbar(tree_frame, orient="vertical")
 
-        tree = ttk.Treeview(tree_frame, columns=["idx"] + columns,
+        tree = ttk.Treeview(tree_frame, columns=["day_no", "idx"] + columns,
                             show="headings", height=20,
                             xscrollcommand=xscroll.set,
                             yscrollcommand=yscroll.set)
         xscroll.config(command=tree.xview)
         yscroll.config(command=tree.yview)
 
+        tree.heading("day_no", text="交易日")
+        tree.column("day_no", width=55, anchor="center")
         tree.heading("idx", text=df.index.name or "日期")
         tree.column("idx", width=90, anchor="center")
         for col in columns:
             tree.heading(col, text=col)
             tree.column(col, width=85, anchor="e")
 
-        for idx, row in df.iterrows():
+        for i, (idx, row) in enumerate(df.iterrows()):
             idx_str = str(idx)[:10] if hasattr(idx, 'strftime') else str(idx)
-            values = [idx_str] + [f"{v:.4f}" if isinstance(v, float) else str(v)
-                                  for v in row.values]
+            values = [i, idx_str] + [f"{v:.4f}" if isinstance(v, float) else str(v)
+                                     for v in row.values]
             tree.insert("", "end", values=values)
 
         tree.grid(row=0, column=0, sticky="nsew")

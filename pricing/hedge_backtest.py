@@ -7,13 +7,35 @@
 """
 
 import copy
+import os
 import numpy as np
 import matplotlib.pyplot as plt
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 try:
     from .constants import ANNUAL_DAYS
 except ImportError:
     from constants import ANNUAL_DAYS
+
+
+# ---- 多线程工作函数 ----
+
+def _run_single_path(args):
+    """线程池工作函数：对单条路径执行回测"""
+    option_init, price_path, hedge_freq, tc_rate, position, quantity, multiplier = args
+    bt = HedgeBacktest(
+        option_init, price_path,
+        hedge_freq=hedge_freq, tc_rate=tc_rate,
+        position=position, quantity=quantity, multiplier=multiplier,
+    )
+    res = bt.run()
+    return {
+        'hedging_error': res['hedging_error'],
+        'final_pnl': res['cumulative_pnl'][-1],
+        'total_tc': res['total_tc'],
+        'final_price': price_path[-1],
+        'realized_vol': res['realized_vol'],
+    }
 
 
 class HedgeBacktest:
@@ -167,6 +189,34 @@ class HedgeBacktest:
         # 最终对冲误差：完美对冲时应接近 0
         hedging_error = PV[-1] - pos * V[-1] * qty
 
+        # ---- 波动率分析 ----
+        implied_vol = option.sigma  # 成交时隐含波动率
+
+        # 日收益率（对数）
+        log_ret = np.log(S[1:] / S[:-1])  # 长度 n
+
+        # 全区间已实现波动率（年化）
+        realized_vol = np.std(log_ret, ddof=1) * np.sqrt(ANNUAL_DAYS) if n > 1 else 0.0
+
+        # 滚动已实现波动率（窗口 = min(20, n)）
+        win = min(20, n)
+        rolling_realized = np.full(n + 1, np.nan)
+        for i in range(win, n + 1):
+            window_ret = log_ret[i - win:i]
+            rolling_realized[i] = np.std(window_ret, ddof=1) * np.sqrt(ANNUAL_DAYS)
+        # 前 win 个交易日用累计已实现波动率填充
+        for i in range(1, min(win, n + 1)):
+            rolling_realized[i] = np.std(log_ret[:i], ddof=1) * np.sqrt(ANNUAL_DAYS) if i > 1 else 0.0
+        rolling_realized[0] = 0.0
+
+        # 波动率价差：隐含 - 已实现（正值 → 卖方有优势）
+        vol_spread = implied_vol - realized_vol
+
+        # 逐日累计已实现波动率
+        cumulative_realized = np.zeros(n + 1)
+        for i in range(2, n + 1):
+            cumulative_realized[i] = np.std(log_ret[:i], ddof=1) * np.sqrt(ANNUAL_DAYS)
+
         self._results = {
             'n_days': n,
             'prices': S,
@@ -187,6 +237,11 @@ class HedgeBacktest:
             'cumulative_pnl': cum_pnl,
             'hedging_error': hedging_error,
             'total_tc': np.sum(TC),
+            'implied_vol': implied_vol,
+            'realized_vol': realized_vol,
+            'rolling_realized': rolling_realized,
+            'cumulative_realized': cumulative_realized,
+            'vol_spread': vol_spread,
         }
         return self._results
 
@@ -367,32 +422,93 @@ class HedgeBacktest:
         paths[:, 1:] = s0 * np.exp(np.cumsum(log_returns, axis=1))
         return paths
 
-    def run_multi(self, paths):
+    def run_multi(self, paths, progress_callback=None, max_workers=None):
         """
-        对多条价格路径批量回测，返回对冲误差分布
+        对多条价格路径批量回测，返回详细统计（多线程并行）
+
+        NumPy 运算会释放 GIL，ThreadPoolExecutor 可有效利用多核并行。
 
         Parameters
         ----------
         paths : ndarray, shape (n_paths, T_days + 1)
+        progress_callback : callable(completed: int, total: int), optional
+            每完成一条路径后调用，用于更新进度
+        max_workers : int, optional
+            并行线程数，默认 min(cpu_count, n_paths)
 
         Returns
         -------
-        errors : ndarray, shape (n_paths,)
-            每条路径的对冲误差
+        dict with keys:
+            n_paths        : int
+            errors         : ndarray — 每条路径的对冲误差
+            total_pnl      : ndarray — 每条路径的累计净盈亏 (cum_pnl[-1])
+            total_tc       : ndarray — 每条路径的累计交易成本
+            final_prices   : ndarray — 每条路径的到期标的价格
+            implied_vol    : float   — 隐含波动率
+            realized_vols  : ndarray — 每条路径的已实现波动率（年化）
         """
-        errors = np.zeros(len(paths))
-        for i, p in enumerate(paths):
-            bt = HedgeBacktest(
-                self.option_init, p,
-                hedge_freq=self.hedge_freq,
-                tc_rate=self.tc_rate,
-                position=self.position,
-                quantity=self.quantity,
-                multiplier=self.multiplier,
-            )
-            res = bt.run()
-            errors[i] = res['hedging_error']
-        return errors
+        n = len(paths)
+        errors = np.zeros(n)
+        total_pnl = np.zeros(n)
+        total_tc = np.zeros(n)
+        final_prices = np.zeros(n)
+        realized_vols = np.zeros(n)
+        implied_vol = self.option_init.sigma
+
+        if max_workers is None:
+            max_workers = min(os.cpu_count() or 4, n)
+
+        task_args = [
+            (self.option_init, paths[i], self.hedge_freq,
+             self.tc_rate, self.position, self.quantity, self.multiplier)
+            for i in range(n)
+        ]
+
+        completed = 0
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {executor.submit(_run_single_path, a): i
+                       for i, a in enumerate(task_args)}
+            for future in as_completed(futures):
+                idx = futures[future]
+                res = future.result()
+                errors[idx] = res['hedging_error']
+                total_pnl[idx] = res['final_pnl']
+                total_tc[idx] = res['total_tc']
+                final_prices[idx] = res['final_price']
+                realized_vols[idx] = res['realized_vol']
+                completed += 1
+                if progress_callback:
+                    progress_callback(completed, n)
+
+        return {
+            'n_paths': n,
+            'errors': errors,
+            'total_pnl': total_pnl,
+            'total_tc': total_tc,
+            'final_prices': final_prices,
+            'implied_vol': implied_vol,
+            'realized_vols': realized_vols,
+        }
+
+        return {
+            'n_paths': n,
+            'errors': errors,
+            'total_pnl': total_pnl,
+            'total_tc': total_tc,
+            'final_prices': final_prices,
+            'implied_vol': implied_vol,
+            'realized_vols': realized_vols,
+        }
+
+        return {
+            'n_paths': n,
+            'errors': errors,
+            'total_pnl': total_pnl,
+            'total_tc': total_tc,
+            'final_prices': final_prices,
+            'implied_vol': implied_vol,
+            'realized_vols': realized_vols,
+        }
 
     def plot_error_dist(self, errors, figsize=(10, 5)):
         """绘制对冲误差分布直方图"""
@@ -469,7 +585,7 @@ class HedgeBacktest:
         opt.s0 = float(prices[0])
 
         bt = cls(opt, prices, hedge_freq=hedge_freq, tc_rate=tc_rate, position=position,
-                 notional=notional, lot_size=lot_size)
+                 quantity=quantity, multiplier=multiplier)
         bt._wind_meta = {
             'code': code,
             'start_date': start_date,
