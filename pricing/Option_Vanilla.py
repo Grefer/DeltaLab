@@ -1,38 +1,66 @@
 # _*_ coding: utf-8 _*_
 """
-Created on 12月 20 11:05 2023 
+Created on 12月 20 11:05 2023
 
 @author: Grefer
 """
 from scipy.stats import norm
 from math import log, sqrt, exp
 
+try:
+    from .constants import ANNUAL_DAYS
+    from .option_base import OptionBase
+except ImportError:
+    from constants import ANNUAL_DAYS
+    from option_base import OptionBase
 
-class Option_Vanilla(object):
 
+class Option_Vanilla(OptionBase):
     def __init__(self,
-                 s: float,
-                 k: float,
-                 r: float,
-                 g: float,
-                 t: float,
+                 optiontype: str,
+                 s0: float,
+                 sr: list,
+                 K: float,
+                 T: int,
                  sigma: float,
                  cp: int,
-                 exe_mode: str
+                 r: float = 0.03,
+                 q: float = 0.03,
+                 exe_mode: str = "Eu",
+                 **kwargs: float
                  ):
-        self.s = s
-        self.k = k
-        self.r = r
-        self.g = g
-        self.t = t
+        self.optiontype = optiontype
+        self.s0 = s0
+        self.sr = sr
+        self.K = K
+        self.T = T
         self.sigma = sigma
         self.cp = cp
+        self.r = r
+        self.q = q
         self.exe_mode = exe_mode
 
     def get_price(self):
+        if self.T <= 0:
+            payoff = max(self.cp * (self.s0 - self.K), 0.0)
+            return payoff
         if self.exe_mode == "Eu":
-            price = blsprice(self.s, self.k, self.r, self.g, self.t, self.sigma, self.cp)
-            return price
+            t_years = self.T / ANNUAL_DAYS
+            return blsprice(self.s0, self.K, self.r, self.q, t_years, self.sigma, self.cp)
+        return None
+
+    @property
+    def _time_remaining(self):
+        return self.T
+
+    def _theta_overrides(self, dt):
+        return {
+            'sr': list(self.sr) + [self.s0],
+            'T': self.T - dt,
+        }
+
+    def _decrement_time(self):
+        self.T -= 1
 
 
 def blsprice(s, k, r, g, t, sigma, cp):

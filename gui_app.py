@@ -9,6 +9,7 @@
 import sys
 import os
 import copy
+import platform
 import threading
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
@@ -16,13 +17,40 @@ import numpy as np
 import matplotlib
 matplotlib.use("TkAgg")
 import matplotlib.pyplot as plt
-plt.rcParams['font.sans-serif'] = ['SimHei', 'Microsoft YaHei']
+from matplotlib import font_manager
+
+# ---- 跨平台中文字体设置 ----
+_SYSTEM = platform.system()
+if _SYSTEM == "Darwin":
+    _CJK_CANDIDATES = ["PingFang SC", "Heiti SC", "STHeiti", "Arial Unicode MS",
+                       "Hiragino Sans GB", "Songti SC"]
+elif _SYSTEM == "Windows":
+    _CJK_CANDIDATES = ["Microsoft YaHei", "SimHei", "SimSun"]
+else:
+    _CJK_CANDIDATES = ["Noto Sans CJK SC", "WenQuanYi Zen Hei",
+                       "WenQuanYi Micro Hei", "Source Han Sans SC"]
+
+_AVAILABLE_FONTS = {f.name for f in font_manager.fontManager.ttflist}
+_CJK_FALLBACK = [f for f in _CJK_CANDIDATES if f in _AVAILABLE_FONTS] + ["DejaVu Sans"]
+plt.rcParams['font.sans-serif'] = _CJK_FALLBACK
+plt.rcParams['font.family'] = 'sans-serif'
 plt.rcParams['axes.unicode_minus'] = False
+
+# 显式绑定一个 CJK 字体文件, 供 matplotlib text() 等接口通过 fontproperties 强制使用,
+# 避免某些调用路径回退到不含 CJK 字形的默认字体导致乱码.
+_MPL_CJK_FP = None
+for _f in font_manager.fontManager.ttflist:
+    if _f.name in _CJK_CANDIDATES:
+        _MPL_CJK_FP = font_manager.FontProperties(fname=_f.fname)
+        break
+
+# Tk/ttk 使用的中文 UI 字体族（取第一个可用的 CJK 字体）
+_UI_FONT_FAMILY = _CJK_FALLBACK[0] if _CJK_FALLBACK[0] != "DejaVu Sans" else "TkDefaultFont"
 
 # 确保 pricing 包可导入
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from pricing import Option_AB, Option_AS, Option_DE, HedgeBacktest
+from pricing import Option_AB, Option_AS, Option_DE, Option_Vanilla, HedgeBacktest
 from pricing.constants import ANNUAL_DAYS
 
 # ============================================================
@@ -30,48 +58,21 @@ from pricing.constants import ANNUAL_DAYS
 # ============================================================
 
 OPTION_CLASSES = {
-    "气囊期权 (Airbag)": {
-        "class": Option_AB,
-        "subtypes": ["Opt_Airbag"],
-        "params": [
-            ("K",     "行权价",        float, 100.0),
-            ("KI",    "敲入价",        float, 90.0),
-            ("T_days","期限(交易日)",   int,   20),
-            ("sigma", "波动率",        float, 0.18),
-            ("pr",    "参与率",        float, 0.8),
-            ("pr_ki", "敲入参与率",     float, 1.0),
-            ("cp",    "方向(1看涨/-1看跌)", int, 1),
-            ("r",     "无风险利率",     float, 0.03),
-            ("q",     "分红率",        float, 0.03),
-            ("nPath", "模拟路径数",     int,   100000),
-        ],
-        "build": lambda st, p: Option_AB(
-            st, p["s0"], [], p["K"], p["KI"], p["T_days"],
-            list(range(1, p["T_days"] + 1)),
-            p["sigma"], p["pr"], p["pr_ki"], p["cp"],
-            r=p["r"], q=p["q"], nPath=p["nPath"]
-        ),
-    },
-    "亚式期权 (Asian)": {
-        "class": Option_AS,
-        "subtypes": ["Asian", "EnhanceAsian"],
+    "香草期权 (Vanilla)": {
+        "class": Option_Vanilla,
+        "subtypes": ["Eu"],
         "params": [
             ("K",      "行权价",        float, 100.0),
-            ("E",      "增强价(Enhanced)", float, 100.0),
-            ("T",      "期限(交易日)",   int,   22),
-            ("N",      "观察日数",       int,   22),
-            ("sigma",  "波动率",        float, 0.15),
+            ("T_days", "期限(交易日)",   int,   22),
+            ("sigma",  "波动率",        float, 0.18),
             ("cp",     "方向(1看涨/-1看跌)", int, 1),
-            ("minPay", "最低赔付",       float, 0.0),
-            ("maxPay", "最高赔付",       float, 999999.0),
             ("r",      "无风险利率",     float, 0.03),
             ("q",      "分红率",        float, 0.03),
-            ("nPath",  "模拟路径数",     int,   100000),
         ],
-        "build": lambda st, p: Option_AS(
-            st, p["s0"], [], p["K"], p["E"], p["T"], p["N"],
-            p["sigma"], p["cp"], p["minPay"], p["maxPay"],
-            r=p["r"], q=p["q"], nPath=p["nPath"]
+        "build": lambda st, p: Option_Vanilla(
+            st, p["s0"], [], p["K"], p["T_days"],
+            p["sigma"], p["cp"],
+            r=p["r"], q=p["q"], exe_mode=st,
         ),
     },
     "累计期权 (Decumulator)": {
@@ -107,6 +108,151 @@ OPTION_CLASSES = {
             amount=p["amount"] if p["amount"] else None,
         ),
     },
+    "亚式期权 (Asian)": {
+        "class": Option_AS,
+        "subtypes": ["Asian", "EnhanceAsian"],
+        "params": [
+            ("K",      "行权价",        float, 100.0),
+            ("E",      "增强价(Enhanced)", float, 100.0),
+            ("T",      "期限(交易日)",   int,   22),
+            ("N",      "观察日数",       int,   22),
+            ("sigma",  "波动率",        float, 0.15),
+            ("cp",     "方向(1看涨/-1看跌)", int, 1),
+            ("minPay", "最低赔付",       float, 0.0),
+            ("maxPay", "最高赔付",       float, 999999.0),
+            ("r",      "无风险利率",     float, 0.03),
+            ("q",      "分红率",        float, 0.03),
+            ("nPath",  "模拟路径数",     int,   100000),
+        ],
+        "build": lambda st, p: Option_AS(
+            st, p["s0"], [], p["K"], p["E"], p["T"], p["N"],
+            p["sigma"], p["cp"], p["minPay"], p["maxPay"],
+            r=p["r"], q=p["q"], nPath=p["nPath"]
+        ),
+    },
+    "气囊期权 (Airbag)": {
+        "class": Option_AB,
+        "subtypes": ["Opt_Airbag"],
+        "params": [
+            ("K",     "行权价",        float, 100.0),
+            ("KI",    "敲入价",        float, 90.0),
+            ("T_days","期限(交易日)",   int,   20),
+            ("sigma", "波动率",        float, 0.18),
+            ("pr",    "参与率",        float, 0.8),
+            ("pr_ki", "敲入参与率",     float, 1.0),
+            ("cp",    "方向(1看涨/-1看跌)", int, 1),
+            ("r",     "无风险利率",     float, 0.03),
+            ("q",     "分红率",        float, 0.03),
+            ("nPath", "模拟路径数",     int,   100000),
+        ],
+        "build": lambda st, p: Option_AB(
+            st, p["s0"], [], p["K"], p["KI"], p["T_days"],
+            list(range(1, p["T_days"] + 1)),
+            p["sigma"], p["pr"], p["pr_ki"], p["cp"],
+            r=p["r"], q=p["q"], nPath=p["nPath"]
+        ),
+    },
+}
+
+
+# ============================================================
+#  期权结构说明文档
+# ============================================================
+
+STRUCTURE_DOCS = {
+    ("香草期权 (Vanilla)", "Eu"): (
+        "【欧式香草期权】\n"
+        "• Payoff: Call max(S_T−K,0) / Put max(K−S_T,0)\n"
+        "• 定价: Black-Scholes 封闭解\n\n"
+        "风险特征:\n"
+        "  Delta 单调 0→1 (call) 或 −1→0 (put)\n"
+        "  Gamma 集中于 ATM (S≈K), 随 T 缩小放大\n"
+        "  Vega 对 ATM 最敏感, 随 √T 增长\n"
+        "  Theta 为买方持续付出的时间价值"
+    ),
+    ("累计期权 (Decumulator)", "Opt_Decumulator_Back"): (
+        "【回归累计 Opt_Decumulator_Back】\n"
+        "每日观察 + 每日结算, 三段式 cashflow:\n"
+        "  • S ≥ H  (敲出障碍):  当日 0 赔付\n"
+        "  • K < S < H       :  1 倍 (S − K) 结算\n"
+        "  • S ≤ K           :  N 倍杠杆 (S − K) 结算\n\n"
+        "总损益 = 所有观察日折现加总.\n"
+        "卖方希望标的震荡于 (K, H) 区间, 触 K 承 N 倍下行."
+    ),
+    ("累计期权 (Decumulator)", "Opt_Decumulator_Fix"): (
+        "【固定赔付回归累计 Opt_Decumulator_Fix】\n"
+        "结构同 Back, 差异:\n"
+        "  • K < S < H 区间按固定金额 `fix` 结算, 而非 (S−K)\n"
+        "  • 敲出段/杠杆段逻辑不变\n\n"
+        "锁定中间段现金流, 便于账务管理."
+    ),
+    ("累计期权 (Decumulator)", "Opt_EnDecumulator"): (
+        "【增强回归累计 Opt_EnDecumulator】\n"
+        "三段式每日结算:\n"
+        "  • S ≥ H :  (S − H) 1 倍  (敲出后仍给买方正向收益)\n"
+        "  • K < S < H: (S − K) 1 倍\n"
+        "  • S ≤ K :  (S − K) N 倍\n\n"
+        "相比 Back, 保留敲出后上行收益, 故称'增强'."
+    ),
+    ("累计期权 (Decumulator)", "Opt_EnDecumulator_Fix"): (
+        "【固定赔付增强累计 Opt_EnDecumulator_Fix】\n"
+        "  • S ≥ H :  (S − H) 1 倍\n"
+        "  • K < S < H: 固定金额 `fix`\n"
+        "  • S ≤ K :  (S − K) N 倍"
+    ),
+    ("累计期权 (Decumulator)", "Opt_ASGQ_call_put"): (
+        "【到期观察熔断保障累计 ASGQ_call_put】\n"
+        "路径依赖 + 到期一次性结算:\n"
+        "  • 若路径曾 S ≥ H (熔断): 熔断日后统一按 (S_T − P)\n"
+        "  • 从未熔断: 按 (S_T − K), 若 S_T ≤ K 额外 N 倍\n\n"
+        "保障价 P 提供下行软保护, ASGQ = 熔断保障累计."
+    ),
+    ("累计期权 (Decumulator)", "Opt_ASGQ_EP"): (
+        "【熔断保障累计(每日结算) ASGQ_EP】\n"
+        "  • 未熔断部分: 按日 (S − K) 累加\n"
+        "  • 熔断日起  : 每日 (S − P) 结算"
+    ),
+    ("累计期权 (Decumulator)", "Opt_ASGQ_EF"): (
+        "【熔断固定赔付累计 ASGQ_EF】\n"
+        "  • 未熔断部分: 按日 (S − K) 累加\n"
+        "  • 熔断日起  : 每日固定金额 `amount`"
+    ),
+    ("累计期权 (Decumulator)", "Opt_ASGQ_DP"): (
+        "【每日观察熔断保障累计 ASGQ_DP】\n"
+        "每日观察 + 每日结算:\n"
+        "  • 未熔断: (S − K), S ≤ K 时乘 N 倍\n"
+        "  • 熔断日起: 每日 (S − P)\n\n"
+        "比到期版对路径更敏感, Delta/Gamma 跳跃更剧烈."
+    ),
+    ("累计期权 (Decumulator)", "Opt_ASGQ_DF"): (
+        "【每日观察熔断固定赔付累计 ASGQ_DF】\n"
+        "  • 未熔断: (S − K), S ≤ K 时 N 倍\n"
+        "  • 熔断日起: 每日固定金额 `amount`"
+    ),
+    ("亚式期权 (Asian)", "Asian"): (
+        "【亚式期权 Asian】\n"
+        "Payoff = clip( mean(S[-N:]) − K,  minPay,  maxPay ) × cp\n\n"
+        "  • 取最后 N 个交易日均价与 K 的差额\n"
+        "  • minPay / maxPay 限定赔付区间\n"
+        "  • 平均化显著降低末日价格风险\n"
+        "  • Gamma / Vega 远低于同期限 Vanilla"
+    ),
+    ("亚式期权 (Asian)", "EnhanceAsian"): (
+        "【增强亚式 EnhanceAsian】\n"
+        "每日先做价格增强:\n"
+        "  • Call: 观察价 = max(S, E)\n"
+        "  • Put : 观察价 = min(S, E)\n"
+        "再求均值与 K 比较, 并 clip 到 [minPay, maxPay].\n\n"
+        "E 提供'每日保底'效果, 提升买方期望."
+    ),
+    ("气囊期权 (Airbag)", "Opt_Airbag"): (
+        "【气囊期权 Opt_Airbag】\n"
+        "到期结算, 路径判断是否敲入 KI:\n"
+        "  • 未敲入 (Call: min(S) > KI):  pr × max(S_T − K, 0)\n"
+        "  • 已敲入                    : pr_ki × (S_T − K)\n\n"
+        "小幅下行时买方有软垫保护 (payoff=0 而非负);\n"
+        "一旦跌破 KI, 转为线性承担下行, 即'气囊爆掉'."
+    ),
 }
 
 
@@ -130,9 +276,9 @@ class BacktestApp(tk.Tk):
     def _setup_styles(self):
         style = ttk.Style(self)
         style.theme_use("clam")
-        style.configure("Title.TLabel", font=("Microsoft YaHei UI", 14, "bold"))
-        style.configure("Header.TLabel", font=("Microsoft YaHei UI", 10, "bold"))
-        style.configure("Run.TButton", font=("Microsoft YaHei UI", 11, "bold"),
+        style.configure("Title.TLabel", font=(_UI_FONT_FAMILY, 14, "bold"))
+        style.configure("Header.TLabel", font=(_UI_FONT_FAMILY, 10, "bold"))
+        style.configure("Run.TButton", font=(_UI_FONT_FAMILY, 11, "bold"),
                         foreground="white", background="#2563EB")
         style.map("Run.TButton",
                   background=[("active", "#1D4ED8"), ("pressed", "#1E40AF")])
@@ -302,6 +448,19 @@ class BacktestApp(tk.Tk):
                                    command=self._run_backtest)
         self._run_btn.pack(fill="x", ipady=4)
 
+        self._struct_btn = ttk.Button(btn_frame, text="📊  绘制结构图",
+                                      command=self._plot_structure)
+        self._struct_btn.pack(fill="x", ipady=3, pady=(3, 0))
+
+        struct_ctrl = ttk.Frame(btn_frame)
+        struct_ctrl.pack(fill="x", pady=(2, 0))
+        ttk.Label(struct_ctrl, text="扫描 ±%:").pack(side="left")
+        self._struct_range_var = tk.StringVar(value="30")
+        ttk.Entry(struct_ctrl, textvariable=self._struct_range_var, width=5).pack(side="left", padx=(2, 8))
+        ttk.Label(struct_ctrl, text="点数:").pack(side="left")
+        self._struct_npts_var = tk.StringVar(value="31")
+        ttk.Entry(struct_ctrl, textvariable=self._struct_npts_var, width=5).pack(side="left", padx=2)
+
         self._progress = ttk.Progressbar(btn_frame, mode="indeterminate")
         self._progress_label = ttk.Label(btn_frame, text="", anchor="center")
 
@@ -339,7 +498,13 @@ class BacktestApp(tk.Tk):
         self._dist_container = ttk.Frame(self._dist_tab)
         self._dist_container.pack(fill="both", expand=True)
 
-        # Tab 5: 明细表
+        # Tab 5: 结构分析
+        self._struct_tab = ttk.Frame(self._nb)
+        self._nb.add(self._struct_tab, text="  结构分析  ")
+        self._struct_container = ttk.Frame(self._struct_tab)
+        self._struct_container.pack(fill="both", expand=True)
+
+        # Tab 6: 明细表
         self._table_tab = ttk.Frame(self._nb)
         self._nb.add(self._table_tab, text="  每日明细  ")
 
@@ -990,6 +1155,215 @@ class BacktestApp(tk.Tk):
         btn_frame.pack(fill="x", padx=5, pady=3)
         ttk.Button(btn_frame, text="导出 CSV", command=lambda: self._export_csv(df)).pack(
             side="right")
+
+    # ---- 结构分析 ----
+    def _plot_structure(self):
+        try:
+            gui_state = self._collect_gui_state()
+        except Exception as e:
+            messagebox.showerror("参数错误", str(e))
+            return
+        try:
+            range_pct = float(self._struct_range_var.get()) / 100.0
+            n_points = int(self._struct_npts_var.get())
+            if n_points < 5 or n_points > 201:
+                raise ValueError("扫描点数需在 5~201")
+            if range_pct <= 0 or range_pct >= 1:
+                raise ValueError("扫描 ±% 需在 (0, 100)")
+        except Exception as e:
+            messagebox.showerror("参数错误", str(e))
+            return
+
+        if not gui_state["s0"]:
+            messagebox.showerror("参数错误", "请先在左侧设置初始价格 s0")
+            return
+
+        self._struct_btn.configure(state="disabled")
+        self._run_btn.configure(state="disabled")
+        self._progress.pack(fill="x", pady=(3, 0))
+        self._progress.configure(mode="determinate", maximum=n_points, value=0)
+        self._progress_label.configure(text=f"结构扫描: 0/{n_points}")
+        self._progress_label.pack(fill="x")
+        self._nb.select(self._struct_tab)
+        threading.Thread(target=self._structure_worker,
+                         args=(gui_state, range_pct, n_points),
+                         daemon=True).start()
+
+    def _structure_worker(self, gui_state, range_pct, n_points):
+        try:
+            cfg = gui_state["cfg"]
+            subtype = gui_state["subtype"]
+            base_params = dict(gui_state["params"])
+
+            s0_center = float(gui_state["s0"])
+            # 限制 MC 路径数以加速扫描
+            if "nPath" in base_params and base_params["nPath"] > 20000:
+                base_params["nPath"] = 20000
+
+            s_grid = np.linspace(s0_center * (1 - range_pct),
+                                 s0_center * (1 + range_pct), n_points)
+            prices = np.empty(n_points)
+            deltas = np.empty(n_points)
+            gammas = np.empty(n_points)
+            vegas  = np.empty(n_points)
+            thetas = np.empty(n_points)
+
+            for i, s in enumerate(s_grid):
+                p = dict(base_params)
+                p["s0"] = float(s)
+                opt = cfg["build"](subtype, p)
+                price = opt.get_price()
+                prices[i] = price if price is not None else 0.0
+                g = opt.get_greeks()
+                deltas[i] = g[0]
+                gammas[i] = g[1]
+                vegas[i]  = g[2]
+                thetas[i] = g[3]
+
+                done = i + 1
+                self.after(0, lambda d=done: (
+                    self._progress.configure(value=d),
+                    self._progress_label.configure(
+                        text=f"结构扫描: {d}/{n_points}"),
+                ))
+
+            self.after(0, lambda: self._show_structure(
+                gui_state, s_grid, prices, deltas, gammas, vegas, thetas))
+        except Exception as e:
+            import traceback
+            err_msg = traceback.format_exc()
+            print(err_msg, file=sys.stderr)
+            self.after(0, lambda: messagebox.showerror("结构分析失败", err_msg))
+        finally:
+            self.after(0, self._finish_structure)
+
+    def _finish_structure(self):
+        self._progress.stop()
+        self._progress.configure(mode="indeterminate")
+        self._progress.pack_forget()
+        self._progress_label.pack_forget()
+        self._progress_label.configure(text="")
+        self._struct_btn.configure(state="normal")
+        self._run_btn.configure(state="normal")
+
+    def _show_structure(self, gui_state, s_grid, prices, deltas,
+                        gammas, vegas, thetas):
+        for w in self._struct_container.winfo_children():
+            w.destroy()
+
+        from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+        from matplotlib.figure import Figure
+
+        cls_name = gui_state["cls_name"]
+        subtype = gui_state["subtype"]
+        params = gui_state["params"]
+
+        doc_key = (cls_name, subtype)
+        doc_text = STRUCTURE_DOCS.get(doc_key, "(暂无结构说明)")
+        header = f"{cls_name}  /  {subtype}\n" + "─" * 60 + "\n"
+
+        def _fmt(v):
+            if isinstance(v, float):
+                return f"{v:g}"
+            return str(v)
+
+        param_summary = "  ".join(
+            f"{k}={_fmt(v)}"
+            for k, v in params.items()
+            if k != "nPath"
+        )
+        full_text = header + doc_text + "\n\n参数: " + param_summary
+
+        # 顶部文本
+        text_frame = ttk.Frame(self._struct_container)
+        text_frame.pack(fill="x", padx=5, pady=(5, 3))
+        text_widget = tk.Text(text_frame, wrap="word", height=11,
+                              font=("Consolas", 9), bg="#FAFAFA")
+        text_widget.insert("1.0", full_text)
+        text_widget.configure(state="disabled")
+        text_widget.pack(fill="x")
+
+        # 图表
+        chart_frame = ttk.Frame(self._struct_container)
+        chart_frame.pack(fill="both", expand=True, padx=5, pady=3)
+
+        fig = Figure(figsize=(10, 6.2), dpi=96)
+
+        def _has(key):
+            v = params.get(key)
+            return v is not None and v != 0
+
+        markers = []
+        if _has("K"):  markers.append(("K", params["K"], "red"))
+        if _has("H"):  markers.append(("H", params["H"], "orange"))
+        if _has("KI"): markers.append(("KI", params["KI"], "purple"))
+        if _has("E") and subtype == "EnhanceAsian":
+            markers.append(("E", params["E"], "green"))
+        if _has("P"):  markers.append(("P", params["P"], "brown"))
+
+        def add_markers(ax):
+            for _, val, color in markers:
+                if s_grid[0] <= val <= s_grid[-1]:
+                    ax.axvline(val, color=color, linestyle=":",
+                               linewidth=1.0, alpha=0.7)
+
+        def style(ax, title, ylabel):
+            ax.set_title(title, fontsize=10)
+            ax.set_xlabel("标的价格 S", fontsize=8)
+            ax.set_ylabel(ylabel, fontsize=8)
+            ax.grid(True, alpha=0.3)
+            ax.axhline(0, color="gray", linestyle="--", alpha=0.4)
+            add_markers(ax)
+            ax.tick_params(labelsize=7)
+
+        ax1 = fig.add_subplot(2, 3, 1)
+        ax1.plot(s_grid, prices, "b-", linewidth=1.4)
+        style(ax1, "期权价格", "Price")
+
+        ax2 = fig.add_subplot(2, 3, 2)
+        ax2.plot(s_grid, deltas, "r-", linewidth=1.4)
+        style(ax2, "Delta", "Δ")
+
+        ax3 = fig.add_subplot(2, 3, 3)
+        ax3.plot(s_grid, gammas, "m-", linewidth=1.4)
+        style(ax3, "Gamma", "Γ")
+
+        ax4 = fig.add_subplot(2, 3, 4)
+        ax4.plot(s_grid, vegas, "c-", linewidth=1.4)
+        style(ax4, "Vega", "ν")
+
+        ax5 = fig.add_subplot(2, 3, 5)
+        ax5.plot(s_grid, thetas, color="orange", linewidth=1.4)
+        style(ax5, "Theta", "Θ")
+
+        # 第 6 格：参考线图例与扫描信息
+        ax6 = fig.add_subplot(2, 3, 6)
+        ax6.axis("off")
+        legend_lines = ["参考线 (虚线):"]
+        label_map = {"K": "行权", "H": "障碍", "KI": "敲入",
+                     "E": "增强", "P": "保障"}
+        for name, val, color in markers:
+            legend_lines.append(f"  {name}={val:g}  ({label_map.get(name, '')})")
+        legend_lines.append("")
+        legend_lines.append(f"扫描范围: [{s_grid[0]:.2f}, {s_grid[-1]:.2f}]")
+        legend_lines.append(f"采样点数: {len(s_grid)}")
+        if "nPath" in params:
+            legend_lines.append(f"MC路径数:  {min(params['nPath'], 20000)}")
+            if params['nPath'] > 20000:
+                legend_lines.append("(已限制为 20000 以加速)")
+        if _MPL_CJK_FP is not None:
+            ax6.text(0.02, 0.98, "\n".join(legend_lines),
+                     transform=ax6.transAxes, va="top", ha="left",
+                     fontsize=9, fontproperties=_MPL_CJK_FP)
+        else:
+            ax6.text(0.02, 0.98, "\n".join(legend_lines),
+                     transform=ax6.transAxes, va="top", ha="left",
+                     fontsize=9)
+
+        fig.tight_layout()
+        canvas = FigureCanvasTkAgg(fig, master=chart_frame)
+        canvas.draw()
+        canvas.get_tk_widget().pack(fill="both", expand=True)
 
     def _export_csv(self, df):
         path = filedialog.asksaveasfilename(

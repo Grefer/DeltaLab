@@ -6,6 +6,7 @@ Created on Nov 08 17:23 2023
 基于NumPy的向量化期权定价
 """
 import time
+from typing import Optional
 
 import numpy as np
 
@@ -37,7 +38,10 @@ class Option_DE(OptionBase):
                  r: float = 0.03,
                  q: float = 0.03,
                  nPath: int = 100000,
-                 **kwargs: float
+                 fix: Optional[float] = None,
+                 P: Optional[float] = None,
+                 amount: Optional[float] = None,
+                 **kwargs
                  ):
         self.optiontype = optiontype
         self.s0 = s0
@@ -53,9 +57,9 @@ class Option_DE(OptionBase):
         self.N = N
         self.nPath = nPath
         self.cp = cp
-        self.fix = kwargs.get('fix')
-        self.P = kwargs.get('P')
-        self.amount = kwargs.get('amount')
+        self.fix = fix
+        self.P = P
+        self.amount = amount
 
     # 定价整合函数
     def get_price(self):
