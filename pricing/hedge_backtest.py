@@ -76,10 +76,53 @@ class HedgeBacktest:
     >>> bt.plot()
     """
 
-    def __init__(self, option, prices, hedge_freq=1, tc_rate=0.0, position=1,
-                 quantity=1.0, multiplier=0):
+    def __init__(self, option, prices=None, hedge_freq=1, tc_rate=0.0, position=1,
+                 quantity=1.0, multiplier=0,
+                 path_source="gbm", external_path=None, detrend=False,
+                 is_future=False, contract_multiplier=1.0):
+        """
+        Parameters
+        ----------
+        path_source : str
+            "gbm"（默认）：使用传入的 prices（外部生成，兼容历史行为）。
+            "historical"：使用 external_path 作为标的价格路径。
+        external_path : pd.Series | np.ndarray | None
+            historical 模式下的标的价格序列，长度需 >= 回测所需步数 + 1。
+        detrend : bool
+            去趋势开关（本轮占位，暂不实现）。
+        is_future : bool
+            标的是否为期货。True 时按 `contract_multiplier` 取整到整数张，
+            并在结果中给出理论 Δ 手数与离散化误差分项。
+        contract_multiplier : float
+            期货合约乘数（每张合约对应的标的数量），`is_future=True` 时生效。
+        """
         self.option_init = copy.deepcopy(option)
-        self.prices = np.asarray(prices, dtype=float)
+        self._path_source = str(path_source).lower()
+        self._external_path = external_path
+        self._detrend = bool(detrend)  # 占位，本 Phase 不使用
+        self.is_future = bool(is_future)
+        self.contract_multiplier = float(contract_multiplier)
+
+        # ---- 价格来源分流 ----
+        if self._path_source == "historical":
+            if external_path is None:
+                raise ValueError("path_source='historical' 时必须传 external_path")
+            ext = np.asarray(
+                external_path.values if hasattr(external_path, "values") else external_path,
+                dtype=float,
+            )
+            if ext.ndim != 1:
+                ext = ext.reshape(-1)
+            if len(ext) < 2:
+                raise ValueError(f"external_path 长度不足：需要 >= 2, 实际 {len(ext)}")
+            self.prices = ext
+        elif self._path_source == "gbm":
+            if prices is None:
+                raise ValueError("path_source='gbm' 时必须传 prices")
+            self.prices = np.asarray(prices, dtype=float)
+        else:
+            raise ValueError(f"未知 path_source: {path_source}，仅支持 'gbm' | 'historical'")
+
         self.hedge_freq = max(1, int(hedge_freq))
         self.tc_rate = tc_rate
         self.position = position
@@ -107,9 +150,16 @@ class HedgeBacktest:
         C = np.zeros(n + 1)        # 现金账户
         TC = np.zeros(n + 1)       # 当日交易成本
 
+        # 期货模式下的理论/实际 Δ 手数记录
+        delta_theo_qty = np.zeros(n + 1)  # 理论 Δ 手数（float，期货张数）
+        delta_real_qty = np.zeros(n + 1)  # 实际 Δ 手数（int，期货张数）
+        delta_disc_pnl = np.zeros(n + 1)  # 每日离散化误差盈亏
+
         # 取整辅助函数
         qty = self.quantity
         mult = self.multiplier
+        is_fut = self.is_future
+        cmult = self.contract_multiplier
 
         def _round_to_lots(target):
             """将目标持仓取整到 multiplier 的整数倍（向零取整）"""
@@ -120,17 +170,34 @@ class HedgeBacktest:
             else:
                 return -int(-target / mult) * mult
 
-        def _target_shares(delta_val):
-            """根据 Delta 计算目标持仓（含数量缩放与取整）"""
+        def _compute_target(delta_val):
+            """
+            根据 Delta 计算目标持仓与期货理论/实际手数。
+
+            Returns
+            -------
+            target_shares : float
+                实际用于对冲的标的份额（H 存的就是这个量）
+            theo_lots : float
+                理论期货张数（仅 is_future=True 时有意义，否则为 0）
+            real_lots : int
+                实际期货张数（仅 is_future=True 时有意义，否则为 0）
+            """
             raw = pos * delta_val * qty
-            return _round_to_lots(raw)
+            if is_fut and cmult > 0:
+                # 期货：按合约张数取整（round to nearest）
+                theo = raw / cmult
+                real = int(np.rint(theo))
+                return real * cmult, theo, real
+            # 非期货：沿用原 multiplier 机制
+            return _round_to_lots(raw), 0.0, 0
 
         # ---- Day 0: 建仓 ----
         V[0] = option.get_price() or 0.0
         greeks = option.get_greeks()
         delta[0], gamma[0], vega[0], theta[0], rho[0] = greeks
 
-        H[0] = _target_shares(delta[0])
+        H[0], delta_theo_qty[0], delta_real_qty[0] = _compute_target(delta[0])
         TC[0] = abs(H[0]) * S[0] * self.tc_rate
         C[0] = pos * V[0] * qty - H[0] * S[0] - TC[0]
 
@@ -157,6 +224,10 @@ class HedgeBacktest:
             C[i] = C[i - 1] * np.exp(r * dt)
             H[i] = H[i - 1]
 
+            # 默认沿用上一期的理论/实际手数（若本日未调仓）
+            delta_theo_qty[i] = delta_theo_qty[i - 1]
+            delta_real_qty[i] = delta_real_qty[i - 1]
+
             # 调仓逻辑
             if i == n:
                 # 到期日：平仓所有标的头寸
@@ -164,12 +235,16 @@ class HedgeBacktest:
                 TC[i] = abs(trade) * S[i] * self.tc_rate
                 C[i] -= trade * S[i] + TC[i]
                 H[i] = 0.0
+                delta_theo_qty[i] = 0.0
+                delta_real_qty[i] = 0
             elif i % self.hedge_freq == 0:
-                target = _target_shares(delta[i])
+                target, theo, real = _compute_target(delta[i])
                 trade = target - H[i]
                 TC[i] = abs(trade) * S[i] * self.tc_rate
                 C[i] -= trade * S[i] + TC[i]
                 H[i] = target
+                delta_theo_qty[i] = theo
+                delta_real_qty[i] = real
 
         # ---- 盈亏分解 ----
         PV = C + H * S  # 组合市值（现金 + 标的持仓）
@@ -182,6 +257,10 @@ class HedgeBacktest:
             hedge_daily[i] = H[i - 1] * (S[i] - S[i - 1])
             option_daily[i] = -pos * (V[i] - V[i - 1]) * qty
             interest_daily[i] = C[i - 1] * (np.exp(r * dt) - 1)
+            # 期货取整的离散化误差：(理论手数 - 实际手数) * 价格变动 * 合约乘数
+            if is_fut:
+                qty_gap = delta_theo_qty[i - 1] - float(delta_real_qty[i - 1])
+                delta_disc_pnl[i] = qty_gap * (S[i] - S[i - 1]) * cmult
 
         net_daily = hedge_daily + option_daily + interest_daily - TC
         cum_pnl = np.cumsum(net_daily)
@@ -242,6 +321,16 @@ class HedgeBacktest:
             'rolling_realized': rolling_realized,
             'cumulative_realized': cumulative_realized,
             'vol_spread': vol_spread,
+            # 期货取整相关（非期货场景下保持为 0 数组）
+            'delta_theo_qty_series': delta_theo_qty,
+            'delta_real_qty_series': delta_real_qty,
+            'delta_discretization_pnl': np.cumsum(delta_disc_pnl),
+            'delta_discretization_daily': delta_disc_pnl,
+            'path_source': self._path_source,
+            'is_future': self.is_future,
+            'contract_multiplier': self.contract_multiplier,
+            # 为方便 Phase 3 调用，暴露 total_pnl 标量（= cum_pnl[-1]）
+            'total_pnl': float(cum_pnl[-1]) if n > 0 else 0.0,
         }
         return self._results
 

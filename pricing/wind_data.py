@@ -6,8 +6,19 @@ Wind 数据接口模块
 供对冲回测和期权定价使用。
 """
 
+import functools
+import os
+
 import numpy as np
 import pandas as pd
+
+
+# 缓存目录：data/cache
+_CACHE_DIR = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "data",
+    "cache",
+)
 
 
 def _ensure_wind():
@@ -122,3 +133,160 @@ def get_hist_vol(code, start_date, end_date, window=20, adjust="F"):
     vol = log_ret.rolling(window).std() * np.sqrt(243)
     vol.name = f"HV{window}"
     return vol.dropna()
+
+
+# =============================================================================
+# 滚动历史回测：缓存 / 收益 / rebase / 合约规格
+# =============================================================================
+
+def _cache_path(code, start, end, asset_type):
+    """返回 parquet 缓存文件路径"""
+    os.makedirs(_CACHE_DIR, exist_ok=True)
+    # 文件名中不能有冒号等特殊字符
+    safe_code = code.replace("/", "_").replace("\\", "_")
+    fname = f"{safe_code}_{start}_{end}_{asset_type}.parquet"
+    return os.path.join(_CACHE_DIR, fname)
+
+
+def load_history_cached(code, start, end, asset_type="equity"):
+    """
+    带 parquet 缓存的历史收盘价读取
+
+    Parameters
+    ----------
+    code : str
+        Wind 代码
+    start, end : str
+        "YYYY-MM-DD"
+    asset_type : str
+        "equity" -> 后复权 (PriceAdj=B)
+        "future" -> 不传 PriceAdj (期货无分红)
+
+    Returns
+    -------
+    pd.Series
+        index 为 DatetimeIndex, values 为收盘价
+    """
+    path = _cache_path(code, start, end, asset_type)
+    if os.path.exists(path):
+        df = pd.read_parquet(path)
+        # 只有一列；兼容 index 名称
+        ser = df.iloc[:, 0]
+        ser.index = pd.to_datetime(ser.index)
+        ser.name = code
+        return ser
+
+    w = _ensure_wind()
+    if asset_type == "equity":
+        data = w.wsd(code, "close", start, end, "PriceAdj=B")
+    elif asset_type == "future":
+        # 期货不传 PriceAdj
+        data = w.wsd(code, "close", start, end, "")
+    else:
+        raise ValueError(f"未知 asset_type: {asset_type}")
+
+    if data.ErrorCode != 0:
+        raise RuntimeError(
+            f"Wind 数据获取失败 [{code}]: ErrorCode={data.ErrorCode}"
+        )
+
+    ser = pd.Series(
+        data.Data[0],
+        index=pd.to_datetime(data.Times),
+        name=code,
+    ).dropna()
+
+    # 写入缓存
+    ser.to_frame(name="close").to_parquet(path)
+    return ser
+
+
+def get_log_returns(code, start, end, asset_type="equity"):
+    """
+    读取历史收盘价并返回对数收益序列（从 t=1 开始，已 dropna）
+
+    Returns
+    -------
+    pd.Series
+        log(P[t]/P[t-1])
+    """
+    prices = load_history_cached(code, start, end, asset_type)
+    log_ret = np.log(prices / prices.shift(1)).dropna()
+    log_ret.name = f"{code}_logret"
+    return log_ret
+
+
+def rebase_path(log_return_slice, s0):
+    """
+    把一段 log return 序列 rebase 到指定的 s0
+
+    约定：log_return_slice 的第 0 个元素对应 t=1 的收益，
+    因此返回序列长度为 len(log_return_slice)+1：
+        S[0] = s0
+        S[k] = s0 * exp(sum(log_return_slice[:k]))    for k>=1
+
+    Parameters
+    ----------
+    log_return_slice : pd.Series
+        对数收益切片
+    s0 : float
+        起点价格
+
+    Returns
+    -------
+    pd.Series
+        rebase 后的价格序列
+    """
+    if len(log_return_slice) == 0:
+        return pd.Series([s0], name="rebased")
+
+    cum = np.cumsum(log_return_slice.values)
+    prices = np.concatenate([[s0], s0 * np.exp(cum)])
+
+    # index：在前面补一个 t0（用 log_return 第一天往前推 1 天作为占位，
+    # 若没有可用的日期则用 RangeIndex）
+    try:
+        first_date = log_return_slice.index[0]
+        # 前面补一个"虚拟起点"，用 NaT 会影响后续切片；这里直接用第一个日期作为 t0
+        # 更稳妥：向前退一个位置，用 BDay
+        t0 = first_date - pd.Timedelta(days=1)
+        idx = pd.DatetimeIndex([t0]).append(pd.DatetimeIndex(log_return_slice.index))
+    except Exception:
+        idx = pd.RangeIndex(len(prices))
+
+    return pd.Series(prices, index=idx, name="rebased")
+
+
+@functools.lru_cache(maxsize=128)
+def get_contract_spec(code):
+    """
+    查询合约规格：期货取 contractmultiplier，股票/ETF 返回 1.0
+
+    判定规则：代码后缀是 .CFE / .SHF / .DCE / .CZC / .INE / .GFE 视为期货。
+
+    Returns
+    -------
+    dict
+        {"multiplier": float, "is_future": bool}
+    """
+    future_suffixes = (".CFE", ".SHF", ".DCE", ".CZC", ".INE", ".GFE")
+    upper = code.upper()
+    is_future = any(upper.endswith(s) for s in future_suffixes)
+
+    if not is_future:
+        return {"multiplier": 1.0, "is_future": False}
+
+    try:
+        w = _ensure_wind()
+        data = w.wsd(code, "contractmultiplier")
+        if data.ErrorCode != 0:
+            raise RuntimeError(
+                f"Wind contractmultiplier 查询失败 [{code}]: "
+                f"ErrorCode={data.ErrorCode}"
+            )
+        mult = float(data.Data[0][0])
+    except ImportError:
+        # WindPy 不可用时返回占位，调用方需自行处理
+        mult = 1.0
+
+    return {"multiplier": mult, "is_future": True}
