@@ -411,7 +411,7 @@ class BacktestApp(tk.Tk):
 
         row_h += 1
         ttk.Label(sec3, text="交易成本率(%):").grid(row=row_h, column=0, sticky="w")
-        self._tc_var = tk.StringVar(value="0.1")
+        self._tc_var = tk.StringVar(value="0.01")
         ttk.Entry(sec3, textvariable=self._tc_var, width=8).grid(
             row=row_h, column=1, sticky="w", padx=3)
 
