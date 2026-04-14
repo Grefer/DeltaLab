@@ -265,8 +265,8 @@ class BacktestApp(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("期权对冲回测系统")
-        self.geometry("1100x750")
-        self.minsize(900, 650)
+        self.geometry("1500x950")
+        self.minsize(1200, 800)
         self._setup_styles()
         self._build_ui()
         self._param_entries = {}
@@ -1258,9 +1258,20 @@ class BacktestApp(tk.Tk):
         subtype = gui_state["subtype"]
         params = gui_state["params"]
 
+        # 与下方回测的头寸方向联动：position=1 卖出, position=-1 买入
+        position = gui_state.get("position", -1)
+        sign = -1.0 if position == 1 else 1.0
+        perspective = "卖方(short)" if position == 1 else "买方(long)"
+        prices = prices * sign
+        deltas = deltas * sign
+        gammas = gammas * sign
+        vegas  = vegas  * sign
+        thetas = thetas * sign
+
         doc_key = (cls_name, subtype)
         doc_text = STRUCTURE_DOCS.get(doc_key, "(暂无结构说明)")
-        header = f"{cls_name}  /  {subtype}\n" + "─" * 60 + "\n"
+        header = (f"{cls_name}  /  {subtype}   [视角: {perspective}]\n"
+                  + "─" * 60 + "\n")
 
         def _fmt(v):
             if isinstance(v, float):
