@@ -8,9 +8,16 @@
     2) 同 σ 生成的一条 GBM 对照路径（path_source="gbm"）
 并将两边的对冲 PnL、离散化误差等汇总到一张 DataFrame。
 
+语义说明（与 from_wind / from_csv 对齐）：
+- 历史价格保留真实水平（不再 rebase 到 option_cfg['s0']）。
+- option_cfg['s0'] 视为参考价 S_ref，仅用于配置 strike / barrier / cashflow
+  等价格量纲字段。每一轮以该窗口的真实起始价 S_real 为基准，按
+  ratio = S_real / S_ref 通过 ``_rescale_option_to_real_s0`` 缩放期权要素。
+- 由于每轮 S_real 不同，每轮独立缩放（ratio 随窗口变化）。
+
 依赖：
-- pricing.wind_data.get_log_returns / rebase_path / get_contract_spec
-- pricing.hedge_backtest.HedgeBacktest
+- pricing.wind_data.get_log_returns / get_contract_spec
+- pricing.hedge_backtest.HedgeBacktest / _rescale_option_to_real_s0
 
 注意：本模块不做期权类型特判，调用方负责传入正确的 option_cfg。
 """
@@ -22,12 +29,12 @@ import pandas as pd
 
 try:
     from .constants import ANNUAL_DAYS
-    from .hedge_backtest import HedgeBacktest
-    from .wind_data import get_log_returns, rebase_path, get_contract_spec
+    from .hedge_backtest import HedgeBacktest, _rescale_option_to_real_s0
+    from .wind_data import get_log_returns, get_contract_spec
 except ImportError:  # 兼容脚本直接运行
     from constants import ANNUAL_DAYS
-    from hedge_backtest import HedgeBacktest
-    from wind_data import get_log_returns, rebase_path, get_contract_spec
+    from hedge_backtest import HedgeBacktest, _rescale_option_to_real_s0
+    from wind_data import get_log_returns, get_contract_spec
 
 
 def run_rolling_backtest(
@@ -102,6 +109,31 @@ def run_rolling_backtest(
             f"{hv_window + T} > len(log_ret)={len(log_ret)}"
         )
 
+    # 同时拿到真实收盘价序列：保留真实价格水平。
+    # log_ret 长度比 prices 少 1（dropna 第 0 行），对齐方式：
+    #     log_ret.index[k] 对应 prices.index[k+1]
+    # 在 Wind 缓存可用时优先取真实价格；若不可用（例如单测对 get_log_returns
+    # 做了 patch 而真实数据不存在），则退化为以 cfg s0 为起点根据 log_ret
+    # 重建价格（此时 ratio≈1，等价于旧的 rebase_path 行为）。
+    cfg_s0_for_recon = float(option_cfg["s0"])
+    prices_arr = None
+    try:
+        try:
+            from .wind_data import load_history_cached
+        except ImportError:
+            from wind_data import load_history_cached
+        prices_series = load_history_cached(code, start, end, asset_type)
+        candidate = np.asarray(prices_series.values, dtype=float)
+        if len(candidate) >= len(log_ret) + 1:
+            prices_arr = candidate[-(len(log_ret) + 1):]
+    except Exception:
+        prices_arr = None
+
+    if prices_arr is None:
+        # 退化路径：用 log_ret 重建价格，起点 = 配置 s0
+        cum = np.concatenate([[0.0], np.cumsum(log_ret.values)])
+        prices_arr = cfg_s0_for_recon * np.exp(cum)
+
     # ---- 期货 vs 权益：合约乘数与有效 q ----
     if asset_type == "future":
         spec = get_contract_spec(code)
@@ -125,11 +157,12 @@ def run_rolling_backtest(
         )
     )
 
-    s0 = float(option_cfg["s0"])
+    cfg_s0 = float(option_cfg["s0"])  # S_ref，仅用于按比例缩放期权要素
     dt = 1.0 / ANNUAL_DAYS
 
     rows = []
     skipped = 0
+    first_rescale_info = None
     n_lr = len(log_ret)
 
     # 遍历所有可行滚动起点
@@ -144,34 +177,49 @@ def run_rolling_backtest(
                     print(f"[skip t0={t0}] sigma_pre 非法: {sigma_pre}")
                 continue
 
-            # 4.2 切片 + rebase 到 s0
-            lr_slice = log_ret.iloc[t0: t0 + T]
-            real_path = rebase_path(lr_slice, s0)
-            real_vals = (
-                real_path.values if hasattr(real_path, "values") else np.asarray(real_path)
-            )
+            # 4.2 真实价格切片：保留真实价格水平，长度 T+1（含 t0 当日建仓价）
+            # log_ret.index[t0] 对应 prices_series.index[t0 + 1]，
+            # 因此建仓日（t0 当天）价格为 prices_arr[t0]，到期日为 prices_arr[t0 + T]。
+            real_vals = prices_arr[t0: t0 + T + 1].astype(float)
+            if len(real_vals) != T + 1:
+                skipped += 1
+                if verbose:
+                    print(f"[skip t0={t0}] 真实价格切片长度 {len(real_vals)} != {T + 1}")
+                continue
+            real_s0 = float(real_vals[0])
+            if not np.isfinite(real_s0) or real_s0 <= 0:
+                skipped += 1
+                if verbose:
+                    print(f"[skip t0={t0}] real_s0 非法: {real_s0}")
+                continue
 
-            # 4.3 构造期权实例
+            # 4.3 构造期权实例（先以配置 s0 = S_ref 创建，再按 ratio 缩放价格量纲字段）
             opt_params = dict(option_cfg)
             opt_params["sigma"] = sigma_pre
+            opt_params["s0"] = cfg_s0  # 显式确保 S_ref
             opt_params.setdefault("r", effective_r)
             opt_params.setdefault("q", effective_q)
-            opt = option_class(**opt_params)
+            opt_ref = option_class(**opt_params)
 
-            # 4.4 MC 对照路径（独立种子，长度 T+1）
+            opt, rescale_info = _rescale_option_to_real_s0(opt_ref, real_s0)
+            if first_rescale_info is None:
+                first_rescale_info = rescale_info
+
+            # 4.4 MC 对照路径（独立种子，长度 T+1）；以 real_s0 为起点，
+            # 与历史路径处于同一价格水平，对照公平。
             rng = np.random.default_rng(mc_seed + t0)
             drift = (effective_r - effective_q - 0.5 * sigma_pre ** 2) * dt
             diff = sigma_pre * np.sqrt(dt)
             mc_lr = rng.normal(drift, diff, size=T)
             mc_path = np.empty(T + 1)
-            mc_path[0] = s0
-            mc_path[1:] = s0 * np.exp(np.cumsum(mc_lr))
+            mc_path[0] = real_s0
+            mc_path[1:] = real_s0 * np.exp(np.cumsum(mc_lr))
 
             # 4.5 两边回测
             bt_real = HedgeBacktest(
                 option=opt,
                 path_source="historical",
-                external_path=real_path,
+                external_path=real_vals,
                 **hk_base,
             )
             res_real = bt_real.run()
@@ -198,6 +246,8 @@ def run_rolling_backtest(
                 {
                     "start_date": log_ret.index[t0],
                     "sigma_pre": sigma_pre,
+                    "real_s0": real_s0,
+                    "rescale_ratio": float(rescale_info["ratio"]),
                     "hedge_pnl_real": float(res_real["total_pnl"]),
                     "hedge_pnl_mc": float(res_mc["total_pnl"]),
                     "final_price_real": float(real_vals[-1]),
@@ -215,4 +265,9 @@ def run_rolling_backtest(
     if verbose or skipped > 0:
         print(f"[rolling_backtest] rows={len(rows)}, skipped={skipped}")
 
-    return pd.DataFrame(rows)
+    df = pd.DataFrame(rows)
+    # 把首轮的期权要素伸缩明细挂到 DataFrame.attrs 上，便于 GUI 展示。
+    # 注意：每一轮的 ratio 单独存在 'rescale_ratio' 列中。
+    df.attrs["first_rescale_info"] = first_rescale_info
+    df.attrs["s_ref"] = cfg_s0
+    return df

@@ -18,6 +18,114 @@ except ImportError:
     from constants import ANNUAL_DAYS
 
 
+# ============================================================
+#  期权要素伸缩（用于真实行情回测）
+# ============================================================
+#
+# 用户在 GUI 中通常基于一个"参考价" S_ref（即 option.s0）配置 strike /
+# barrier 等价格量纲字段。当切换到真实行情时，真实起始价 S_real 与 S_ref
+# 不一致，需要按比例 ratio = S_real / S_ref 把这些字段缩放到真实价格水平
+# 上，否则期权结构会被破坏（例如 ATM call 变成深度虚值）。
+#
+# 仅缩放价格量纲 / cashflow 量纲字段；σ、r、q、期限、观察日索引、N、cp、
+# 参与率等比例量保持不变。
+#
+# 字段白名单按期权类名维护。若未识别类名则只缩放 s0，并在 sr 已经写入历史
+# 时按比例搬运（rebase 后历史价的相对位置保持不变）。
+
+_PRICE_FIELDS_BY_CLS = {
+    "Option_Vanilla": ("K",),
+    "Option_AB":      ("K", "KI"),
+    "Option_AS":      ("K", "E", "minPay", "maxPay"),
+    "Option_DE":      ("K", "H", "P", "fix", "amount"),
+}
+
+
+def _rescale_option_to_real_s0(option, real_s0):
+    """
+    将期权对象的价格量纲要素从 option.s0 (S_ref) 缩放到 real_s0。
+
+    返回 (scaled_option, info_dict)，其中 info_dict 记录原始值/缩放后值，
+    便于 GUI / 日志展示。原对象不会被修改。
+
+    Parameters
+    ----------
+    option : OptionBase
+        用户配置的期权实例，option.s0 视为参考价 S_ref。
+    real_s0 : float
+        真实行情下的起始价格。
+
+    Returns
+    -------
+    (OptionBase, dict)
+    """
+    s_ref = float(option.s0)
+    if s_ref <= 0:
+        raise ValueError(
+            f"无法对参考价 s_ref={s_ref} 做伸缩处理；请在 GUI 中填入正的 s0 "
+            f"作为期权要素的参考价水平。"
+        )
+
+    ratio = float(real_s0) / s_ref
+    cls_name = type(option).__name__
+    fields = _PRICE_FIELDS_BY_CLS.get(cls_name, ())
+
+    opt = copy.deepcopy(option)
+
+    info = {
+        "cls": cls_name,
+        "s_ref": s_ref,
+        "s_real": float(real_s0),
+        "ratio": ratio,
+        "fields": {},   # name -> (old, new)
+    }
+
+    # s0 永远缩放
+    info["fields"]["s0"] = (s_ref, float(real_s0))
+    opt.s0 = float(real_s0)
+
+    # 已经入场的历史价（sr）按比例搬运；保持相对位置
+    if hasattr(opt, "sr") and opt.sr is not None and len(opt.sr) > 0:
+        old_sr = list(opt.sr)
+        opt.sr = [float(x) * ratio for x in old_sr]
+        info["fields"]["sr"] = (old_sr, list(opt.sr))
+
+    # 价格量纲字段
+    for name in fields:
+        if not hasattr(opt, name):
+            continue
+        old = getattr(opt, name)
+        if old is None:
+            continue
+        # maxPay 用 float('inf') 占位时无需缩放
+        try:
+            old_f = float(old)
+        except (TypeError, ValueError):
+            continue
+        if not np.isfinite(old_f):
+            continue
+        new_f = old_f * ratio
+        setattr(opt, name, new_f)
+        info["fields"][name] = (old_f, new_f)
+
+    return opt, info
+
+
+def _format_rescale_info(info):
+    """把 _rescale_option_to_real_s0 返回的 info 渲染成可读多行字符串。"""
+    lines = [
+        f"[期权要素伸缩] {info['cls']}  S_ref={info['s_ref']:.4f} -> "
+        f"S_real={info['s_real']:.4f}  ratio={info['ratio']:.6f}"
+    ]
+    for name, (old, new) in info["fields"].items():
+        if name == "sr":
+            n = len(old) if hasattr(old, "__len__") else 0
+            lines.append(f"  - sr (历史 {n} 个) 已按比例搬运")
+            continue
+        lines.append(f"  - {name:<8s}: {old:>14.6f} -> {new:.6f}")
+    return "\n".join(lines)
+
+
 # ---- 多线程工作函数 ----
 
 def _run_single_path(args):
@@ -130,6 +238,29 @@ class HedgeBacktest:
         self.multiplier = float(multiplier)
         self._results = None
 
+        # ---- 价格序列长度校正：严格裁剪到期权剩余期限 ----
+        #
+        # 口径：Day 0 = 建仓日，Day T = 到期日，共 T+1 个价格点。
+        # 如果外部价格序列（historical / from_wind / from_csv）长度 > T+1，
+        # 必须裁剪；否则主循环会跑到到期日之后，此时 V[i]=0 与 V[T] 之间会
+        # 产生一次伪 MtM 盈亏跳变，对冲头寸平仓分支（i==n）也会错位到非到
+        # 期日上，整段盈亏分解失真。长度不足 T+1 时直接报错，避免静默截断
+        # 期权期限。
+        try:
+            t_rem = int(option._time_remaining)
+        except Exception:
+            t_rem = None
+        if t_rem is not None and t_rem > 0:
+            need = t_rem + 1
+            have = len(self.prices)
+            if have < need:
+                raise ValueError(
+                    f"价格序列长度不足：期权剩余 {t_rem} 日需要 {need} 个价格点，"
+                    f"实际仅 {have} 个。"
+                )
+            if have > need:
+                self.prices = self.prices[:need]
+
     def run(self):
         """执行回测，返回结果字典"""
         option = copy.deepcopy(self.option_init)
@@ -147,7 +278,6 @@ class HedgeBacktest:
         theta = np.zeros(n + 1)    # Theta
         rho = np.zeros(n + 1)      # Rho
         H = np.zeros(n + 1)        # 持有标的数量
-        C = np.zeros(n + 1)        # 现金账户
         TC = np.zeros(n + 1)       # 当日交易成本
 
         # 期货模式下的理论/实际 Δ 手数记录
@@ -199,7 +329,6 @@ class HedgeBacktest:
 
         H[0], delta_theo_qty[0], delta_real_qty[0] = _compute_target(delta[0])
         TC[0] = abs(H[0]) * S[0] * self.tc_rate
-        C[0] = pos * V[0] * qty - H[0] * S[0] - TC[0]
 
         # ---- Day 1 ~ n ----
         for i in range(1, n + 1):
@@ -220,8 +349,6 @@ class HedgeBacktest:
             else:
                 V[i] = delta[i] = gamma[i] = vega[i] = theta[i] = rho[i] = 0.0
 
-            # 现金隔夜利息
-            C[i] = C[i - 1] * np.exp(r * dt)
             H[i] = H[i - 1]
 
             # 默认沿用上一期的理论/实际手数（若本日未调仓）
@@ -233,7 +360,6 @@ class HedgeBacktest:
                 # 到期日：平仓所有标的头寸
                 trade = -H[i]
                 TC[i] = abs(trade) * S[i] * self.tc_rate
-                C[i] -= trade * S[i] + TC[i]
                 H[i] = 0.0
                 delta_theo_qty[i] = 0.0
                 delta_real_qty[i] = 0
@@ -241,32 +367,27 @@ class HedgeBacktest:
                 target, theo, real = _compute_target(delta[i])
                 trade = target - H[i]
                 TC[i] = abs(trade) * S[i] * self.tc_rate
-                C[i] -= trade * S[i] + TC[i]
                 H[i] = target
                 delta_theo_qty[i] = theo
                 delta_real_qty[i] = real
 
         # ---- 盈亏分解 ----
-        PV = C + H * S  # 组合市值（现金 + 标的持仓）
-
-        hedge_daily = np.zeros(n + 1)     # 标的头寸每日盈亏
+        hedge_daily = np.zeros(n + 1)     # 标的头寸每日盈亏（不含 TC）
         option_daily = np.zeros(n + 1)    # 期权 MtM 每日盈亏（从对冲方视角）
-        interest_daily = np.zeros(n + 1)  # 利息收入
 
         for i in range(1, n + 1):
             hedge_daily[i] = H[i - 1] * (S[i] - S[i - 1])
             option_daily[i] = -pos * (V[i] - V[i - 1]) * qty
-            interest_daily[i] = C[i - 1] * (np.exp(r * dt) - 1)
             # 期货取整的离散化误差：(理论手数 - 实际手数) * 价格变动 * 合约乘数
             if is_fut:
                 qty_gap = delta_theo_qty[i - 1] - float(delta_real_qty[i - 1])
                 delta_disc_pnl[i] = qty_gap * (S[i] - S[i - 1]) * cmult
 
-        net_daily = hedge_daily + option_daily + interest_daily - TC
+        net_daily = hedge_daily + option_daily - TC
         cum_pnl = np.cumsum(net_daily)
 
-        # 最终对冲误差：完美对冲时应接近 0
-        hedging_error = PV[-1] - pos * V[-1] * qty
+        # 对冲误差新口径：期权权利金收入 + 标的腿累计盈亏 - 累计 TC - 期末期权赔付
+        hedging_error = pos * V[0] * qty + np.sum(hedge_daily) - np.sum(TC) - pos * V[-1] * qty
 
         # ---- 波动率分析 ----
         implied_vol = option.sigma  # 成交时隐含波动率
@@ -306,11 +427,8 @@ class HedgeBacktest:
             'theta': theta,
             'rho': rho,
             'shares': H,
-            'cash': C,
-            'portfolio_val': PV,
             'hedge_daily': hedge_daily,
             'option_daily': option_daily,
-            'interest_daily': interest_daily,
             'tc_paid': TC,
             'net_daily': net_daily,
             'cumulative_pnl': cum_pnl,
@@ -345,7 +463,7 @@ class HedgeBacktest:
             "=" * 52,
             "          动态对冲回测结果摘要",
             "=" * 52,
-            f"  回测天数          :  {n:>10d}",
+            f"  回测天数          :  {n:>10d}   (Day 0=建仓, Day {n}=到期)",
             f"  调仓频率          :  每 {self.hedge_freq} 天",
             f"  交易成本率        :  {self.tc_rate * 100:.2f}%",
             "-" * 52,
@@ -358,7 +476,6 @@ class HedgeBacktest:
             "-" * 52,
             f"  标的对冲盈亏      :  {np.sum(r['hedge_daily']):>12.4f}",
             f"  期权 MtM 盈亏     :  {np.sum(r['option_daily']):>12.4f}",
-            f"  利息收入          :  {np.sum(r['interest_daily']):>12.4f}",
             f"  累计交易成本      :  {r['total_tc']:>12.4f}",
             f"  对冲误差          :  {r['hedging_error']:>12.4f}",
             "-" * 52,
@@ -443,11 +560,8 @@ class HedgeBacktest:
             'Theta': r['theta'],
             'Rho': r['rho'],
             '持仓': r['shares'],
-            '现金': r['cash'],
-            '组合市值': r['portfolio_val'],
             '标的盈亏': r['hedge_daily'],
             '期权盈亏': r['option_daily'],
-            '利息': r['interest_daily'],
             '交易成本': r['tc_paid'],
             '每日净盈亏': r['net_daily'],
             '累计盈亏': r['cumulative_pnl'],
@@ -669,19 +783,28 @@ class HedgeBacktest:
         if len(prices) < 2:
             raise ValueError(f"价格数据不足: {code} {start_date}~{end_date} 仅 {len(prices)} 条")
 
-        # 用实际起始价替换 option.s0
-        opt = copy.deepcopy(option)
-        opt.s0 = float(prices[0])
+        # 按真实起始价缩放期权要素：option.s0 视为参考价 S_ref，
+        # ratio = real_s0 / S_ref 作用于 strike / barrier / cashflow 等字段。
+        real_s0 = float(prices[0])
+        opt, rescale_info = _rescale_option_to_real_s0(option, real_s0)
+        try:
+            print(_format_rescale_info(rescale_info))
+        except Exception:
+            pass
 
         bt = cls(opt, prices, hedge_freq=hedge_freq, tc_rate=tc_rate, position=position,
                  quantity=quantity, multiplier=multiplier)
+        # __init__ 可能已按期权剩余期限裁剪价格；meta 里的 dates / n_trade_days
+        # 也同步截断，避免 to_dataframe 等下游长度不一致。
+        used_len = len(bt.prices)
         bt._wind_meta = {
             'code': code,
             'start_date': start_date,
             'end_date': end_date,
-            'dates': series.index,
-            'n_trade_days': len(prices) - 1,
+            'dates': series.index[:used_len],
+            'n_trade_days': used_len - 1,
         }
+        bt._rescale_info = rescale_info
         return bt
 
     @classmethod
@@ -716,16 +839,24 @@ class HedgeBacktest:
         series = df[price_col].dropna()
         prices = series.values
 
-        opt = copy.deepcopy(option)
-        opt.s0 = float(prices[0])
+        # 按真实起始价缩放期权要素，逻辑与 from_wind 一致。
+        real_s0 = float(prices[0])
+        opt, rescale_info = _rescale_option_to_real_s0(option, real_s0)
+        try:
+            print(_format_rescale_info(rescale_info))
+        except Exception:
+            pass
 
         bt = cls(opt, prices, hedge_freq=hedge_freq, tc_rate=tc_rate, position=position,
                  quantity=quantity, multiplier=multiplier)
+        used_len = len(bt.prices)
+        used_index = series.index[:used_len]
         bt._wind_meta = {
             'code': filepath,
-            'start_date': str(series.index[0].date()),
-            'end_date': str(series.index[-1].date()),
-            'dates': series.index,
-            'n_trade_days': len(prices) - 1,
+            'start_date': str(used_index[0].date()),
+            'end_date': str(used_index[-1].date()),
+            'dates': used_index,
+            'n_trade_days': used_len - 1,
         }
+        bt._rescale_info = rescale_info
         return bt

@@ -62,6 +62,7 @@ OPTION_CLASSES = {
         "class": Option_Vanilla,
         "subtypes": ["Eu"],
         "params": [
+            ("s0",     "初始价格 S0",    float, 100.0),
             ("K",      "行权价",        float, 100.0),
             ("T_days", "期限(交易日)",   int,   22),
             ("sigma",  "波动率",        float, 0.18),
@@ -84,6 +85,7 @@ OPTION_CLASSES = {
             "Opt_ASGQ_DP", "Opt_ASGQ_DF",
         ],
         "params": [
+            ("s0",     "初始价格 S0",    float, 100.0),
             ("K",      "行权价",        float, 90.0),
             ("T_days", "剩余期限(交易日)", int, 20),
             ("T_over", "已过天数",       int,   0),
@@ -112,6 +114,7 @@ OPTION_CLASSES = {
         "class": Option_AS,
         "subtypes": ["Asian", "EnhanceAsian"],
         "params": [
+            ("s0",     "初始价格 S0",    float, 100.0),
             ("K",      "行权价",        float, 100.0),
             ("E",      "增强价(Enhanced)", float, 100.0),
             ("T",      "期限(交易日)",   int,   22),
@@ -134,6 +137,7 @@ OPTION_CLASSES = {
         "class": Option_AB,
         "subtypes": ["Opt_Airbag"],
         "params": [
+            ("s0",    "初始价格 S0",    float, 100.0),
             ("K",     "行权价",        float, 100.0),
             ("KI",    "敲入价",        float, 90.0),
             ("T_days","期限(交易日)",   int,   20),
@@ -355,14 +359,10 @@ class BacktestApp(tk.Tk):
         # 模拟参数
         self._sim_frame = ttk.Frame(sec3)
         self._sim_frame.grid(row=1, column=0, columnspan=2, sticky="ew", pady=2)
-        ttk.Label(self._sim_frame, text="初始价格:").grid(row=0, column=0, sticky="w")
-        self._s0_var = tk.StringVar(value="100")
-        ttk.Entry(self._sim_frame, textvariable=self._s0_var, width=12).grid(
-            row=0, column=1, padx=3)
-        ttk.Label(self._sim_frame, text="种子:").grid(row=0, column=2, sticky="w")
+        ttk.Label(self._sim_frame, text="种子:").grid(row=0, column=0, sticky="w")
         self._seed_var = tk.StringVar(value="42")
         ttk.Entry(self._sim_frame, textvariable=self._seed_var, width=8).grid(
-            row=0, column=3, padx=3)
+            row=0, column=1, padx=3, sticky="w")
         ttk.Label(self._sim_frame, text="已实现波动率:").grid(row=1, column=0, sticky="w")
         self._real_vol_var = tk.StringVar(value="")
         rv_frame = ttk.Frame(self._sim_frame)
@@ -593,7 +593,7 @@ class BacktestApp(tk.Tk):
             "position": int(self._pos_var.get()),
             "quantity": float(self._qty_var.get()),
             "multiplier": float(self._mult_var.get()),
-            "s0": self._s0_var.get().strip(),
+            "s0": str(params.get("s0", "")),
             "seed": self._seed_var.get().strip(),
             "real_vol": self._real_vol_var.get().strip(),
             "n_paths": self._npaths_var.get().strip(),
@@ -674,9 +674,8 @@ class BacktestApp(tk.Tk):
         multiplier = gs["multiplier"]
 
         if src == "simulate":
-            s0 = float(gs["s0"])
+            s0 = float(params["s0"])
             seed = int(gs["seed"])
-            params["s0"] = s0
 
             option = cfg["build"](subtype, params)
 
@@ -698,7 +697,8 @@ class BacktestApp(tk.Tk):
             if not filepath:
                 raise ValueError("请选择 CSV 文件")
             price_col = gs["csv_col"]
-            params["s0"] = 0  # 占位，from_csv 会覆盖
+            # 期权参数中的 s0 作为参考价 S_ref，
+            # from_csv 会按 ratio = 真实起始价 / S_ref 自动缩放价格量纲要素。
             option = cfg["build"](subtype, params)
             bt = HedgeBacktest.from_csv(option, filepath, price_col=price_col,
                                         hedge_freq=hedge_freq, tc_rate=tc_rate,
@@ -709,7 +709,8 @@ class BacktestApp(tk.Tk):
             code = gs["wind_code"]
             start = gs["wind_start"]
             end = gs["wind_end"]
-            params["s0"] = 0
+            # 期权参数中的 s0 作为参考价 S_ref，
+            # from_wind 会按 ratio = 真实起始价 / S_ref 自动缩放价格量纲要素。
             option = cfg["build"](subtype, params)
             bt = HedgeBacktest.from_wind(option, code, start, end,
                                          hedge_freq=hedge_freq, tc_rate=tc_rate,
@@ -760,13 +761,28 @@ class BacktestApp(tk.Tk):
             f"  标的到期价格      :  {r['prices'][-1]:>12.4f}",
             f"  标的涨跌幅        :  {(r['prices'][-1] / r['prices'][0] - 1) * 100:>11.2f}%",
             "─" * 54,
+        ]
+        # 真实数据回测时附加期权要素伸缩明细
+        rescale_info = getattr(bt, "_rescale_info", None)
+        if rescale_info is not None:
+            lines.append("  【期权要素伸缩 (S_ref → S_real)】")
+            lines.append(
+                f"  S_ref={rescale_info['s_ref']:.4f}   "
+                f"S_real={rescale_info['s_real']:.4f}   "
+                f"ratio={rescale_info['ratio']:.6f}"
+            )
+            for name, (old, new) in rescale_info["fields"].items():
+                if name in ("s0", "sr"):
+                    continue
+                lines.append(f"    {name:<8s}: {old:>12.4f}  →  {new:.4f}")
+            lines.append("─" * 54)
+        lines += [
             f"  期权初始价值      :  {r['opt_value'][0]:>12.4f}",
             f"  期权到期价值      :  {r['opt_value'][-1]:>12.4f}",
             "─" * 54,
             "  【单路径盈亏分解（种子路径）】",
             f"  标的对冲盈亏      :  {np.sum(r['hedge_daily']):>12.4f}",
             f"  期权 MtM 盈亏     :  {np.sum(r['option_daily']):>12.4f}",
-            f"  利息收入          :  {np.sum(r['interest_daily']):>12.4f}",
             f"  累计交易成本      :  {r['total_tc']:>12.4f}",
             f"  对冲误差          :  {r['hedging_error']:>12.4f}",
             "─" * 54,
