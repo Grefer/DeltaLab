@@ -47,6 +47,50 @@ for _f in font_manager.fontManager.ttflist:
 # Tk/ttk 使用的中文 UI 字体族（取第一个可用的 CJK 字体）
 _UI_FONT_FAMILY = _CJK_FALLBACK[0] if _CJK_FALLBACK[0] != "DejaVu Sans" else "TkDefaultFont"
 
+# 等宽字体 (用于摘要/结构文本)
+if _SYSTEM == "Windows":
+    _MONO_CANDIDATES = ["Cascadia Mono", "Consolas", "Courier New"]
+elif _SYSTEM == "Darwin":
+    _MONO_CANDIDATES = ["Menlo", "Monaco", "Courier New"]
+else:
+    _MONO_CANDIDATES = ["DejaVu Sans Mono", "Liberation Mono", "Courier New"]
+_MONO_FONT_FAMILY = next((f for f in _MONO_CANDIDATES if f in _AVAILABLE_FONTS), "Courier")
+
+# ---- 统一视觉调色板 (现代扁平风格, 蓝灰系) ----
+PALETTE = {
+    "bg":           "#F3F5F9",   # 窗口底色
+    "surface":      "#FFFFFF",   # 卡片/面板
+    "surface_alt":  "#F8FAFC",   # 次级表面 (Text 背景, 斑马行)
+    "border":       "#D8DEE8",   # 边框
+    "border_soft":  "#E5E9F0",   # 轻分割线
+    "text":         "#1F2937",   # 主文字
+    "text_muted":   "#6B7280",   # 次要文字
+    "primary":      "#2563EB",   # 主色 (运行按钮)
+    "primary_hov":  "#1D4ED8",
+    "primary_act":  "#1E40AF",
+    "accent":       "#0EA5E9",   # 次级按钮
+    "accent_hov":   "#0284C7",
+    "success":      "#16A34A",
+    "warning":      "#D97706",
+    "danger":       "#DC2626",
+    "selected":     "#DBEAFE",   # 选中高亮
+}
+
+# matplotlib 整体风格配置 (与 Tk 主题协调)
+plt.rcParams['axes.facecolor']   = PALETTE["surface"]
+plt.rcParams['figure.facecolor'] = PALETTE["surface"]
+plt.rcParams['axes.edgecolor']   = PALETTE["border"]
+plt.rcParams['axes.labelcolor']  = PALETTE["text"]
+plt.rcParams['xtick.color']      = PALETTE["text_muted"]
+plt.rcParams['ytick.color']      = PALETTE["text_muted"]
+plt.rcParams['axes.titlecolor']  = PALETTE["text"]
+plt.rcParams['axes.titleweight'] = 'bold'
+plt.rcParams['grid.color']       = PALETTE["border_soft"]
+plt.rcParams['grid.linestyle']   = '--'
+plt.rcParams['grid.linewidth']   = 0.6
+plt.rcParams['axes.spines.top']   = False
+plt.rcParams['axes.spines.right'] = False
+
 # 确保 pricing 包可导入
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -271,6 +315,7 @@ class BacktestApp(tk.Tk):
         self.title("期权对冲回测系统")
         self.geometry("1500x950")
         self.minsize(1200, 800)
+        self.configure(bg=PALETTE["bg"])
         self._setup_styles()
         self._build_ui()
         self._param_entries = {}
@@ -280,55 +325,279 @@ class BacktestApp(tk.Tk):
     def _setup_styles(self):
         style = ttk.Style(self)
         style.theme_use("clam")
-        style.configure("Title.TLabel", font=(_UI_FONT_FAMILY, 14, "bold"))
-        style.configure("Header.TLabel", font=(_UI_FONT_FAMILY, 10, "bold"))
-        style.configure("Run.TButton", font=(_UI_FONT_FAMILY, 11, "bold"),
-                        foreground="white", background="#2563EB")
+
+        base_font    = (_UI_FONT_FAMILY, 10)
+        small_font   = (_UI_FONT_FAMILY, 9)
+        title_font   = (_UI_FONT_FAMILY, 18, "bold")
+        subtitle_font = (_UI_FONT_FAMILY, 10)
+        header_font  = (_UI_FONT_FAMILY, 10, "bold")
+        group_font   = (_UI_FONT_FAMILY, 10, "bold")
+        tab_font     = (_UI_FONT_FAMILY, 10)
+        btn_font     = (_UI_FONT_FAMILY, 10)
+        run_font     = (_UI_FONT_FAMILY, 11, "bold")
+
+        # 默认选项 (供 tk.* 原生控件继承)
+        self.option_add("*Font", base_font)
+        self.option_add("*TCombobox*Listbox*Font", base_font)
+
+        # ---- 通用 Frame / Label ----
+        style.configure("TFrame", background=PALETTE["bg"])
+        style.configure("Surface.TFrame", background=PALETTE["surface"])
+        style.configure("Card.TFrame",
+                        background=PALETTE["surface"],
+                        relief="flat", borderwidth=1)
+
+        style.configure("TLabel",
+                        background=PALETTE["bg"],
+                        foreground=PALETTE["text"],
+                        font=base_font)
+        style.configure("Surface.TLabel",
+                        background=PALETTE["surface"],
+                        foreground=PALETTE["text"])
+        style.configure("Muted.TLabel",
+                        background=PALETTE["bg"],
+                        foreground=PALETTE["text_muted"],
+                        font=small_font)
+        style.configure("SurfaceMuted.TLabel",
+                        background=PALETTE["surface"],
+                        foreground=PALETTE["text_muted"],
+                        font=small_font)
+        style.configure("Title.TLabel",
+                        background=PALETTE["bg"],
+                        foreground=PALETTE["text"],
+                        font=title_font)
+        style.configure("Subtitle.TLabel",
+                        background=PALETTE["bg"],
+                        foreground=PALETTE["text_muted"],
+                        font=subtitle_font)
+        style.configure("Header.TLabel",
+                        background=PALETTE["bg"],
+                        foreground=PALETTE["text"],
+                        font=header_font)
+        style.configure("Status.TLabel",
+                        background=PALETTE["surface"],
+                        foreground=PALETTE["text_muted"],
+                        font=small_font,
+                        padding=(8, 4))
+
+        # ---- LabelFrame (分组容器) ----
+        style.configure("TLabelframe",
+                        background=PALETTE["surface"],
+                        bordercolor=PALETTE["border"],
+                        relief="solid", borderwidth=1)
+        style.configure("TLabelframe.Label",
+                        background=PALETTE["surface"],
+                        foreground=PALETTE["primary"],
+                        font=group_font,
+                        padding=(4, 0))
+
+        # ---- 输入控件 ----
+        style.configure("TEntry",
+                        fieldbackground=PALETTE["surface"],
+                        foreground=PALETTE["text"],
+                        bordercolor=PALETTE["border"],
+                        lightcolor=PALETTE["border"],
+                        darkcolor=PALETTE["border"],
+                        padding=4)
+        style.map("TEntry",
+                  bordercolor=[("focus", PALETTE["primary"])],
+                  lightcolor=[("focus", PALETTE["primary"])])
+
+        style.configure("TCombobox",
+                        fieldbackground=PALETTE["surface"],
+                        background=PALETTE["surface"],
+                        foreground=PALETTE["text"],
+                        bordercolor=PALETTE["border"],
+                        arrowcolor=PALETTE["text_muted"],
+                        padding=3)
+        style.map("TCombobox",
+                  fieldbackground=[("readonly", PALETTE["surface"])],
+                  bordercolor=[("focus", PALETTE["primary"])],
+                  arrowcolor=[("active", PALETTE["primary"])])
+
+        # ---- Radio/Check (背景分两套: Frame 背景 vs Surface 背景) ----
+        style.configure("TRadiobutton",
+                        background=PALETTE["surface"],
+                        foreground=PALETTE["text"],
+                        font=base_font,
+                        focuscolor=PALETTE["surface"])
+        style.map("TRadiobutton",
+                  background=[("active", PALETTE["surface"])],
+                  foreground=[("active", PALETTE["primary"])])
+
+        style.configure("TCheckbutton",
+                        background=PALETTE["surface"],
+                        foreground=PALETTE["text"],
+                        font=base_font,
+                        focuscolor=PALETTE["surface"])
+
+        # ---- 按钮 ----
+        style.configure("TButton",
+                        font=btn_font,
+                        background=PALETTE["surface"],
+                        foreground=PALETTE["text"],
+                        bordercolor=PALETTE["border"],
+                        focusthickness=0,
+                        padding=(10, 6),
+                        relief="flat")
+        style.map("TButton",
+                  background=[("active", PALETTE["border_soft"]),
+                              ("pressed", PALETTE["border"])],
+                  bordercolor=[("active", PALETTE["primary"])])
+
+        # 主色按钮 (运行)
+        style.configure("Run.TButton",
+                        font=run_font,
+                        foreground="white",
+                        background=PALETTE["primary"],
+                        bordercolor=PALETTE["primary"],
+                        padding=(14, 8),
+                        relief="flat")
         style.map("Run.TButton",
-                  background=[("active", "#1D4ED8"), ("pressed", "#1E40AF")])
+                  background=[("active", PALETTE["primary_hov"]),
+                              ("pressed", PALETTE["primary_act"]),
+                              ("disabled", "#9CA3AF")],
+                  foreground=[("disabled", "#E5E7EB")])
+
+        # 次级按钮 (结构图)
+        style.configure("Accent.TButton",
+                        font=btn_font,
+                        foreground="white",
+                        background=PALETTE["accent"],
+                        bordercolor=PALETTE["accent"],
+                        padding=(10, 6),
+                        relief="flat")
+        style.map("Accent.TButton",
+                  background=[("active", PALETTE["accent_hov"]),
+                              ("pressed", PALETTE["accent_hov"]),
+                              ("disabled", "#9CA3AF")],
+                  foreground=[("disabled", "#E5E7EB")])
+
+        # ---- Notebook ----
+        style.configure("TNotebook",
+                        background=PALETTE["bg"],
+                        bordercolor=PALETTE["border"],
+                        tabmargins=(6, 6, 6, 0))
+        style.configure("TNotebook.Tab",
+                        font=tab_font,
+                        background=PALETTE["bg"],
+                        foreground=PALETTE["text_muted"],
+                        bordercolor=PALETTE["border"],
+                        padding=(16, 8))
+        style.map("TNotebook.Tab",
+                  background=[("selected", PALETTE["surface"]),
+                              ("active", PALETTE["border_soft"])],
+                  foreground=[("selected", PALETTE["primary"]),
+                              ("active", PALETTE["text"])],
+                  expand=[("selected", (0, 0, 0, 0))])
+
+        # ---- Treeview ----
+        style.configure("Treeview",
+                        background=PALETTE["surface"],
+                        fieldbackground=PALETTE["surface"],
+                        foreground=PALETTE["text"],
+                        bordercolor=PALETTE["border"],
+                        rowheight=24,
+                        font=(_MONO_FONT_FAMILY, 9))
+        style.configure("Treeview.Heading",
+                        background=PALETTE["border_soft"],
+                        foreground=PALETTE["text"],
+                        font=header_font,
+                        relief="flat",
+                        padding=(6, 6))
+        style.map("Treeview.Heading",
+                  background=[("active", PALETTE["selected"])])
+        style.map("Treeview",
+                  background=[("selected", PALETTE["selected"])],
+                  foreground=[("selected", PALETTE["text"])])
+
+        # ---- Scrollbar ----
+        style.configure("Vertical.TScrollbar",
+                        background=PALETTE["bg"],
+                        troughcolor=PALETTE["bg"],
+                        bordercolor=PALETTE["bg"],
+                        arrowcolor=PALETTE["text_muted"],
+                        gripcount=0)
+        style.map("Vertical.TScrollbar",
+                  background=[("active", PALETTE["border"])])
+        style.configure("Horizontal.TScrollbar",
+                        background=PALETTE["bg"],
+                        troughcolor=PALETTE["bg"],
+                        bordercolor=PALETTE["bg"],
+                        arrowcolor=PALETTE["text_muted"],
+                        gripcount=0)
+        style.map("Horizontal.TScrollbar",
+                  background=[("active", PALETTE["border"])])
+
+        # ---- Progressbar ----
+        style.configure("TProgressbar",
+                        background=PALETTE["primary"],
+                        troughcolor=PALETTE["border_soft"],
+                        bordercolor=PALETTE["border_soft"],
+                        lightcolor=PALETTE["primary"],
+                        darkcolor=PALETTE["primary"])
+
+        # ---- PanedWindow ----
+        style.configure("TPanedwindow", background=PALETTE["bg"])
+        style.configure("TPanedwindow.Sash",
+                        background=PALETTE["border"],
+                        sashthickness=6)
+
+        # ---- Separator ----
+        style.configure("TSeparator", background=PALETTE["border"])
 
     # ---- 界面构建 ----
     def _build_ui(self):
-        # 顶部标题
-        title_frame = ttk.Frame(self)
-        title_frame.pack(fill="x", padx=10, pady=(10, 5))
-        ttk.Label(title_frame, text="期权动态对冲回测系统",
+        # 顶部标题条 (带底部分隔线)
+        header = ttk.Frame(self)
+        header.pack(fill="x", padx=0, pady=0)
+
+        title_row = ttk.Frame(header)
+        title_row.pack(fill="x", padx=18, pady=(14, 4))
+        ttk.Label(title_row, text="期权动态对冲回测系统",
                   style="Title.TLabel").pack(side="left")
+        ttk.Label(title_row,
+                  text="Derivatives Hedging Backtest Studio",
+                  style="Subtitle.TLabel").pack(side="left", padx=(12, 0), pady=(8, 0))
+
+        ttk.Separator(header, orient="horizontal").pack(fill="x", padx=0, pady=(6, 0))
 
         # 主体：左侧参数 + 右侧结果
         body = ttk.PanedWindow(self, orient="horizontal")
-        body.pack(fill="both", expand=True, padx=10, pady=5)
+        body.pack(fill="both", expand=True, padx=12, pady=(8, 4))
 
         # ─── 左侧面板 ───
         left = ttk.Frame(body, width=380)
         body.add(left, weight=1)
 
         # 1) 期权大类
-        sec1 = ttk.LabelFrame(left, text="期权类型", padding=8)
-        sec1.pack(fill="x", pady=(0, 5))
+        sec1 = ttk.LabelFrame(left, text=" 期权类型 ", padding=12)
+        sec1.pack(fill="x", pady=(0, 8))
 
-        ttk.Label(sec1, text="大类:").grid(row=0, column=0, sticky="w")
+        ttk.Label(sec1, text="大类:", style="Surface.TLabel").grid(
+            row=0, column=0, sticky="w", pady=4)
         self._class_var = tk.StringVar()
         class_cb = ttk.Combobox(sec1, textvariable=self._class_var, width=25,
                                 values=list(OPTION_CLASSES.keys()), state="readonly")
-        class_cb.grid(row=0, column=1, padx=5, pady=2, sticky="ew")
+        class_cb.grid(row=0, column=1, padx=(8, 0), pady=4, sticky="ew")
         class_cb.current(0)
         class_cb.bind("<<ComboboxSelected>>", self._on_option_class_change)
 
-        ttk.Label(sec1, text="子类型:").grid(row=1, column=0, sticky="w")
+        ttk.Label(sec1, text="子类型:", style="Surface.TLabel").grid(
+            row=1, column=0, sticky="w", pady=4)
         self._subtype_var = tk.StringVar()
         self._subtype_cb = ttk.Combobox(sec1, textvariable=self._subtype_var,
                                         width=25, state="readonly")
-        self._subtype_cb.grid(row=1, column=1, padx=5, pady=2, sticky="ew")
+        self._subtype_cb.grid(row=1, column=1, padx=(8, 0), pady=4, sticky="ew")
         sec1.columnconfigure(1, weight=1)
 
         # 2) 期权参数（可滚动）
-        sec2 = ttk.LabelFrame(left, text="期权参数", padding=8)
-        sec2.pack(fill="both", expand=True, pady=(0, 5))
+        sec2 = ttk.LabelFrame(left, text=" 期权参数 ", padding=12)
+        sec2.pack(fill="both", expand=True, pady=(0, 8))
 
-        canvas = tk.Canvas(sec2, highlightthickness=0)
+        canvas = tk.Canvas(sec2, highlightthickness=0, bg=PALETTE["surface"])
         scrollbar = ttk.Scrollbar(sec2, orient="vertical", command=canvas.yview)
-        self._param_frame = ttk.Frame(canvas)
+        self._param_frame = ttk.Frame(canvas, style="Surface.TFrame")
         self._param_frame.bind("<Configure>",
                                lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
         canvas.create_window((0, 0), window=self._param_frame, anchor="nw")
@@ -342,127 +611,149 @@ class BacktestApp(tk.Tk):
         canvas.bind_all("<MouseWheel>", _on_mousewheel)
 
         # 3) 回测设置
-        sec3 = ttk.LabelFrame(left, text="回测设置", padding=8)
-        sec3.pack(fill="x", pady=(0, 5))
+        sec3 = ttk.LabelFrame(left, text=" 回测设置 ", padding=12)
+        sec3.pack(fill="x", pady=(0, 8))
 
-        ttk.Label(sec3, text="数据来源:").grid(row=0, column=0, sticky="w")
+        ttk.Label(sec3, text="数据来源:", style="Surface.TLabel").grid(
+            row=0, column=0, sticky="w", pady=4)
         self._source_var = tk.StringVar(value="simulate")
-        src_frame = ttk.Frame(sec3)
-        src_frame.grid(row=0, column=1, sticky="w")
-        ttk.Radiobutton(src_frame, text="模拟数据", variable=self._source_var,
-                        value="simulate", command=self._toggle_source).pack(side="left")
-        ttk.Radiobutton(src_frame, text="CSV文件", variable=self._source_var,
-                        value="csv", command=self._toggle_source).pack(side="left")
+        src_frame = ttk.Frame(sec3, style="Surface.TFrame")
+        src_frame.grid(row=0, column=1, sticky="w", padx=(8, 0))
+        ttk.Radiobutton(src_frame, text="模拟", variable=self._source_var,
+                        value="simulate", command=self._toggle_source).pack(side="left", padx=(0, 6))
+        ttk.Radiobutton(src_frame, text="CSV", variable=self._source_var,
+                        value="csv", command=self._toggle_source).pack(side="left", padx=6)
         ttk.Radiobutton(src_frame, text="Wind", variable=self._source_var,
-                        value="wind", command=self._toggle_source).pack(side="left")
+                        value="wind", command=self._toggle_source).pack(side="left", padx=6)
 
         # 模拟参数
-        self._sim_frame = ttk.Frame(sec3)
-        self._sim_frame.grid(row=1, column=0, columnspan=2, sticky="ew", pady=2)
-        ttk.Label(self._sim_frame, text="种子:").grid(row=0, column=0, sticky="w")
+        self._sim_frame = ttk.Frame(sec3, style="Surface.TFrame")
+        self._sim_frame.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(4, 2))
+        ttk.Label(self._sim_frame, text="种子:", style="Surface.TLabel").grid(
+            row=0, column=0, sticky="w", pady=2)
         self._seed_var = tk.StringVar(value="42")
-        ttk.Entry(self._sim_frame, textvariable=self._seed_var, width=8).grid(
-            row=0, column=1, padx=3, sticky="w")
-        ttk.Label(self._sim_frame, text="已实现波动率:").grid(row=1, column=0, sticky="w")
+        ttk.Entry(self._sim_frame, textvariable=self._seed_var, width=10).grid(
+            row=0, column=1, padx=(6, 0), pady=2, sticky="w")
+        ttk.Label(self._sim_frame, text="已实现波动率:", style="Surface.TLabel").grid(
+            row=1, column=0, sticky="w", pady=2)
         self._real_vol_var = tk.StringVar(value="")
-        rv_frame = ttk.Frame(self._sim_frame)
-        rv_frame.grid(row=1, column=1, columnspan=3, sticky="w", padx=3)
-        ttk.Entry(rv_frame, textvariable=self._real_vol_var, width=8).pack(side="left")
-        ttk.Label(rv_frame, text="(空=同隐含波动率)").pack(side="left", padx=3)
-        ttk.Label(self._sim_frame, text="模拟路径数:").grid(row=2, column=0, sticky="w")
+        rv_frame = ttk.Frame(self._sim_frame, style="Surface.TFrame")
+        rv_frame.grid(row=1, column=1, columnspan=3, sticky="w", padx=(6, 0), pady=2)
+        ttk.Entry(rv_frame, textvariable=self._real_vol_var, width=10).pack(side="left")
+        ttk.Label(rv_frame, text=" 空=同隐含", style="SurfaceMuted.TLabel").pack(side="left")
+        ttk.Label(self._sim_frame, text="模拟路径数:", style="Surface.TLabel").grid(
+            row=2, column=0, sticky="w", pady=2)
         self._npaths_var = tk.StringVar(value="10")
-        ttk.Entry(self._sim_frame, textvariable=self._npaths_var, width=8).grid(
-            row=2, column=1, padx=3, sticky="w")
+        ttk.Entry(self._sim_frame, textvariable=self._npaths_var, width=10).grid(
+            row=2, column=1, padx=(6, 0), pady=2, sticky="w")
 
         # CSV 参数
-        self._csv_frame = ttk.Frame(sec3)
-        ttk.Label(self._csv_frame, text="文件:").grid(row=0, column=0, sticky="w")
+        self._csv_frame = ttk.Frame(sec3, style="Surface.TFrame")
+        ttk.Label(self._csv_frame, text="文件:", style="Surface.TLabel").grid(
+            row=0, column=0, sticky="w", pady=2)
         self._csv_path_var = tk.StringVar()
         ttk.Entry(self._csv_frame, textvariable=self._csv_path_var, width=22).grid(
-            row=0, column=1, padx=3)
-        ttk.Button(self._csv_frame, text="浏览...", width=6,
-                   command=self._browse_csv).grid(row=0, column=2)
-        ttk.Label(self._csv_frame, text="价格列:").grid(row=1, column=0, sticky="w")
+            row=0, column=1, padx=(6, 4), pady=2)
+        ttk.Button(self._csv_frame, text="浏览…", width=6,
+                   command=self._browse_csv).grid(row=0, column=2, pady=2)
+        ttk.Label(self._csv_frame, text="价格列:", style="Surface.TLabel").grid(
+            row=1, column=0, sticky="w", pady=2)
         self._csv_col_var = tk.StringVar(value="close")
         ttk.Entry(self._csv_frame, textvariable=self._csv_col_var, width=12).grid(
-            row=1, column=1, padx=3, sticky="w")
+            row=1, column=1, padx=(6, 0), pady=2, sticky="w")
 
         # Wind 参数
-        self._wind_frame = ttk.Frame(sec3)
-        ttk.Label(self._wind_frame, text="代码:").grid(row=0, column=0, sticky="w")
+        self._wind_frame = ttk.Frame(sec3, style="Surface.TFrame")
+        ttk.Label(self._wind_frame, text="代码:", style="Surface.TLabel").grid(
+            row=0, column=0, sticky="w", pady=2)
         self._wind_code_var = tk.StringVar(value="510050.SH")
         ttk.Entry(self._wind_frame, textvariable=self._wind_code_var, width=15).grid(
-            row=0, column=1, padx=3)
-        ttk.Label(self._wind_frame, text="起始日:").grid(row=1, column=0, sticky="w")
+            row=0, column=1, padx=(6, 0), pady=2)
+        ttk.Label(self._wind_frame, text="起始日:", style="Surface.TLabel").grid(
+            row=1, column=0, sticky="w", pady=2)
         self._wind_start_var = tk.StringVar(value="2026-01-02")
         ttk.Entry(self._wind_frame, textvariable=self._wind_start_var, width=15).grid(
-            row=1, column=1, padx=3)
-        ttk.Label(self._wind_frame, text="结束日:").grid(row=1, column=2, sticky="w")
-        self._wind_end_var = tk.StringVar(value="2026-02-07")
+            row=1, column=1, padx=(6, 8), pady=2)
+        ttk.Label(self._wind_frame, text="结束日:", style="Surface.TLabel").grid(
+            row=1, column=2, sticky="w", pady=2)
+        self._wind_end_var = tk.StringVar(value="2026-04-15")
         ttk.Entry(self._wind_frame, textvariable=self._wind_end_var, width=15).grid(
-            row=1, column=3, padx=3)
+            row=1, column=3, padx=(6, 0), pady=2)
+
+        # 轻分割线
+        ttk.Separator(sec3, orient="horizontal").grid(
+            row=2, column=0, columnspan=2, sticky="ew", pady=(8, 6))
 
         # 对冲参数
         row_h = 3
-        ttk.Label(sec3, text="调仓频率(天):").grid(row=row_h, column=0, sticky="w")
+        ttk.Label(sec3, text="调仓频率(天):", style="Surface.TLabel").grid(
+            row=row_h, column=0, sticky="w", pady=4)
         self._freq_var = tk.StringVar(value="1")
-        ttk.Entry(sec3, textvariable=self._freq_var, width=8).grid(
-            row=row_h, column=1, sticky="w", padx=3)
+        ttk.Entry(sec3, textvariable=self._freq_var, width=10).grid(
+            row=row_h, column=1, sticky="w", padx=(8, 0), pady=4)
 
         row_h += 1
-        ttk.Label(sec3, text="交易成本率(%):").grid(row=row_h, column=0, sticky="w")
+        ttk.Label(sec3, text="交易成本率(%):", style="Surface.TLabel").grid(
+            row=row_h, column=0, sticky="w", pady=4)
         self._tc_var = tk.StringVar(value="0.01")
-        ttk.Entry(sec3, textvariable=self._tc_var, width=8).grid(
-            row=row_h, column=1, sticky="w", padx=3)
+        ttk.Entry(sec3, textvariable=self._tc_var, width=10).grid(
+            row=row_h, column=1, sticky="w", padx=(8, 0), pady=4)
 
         row_h += 1
-        ttk.Label(sec3, text="头寸方向:").grid(row=row_h, column=0, sticky="w")
+        ttk.Label(sec3, text="头寸方向:", style="Surface.TLabel").grid(
+            row=row_h, column=0, sticky="w", pady=4)
         self._pos_var = tk.StringVar(value="1")
-        pos_frame = ttk.Frame(sec3)
-        pos_frame.grid(row=row_h, column=1, sticky="w")
-        ttk.Radiobutton(pos_frame, text="卖出(short)", variable=self._pos_var,
-                        value="1").pack(side="left")
-        ttk.Radiobutton(pos_frame, text="买入(long)", variable=self._pos_var,
+        pos_frame = ttk.Frame(sec3, style="Surface.TFrame")
+        pos_frame.grid(row=row_h, column=1, sticky="w", padx=(8, 0), pady=4)
+        ttk.Radiobutton(pos_frame, text="卖出 (short)", variable=self._pos_var,
+                        value="1").pack(side="left", padx=(0, 8))
+        ttk.Radiobutton(pos_frame, text="买入 (long)", variable=self._pos_var,
                         value="-1").pack(side="left")
 
         row_h += 1
-        ttk.Label(sec3, text="交易数量:").grid(row=row_h, column=0, sticky="w")
+        ttk.Label(sec3, text="交易数量:", style="Surface.TLabel").grid(
+            row=row_h, column=0, sticky="w", pady=4)
         self._qty_var = tk.StringVar(value="100")
         ttk.Entry(sec3, textvariable=self._qty_var, width=12).grid(
-            row=row_h, column=1, sticky="w", padx=3)
+            row=row_h, column=1, sticky="w", padx=(8, 0), pady=4)
 
         row_h += 1
-        ttk.Label(sec3, text="合约乘数:").grid(row=row_h, column=0, sticky="w")
+        ttk.Label(sec3, text="合约乘数:", style="Surface.TLabel").grid(
+            row=row_h, column=0, sticky="w", pady=4)
         self._mult_var = tk.StringVar(value="5")
-        mult_frame = ttk.Frame(sec3)
-        mult_frame.grid(row=row_h, column=1, sticky="w")
-        ttk.Entry(mult_frame, textvariable=self._mult_var, width=8).pack(side="left")
-        ttk.Label(mult_frame, text="(0=不取整)").pack(side="left", padx=3)
+        mult_frame = ttk.Frame(sec3, style="Surface.TFrame")
+        mult_frame.grid(row=row_h, column=1, sticky="w", padx=(8, 0), pady=4)
+        ttk.Entry(mult_frame, textvariable=self._mult_var, width=10).pack(side="left")
+        ttk.Label(mult_frame, text=" 0=不取整", style="SurfaceMuted.TLabel").pack(side="left")
 
         sec3.columnconfigure(1, weight=1)
 
         # 运行按钮
         btn_frame = ttk.Frame(left)
-        btn_frame.pack(fill="x", pady=5)
+        btn_frame.pack(fill="x", pady=(2, 6))
         self._run_btn = ttk.Button(btn_frame, text="▶  运行回测", style="Run.TButton",
                                    command=self._run_backtest)
         self._run_btn.pack(fill="x", ipady=4)
 
         self._struct_btn = ttk.Button(btn_frame, text="📊  绘制结构图",
+                                      style="Accent.TButton",
                                       command=self._plot_structure)
-        self._struct_btn.pack(fill="x", ipady=3, pady=(3, 0))
+        self._struct_btn.pack(fill="x", ipady=2, pady=(6, 0))
 
         struct_ctrl = ttk.Frame(btn_frame)
-        struct_ctrl.pack(fill="x", pady=(2, 0))
-        ttk.Label(struct_ctrl, text="扫描 ±%:").pack(side="left")
+        struct_ctrl.pack(fill="x", pady=(6, 0))
+        ttk.Label(struct_ctrl, text="扫描 ±%:", style="Muted.TLabel").pack(side="left")
         self._struct_range_var = tk.StringVar(value="30")
-        ttk.Entry(struct_ctrl, textvariable=self._struct_range_var, width=5).pack(side="left", padx=(2, 8))
-        ttk.Label(struct_ctrl, text="点数:").pack(side="left")
+        ttk.Entry(struct_ctrl, textvariable=self._struct_range_var, width=6).pack(
+            side="left", padx=(4, 10))
+        ttk.Label(struct_ctrl, text="点数:", style="Muted.TLabel").pack(side="left")
         self._struct_npts_var = tk.StringVar(value="31")
-        ttk.Entry(struct_ctrl, textvariable=self._struct_npts_var, width=5).pack(side="left", padx=2)
+        ttk.Entry(struct_ctrl, textvariable=self._struct_npts_var, width=6).pack(
+            side="left", padx=(4, 0))
 
         self._progress = ttk.Progressbar(btn_frame, mode="indeterminate")
-        self._progress_label = ttk.Label(btn_frame, text="", anchor="center")
+        self._progress_label = ttk.Label(btn_frame, text="", anchor="center",
+                                          style="Muted.TLabel")
 
         # ─── 右侧面板 ───
         right = ttk.Frame(body)
@@ -473,40 +764,58 @@ class BacktestApp(tk.Tk):
         self._nb.pack(fill="both", expand=True)
 
         # Tab 1: 摘要
-        self._summary_tab = ttk.Frame(self._nb)
+        self._summary_tab = ttk.Frame(self._nb, style="Surface.TFrame")
         self._nb.add(self._summary_tab, text="  回测摘要  ")
-        self._summary_text = tk.Text(self._summary_tab, wrap="word",
-                                     font=("Consolas", 10), state="disabled",
-                                     bg="#FAFAFA")
-        self._summary_text.pack(fill="both", expand=True, padx=5, pady=5)
+        self._summary_text = tk.Text(
+            self._summary_tab, wrap="word",
+            font=(_MONO_FONT_FAMILY, 10),
+            state="disabled",
+            bg=PALETTE["surface_alt"],
+            fg=PALETTE["text"],
+            relief="flat", borderwidth=0,
+            padx=14, pady=12,
+            insertbackground=PALETTE["primary"],
+            selectbackground=PALETTE["selected"],
+            selectforeground=PALETTE["text"],
+        )
+        self._summary_text.pack(fill="both", expand=True, padx=6, pady=6)
 
         # Tab 2: 图表
-        self._chart_tab = ttk.Frame(self._nb)
+        self._chart_tab = ttk.Frame(self._nb, style="Surface.TFrame")
         self._nb.add(self._chart_tab, text="  对冲图表  ")
-        self._chart_container = ttk.Frame(self._chart_tab)
-        self._chart_container.pack(fill="both", expand=True)
+        self._chart_container = ttk.Frame(self._chart_tab, style="Surface.TFrame")
+        self._chart_container.pack(fill="both", expand=True, padx=4, pady=4)
 
         # Tab 3: 波动率分析
-        self._vol_tab = ttk.Frame(self._nb)
+        self._vol_tab = ttk.Frame(self._nb, style="Surface.TFrame")
         self._nb.add(self._vol_tab, text="  波动率分析  ")
-        self._vol_container = ttk.Frame(self._vol_tab)
-        self._vol_container.pack(fill="both", expand=True)
+        self._vol_container = ttk.Frame(self._vol_tab, style="Surface.TFrame")
+        self._vol_container.pack(fill="both", expand=True, padx=4, pady=4)
 
         # Tab 4: 盈亏分布（蒙特卡洛）
-        self._dist_tab = ttk.Frame(self._nb)
+        self._dist_tab = ttk.Frame(self._nb, style="Surface.TFrame")
         self._nb.add(self._dist_tab, text="  盈亏分布  ")
-        self._dist_container = ttk.Frame(self._dist_tab)
-        self._dist_container.pack(fill="both", expand=True)
+        self._dist_container = ttk.Frame(self._dist_tab, style="Surface.TFrame")
+        self._dist_container.pack(fill="both", expand=True, padx=4, pady=4)
 
         # Tab 5: 结构分析
-        self._struct_tab = ttk.Frame(self._nb)
+        self._struct_tab = ttk.Frame(self._nb, style="Surface.TFrame")
         self._nb.add(self._struct_tab, text="  结构分析  ")
-        self._struct_container = ttk.Frame(self._struct_tab)
-        self._struct_container.pack(fill="both", expand=True)
+        self._struct_container = ttk.Frame(self._struct_tab, style="Surface.TFrame")
+        self._struct_container.pack(fill="both", expand=True, padx=4, pady=4)
 
         # Tab 6: 明细表
-        self._table_tab = ttk.Frame(self._nb)
+        self._table_tab = ttk.Frame(self._nb, style="Surface.TFrame")
         self._nb.add(self._table_tab, text="  每日明细  ")
+
+        # 底部状态栏
+        status_bar = ttk.Frame(self, style="Surface.TFrame")
+        status_bar.pack(fill="x", side="bottom")
+        ttk.Separator(status_bar, orient="horizontal").pack(fill="x")
+        self._status_var = tk.StringVar(
+            value="就绪  |  选择期权类型、设置参数后点击『运行回测』")
+        ttk.Label(status_bar, textvariable=self._status_var,
+                  style="Status.TLabel", anchor="w").pack(fill="x", padx=10)
 
         self._toggle_source()
 
@@ -523,11 +832,12 @@ class BacktestApp(tk.Tk):
             w.destroy()
         self._param_entries = {}
         for i, (key, label, dtype, default) in enumerate(params):
-            ttk.Label(self._param_frame, text=f"{label}:").grid(
-                row=i, column=0, sticky="w", padx=(0, 5), pady=1)
+            ttk.Label(self._param_frame, text=f"{label}:",
+                      style="Surface.TLabel").grid(
+                row=i, column=0, sticky="w", padx=(2, 8), pady=3)
             var = tk.StringVar(value=str(default))
-            entry = ttk.Entry(self._param_frame, textvariable=var, width=15)
-            entry.grid(row=i, column=1, sticky="ew", pady=1)
+            entry = ttk.Entry(self._param_frame, textvariable=var, width=16)
+            entry.grid(row=i, column=1, sticky="ew", pady=3, padx=(0, 2))
             self._param_entries[key] = (var, dtype)
         self._param_frame.columnconfigure(1, weight=1)
 
@@ -559,8 +869,9 @@ class BacktestApp(tk.Tk):
             return
 
         self._run_btn.configure(state="disabled")
-        self._progress.pack(fill="x", pady=(3, 0))
+        self._progress.pack(fill="x", pady=(6, 0))
         self._progress.start(15)
+        self._set_status("正在运行回测…")
         threading.Thread(target=self._backtest_worker, args=(gui_state,),
                          daemon=True).start()
 
@@ -653,6 +964,13 @@ class BacktestApp(tk.Tk):
         finally:
             self.after(0, self._finish_run)
 
+    def _set_status(self, text):
+        """更新底部状态栏文字 (线程安全: 调用方需保证在主线程或通过 after)。"""
+        try:
+            self._status_var.set(text)
+        except Exception:
+            pass
+
     def _finish_run(self):
         self._progress.stop()
         self._progress.configure(mode="indeterminate")
@@ -660,6 +978,7 @@ class BacktestApp(tk.Tk):
         self._progress_label.pack_forget()
         self._progress_label.configure(text="")
         self._run_btn.configure(state="normal")
+        self._set_status("回测完成  |  切换上方 Tab 查看各项结果")
 
     def _build_backtest(self, gs):
         """根据已收集的 GUI 状态构建 HedgeBacktest 实例（可在任意线程调用）"""
@@ -1043,7 +1362,8 @@ class BacktestApp(tk.Tk):
         if multi_stats is None:
             lbl = ttk.Label(self._dist_container,
                             text="盈亏分布仅在模拟数据模式下显示（需路径数 > 1）",
-                            font=("", 11))
+                            style="SurfaceMuted.TLabel",
+                            font=(_UI_FONT_FAMILY, 11))
             lbl.pack(expand=True)
             return
 
@@ -1131,10 +1451,19 @@ class BacktestApp(tk.Tk):
 
         df = bt.to_dataframe()
 
+        # 顶部工具栏 (导出 + 行数提示)
+        toolbar = ttk.Frame(self._table_tab, style="Surface.TFrame")
+        toolbar.pack(fill="x", padx=8, pady=(8, 4))
+        ttk.Label(toolbar,
+                  text=f"共 {len(df)} 行 × {len(df.columns)} 列",
+                  style="SurfaceMuted.TLabel").pack(side="left")
+        ttk.Button(toolbar, text="导出 CSV", style="Accent.TButton",
+                   command=lambda: self._export_csv(df)).pack(side="right")
+
         # Treeview
         columns = list(df.columns)
-        tree_frame = ttk.Frame(self._table_tab)
-        tree_frame.pack(fill="both", expand=True, padx=5, pady=5)
+        tree_frame = ttk.Frame(self._table_tab, style="Surface.TFrame")
+        tree_frame.pack(fill="both", expand=True, padx=8, pady=(0, 8))
 
         xscroll = ttk.Scrollbar(tree_frame, orient="horizontal")
         yscroll = ttk.Scrollbar(tree_frame, orient="vertical")
@@ -1147,30 +1476,29 @@ class BacktestApp(tk.Tk):
         yscroll.config(command=tree.yview)
 
         tree.heading("day_no", text="交易日")
-        tree.column("day_no", width=55, anchor="center")
+        tree.column("day_no", width=60, anchor="center")
         tree.heading("idx", text=df.index.name or "日期")
-        tree.column("idx", width=90, anchor="center")
+        tree.column("idx", width=96, anchor="center")
         for col in columns:
             tree.heading(col, text=col)
-            tree.column(col, width=85, anchor="e")
+            tree.column(col, width=92, anchor="e")
+
+        # 斑马行
+        tree.tag_configure("odd",  background=PALETTE["surface"])
+        tree.tag_configure("even", background=PALETTE["surface_alt"])
 
         for i, (idx, row) in enumerate(df.iterrows()):
             idx_str = str(idx)[:10] if hasattr(idx, 'strftime') else str(idx)
             values = [i, idx_str] + [f"{v:.4f}" if isinstance(v, float) else str(v)
                                      for v in row.values]
-            tree.insert("", "end", values=values)
+            tag = "even" if i % 2 == 0 else "odd"
+            tree.insert("", "end", values=values, tags=(tag,))
 
         tree.grid(row=0, column=0, sticky="nsew")
         yscroll.grid(row=0, column=1, sticky="ns")
         xscroll.grid(row=1, column=0, sticky="ew")
         tree_frame.rowconfigure(0, weight=1)
         tree_frame.columnconfigure(0, weight=1)
-
-        # 导出按钮
-        btn_frame = ttk.Frame(self._table_tab)
-        btn_frame.pack(fill="x", padx=5, pady=3)
-        ttk.Button(btn_frame, text="导出 CSV", command=lambda: self._export_csv(df)).pack(
-            side="right")
 
     # ---- 结构分析 ----
     def _plot_structure(self):
@@ -1196,10 +1524,11 @@ class BacktestApp(tk.Tk):
 
         self._struct_btn.configure(state="disabled")
         self._run_btn.configure(state="disabled")
-        self._progress.pack(fill="x", pady=(3, 0))
+        self._progress.pack(fill="x", pady=(6, 0))
         self._progress.configure(mode="determinate", maximum=n_points, value=0)
         self._progress_label.configure(text=f"结构扫描: 0/{n_points}")
         self._progress_label.pack(fill="x")
+        self._set_status("正在进行结构扫描…")
         self._nb.select(self._struct_tab)
         threading.Thread(target=self._structure_worker,
                          args=(gui_state, range_pct, n_points),
@@ -1261,6 +1590,7 @@ class BacktestApp(tk.Tk):
         self._progress_label.configure(text="")
         self._struct_btn.configure(state="normal")
         self._run_btn.configure(state="normal")
+        self._set_status("结构扫描完成")
 
     def _show_structure(self, gui_state, s_grid, prices, deltas,
                         gammas, vegas, thetas):
@@ -1302,17 +1632,24 @@ class BacktestApp(tk.Tk):
         full_text = header + doc_text + "\n\n参数: " + param_summary
 
         # 顶部文本
-        text_frame = ttk.Frame(self._struct_container)
-        text_frame.pack(fill="x", padx=5, pady=(5, 3))
-        text_widget = tk.Text(text_frame, wrap="word", height=11,
-                              font=("Consolas", 9), bg="#FAFAFA")
+        text_frame = ttk.Frame(self._struct_container, style="Surface.TFrame")
+        text_frame.pack(fill="x", padx=8, pady=(8, 4))
+        text_widget = tk.Text(
+            text_frame, wrap="word", height=11,
+            font=(_MONO_FONT_FAMILY, 10),
+            bg=PALETTE["surface_alt"],
+            fg=PALETTE["text"],
+            relief="flat", borderwidth=0,
+            padx=12, pady=10,
+            selectbackground=PALETTE["selected"],
+        )
         text_widget.insert("1.0", full_text)
         text_widget.configure(state="disabled")
         text_widget.pack(fill="x")
 
         # 图表
-        chart_frame = ttk.Frame(self._struct_container)
-        chart_frame.pack(fill="both", expand=True, padx=5, pady=3)
+        chart_frame = ttk.Frame(self._struct_container, style="Surface.TFrame")
+        chart_frame.pack(fill="both", expand=True, padx=8, pady=(4, 8))
 
         fig = Figure(figsize=(10, 6.2), dpi=96)
 
