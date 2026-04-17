@@ -313,8 +313,10 @@ class BacktestApp(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("期权对冲回测系统")
-        self.geometry("1500x950")
-        self.minsize(1200, 800)
+        self.geometry("1600x1000")
+        # 左侧面板已启用垂直滚动, 这里可以给一个更宽容的最小尺寸,
+        # 即便在高 DPI / 小分辨率屏幕下也不会裁掉底部按钮.
+        self.minsize(1200, 720)
         self.configure(bg=PALETTE["bg"])
         self._setup_styles()
         self._build_ui()
@@ -332,7 +334,7 @@ class BacktestApp(tk.Tk):
         subtitle_font = (_UI_FONT_FAMILY, 10)
         header_font  = (_UI_FONT_FAMILY, 10, "bold")
         group_font   = (_UI_FONT_FAMILY, 10, "bold")
-        tab_font     = (_UI_FONT_FAMILY, 10)
+        tab_font     = (_UI_FONT_FAMILY, 12, "bold")
         btn_font     = (_UI_FONT_FAMILY, 10)
         run_font     = (_UI_FONT_FAMILY, 11, "bold")
 
@@ -483,7 +485,7 @@ class BacktestApp(tk.Tk):
                         background=PALETTE["bg"],
                         foreground=PALETTE["text_muted"],
                         bordercolor=PALETTE["border"],
-                        padding=(16, 8))
+                        padding=(22, 11))
         style.map("TNotebook.Tab",
                   background=[("selected", PALETTE["surface"]),
                               ("active", PALETTE["border_soft"])],
@@ -566,9 +568,62 @@ class BacktestApp(tk.Tk):
         body = ttk.PanedWindow(self, orient="horizontal")
         body.pack(fill="both", expand=True, padx=12, pady=(8, 4))
 
-        # ─── 左侧面板 ───
-        left = ttk.Frame(body, width=380)
-        body.add(left, weight=1)
+        # ─── 左侧面板 (整体包一层 Canvas + Scrollbar, 解决低分辨率/高 DPI 下底部按钮被裁) ───
+        left_outer = ttk.Frame(body, width=460)
+        left_outer.pack_propagate(False)
+        body.add(left_outer, weight=1)
+
+        # 外层 Canvas 横向充满, Scrollbar 靠右
+        self._left_canvas = tk.Canvas(
+            left_outer, highlightthickness=0, bd=0,
+            bg=PALETTE["surface"],
+        )
+        self._left_scrollbar = ttk.Scrollbar(
+            left_outer, orient="vertical", command=self._left_canvas.yview
+        )
+        self._left_canvas.configure(yscrollcommand=self._left_scrollbar.set)
+        self._left_scrollbar.pack(side="right", fill="y")
+        self._left_canvas.pack(side="left", fill="both", expand=True)
+
+        # inner frame: 真正承载左侧所有 LabelFrame/按钮; 父控件必须是 Canvas 本身.
+        self._left_inner = ttk.Frame(self._left_canvas, style="Surface.TFrame")
+        self._left_inner_id = self._left_canvas.create_window(
+            (0, 0), window=self._left_inner, anchor="nw"
+        )
+
+        # inner 尺寸变化 → 更新 scrollregion
+        def _on_inner_configure(event):
+            self._left_canvas.configure(scrollregion=self._left_canvas.bbox("all"))
+        self._left_inner.bind("<Configure>", _on_inner_configure)
+
+        # canvas 宽度变化 → inner 跟随横向铺满 (否则 inner 默认是内容宽度, 右侧会有空白)
+        def _on_canvas_configure(event):
+            self._left_canvas.itemconfigure(self._left_inner_id, width=event.width)
+        self._left_canvas.bind("<Configure>", _on_canvas_configure)
+
+        # 鼠标滚轮处理: 只在鼠标进入左侧面板时启用, 离开则取消, 避免劫持右侧图表/表格的滚轮.
+        def _on_left_mousewheel(event):
+            # Windows: event.delta 为 ±120 的倍数; 正值向上滚, 负值向下滚.
+            self._left_canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+            return "break"
+
+        def _bind_left_wheel(_event=None):
+            self._left_canvas.bind_all("<MouseWheel>", _on_left_mousewheel)
+
+        def _unbind_left_wheel(_event=None):
+            self._left_canvas.unbind_all("<MouseWheel>")
+
+        # 保留引用, 其它地方如需手动启停滚轮可复用
+        self._left_wheel_bind = _bind_left_wheel
+        self._left_wheel_unbind = _unbind_left_wheel
+
+        self._left_canvas.bind("<Enter>", _bind_left_wheel)
+        self._left_canvas.bind("<Leave>", _unbind_left_wheel)
+        self._left_inner.bind("<Enter>", _bind_left_wheel)
+        self._left_inner.bind("<Leave>", _unbind_left_wheel)
+
+        # 之后所有原本放在 left 里的控件, 父容器改为 left_inner
+        left = self._left_inner
 
         # 1) 期权大类
         sec1 = ttk.LabelFrame(left, text=" 期权类型 ", padding=12)
@@ -591,24 +646,14 @@ class BacktestApp(tk.Tk):
         self._subtype_cb.grid(row=1, column=1, padx=(8, 0), pady=4, sticky="ew")
         sec1.columnconfigure(1, weight=1)
 
-        # 2) 期权参数（可滚动）
+        # 2) 期权参数
+        # 说明: 外层左侧已经有整体 Canvas+Scrollbar, 这里不再嵌套独立滚动容器,
+        # 让参数区按内容自然撑开高度, 整体滚动由外层统一处理.
         sec2 = ttk.LabelFrame(left, text=" 期权参数 ", padding=12)
-        sec2.pack(fill="both", expand=True, pady=(0, 8))
+        sec2.pack(fill="x", pady=(0, 8))
 
-        canvas = tk.Canvas(sec2, highlightthickness=0, bg=PALETTE["surface"])
-        scrollbar = ttk.Scrollbar(sec2, orient="vertical", command=canvas.yview)
-        self._param_frame = ttk.Frame(canvas, style="Surface.TFrame")
-        self._param_frame.bind("<Configure>",
-                               lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
-        canvas.create_window((0, 0), window=self._param_frame, anchor="nw")
-        canvas.configure(yscrollcommand=scrollbar.set)
-        canvas.pack(side="left", fill="both", expand=True)
-        scrollbar.pack(side="right", fill="y")
-
-        # 鼠标滚轮
-        def _on_mousewheel(event):
-            canvas.yview_scroll(-1 * (event.delta // 120), "units")
-        canvas.bind_all("<MouseWheel>", _on_mousewheel)
+        self._param_frame = ttk.Frame(sec2, style="Surface.TFrame")
+        self._param_frame.pack(fill="x", expand=True)
 
         # 3) 回测设置
         sec3 = ttk.LabelFrame(left, text=" 回测设置 ", padding=12)
