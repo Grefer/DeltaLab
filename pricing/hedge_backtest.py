@@ -19,6 +19,93 @@ except ImportError:
 
 
 # ============================================================
+#  对冲触发策略（HedgeStrategy）
+# ============================================================
+#
+# 主循环在每个 bar 调用 strategy.should_hedge(ctx) -> bool 决定是否重新
+# 计算目标持仓并交易。除 Day 0 建仓、Day n 到期平仓外，所有对冲决策都
+# 交给 strategy。
+#
+# ctx 字段：
+#   i            : 当前 bar 索引（1..n-1，Day 0 / Day n 主循环单独处理）
+#   S            : 当前 bar 标的价
+#   S_last       : 上一次触发对冲时的标的价（Day 0 或上次 hedge）
+#   i_last       : 上一次触发对冲时的 bar 索引
+#   dt_bar       : 单 bar 的年化时长
+#   sigma_impl   : 期权隐含波动率（option.sigma）
+#   log_ret_hist : 截至当前 bar 的对数收益序列（长度 = i），np.ndarray
+
+
+class HedgeStrategy:
+    """对冲触发策略基类。子类实现 should_hedge(ctx) -> bool。"""
+
+    name = "base"
+
+    def should_hedge(self, ctx):
+        raise NotImplementedError
+
+
+class FixedFreqStrategy(HedgeStrategy):
+    """按固定 bar 间隔触发：每 hedge_freq 个 bar 调仓一次。"""
+
+    name = "fixed_freq"
+
+    def __init__(self, hedge_freq=1):
+        self.hedge_freq = max(1, int(hedge_freq))
+
+    def should_hedge(self, ctx):
+        return (ctx["i"] % self.hedge_freq) == 0
+
+
+class SigmaBandStrategy(HedgeStrategy):
+    """
+    x-sigma 带触发：当 |ln(S/S_last)| >= k * sigma_ref * sqrt(dt_since_last)
+    时重建 Δ 对冲。sigma_ref 有两种来源：
+      - 'implied'  : 使用 option.sigma
+      - 'realized' : 过去 window 个 bar 对数收益的年化 std，
+                     不足 window 时回退到 option.sigma
+    """
+
+    name = "sigma_band"
+
+    def __init__(self, k=0.5, sigma_source="implied", window=20):
+        self.k = float(k)
+        self.sigma_source = str(sigma_source).lower()
+        if self.sigma_source not in ("implied", "realized"):
+            raise ValueError(f"未知 sigma_source: {sigma_source}")
+        self.window = max(2, int(window))
+
+    def _sigma_ref(self, ctx):
+        if self.sigma_source == "implied":
+            return float(ctx["sigma_impl"])
+        lr = ctx["log_ret_hist"]
+        if lr is None or len(lr) < self.window:
+            return float(ctx["sigma_impl"])
+        tail = lr[-self.window:]
+        std = float(np.std(tail, ddof=1))
+        if not np.isfinite(std) or std <= 0:
+            return float(ctx["sigma_impl"])
+        # intraday 下 bar 级 std 的年化因子必须是 ANNUAL_DAYS * spd，
+        # 否则 spd>1 时会把 σ 年化压低，σ 带被频繁击穿。
+        spd = int(ctx.get("steps_per_day", 1))
+        return std * np.sqrt(ANNUAL_DAYS * max(1, spd))
+
+    def should_hedge(self, ctx):
+        sigma_ref = self._sigma_ref(ctx)
+        if sigma_ref <= 0:
+            return False
+        bars_since = max(1, ctx["i"] - ctx["i_last"])
+        # dt_since_last = bars_since * dt_bar（从上次触发至今的年化时长）
+        dt_since = bars_since * ctx["dt_bar"]
+        threshold = self.k * sigma_ref * np.sqrt(dt_since)
+        s_last = ctx["S_last"]
+        if s_last <= 0:
+            return False
+        move = abs(np.log(ctx["S"] / s_last))
+        return move >= threshold
+
+
+# ============================================================
 #  期权要素伸缩（用于真实行情回测）
 # ============================================================
 #
@@ -130,11 +217,15 @@ def _format_rescale_info(info):
 
 def _run_single_path(args):
     """线程池工作函数：对单条路径执行回测"""
-    option_init, price_path, hedge_freq, tc_rate, position, quantity, multiplier = args
+    (option_init, price_path, hedge_freq, tc_rate, position, quantity, multiplier,
+     strategy, steps_per_day, slippage_bps) = args
     bt = HedgeBacktest(
         option_init, price_path,
         hedge_freq=hedge_freq, tc_rate=tc_rate,
         position=position, quantity=quantity, multiplier=multiplier,
+        strategy=copy.deepcopy(strategy) if strategy is not None else None,
+        steps_per_day=steps_per_day,
+        slippage_bps=slippage_bps,
     )
     res = bt.run()
     return {
@@ -187,7 +278,8 @@ class HedgeBacktest:
     def __init__(self, option, prices=None, hedge_freq=1, tc_rate=0.0, position=1,
                  quantity=1.0, multiplier=0,
                  path_source="gbm", external_path=None, detrend=False,
-                 is_future=False, contract_multiplier=1.0):
+                 is_future=False, contract_multiplier=1.0,
+                 strategy=None, steps_per_day=1, slippage_bps=0.0):
         """
         Parameters
         ----------
@@ -236,6 +328,12 @@ class HedgeBacktest:
         self.position = position
         self.quantity = float(quantity)
         self.multiplier = float(multiplier)
+        # 日内 intraday 支持：每个交易日切分成 steps_per_day 个 bar。
+        # steps_per_day=1 时行为与旧代码一致。
+        self.steps_per_day = max(1, int(steps_per_day))
+        self.slippage_bps = float(slippage_bps)
+        # strategy=None 时回退到旧的 FixedFreqStrategy(hedge_freq) 以保持兼容。
+        self.strategy = strategy if strategy is not None else FixedFreqStrategy(self.hedge_freq)
         self._results = None
 
         # ---- 价格序列长度校正：严格裁剪到期权剩余期限 ----
@@ -251,12 +349,13 @@ class HedgeBacktest:
         except Exception:
             t_rem = None
         if t_rem is not None and t_rem > 0:
-            need = t_rem + 1
+            # intraday 模式下 prices 每日有 steps_per_day 个 bar，总长 T*spd + 1。
+            need = t_rem * self.steps_per_day + 1
             have = len(self.prices)
             if have < need:
                 raise ValueError(
-                    f"价格序列长度不足：期权剩余 {t_rem} 日需要 {need} 个价格点，"
-                    f"实际仅 {have} 个。"
+                    f"价格序列长度不足：期权剩余 {t_rem} 日 x steps_per_day="
+                    f"{self.steps_per_day} 需要 {need} 个价格点，实际仅 {have} 个。"
                 )
             if have > need:
                 self.prices = self.prices[:need]
@@ -267,7 +366,9 @@ class HedgeBacktest:
         S = self.prices
         n = len(S) - 1
         r = option.r
-        dt = 1.0 / ANNUAL_DAYS
+        spd = self.steps_per_day
+        dt_bar = 1.0 / (ANNUAL_DAYS * spd)  # 单 bar 年化时长
+        dt = 1.0 / ANNUAL_DAYS  # 日粒度（兼容旧字段）
         pos = self.position
 
         # 存储数组
@@ -330,20 +431,37 @@ class HedgeBacktest:
         H[0], delta_theo_qty[0], delta_real_qty[0] = _compute_target(delta[0])
         TC[0] = abs(H[0]) * S[0] * self.tc_rate
 
+        # 策略 context：记录最近一次触发对冲的 bar 索引 / 价格
+        i_last = 0
+        S_last = float(S[0])
+        hedge_triggered = np.zeros(n + 1, dtype=bool)
+        hedge_triggered[0] = True  # Day 0 建仓视为一次触发
+
+        sl_rate = self.slippage_bps * 1e-4  # bps -> ratio
+
         # ---- Day 1 ~ n ----
         for i in range(1, n + 1):
-            # 推进一天
-            option.step_forward(S[i])
-            time_left = option._time_remaining
+            # 日粒度划分：i % spd == 0 时是"跨日收盘"，需要 step_forward；
+            # 其他 bar 为日内 bar，仅用临时 bumped copy 重算 Δ，不污染 option 内部状态。
+            crosses_day = (i % spd == 0)
+
+            if crosses_day:
+                option.step_forward(S[i])
+                eval_opt = option
+            else:
+                # 日内：用临时副本评估 price / Δ，option 本体状态保持到当日收盘。
+                eval_opt = option._bumped_copy(s0=float(S[i]))
+
+            time_left = eval_opt._time_remaining
 
             # 计算价值与 Greeks
             if time_left > 0:
-                val = option.get_price()
+                val = eval_opt.get_price()
                 V[i] = val if val is not None else 0.0
-                greeks = option.get_greeks()
+                greeks = eval_opt.get_greeks()
                 delta[i], gamma[i], vega[i], theta[i], rho[i] = greeks
             elif time_left == 0:
-                val = option.get_price()
+                val = eval_opt.get_price()
                 V[i] = val if val is not None else 0.0
                 delta[i] = gamma[i] = vega[i] = theta[i] = rho[i] = 0.0
             else:
@@ -351,25 +469,44 @@ class HedgeBacktest:
 
             H[i] = H[i - 1]
 
-            # 默认沿用上一期的理论/实际手数（若本日未调仓）
+            # 默认沿用上一期的理论/实际手数（若本 bar 未调仓）
             delta_theo_qty[i] = delta_theo_qty[i - 1]
             delta_real_qty[i] = delta_real_qty[i - 1]
 
             # 调仓逻辑
             if i == n:
-                # 到期日：平仓所有标的头寸
+                # 到期：平仓所有标的头寸
                 trade = -H[i]
-                TC[i] = abs(trade) * S[i] * self.tc_rate
+                cost = abs(trade) * S[i] * (self.tc_rate + sl_rate)
+                TC[i] = cost
                 H[i] = 0.0
                 delta_theo_qty[i] = 0.0
                 delta_real_qty[i] = 0
-            elif i % self.hedge_freq == 0:
-                target, theo, real = _compute_target(delta[i])
-                trade = target - H[i]
-                TC[i] = abs(trade) * S[i] * self.tc_rate
-                H[i] = target
-                delta_theo_qty[i] = theo
-                delta_real_qty[i] = real
+                hedge_triggered[i] = True
+            else:
+                # 组装策略 context
+                ctx = {
+                    "i": i,
+                    "S": float(S[i]),
+                    "S_last": S_last,
+                    "i_last": i_last,
+                    "dt_bar": dt_bar,
+                    "steps_per_day": spd,
+                    "sigma_impl": float(option.sigma),
+                    # 对数收益历史（到当前 bar 为止），仅 realized σ 时用到
+                    "log_ret_hist": np.log(S[1:i + 1] / S[0:i]) if i >= 1 else np.array([]),
+                }
+                if self.strategy.should_hedge(ctx):
+                    target, theo, real = _compute_target(delta[i])
+                    trade = target - H[i]
+                    cost = abs(trade) * S[i] * (self.tc_rate + sl_rate)
+                    TC[i] = cost
+                    H[i] = target
+                    delta_theo_qty[i] = theo
+                    delta_real_qty[i] = real
+                    hedge_triggered[i] = True
+                    i_last = i
+                    S_last = float(S[i])
 
         # ---- 盈亏分解 ----
         hedge_daily = np.zeros(n + 1)     # 标的头寸每日盈亏（不含 TC）
@@ -392,33 +529,42 @@ class HedgeBacktest:
         # ---- 波动率分析 ----
         implied_vol = option.sigma  # 成交时隐含波动率
 
-        # 日收益率（对数）
-        log_ret = np.log(S[1:] / S[:-1])  # 长度 n
+        # bar 级对数收益
+        log_ret = np.log(S[1:] / S[:-1])  # 长度 n（若 intraday 则每 bar 一个）
+
+        # intraday 情形下年化因子按 bar 数换算
+        ann_factor = ANNUAL_DAYS * spd
 
         # 全区间已实现波动率（年化）
-        realized_vol = np.std(log_ret, ddof=1) * np.sqrt(ANNUAL_DAYS) if n > 1 else 0.0
+        realized_vol = np.std(log_ret, ddof=1) * np.sqrt(ann_factor) if n > 1 else 0.0
 
         # 滚动已实现波动率（窗口 = min(20, n)）
         win = min(20, n)
         rolling_realized = np.full(n + 1, np.nan)
         for i in range(win, n + 1):
             window_ret = log_ret[i - win:i]
-            rolling_realized[i] = np.std(window_ret, ddof=1) * np.sqrt(ANNUAL_DAYS)
-        # 前 win 个交易日用累计已实现波动率填充
+            rolling_realized[i] = np.std(window_ret, ddof=1) * np.sqrt(ann_factor)
+        # 前 win 个 bar 用累计已实现波动率填充
         for i in range(1, min(win, n + 1)):
-            rolling_realized[i] = np.std(log_ret[:i], ddof=1) * np.sqrt(ANNUAL_DAYS) if i > 1 else 0.0
+            rolling_realized[i] = np.std(log_ret[:i], ddof=1) * np.sqrt(ann_factor) if i > 1 else 0.0
         rolling_realized[0] = 0.0
 
         # 波动率价差：隐含 - 已实现（正值 → 卖方有优势）
         vol_spread = implied_vol - realized_vol
 
-        # 逐日累计已实现波动率
+        # 逐 bar 累计已实现波动率
         cumulative_realized = np.zeros(n + 1)
         for i in range(2, n + 1):
-            cumulative_realized[i] = np.std(log_ret[:i], ddof=1) * np.sqrt(ANNUAL_DAYS)
+            cumulative_realized[i] = np.std(log_ret[:i], ddof=1) * np.sqrt(ann_factor)
 
+        # intraday 下 n 是 bar 数，真正的日数 = n // spd。
         self._results = {
-            'n_days': n,
+            'n_days': n // spd if spd > 0 else n,
+            'n_bars': n,
+            'steps_per_day': spd,
+            'n_trade_days': n // spd if spd > 0 else n,
+            'hedge_triggered': hedge_triggered,
+            'strategy_name': getattr(self.strategy, 'name', 'unknown'),
             'prices': S,
             'opt_value': V,
             'delta': delta,
@@ -575,7 +721,7 @@ class HedgeBacktest:
         return df
 
     @staticmethod
-    def simulate_prices(s0, sigma, T_days, r=0.03, q=0.03, seed=42):
+    def simulate_prices(s0, sigma, T_days, r=0.03, q=0.03, seed=42, steps_per_day=1):
         """
         生成 GBM 模拟价格路径，用于回测测试
 
@@ -591,36 +737,43 @@ class HedgeBacktest:
             无风险利率、分红率
         seed : int
             随机种子
+        steps_per_day : int
+            每日 bar 数；默认 1 与历史行为一致。
 
         Returns
         -------
-        prices : ndarray, shape (T_days + 1,)
+        prices : ndarray, shape (T_days * steps_per_day + 1,)
         """
+        spd = max(1, int(steps_per_day))
         rng = np.random.default_rng(seed)
-        dt = 1.0 / ANNUAL_DAYS
+        dt = 1.0 / (ANNUAL_DAYS * spd)
+        n_steps = T_days * spd
         drift = (r - q - 0.5 * sigma ** 2) * dt
         vol = sigma * np.sqrt(dt)
-        log_returns = drift + vol * rng.standard_normal(T_days)
-        prices = np.zeros(T_days + 1)
+        log_returns = drift + vol * rng.standard_normal(n_steps)
+        prices = np.zeros(n_steps + 1)
         prices[0] = s0
         prices[1:] = s0 * np.exp(np.cumsum(log_returns))
         return prices
 
     @staticmethod
-    def simulate_multi_paths(s0, sigma, T_days, n_paths=100, r=0.03, q=0.03, seed=42):
+    def simulate_multi_paths(s0, sigma, T_days, n_paths=100, r=0.03, q=0.03, seed=42,
+                             steps_per_day=1):
         """
         批量生成多条价格路径，用于对冲效果的统计分析
 
         Returns
         -------
-        paths : ndarray, shape (n_paths, T_days + 1)
+        paths : ndarray, shape (n_paths, T_days * steps_per_day + 1)
         """
+        spd = max(1, int(steps_per_day))
         rng = np.random.default_rng(seed)
-        dt = 1.0 / ANNUAL_DAYS
+        dt = 1.0 / (ANNUAL_DAYS * spd)
+        n_steps = T_days * spd
         drift = (r - q - 0.5 * sigma ** 2) * dt
         vol = sigma * np.sqrt(dt)
-        log_returns = drift + vol * rng.standard_normal((n_paths, T_days))
-        paths = np.zeros((n_paths, T_days + 1))
+        log_returns = drift + vol * rng.standard_normal((n_paths, n_steps))
+        paths = np.zeros((n_paths, n_steps + 1))
         paths[:, 0] = s0
         paths[:, 1:] = s0 * np.exp(np.cumsum(log_returns, axis=1))
         return paths
@@ -663,7 +816,8 @@ class HedgeBacktest:
 
         task_args = [
             (self.option_init, paths[i], self.hedge_freq,
-             self.tc_rate, self.position, self.quantity, self.multiplier)
+             self.tc_rate, self.position, self.quantity, self.multiplier,
+             self.strategy, self.steps_per_day, self.slippage_bps)
             for i in range(n)
         ]
 
@@ -682,26 +836,6 @@ class HedgeBacktest:
                 completed += 1
                 if progress_callback:
                     progress_callback(completed, n)
-
-        return {
-            'n_paths': n,
-            'errors': errors,
-            'total_pnl': total_pnl,
-            'total_tc': total_tc,
-            'final_prices': final_prices,
-            'implied_vol': implied_vol,
-            'realized_vols': realized_vols,
-        }
-
-        return {
-            'n_paths': n,
-            'errors': errors,
-            'total_pnl': total_pnl,
-            'total_tc': total_tc,
-            'final_prices': final_prices,
-            'implied_vol': implied_vol,
-            'realized_vols': realized_vols,
-        }
 
         return {
             'n_paths': n,
@@ -736,7 +870,8 @@ class HedgeBacktest:
     @classmethod
     def from_wind(cls, option, code, start_date, end_date,
                   hedge_freq=1, tc_rate=0.0, position=1, adjust="F",
-                  quantity=1.0, multiplier=0):
+                  quantity=1.0, multiplier=0,
+                  strategy=None, steps_per_day=1, slippage_bps=0.0):
         """
         使用 Wind 历史行情创建回测实例
 
@@ -792,8 +927,15 @@ class HedgeBacktest:
         except Exception:
             pass
 
+        # 真实行情仅支持日频：若调用方传入 spd>1 则强制置 1 并告警，
+        # 避免静默忽略导致 ctx/结果年化口径混乱。
+        if int(steps_per_day) != 1:
+            print(f"[from_wind] 真实行情仅支持日频，steps_per_day={steps_per_day} 已置 1")
+            steps_per_day = 1
         bt = cls(opt, prices, hedge_freq=hedge_freq, tc_rate=tc_rate, position=position,
-                 quantity=quantity, multiplier=multiplier)
+                 quantity=quantity, multiplier=multiplier,
+                 strategy=strategy, steps_per_day=steps_per_day,
+                 slippage_bps=slippage_bps)
         # __init__ 可能已按期权剩余期限裁剪价格；meta 里的 dates / n_trade_days
         # 也同步截断，避免 to_dataframe 等下游长度不一致。
         used_len = len(bt.prices)
@@ -810,7 +952,8 @@ class HedgeBacktest:
     @classmethod
     def from_csv(cls, option, filepath, price_col='close',
                  date_col=None, hedge_freq=1, tc_rate=0.0, position=1,
-                 quantity=1.0, multiplier=0):
+                 quantity=1.0, multiplier=0,
+                 strategy=None, steps_per_day=1, slippage_bps=0.0):
         """
         从 CSV 文件加载价格数据创建回测实例（无需 Wind 终端）
 
@@ -847,8 +990,13 @@ class HedgeBacktest:
         except Exception:
             pass
 
+        if int(steps_per_day) != 1:
+            print(f"[from_csv] CSV 日频数据仅支持 spd=1，steps_per_day={steps_per_day} 已置 1")
+            steps_per_day = 1
         bt = cls(opt, prices, hedge_freq=hedge_freq, tc_rate=tc_rate, position=position,
-                 quantity=quantity, multiplier=multiplier)
+                 quantity=quantity, multiplier=multiplier,
+                 strategy=strategy, steps_per_day=steps_per_day,
+                 slippage_bps=slippage_bps)
         used_len = len(bt.prices)
         used_index = series.index[:used_len]
         bt._wind_meta = {
@@ -860,3 +1008,79 @@ class HedgeBacktest:
         }
         bt._rescale_info = rescale_info
         return bt
+
+
+if __name__ == "__main__":
+    # --- smoke test: 固定频率 vs x-sigma 带 ---
+    try:
+        from .Option_Vanilla import Option_Vanilla
+    except ImportError:
+        from Option_Vanilla import Option_Vanilla
+
+    s0, sigma, T = 100.0, 0.20, 20
+    opt = Option_Vanilla('European', s0, [], 100.0, T, sigma, 1, r=0.03, q=0.0)
+
+    # intraday 路径：每日 4 个 bar，共 20 日 -> 80 bar
+    spd = 4
+    prices = HedgeBacktest.simulate_prices(
+        s0, sigma, T, r=0.03, q=0.0, seed=7, steps_per_day=spd
+    )
+
+    bt_fixed = HedgeBacktest(
+        opt, prices,
+        hedge_freq=1, tc_rate=0.0005,
+        position=1, quantity=1.0, multiplier=0,
+        strategy=FixedFreqStrategy(hedge_freq=1),
+        steps_per_day=spd, slippage_bps=2.0,
+    )
+    r_fixed = bt_fixed.run()
+    n_trades_fixed = int(np.sum(r_fixed['hedge_triggered']))
+
+    bt_band = HedgeBacktest(
+        opt, prices,
+        hedge_freq=1, tc_rate=0.0005,
+        position=1, quantity=1.0, multiplier=0,
+        strategy=SigmaBandStrategy(k=0.5, sigma_source='implied'),
+        steps_per_day=spd, slippage_bps=2.0,
+    )
+    r_band = bt_band.run()
+    n_trades_band = int(np.sum(r_band['hedge_triggered']))
+
+    bt_band_rv = HedgeBacktest(
+        opt, prices,
+        hedge_freq=1, tc_rate=0.0005,
+        position=1, quantity=1.0, multiplier=0,
+        strategy=SigmaBandStrategy(k=0.5, sigma_source='realized', window=20),
+        steps_per_day=spd, slippage_bps=2.0,
+    )
+    r_band_rv = bt_band_rv.run()
+    n_trades_band_rv = int(np.sum(r_band_rv['hedge_triggered']))
+
+    print("=" * 60)
+    print(f"Smoke test  (T={T}d, spd={spd}, n_bars={len(prices) - 1})")
+    print("=" * 60)
+    print(f"{'strategy':<20} {'trades':>8} {'total_tc':>12} {'hedge_err':>14}")
+    print(f"{'FixedFreq(freq=1)':<20} {n_trades_fixed:>8d} "
+          f"{r_fixed['total_tc']:>12.4f} {r_fixed['hedging_error']:>14.4f}")
+    print(f"{'SigmaBand(impl)':<20} {n_trades_band:>8d} "
+          f"{r_band['total_tc']:>12.4f} {r_band['hedging_error']:>14.4f}")
+    print(f"{'SigmaBand(real)':<20} {n_trades_band_rv:>8d} "
+          f"{r_band_rv['total_tc']:>12.4f} {r_band_rv['hedging_error']:>14.4f}")
+    print("=" * 60)
+
+    # ---- 断言: realized σ 年化口径修正（spd=4） ----
+    #
+    # 若错误地用 sqrt(ANNUAL_DAYS) 年化 bar 级 std，σ 会被压低 sqrt(spd)=2 倍，
+    # σ 带阈值同步压低，导致触发次数显著变多。
+    # 正确口径下 realized σ ≈ implied σ，触发次数应与 implied 档接近。
+    assert n_trades_band_rv <= n_trades_band * 2, (
+        f"realized σ 触发次数过高 ({n_trades_band_rv})，疑似年化因子丢失 spd 分量"
+    )
+    # n_days 口径校验：intraday 下应等于交易日数 T，而非 bar 数 T*spd
+    assert r_fixed['n_days'] == T, (
+        f"n_days 应为交易日数 {T}，实际 {r_fixed['n_days']}（疑似混用 bar 数）"
+    )
+    assert r_fixed['n_bars'] == T * spd, (
+        f"n_bars 应为 bar 数 {T*spd}，实际 {r_fixed['n_bars']}"
+    )
+    print(f"[assert] n_days={r_fixed['n_days']} n_bars={r_fixed['n_bars']}  OK")

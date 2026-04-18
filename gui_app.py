@@ -94,7 +94,10 @@ plt.rcParams['axes.spines.right'] = False
 # 确保 pricing 包可导入
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from pricing import Option_AB, Option_AS, Option_DE, Option_Vanilla, HedgeBacktest
+from pricing import (
+    Option_AB, Option_AS, Option_DE, Option_Vanilla, HedgeBacktest,
+    FixedFreqStrategy, SigmaBandStrategy,
+)
 from pricing.constants import ANNUAL_DAYS
 
 # ============================================================
@@ -771,7 +774,71 @@ class BacktestApp(tk.Tk):
         ttk.Entry(mult_frame, textvariable=self._mult_var, width=10).pack(side="left")
         ttk.Label(mult_frame, text=" 0=不取整", style="SurfaceMuted.TLabel").pack(side="left")
 
+        # 轻分割线：高级对冲参数（策略 / intraday / 滑点）
+        row_h += 1
+        ttk.Separator(sec3, orient="horizontal").grid(
+            row=row_h, column=0, columnspan=2, sticky="ew", pady=(8, 4))
+
+        row_h += 1
+        ttk.Label(sec3, text="对冲策略:", style="Surface.TLabel").grid(
+            row=row_h, column=0, sticky="w", pady=4)
+        self._strategy_var = tk.StringVar(value="fixed_freq")
+        strat_frame = ttk.Frame(sec3, style="Surface.TFrame")
+        strat_frame.grid(row=row_h, column=1, sticky="w", padx=(8, 0), pady=4)
+        self._strategy_combo = ttk.Combobox(
+            strat_frame, textvariable=self._strategy_var, width=14,
+            values=("fixed_freq", "sigma_band"), state="readonly",
+        )
+        self._strategy_combo.pack(side="left")
+        self._strategy_combo.bind("<<ComboboxSelected>>", lambda e: self._toggle_strategy())
+
+        # x-sigma 带专用参数（默认隐藏，选 sigma_band 时显示）
+        row_h += 1
+        self._sigma_band_frame = ttk.Frame(sec3, style="Surface.TFrame")
+        self._sigma_band_frame.grid(row=row_h, column=0, columnspan=2, sticky="ew",
+                                    padx=(0, 0), pady=2)
+        ttk.Label(self._sigma_band_frame, text="σ 带 k:",
+                  style="Surface.TLabel").grid(row=0, column=0, sticky="w", pady=2)
+        self._k_var = tk.StringVar(value="0.5")
+        ttk.Entry(self._sigma_band_frame, textvariable=self._k_var, width=8).grid(
+            row=0, column=1, padx=(6, 12), pady=2, sticky="w")
+        ttk.Label(self._sigma_band_frame, text="σ 来源:",
+                  style="Surface.TLabel").grid(row=0, column=2, sticky="w", pady=2)
+        self._sigma_src_var = tk.StringVar(value="implied")
+        ttk.Combobox(self._sigma_band_frame, textvariable=self._sigma_src_var, width=10,
+                     values=("implied", "realized"), state="readonly").grid(
+            row=0, column=3, padx=(6, 12), pady=2, sticky="w")
+        ttk.Label(self._sigma_band_frame, text="HV 窗口 N:",
+                  style="Surface.TLabel").grid(row=0, column=4, sticky="w", pady=2)
+        self._sigma_win_var = tk.StringVar(value="20")
+        ttk.Entry(self._sigma_band_frame, textvariable=self._sigma_win_var, width=6).grid(
+            row=0, column=5, padx=(6, 0), pady=2, sticky="w")
+
+        row_h += 1
+        ttk.Label(sec3, text="每日 bar 数:", style="Surface.TLabel").grid(
+            row=row_h, column=0, sticky="w", pady=4)
+        spd_frame = ttk.Frame(sec3, style="Surface.TFrame")
+        spd_frame.grid(row=row_h, column=1, sticky="w", padx=(8, 0), pady=4)
+        self._spd_var = tk.StringVar(value="1")
+        self._spd_combo = ttk.Combobox(spd_frame, textvariable=self._spd_var, width=6,
+                                       values=("1", "4", "48", "240"), state="readonly")
+        self._spd_combo.pack(side="left")
+        self._spd_hint_label = ttk.Label(
+            spd_frame, text=" 1=日频 / 4=60分 / 48=5分 / 240=1分",
+            style="SurfaceMuted.TLabel")
+        self._spd_hint_label.pack(side="left", padx=(6, 0))
+
+        row_h += 1
+        ttk.Label(sec3, text="滑点 (bps):", style="Surface.TLabel").grid(
+            row=row_h, column=0, sticky="w", pady=4)
+        self._slip_var = tk.StringVar(value="0")
+        ttk.Entry(sec3, textvariable=self._slip_var, width=10).grid(
+            row=row_h, column=1, sticky="w", padx=(8, 0), pady=4)
+
         sec3.columnconfigure(1, weight=1)
+
+        # 依据默认策略（fixed_freq）初始化 sigma 带控件可见性
+        self._toggle_strategy()
 
         # 运行按钮
         btn_frame = ttk.Frame(left)
@@ -897,6 +964,22 @@ class BacktestApp(tk.Tk):
             self._csv_frame.grid(row=1, column=0, columnspan=2, sticky="ew", pady=2)
         elif src == "wind":
             self._wind_frame.grid(row=1, column=0, columnspan=2, sticky="ew", pady=2)
+        # csv / wind 暂不支持 intraday：锁定 spd=1，避免 silent override。
+        if hasattr(self, "_spd_combo"):
+            if src in ("csv", "wind"):
+                self._spd_var.set("1")
+                self._spd_combo.configure(state="disabled")
+                self._spd_hint_label.configure(text=" 实盘/CSV 模式仅支持日频 (spd=1)")
+            else:
+                self._spd_combo.configure(state="readonly")
+                self._spd_hint_label.configure(text=" 1=日频 / 4=60分 / 48=5分 / 240=1分")
+
+    def _toggle_strategy(self):
+        """对冲策略切换：sigma_band 显示 k / σ 源 / N，fixed_freq 隐藏。"""
+        if self._strategy_var.get() == "sigma_band":
+            self._sigma_band_frame.grid()
+        else:
+            self._sigma_band_frame.grid_remove()
 
     def _browse_csv(self):
         path = filedialog.askopenfilename(
@@ -958,6 +1041,13 @@ class BacktestApp(tk.Tk):
             "wind_code": self._wind_code_var.get().strip(),
             "wind_start": self._wind_start_var.get().strip(),
             "wind_end": self._wind_end_var.get().strip(),
+            # --- 新增：对冲策略与 intraday / 滑点 ---
+            "strategy_name": self._strategy_var.get(),
+            "k_band": float(self._k_var.get() or 0.5),
+            "sigma_source": self._sigma_src_var.get(),
+            "sigma_window": int(self._sigma_win_var.get() or 20),
+            "steps_per_day": int(self._spd_var.get() or 1),
+            "slippage_bps": float(self._slip_var.get() or 0.0),
         }
 
     def _backtest_worker(self, gui_state):
@@ -980,9 +1070,10 @@ class BacktestApp(tk.Tk):
                     q = params.get("q", 0.03)
                     real_vol_str = gui_state["real_vol"]
                     sigma_real = float(real_vol_str) if real_vol_str else sigma_impl
+                    spd_mc = int(gui_state.get("steps_per_day", 1))
                     paths = HedgeBacktest.simulate_multi_paths(
                         s0, sigma_real, T_days, n_paths=n_paths,
-                        r=r, q=q, seed=seed)
+                        r=r, q=q, seed=seed, steps_per_day=spd_mc)
 
                     # 切换为确定进度条
                     def _switch_to_determinate():
@@ -1036,6 +1127,24 @@ class BacktestApp(tk.Tk):
         position = gs["position"]
         quantity = gs["quantity"]
         multiplier = gs["multiplier"]
+        slippage_bps = gs.get("slippage_bps", 0.0)
+        steps_per_day = int(gs.get("steps_per_day", 1))
+
+        # 组装对冲策略对象
+        strat_name = gs.get("strategy_name", "fixed_freq")
+        if strat_name == "sigma_band":
+            strategy = SigmaBandStrategy(
+                k=gs.get("k_band", 0.5),
+                sigma_source=gs.get("sigma_source", "implied"),
+                window=gs.get("sigma_window", 20),
+            )
+        else:
+            strategy = FixedFreqStrategy(hedge_freq=hedge_freq)
+
+        # 真实行情（csv / wind）暂不支持 intraday（UI 已禁用 spd 控件），
+        # 这里保留一道防线：若外部仍传入 spd!=1 则强制 1 并在底层 from_csv/from_wind 打日志。
+        if src in ("csv", "wind") and steps_per_day != 1:
+            steps_per_day = 1
 
         if src == "simulate":
             s0 = float(params["s0"])
@@ -1051,10 +1160,15 @@ class BacktestApp(tk.Tk):
             # 已实现波动率：空则同隐含波动率
             real_vol_str = gs["real_vol"]
             sigma_real = float(real_vol_str) if real_vol_str else sigma_impl
-            prices = HedgeBacktest.simulate_prices(s0, sigma_real, T_days, r=r, q=q, seed=seed)
+            prices = HedgeBacktest.simulate_prices(
+                s0, sigma_real, T_days, r=r, q=q, seed=seed,
+                steps_per_day=steps_per_day,
+            )
             bt = HedgeBacktest(option, prices, hedge_freq=hedge_freq,
                                tc_rate=tc_rate, position=position,
-                               quantity=quantity, multiplier=multiplier)
+                               quantity=quantity, multiplier=multiplier,
+                               strategy=strategy, steps_per_day=steps_per_day,
+                               slippage_bps=slippage_bps)
 
         elif src == "csv":
             filepath = gs["csv_path"]
@@ -1067,7 +1181,10 @@ class BacktestApp(tk.Tk):
             bt = HedgeBacktest.from_csv(option, filepath, price_col=price_col,
                                         hedge_freq=hedge_freq, tc_rate=tc_rate,
                                         position=position,
-                                        quantity=quantity, multiplier=multiplier)
+                                        quantity=quantity, multiplier=multiplier,
+                                        strategy=strategy,
+                                        steps_per_day=steps_per_day,
+                                        slippage_bps=slippage_bps)
 
         elif src == "wind":
             code = gs["wind_code"]
@@ -1079,7 +1196,10 @@ class BacktestApp(tk.Tk):
             bt = HedgeBacktest.from_wind(option, code, start, end,
                                          hedge_freq=hedge_freq, tc_rate=tc_rate,
                                          position=position,
-                                         quantity=quantity, multiplier=multiplier)
+                                         quantity=quantity, multiplier=multiplier,
+                                         strategy=strategy,
+                                         steps_per_day=steps_per_day,
+                                         slippage_bps=slippage_bps)
         else:
             raise ValueError(f"未知数据来源: {src}")
 
