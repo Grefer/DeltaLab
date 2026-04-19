@@ -24,3 +24,14 @@ Desktop.ini
 
 # Archive (old duplicated files)
 archive/
+
+# Data cache (runtime generated)
+data/cache/
+*.parquet
+
+# Test cache
+.pytest_cache/
+
+# AI assistants
+.gemini/
+.claude/

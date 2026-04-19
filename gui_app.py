@@ -11,6 +11,7 @@ import os
 import copy
 import platform
 import threading
+import datetime
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 import numpy as np
@@ -719,12 +720,15 @@ class BacktestApp(tk.Tk):
             row=0, column=1, padx=(6, 0), pady=2)
         ttk.Label(self._wind_frame, text="起始日:", style="Surface.TLabel").grid(
             row=1, column=0, sticky="w", pady=2)
-        self._wind_start_var = tk.StringVar(value="2026-01-02")
+        _today = datetime.date.today()
+        _wind_start_default = (_today - datetime.timedelta(days=90)).strftime("%Y-%m-%d")
+        _wind_end_default = _today.strftime("%Y-%m-%d")
+        self._wind_start_var = tk.StringVar(value=_wind_start_default)
         ttk.Entry(self._wind_frame, textvariable=self._wind_start_var, width=15).grid(
             row=1, column=1, padx=(6, 8), pady=2)
         ttk.Label(self._wind_frame, text="结束日:", style="Surface.TLabel").grid(
             row=1, column=2, sticky="w", pady=2)
-        self._wind_end_var = tk.StringVar(value="2026-04-15")
+        self._wind_end_var = tk.StringVar(value=_wind_end_default)
         ttk.Entry(self._wind_frame, textvariable=self._wind_end_var, width=15).grid(
             row=1, column=3, padx=(6, 0), pady=2)
 
@@ -808,7 +812,7 @@ class BacktestApp(tk.Tk):
         ttk.Combobox(self._sigma_band_frame, textvariable=self._sigma_src_var, width=10,
                      values=("implied", "realized"), state="readonly").grid(
             row=0, column=3, padx=(6, 12), pady=2, sticky="w")
-        ttk.Label(self._sigma_band_frame, text="HV 窗口 N:",
+        ttk.Label(self._sigma_band_frame, text="HV 窗口 N 日:",
                   style="Surface.TLabel").grid(row=0, column=4, sticky="w", pady=2)
         self._sigma_win_var = tk.StringVar(value="20")
         ttk.Entry(self._sigma_band_frame, textvariable=self._sigma_win_var, width=6).grid(
@@ -1136,7 +1140,7 @@ class BacktestApp(tk.Tk):
             strategy = SigmaBandStrategy(
                 k=gs.get("k_band", 0.5),
                 sigma_source=gs.get("sigma_source", "implied"),
-                window=gs.get("sigma_window", 20),
+                window_days=gs.get("sigma_window", 20),
             )
         else:
             strategy = FixedFreqStrategy(hedge_freq=hedge_freq)
@@ -1224,6 +1228,24 @@ class BacktestApp(tk.Tk):
         r = bt._results
         n = r['n_days']
         meta = bt._gui_meta
+        strategy = getattr(bt, "strategy", None)
+        strategy_name = getattr(strategy, "name", "fixed_freq")
+        if strategy_name == "sigma_band":
+            k_val = getattr(strategy, "k", float("nan"))
+            sigma_src = getattr(strategy, "sigma_source", "implied")
+            win_days = getattr(strategy, "window_days", None)
+            strategy_lines = [
+                f"  对冲策略          :  sigma_band",
+                f"  σ 带 k            :  {k_val:>12.4f}",
+                f"  σ 来源            :  {sigma_src:>12s}",
+            ]
+            if sigma_src == "realized" and win_days is not None:
+                strategy_lines.append(f"  HV 窗口 (日)      :  {int(win_days):>12d}")
+        else:
+            strategy_lines = [
+                f"  对冲策略          :  fixed_freq",
+                f"  调仓频率          :  每 {bt.hedge_freq} 天",
+            ]
         lines = [
             "═" * 54,
             "            动态对冲回测结果摘要",
@@ -1235,7 +1257,7 @@ class BacktestApp(tk.Tk):
             "",
             "─" * 54,
             f"  回测天数          :  {n:>10d}",
-            f"  调仓频率          :  每 {bt.hedge_freq} 天",
+            *strategy_lines,
             f"  交易成本率        :  {bt.tc_rate * 100:.2f}%",
             f"  头寸方向          :  {'卖出(short)' if bt.position == 1 else '买入(long)'}",
             f"  交易数量          :  {bt.quantity:>12.2f}",
@@ -1499,7 +1521,7 @@ class BacktestApp(tk.Tk):
                  edgecolor='black', alpha=0.7, color='steelblue', density=True)
         # 叠加正态分布（隐含波动率）
         x_range = np.linspace(log_ret.min() * 100, log_ret.max() * 100, 200)
-        daily_impl = implied / np.sqrt(243.0) * 100
+        daily_impl = implied / np.sqrt(ANNUAL_DAYS) * 100
         from scipy.stats import norm
         ax4.plot(x_range, norm.pdf(x_range, 0, daily_impl), 'r--', linewidth=1.2,
                  label=f'隐含波动率正态 σ={daily_impl:.2f}%')
@@ -1770,7 +1792,7 @@ class BacktestApp(tk.Tk):
         params = gui_state["params"]
 
         # 与下方回测的头寸方向联动：position=1 卖出, position=-1 买入
-        position = gui_state.get("position", -1)
+        position = gui_state.get("position", 1)
         sign = -1.0 if position == 1 else 1.0
         perspective = "卖方(short)" if position == 1 else "买方(long)"
         prices = prices * sign

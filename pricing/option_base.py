@@ -22,6 +22,11 @@ class OptionBase:
         - _decrement_time() : 时间推进一天
     """
 
+    # 日内已流逝比例（0~1，单位=日）。bump copy 里用它把 T 方向的剩余时间
+    # 按小数日衰减；默认 0 不影响现有行为。目前仅 Option_Vanilla 在 get_price
+    # 里消费这个字段，MC 类的 T_days 需要整数 nStep，暂不支持 intraday 衰减。
+    _intraday_elapsed = 0.0
+
     @property
     def _time_remaining(self):
         raise NotImplementedError
@@ -42,10 +47,18 @@ class OptionBase:
             self.sr = list(self.sr) + [self.s0]
         self.s0 = new_price
         self._decrement_time()
+        # 跨日后重置日内 elapsed，避免 bump copy 继承残值
+        self._intraday_elapsed = 0.0
 
     def _bumped_copy(self, **overrides):
-        """创建参数副本用于 bump-and-reprice，不修改原对象状态"""
-        obj = copy.copy(self)
+        """创建参数副本用于 bump-and-reprice，不修改原对象状态。
+
+        使用 deepcopy 避免 sr / observ 等可变列表被父子对象共享：
+        get_greeks 里 _theta_overrides 会对 sr 做 list(...) + [s0] 新建列表，
+        但 gamma / delta bump 路径只改 s0，不新建 sr；若是浅拷贝，后续若有
+        任何分支原地 append 到 self.sr，父子对象会相互污染。
+        """
+        obj = copy.deepcopy(self)
         for k, v in overrides.items():
             setattr(obj, k, v)
         return obj

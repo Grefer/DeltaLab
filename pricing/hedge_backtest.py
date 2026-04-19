@@ -62,31 +62,78 @@ class SigmaBandStrategy(HedgeStrategy):
     x-sigma 带触发：当 |ln(S/S_last)| >= k * sigma_ref * sqrt(dt_since_last)
     时重建 Δ 对冲。sigma_ref 有两种来源：
       - 'implied'  : 使用 option.sigma
-      - 'realized' : 过去 window 个 bar 对数收益的年化 std，
-                     不足 window 时回退到 option.sigma
+      - 'realized' : 过去 window_days 个交易日对数收益的年化 std（intraday
+                     下自动换算为 window_days * spd 根 bar），
+                     不足样本时回退到 option.sigma
+
+    window 参数（旧名）已弃用，保留兼容：若调用方传入 window，按 bar 粒度
+    理解并打印 DeprecationWarning；推荐使用 window_days（日单位）。
     """
 
     name = "sigma_band"
 
-    def __init__(self, k=0.5, sigma_source="implied", window=20):
+    def __init__(self, k=0.5, sigma_source="implied", window_days=None, window=None):
         self.k = float(k)
         self.sigma_source = str(sigma_source).lower()
         if self.sigma_source not in ("implied", "realized"):
             raise ValueError(f"未知 sigma_source: {sigma_source}")
-        self.window = max(2, int(window))
+
+        # 归一化参数：优先 window_days（日），fallback 到旧 window（bar）并告警
+        if window_days is not None:
+            self.window_days = max(2, int(window_days))
+            self._legacy_window_bars = None
+        elif window is not None:
+            import warnings
+            warnings.warn(
+                "SigmaBandStrategy(window=...) 已弃用，请改用 window_days（单位=日）。"
+                "传入的 window 按 bar 粒度直接解释。",
+                DeprecationWarning, stacklevel=2,
+            )
+            self.window_days = max(2, int(window))  # 保留一个 days 估计值兜底
+            self._legacy_window_bars = max(2, int(window))
+        else:
+            self.window_days = 20
+            self._legacy_window_bars = None
+
+        # 最近一次 should_hedge 返回 True 的 bar 索引；realized σ 估计时
+        # 会剔除该 bar 对应的 log return，避免触发自身污染窗口样本。
+        self._last_trigger_i = 0
+
+    @property
+    def window(self):
+        """向后兼容属性：返回 window_days。"""
+        return self.window_days
+
+    def _window_bars(self, ctx):
+        if self._legacy_window_bars is not None:
+            return self._legacy_window_bars
+        spd = int(ctx.get("steps_per_day", 1))
+        return self.window_days * max(1, spd)
 
     def _sigma_ref(self, ctx):
         if self.sigma_source == "implied":
             return float(ctx["sigma_impl"])
         lr = ctx["log_ret_hist"]
-        if lr is None or len(lr) < self.window:
+        if lr is None:
             return float(ctx["sigma_impl"])
-        tail = lr[-self.window:]
+        win_bars = self._window_bars(ctx)
+
+        # 剔除"触发当根 bar"的 log return：该 bar 的收益是触发 σ 带的原因，
+        # 若回灌到窗口里会系统性抬高 σ 估计，进一步抑制下一次触发（偏差）。
+        # log_ret_hist[k] = ln(S[k+1]/S[k])，所以触发 bar i 对应的 return 索引是 i-1。
+        i_trig = int(self._last_trigger_i)
+        mask = np.ones(len(lr), dtype=bool)
+        if 0 < i_trig <= len(lr):
+            mask[i_trig - 1] = False
+        clean = lr[mask]
+        if len(clean) < max(2, min(win_bars, 2)):
+            return float(ctx["sigma_impl"])
+        tail = clean[-win_bars:]
+        if len(tail) < 2:
+            return float(ctx["sigma_impl"])
         std = float(np.std(tail, ddof=1))
         if not np.isfinite(std) or std <= 0:
             return float(ctx["sigma_impl"])
-        # intraday 下 bar 级 std 的年化因子必须是 ANNUAL_DAYS * spd，
-        # 否则 spd>1 时会把 σ 年化压低，σ 带被频繁击穿。
         spd = int(ctx.get("steps_per_day", 1))
         return std * np.sqrt(ANNUAL_DAYS * max(1, spd))
 
@@ -102,7 +149,10 @@ class SigmaBandStrategy(HedgeStrategy):
         if s_last <= 0:
             return False
         move = abs(np.log(ctx["S"] / s_last))
-        return move >= threshold
+        triggered = move >= threshold
+        if triggered:
+            self._last_trigger_i = int(ctx["i"])
+        return triggered
 
 
 # ============================================================
@@ -259,7 +309,7 @@ class HedgeBacktest:
     multiplier : float
         合约乘数（每手对应的标的数量），用于取整到整数手。
         手数 = round(持仓 / multiplier)，实际持仓 = 手数 * multiplier。
-        0 表示不取整（连续对冲）。默认 0。
+        0 表示不取整（连续对冲）。默认 5，与 GUI 默认保持一致。
         例：quantity=10, multiplier=10 → 最多 1 手。
 
     Examples
@@ -276,7 +326,7 @@ class HedgeBacktest:
     """
 
     def __init__(self, option, prices=None, hedge_freq=1, tc_rate=0.0, position=1,
-                 quantity=1.0, multiplier=0,
+                 quantity=1.0, multiplier=5,
                  path_source="gbm", external_path=None, detrend=False,
                  is_future=False, contract_multiplier=1.0,
                  strategy=None, steps_per_day=1, slippage_bps=0.0):
@@ -429,7 +479,14 @@ class HedgeBacktest:
         delta[0], gamma[0], vega[0], theta[0], rho[0] = greeks
 
         H[0], delta_theo_qty[0], delta_real_qty[0] = _compute_target(delta[0])
-        TC[0] = abs(H[0]) * S[0] * self.tc_rate
+        # Day 0 建仓同样含滑点：买入时成交价上浮、卖出时下浮
+        sl_rate_d0 = self.slippage_bps * 1e-4
+        if H[0] != 0:
+            sign0 = 1.0 if H[0] > 0 else -1.0
+            s_exec0 = S[0] * (1.0 + sign0 * sl_rate_d0)
+            TC[0] = abs(H[0]) * s_exec0 * self.tc_rate + abs(H[0]) * S[0] * sl_rate_d0
+        else:
+            TC[0] = 0.0
 
         # 策略 context：记录最近一次触发对冲的 bar 索引 / 价格
         i_last = 0
@@ -450,7 +507,12 @@ class HedgeBacktest:
                 eval_opt = option
             else:
                 # 日内：用临时副本评估 price / Δ，option 本体状态保持到当日收盘。
-                eval_opt = option._bumped_copy(s0=float(S[i]))
+                # intraday_elapsed = (i % spd)/spd ∈ [1/spd, (spd-1)/spd]，
+                # 让 Δ 在日内也按 bar 比例消耗 T，避免跨日 bar 单次跳变掉一天 Θ。
+                elapsed = (i % spd) / spd
+                eval_opt = option._bumped_copy(
+                    s0=float(S[i]), _intraday_elapsed=elapsed
+                )
 
             time_left = eval_opt._time_remaining
 
@@ -474,10 +536,18 @@ class HedgeBacktest:
             delta_real_qty[i] = delta_real_qty[i - 1]
 
             # 调仓逻辑
+            # 滑点改变成交价：买入（trade>0）成交价上浮 sl_rate，卖出下浮 sl_rate。
+            # 交易费率基于成交价收取；滑点部分 |trade|*S*sl_rate 已相当于 sign 化后
+            # trade*(S_exec - S)，与交易费率各记一次、不重复。
             if i == n:
                 # 到期：平仓所有标的头寸
                 trade = -H[i]
-                cost = abs(trade) * S[i] * (self.tc_rate + sl_rate)
+                if trade != 0:
+                    sign_trade = 1.0 if trade > 0 else -1.0
+                    s_exec = S[i] * (1.0 + sign_trade * sl_rate)
+                    cost = abs(trade) * s_exec * self.tc_rate + abs(trade) * S[i] * sl_rate
+                else:
+                    cost = 0.0
                 TC[i] = cost
                 H[i] = 0.0
                 delta_theo_qty[i] = 0.0
@@ -499,7 +569,12 @@ class HedgeBacktest:
                 if self.strategy.should_hedge(ctx):
                     target, theo, real = _compute_target(delta[i])
                     trade = target - H[i]
-                    cost = abs(trade) * S[i] * (self.tc_rate + sl_rate)
+                    if trade != 0:
+                        sign_trade = 1.0 if trade > 0 else -1.0
+                        s_exec = S[i] * (1.0 + sign_trade * sl_rate)
+                        cost = abs(trade) * s_exec * self.tc_rate + abs(trade) * S[i] * sl_rate
+                    else:
+                        cost = 0.0
                     TC[i] = cost
                     H[i] = target
                     delta_theo_qty[i] = theo
@@ -870,7 +945,7 @@ class HedgeBacktest:
     @classmethod
     def from_wind(cls, option, code, start_date, end_date,
                   hedge_freq=1, tc_rate=0.0, position=1, adjust="F",
-                  quantity=1.0, multiplier=0,
+                  quantity=1.0, multiplier=5,
                   strategy=None, steps_per_day=1, slippage_bps=0.0):
         """
         使用 Wind 历史行情创建回测实例
@@ -952,7 +1027,7 @@ class HedgeBacktest:
     @classmethod
     def from_csv(cls, option, filepath, price_col='close',
                  date_col=None, hedge_freq=1, tc_rate=0.0, position=1,
-                 quantity=1.0, multiplier=0,
+                 quantity=1.0, multiplier=5,
                  strategy=None, steps_per_day=1, slippage_bps=0.0):
         """
         从 CSV 文件加载价格数据创建回测实例（无需 Wind 终端）
@@ -1050,7 +1125,7 @@ if __name__ == "__main__":
         opt, prices,
         hedge_freq=1, tc_rate=0.0005,
         position=1, quantity=1.0, multiplier=0,
-        strategy=SigmaBandStrategy(k=0.5, sigma_source='realized', window=20),
+        strategy=SigmaBandStrategy(k=0.5, sigma_source='realized', window_days=20),
         steps_per_day=spd, slippage_bps=2.0,
     )
     r_band_rv = bt_band_rv.run()
@@ -1084,3 +1159,36 @@ if __name__ == "__main__":
         f"n_bars 应为 bar 数 {T*spd}，实际 {r_fixed['n_bars']}"
     )
     print(f"[assert] n_days={r_fixed['n_days']} n_bars={r_fixed['n_bars']}  OK")
+
+    # ---- 断言: Fixed > SigmaBand，且 SigmaBand 两档在同量级 ----
+    assert n_trades_fixed > n_trades_band, (
+        f"Fixed({n_trades_fixed}) 应多于 SigmaBand-implied({n_trades_band})"
+    )
+    assert n_trades_fixed > n_trades_band_rv, (
+        f"Fixed({n_trades_fixed}) 应多于 SigmaBand-realized({n_trades_band_rv})"
+    )
+    # 同量级：两档不应差异超过 5 倍
+    lo = min(n_trades_band, n_trades_band_rv)
+    hi = max(n_trades_band, n_trades_band_rv)
+    assert lo > 0 and hi <= lo * 5, (
+        f"SigmaBand implied({n_trades_band}) vs realized({n_trades_band_rv}) 差异过大"
+    )
+    print(f"[assert] trades  Fixed={n_trades_fixed}  Band(impl)={n_trades_band}  "
+          f"Band(real)={n_trades_band_rv}  OK")
+
+    # ---- 断言: T=1 日剩余近到期期权，intraday Δ 随 bar 递进应单调变化 ----
+    #
+    # 构造一支 T=1 日 ATM Call：spd=4 下同一日 4 根 bar，价格固定（排除 Δ 对 s0
+    # 的依赖，只考察 T 衰减）。ATM Call Δ 随 t->0 朝 0.5 靠拢；r=q=0 的 ATM
+    # 在 q=r 场景下 Δ ≈ exp(-rT)N(d1)，T 越小 N(d1)≈0.5+vol小量，Δ 单调下行。
+    opt_near = Option_Vanilla('European', 100.0, [], 100.0, 1, 0.20, 1, r=0.0, q=0.0)
+    # 日初（bar 0，elapsed=0）、日内第 2 / 第 3 bar
+    d_bar0 = opt_near._bumped_copy(s0=100.0, _intraday_elapsed=0.0).get_greeks()[0]
+    d_bar1 = opt_near._bumped_copy(s0=100.0, _intraday_elapsed=0.25).get_greeks()[0]
+    d_bar2 = opt_near._bumped_copy(s0=100.0, _intraday_elapsed=0.75).get_greeks()[0]
+    # r=q=0 的 ATM Call：Δ = N(d1)，d1 = 0.5 σ√t，t 减小 d1 趋于 0，Δ 向 0.5 收敛。
+    # 初始 Δ > 0.5，t 变小后 Δ 应单调下降靠近 0.5。
+    assert d_bar0 > d_bar1 > d_bar2, (
+        f"intraday Δ 应随 elapsed 递增单调下降: {d_bar0:.6f} > {d_bar1:.6f} > {d_bar2:.6f}"
+    )
+    print(f"[assert] intraday Δ 递减  {d_bar0:.6f} -> {d_bar1:.6f} -> {d_bar2:.6f}  OK")

@@ -41,11 +41,14 @@ class Option_Vanilla(OptionBase):
         self.exe_mode = exe_mode
 
     def get_price(self):
-        if self.T <= 0:
+        # intraday 衰减：T 单位是整数日，bump copy 通过 _intraday_elapsed 在
+        # [0, 1) 内按小数日扣减剩余时间，让 Δ 随 bar 推进而平滑变化
+        t_eff = self.T - float(getattr(self, "_intraday_elapsed", 0.0))
+        if t_eff <= 0:
             payoff = max(self.cp * (self.s0 - self.K), 0.0)
             return payoff
         if self.exe_mode == "Eu":
-            t_years = self.T / ANNUAL_DAYS
+            t_years = t_eff / ANNUAL_DAYS
             return blsprice(self.s0, self.K, self.r, self.q, t_years, self.sigma, self.cp)
         return None
 
