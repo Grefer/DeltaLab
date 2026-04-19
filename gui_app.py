@@ -732,6 +732,20 @@ class BacktestApp(tk.Tk):
         ttk.Entry(self._wind_frame, textvariable=self._wind_end_var, width=15).grid(
             row=1, column=3, padx=(6, 0), pady=2)
 
+        # Wind intraday bar_size 选择
+        ttk.Label(self._wind_frame, text="频率:", style="Surface.TLabel").grid(
+            row=2, column=0, sticky="w", pady=2)
+        self._wind_bar_size_var = tk.StringVar(value="日频")
+        self._wind_bar_size_combo = ttk.Combobox(
+            self._wind_frame, textvariable=self._wind_bar_size_var, width=10,
+            values=("日频", "60min", "30min", "15min", "5min", "1min"),
+            state="readonly",
+        )
+        self._wind_bar_size_combo.grid(row=2, column=1, padx=(6, 8),
+                                       pady=2, sticky="w")
+        self._wind_bar_size_combo.bind(
+            "<<ComboboxSelected>>", lambda e: self._toggle_source())
+
         # 轻分割线
         ttk.Separator(sec3, orient="horizontal").grid(
             row=2, column=0, columnspan=2, sticky="ew", pady=(8, 6))
@@ -968,15 +982,37 @@ class BacktestApp(tk.Tk):
             self._csv_frame.grid(row=1, column=0, columnspan=2, sticky="ew", pady=2)
         elif src == "wind":
             self._wind_frame.grid(row=1, column=0, columnspan=2, sticky="ew", pady=2)
-        # csv / wind 暂不支持 intraday：锁定 spd=1，避免 silent override。
+        # CSV 始终日频；Wind 在 bar_size=日频 时锁 spd=1，其它分钟级解锁并按映射自动填值。
         if hasattr(self, "_spd_combo"):
-            if src in ("csv", "wind"):
+            bar_label = getattr(self, "_wind_bar_size_var", None)
+            bar_label = bar_label.get() if bar_label is not None else "日频"
+            wind_intraday = (src == "wind" and bar_label != "日频")
+
+            if src == "csv" or (src == "wind" and not wind_intraday):
                 self._spd_var.set("1")
                 self._spd_combo.configure(state="disabled")
-                self._spd_hint_label.configure(text=" 实盘/CSV 模式仅支持日频 (spd=1)")
+                if src == "csv":
+                    self._spd_hint_label.configure(
+                        text=" CSV 模式仅支持日频 (spd=1)")
+                else:
+                    self._spd_hint_label.configure(
+                        text=" Wind 日频模式 (spd=1)；切到分钟频率可解锁")
+            elif wind_intraday:
+                # 根据 bar_size 自动推导 spd（A 股 240 分钟日盘）
+                bar_min_map = {"60min": 4, "30min": 8, "15min": 16,
+                               "5min": 48, "1min": 240}
+                auto_spd = bar_min_map.get(bar_label, 1)
+                # 每次切换都覆盖一次；避免上轮 simulate/其它 bar_size 残留值
+                self._spd_var.set(str(auto_spd))
+                # 允许用户手动改写（商品期货含夜盘需要自定义 spd）
+                self._spd_combo.configure(state="normal")
+                self._spd_hint_label.configure(
+                    text=f" Wind intraday {bar_label} -> spd={auto_spd}（可手动覆盖）")
             else:
+                # simulate 模式
                 self._spd_combo.configure(state="readonly")
-                self._spd_hint_label.configure(text=" 1=日频 / 4=60分 / 48=5分 / 240=1分")
+                self._spd_hint_label.configure(
+                    text=" 1=日频 / 4=60分 / 48=5分 / 240=1分")
 
     def _toggle_strategy(self):
         """对冲策略切换：sigma_band 显示 k / σ 源 / N，fixed_freq 隐藏。"""
@@ -1045,6 +1081,7 @@ class BacktestApp(tk.Tk):
             "wind_code": self._wind_code_var.get().strip(),
             "wind_start": self._wind_start_var.get().strip(),
             "wind_end": self._wind_end_var.get().strip(),
+            "wind_bar_size": self._wind_bar_size_var.get().strip(),
             # --- 新增：对冲策略与 intraday / 滑点 ---
             "strategy_name": self._strategy_var.get(),
             "k_band": float(self._k_var.get() or 0.5),
@@ -1145,9 +1182,18 @@ class BacktestApp(tk.Tk):
         else:
             strategy = FixedFreqStrategy(hedge_freq=hedge_freq)
 
-        # 真实行情（csv / wind）暂不支持 intraday（UI 已禁用 spd 控件），
-        # 这里保留一道防线：若外部仍传入 spd!=1 则强制 1 并在底层 from_csv/from_wind 打日志。
-        if src in ("csv", "wind") and steps_per_day != 1:
+        # 判断 Wind intraday 频率（None/日频 走日频分支，其它走 wsi）
+        wind_bar_label = gs.get("wind_bar_size", "日频") or "日频"
+        _bar_label_to_size = {
+            "日频": None, "60min": "60", "30min": "30",
+            "15min": "15", "5min": "5", "1min": "1",
+        }
+        wind_bar_size = _bar_label_to_size.get(wind_bar_label, None)
+
+        # CSV 始终日频；Wind 日频下同样强制 spd=1；Wind intraday 保留 spd。
+        if src == "csv" and steps_per_day != 1:
+            steps_per_day = 1
+        if src == "wind" and wind_bar_size is None and steps_per_day != 1:
             steps_per_day = 1
 
         if src == "simulate":
@@ -1197,13 +1243,16 @@ class BacktestApp(tk.Tk):
             # 期权参数中的 s0 作为参考价 S_ref，
             # from_wind 会按 ratio = 真实起始价 / S_ref 自动缩放价格量纲要素。
             option = cfg["build"](subtype, params)
+            # wind_bar_size=None -> 日频；否则 '1'/'5'/'60' 等字符串触发 intraday 分支。
+            # intraday 下 steps_per_day 由 from_wind 自动推导，这里仍显式传入以防覆盖。
             bt = HedgeBacktest.from_wind(option, code, start, end,
                                          hedge_freq=hedge_freq, tc_rate=tc_rate,
                                          position=position,
                                          quantity=quantity, multiplier=multiplier,
                                          strategy=strategy,
                                          steps_per_day=steps_per_day,
-                                         slippage_bps=slippage_bps)
+                                         slippage_bps=slippage_bps,
+                                         bar_size=wind_bar_size)
         else:
             raise ValueError(f"未知数据来源: {src}")
 

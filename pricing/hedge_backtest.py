@@ -946,7 +946,8 @@ class HedgeBacktest:
     def from_wind(cls, option, code, start_date, end_date,
                   hedge_freq=1, tc_rate=0.0, position=1, adjust="F",
                   quantity=1.0, multiplier=5,
-                  strategy=None, steps_per_day=1, slippage_bps=0.0):
+                  strategy=None, steps_per_day=None, slippage_bps=0.0,
+                  bar_size=None):
         """
         使用 Wind 历史行情创建回测实例
 
@@ -957,17 +958,28 @@ class HedgeBacktest:
         code : str
             Wind 标的代码，如 "000001.SH", "510050.SH"
         start_date : str
-            回测起始日 "YYYY-MM-DD"（含当日，作为建仓日）
+            回测起始日 "YYYY-MM-DD"（含当日，作为建仓日）；
+            intraday 模式下也接受 "YYYY-MM-DD HH:MM:SS"。
         end_date : str
-            回测结束日 "YYYY-MM-DD"（含当日）
+            回测结束日 "YYYY-MM-DD"（含当日）；intraday 同上。
         hedge_freq : int
-            调仓频率（交易日数），默认 1
+            调仓频率（bar 数），默认 1
         tc_rate : float
             单边交易成本率
         position : int
             1=卖出期权, -1=买入期权
         adjust : str
             复权方式 "F"=前复权, "B"=后复权, ""=不复权
+        bar_size : str | None
+            None（默认）走 `w.wsd` 日频分支，行为与旧版一致；
+            非 None 走 `w.wsi` intraday 分支，取值如 "1"/"5"/"15"/"30"/"60"。
+        steps_per_day : int | None
+            日频模式下强制为 1；intraday 模式下若未指定则按 A 股日盘 240
+            分钟自动推导：`spd = 240 // int(bar_size)`（60min→4, 5min→48,
+            1min→240）。显式传入时以传入值为准并打印告警。
+            注意：240 分钟假设仅适用于 A 股 / 沪深 300 股指期货日盘；
+            对含夜盘的商品/能源期货（.SHF/.DCE/.CZC/.INE/.GFE）会打印
+            警告，建议手动传入 steps_per_day。
 
         Returns
         -------
@@ -982,19 +994,108 @@ class HedgeBacktest:
         >>> bt.run()
         >>> bt.summary()
         """
+        if bar_size in (None, "", "日频", "daily", "day", "d"):
+            # -------- 日频分支（保持旧行为） --------
+            try:
+                from .wind_data import get_close_prices
+            except ImportError:
+                from wind_data import get_close_prices
+
+            series = get_close_prices(code, start_date, end_date, adjust)
+            prices = series.values
+
+            if len(prices) < 2:
+                raise ValueError(
+                    f"价格数据不足: {code} {start_date}~{end_date} "
+                    f"仅 {len(prices)} 条"
+                )
+
+            # 按真实起始价缩放期权要素
+            real_s0 = float(prices[0])
+            opt, rescale_info = _rescale_option_to_real_s0(option, real_s0)
+            try:
+                print(_format_rescale_info(rescale_info))
+            except Exception:
+                pass
+
+            # 日频：若调用方传入 spd>1 则强制置 1 并告警
+            spd_final = 1 if steps_per_day is None else int(steps_per_day)
+            if spd_final != 1:
+                print(f"[from_wind] 日频行情仅支持 steps_per_day=1，"
+                      f"收到 {spd_final} 已置 1")
+                spd_final = 1
+
+            bt = cls(opt, prices, hedge_freq=hedge_freq, tc_rate=tc_rate,
+                     position=position, quantity=quantity, multiplier=multiplier,
+                     strategy=strategy, steps_per_day=spd_final,
+                     slippage_bps=slippage_bps)
+            used_len = len(bt.prices)
+            bt._wind_meta = {
+                'code': code,
+                'start_date': start_date,
+                'end_date': end_date,
+                'dates': series.index[:used_len],
+                'n_trade_days': used_len - 1,
+                'bar_size': None,
+            }
+            bt._rescale_info = rescale_info
+            return bt
+
+        # -------- intraday 分支 --------
         try:
-            from .wind_data import get_close_prices
+            from .wind_data import get_intraday_close
         except ImportError:
-            from wind_data import get_close_prices
+            from wind_data import get_intraday_close
 
-        series = get_close_prices(code, start_date, end_date, adjust)
+        bar_size_str = str(bar_size).strip()
+        # bar_size 合法性校验
+        try:
+            bar_min = int(bar_size_str)
+        except ValueError:
+            raise ValueError(
+                f"非法 bar_size={bar_size!r}，需要数字字符串（分钟数），"
+                f"例如 '1' / '5' / '60'。"
+            )
+        if bar_min <= 0:
+            raise ValueError(f"bar_size 必须为正整数分钟数，收到 {bar_min}")
+
+        series = get_intraday_close(code, start_date, end_date,
+                                    bar_size=bar_size_str, adjust=adjust)
         prices = series.values
-
         if len(prices) < 2:
-            raise ValueError(f"价格数据不足: {code} {start_date}~{end_date} 仅 {len(prices)} 条")
+            raise ValueError(
+                f"intraday 价格数据不足: {code} {start_date}~{end_date} "
+                f"bar_size={bar_size_str}min 仅 {len(prices)} 条"
+            )
 
-        # 按真实起始价缩放期权要素：option.s0 视为参考价 S_ref，
-        # ratio = real_s0 / S_ref 作用于 strike / barrier / cashflow 等字段。
+        # 通过 Wind wss(exch_eng, sec_type) 查本地常量表，得到日内可交易分钟数；
+        # 无法判定时兜底按 A 股/股指的 240 分钟推导，并打印警告。
+        try:
+            from .wind_data import get_trading_minutes_per_day
+        except ImportError:
+            from wind_data import get_trading_minutes_per_day
+
+        total_min = get_trading_minutes_per_day(code)
+        if total_min is not None:
+            if total_min % bar_min != 0:
+                print(f"[from_wind] 警告：{code} 日内 {total_min} 分钟无法被 "
+                      f"bar_size={bar_min} 整除，spd 取整可能引入偏差。")
+            auto_spd = max(1, total_min // bar_min)
+        else:
+            auto_spd = max(1, 240 // bar_min)
+            print(f"[from_wind] 警告：无法从 Wind 获取 {code} 的交易分钟数，"
+                  f"按 240 分钟（A 股/股指）推导 spd={auto_spd}。"
+                  f"如该合约含夜盘，请显式传入 steps_per_day。")
+
+        if steps_per_day is None:
+            spd_final = auto_spd
+        else:
+            spd_final = max(1, int(steps_per_day))
+            if spd_final != auto_spd:
+                print(f"[from_wind] 用户显式传入 steps_per_day={spd_final}，"
+                      f"覆盖自动推导值 {auto_spd} (bar_size={bar_min}min)")
+
+        # 按真实起始价缩放期权要素
         real_s0 = float(prices[0])
         opt, rescale_info = _rescale_option_to_real_s0(option, real_s0)
         try:
@@ -1002,24 +1103,20 @@ class HedgeBacktest:
         except Exception:
             pass
 
-        # 真实行情仅支持日频：若调用方传入 spd>1 则强制置 1 并告警，
-        # 避免静默忽略导致 ctx/结果年化口径混乱。
-        if int(steps_per_day) != 1:
-            print(f"[from_wind] 真实行情仅支持日频，steps_per_day={steps_per_day} 已置 1")
-            steps_per_day = 1
-        bt = cls(opt, prices, hedge_freq=hedge_freq, tc_rate=tc_rate, position=position,
-                 quantity=quantity, multiplier=multiplier,
-                 strategy=strategy, steps_per_day=steps_per_day,
+        bt = cls(opt, prices, hedge_freq=hedge_freq, tc_rate=tc_rate,
+                 position=position, quantity=quantity, multiplier=multiplier,
+                 strategy=strategy, steps_per_day=spd_final,
                  slippage_bps=slippage_bps)
-        # __init__ 可能已按期权剩余期限裁剪价格；meta 里的 dates / n_trade_days
-        # 也同步截断，避免 to_dataframe 等下游长度不一致。
         used_len = len(bt.prices)
+        used_index = series.index[:used_len]
         bt._wind_meta = {
             'code': code,
             'start_date': start_date,
             'end_date': end_date,
-            'dates': series.index[:used_len],
-            'n_trade_days': used_len - 1,
+            'dates': used_index,
+            # intraday 下 n_trade_days 按 bar 数除以 spd 近似
+            'n_trade_days': max(0, (used_len - 1) // max(1, spd_final)),
+            'bar_size': bar_size_str,
         }
         bt._rescale_info = rescale_info
         return bt
