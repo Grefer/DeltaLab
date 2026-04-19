@@ -66,15 +66,22 @@ PALETTE = {
     "border_soft":  "#E5E9F0",   # 轻分割线
     "text":         "#1F2937",   # 主文字
     "text_muted":   "#6B7280",   # 次要文字
+    "text_light":   "#9CA3AF",   # 更浅文字 (占位符)
     "primary":      "#2563EB",   # 主色 (运行按钮)
     "primary_hov":  "#1D4ED8",
     "primary_act":  "#1E40AF",
+    "primary_light":"#EFF6FF",   # 主色浅底
     "accent":       "#0EA5E9",   # 次级按钮
     "accent_hov":   "#0284C7",
     "success":      "#16A34A",
+    "success_light":"#F0FDF4",   # 成功浅底
     "warning":      "#D97706",
+    "warning_light":"#FFFBEB",   # 警告浅底
     "danger":       "#DC2626",
+    "danger_light": "#FEF2F2",   # 危险浅底
     "selected":     "#DBEAFE",   # 选中高亮
+    "gold":         "#B8860B",   # 金色 (装饰线)
+    "tab_inactive": "#E2E8F0",   # 未选中 tab 底色
 }
 
 # matplotlib 整体风格配置 (与 Tk 主题协调)
@@ -479,43 +486,45 @@ class BacktestApp(tk.Tk):
                               ("disabled", "#9CA3AF")],
                   foreground=[("disabled", "#E5E7EB")])
 
-        # ---- Notebook ----
+        # ---- Notebook (现代卡片式 Tab) ----
         style.configure("TNotebook",
                         background=PALETTE["bg"],
-                        bordercolor=PALETTE["border"],
-                        tabmargins=(6, 6, 6, 0))
+                        bordercolor=PALETTE["border_soft"],
+                        tabmargins=(4, 8, 4, 0))
         style.configure("TNotebook.Tab",
                         font=tab_font,
-                        background=PALETTE["bg"],
+                        background=PALETTE["tab_inactive"],
                         foreground=PALETTE["text_muted"],
-                        bordercolor=PALETTE["border"],
-                        padding=(22, 11))
+                        bordercolor=PALETTE["border_soft"],
+                        padding=(20, 10, 20, 10),
+                        focuscolor=PALETTE["bg"])
         style.map("TNotebook.Tab",
                   background=[("selected", PALETTE["surface"]),
                               ("active", PALETTE["border_soft"])],
                   foreground=[("selected", PALETTE["primary"]),
                               ("active", PALETTE["text"])],
-                  expand=[("selected", (0, 0, 0, 0))])
+                  bordercolor=[("selected", PALETTE["primary"])],
+                  expand=[("selected", (0, 2, 0, 0))])
 
-        # ---- Treeview ----
+        # ---- Treeview (更宽松的行距, 更美观的表头) ----
         style.configure("Treeview",
                         background=PALETTE["surface"],
                         fieldbackground=PALETTE["surface"],
                         foreground=PALETTE["text"],
-                        bordercolor=PALETTE["border"],
-                        rowheight=24,
+                        bordercolor=PALETTE["border_soft"],
+                        rowheight=28,
                         font=(_MONO_FONT_FAMILY, 9))
         style.configure("Treeview.Heading",
-                        background=PALETTE["border_soft"],
-                        foreground=PALETTE["text"],
+                        background=PALETTE["primary_light"],
+                        foreground=PALETTE["primary"],
                         font=header_font,
                         relief="flat",
-                        padding=(6, 6))
+                        padding=(8, 8))
         style.map("Treeview.Heading",
                   background=[("active", PALETTE["selected"])])
         style.map("Treeview",
                   background=[("selected", PALETTE["selected"])],
-                  foreground=[("selected", PALETTE["text"])])
+                  foreground=[("selected", PALETTE["primary"])])
 
         # ---- Scrollbar ----
         style.configure("Vertical.TScrollbar",
@@ -573,14 +582,14 @@ class BacktestApp(tk.Tk):
         body.pack(fill="both", expand=True, padx=12, pady=(8, 4))
 
         # ─── 左侧面板 (整体包一层 Canvas + Scrollbar, 解决低分辨率/高 DPI 下底部按钮被裁) ───
-        left_outer = ttk.Frame(body, width=460)
-        left_outer.pack_propagate(False)
+        left_outer = ttk.Frame(body)
         body.add(left_outer, weight=1)
 
         # 外层 Canvas 横向充满, Scrollbar 靠右
+        # width 仅作为 PanedWindow 初始 sash 位置的参考, 不阻止后续缩放
         self._left_canvas = tk.Canvas(
             left_outer, highlightthickness=0, bd=0,
-            bg=PALETTE["surface"],
+            bg=PALETTE["surface"], width=440,
         )
         self._left_scrollbar = ttk.Scrollbar(
             left_outer, orient="vertical", command=self._left_canvas.yview
@@ -893,9 +902,60 @@ class BacktestApp(tk.Tk):
         self._nb = ttk.Notebook(right)
         self._nb.pack(fill="both", expand=True)
 
-        # Tab 1: 摘要
-        self._summary_tab = ttk.Frame(self._nb, style="Surface.TFrame")
-        self._nb.add(self._summary_tab, text="  回测摘要  ")
+        # Tab 定义表: (属性名后缀, tab 标题, 占位提示标题, 占位提示副标题)
+        _tab_defs = [
+            ("summary", " 📋 回测摘要 ",
+             "回测摘要", "运行回测后此处将展示详细的盈亏、Greeks 和波动率统计"),
+            ("chart",   " 📈 对冲图表 ",
+             "对冲图表", "运行回测后此处将展示标的价格、Delta、Gamma、累计盈亏等图表"),
+            ("vol",     " 📊 波动率分析 ",
+             "波动率分析", "运行回测后此处将展示隐含波动率与已实现波动率的对比分析"),
+            ("dist",    " 🎲 盈亏分布 ",
+             "盈亏分布", "在模拟模式下运行多路径回测后，此处将展示蒙特卡洛盈亏分布"),
+            ("struct",  " 🔬 结构分析 ",
+             "结构分析", "点击左侧『绘制结构图』按钮以生成期权结构的 Greeks 曲线"),
+            ("table",   " 📃 每日明细 ",
+             "每日明细", "运行回测后此处将展示逐日对冲持仓、盈亏与 Greeks 明细表"),
+        ]
+
+        for suffix, title, ph_title, ph_desc in _tab_defs:
+            tab = ttk.Frame(self._nb, style="Surface.TFrame")
+            self._nb.add(tab, text=title)
+            setattr(self, f"_{suffix}_tab", tab)
+
+            # 为需要 container 的 tab 创建内容容器
+            if suffix not in ("summary", "table"):
+                container = ttk.Frame(tab, style="Surface.TFrame")
+                container.pack(fill="both", expand=True, padx=4, pady=4)
+                setattr(self, f"_{suffix}_container", container)
+
+            # ==== 占位 / 欢迎界面 ====
+            placeholder = ttk.Frame(tab, style="Surface.TFrame")
+            placeholder.place(relx=0.5, rely=0.45, anchor="center")
+            setattr(self, f"_{suffix}_placeholder", placeholder)
+
+            # 大图标
+            icon_map = {
+                "summary": "📋", "chart": "📈", "vol": "📊",
+                "dist": "🎲", "struct": "🔬", "table": "📃",
+            }
+            icon_lbl = tk.Label(placeholder, text=icon_map.get(suffix, "📄"),
+                                font=(_UI_FONT_FAMILY, 42),
+                                bg=PALETTE["surface"], fg=PALETTE["text_muted"])
+            icon_lbl.pack(pady=(0, 10))
+
+            title_lbl = tk.Label(placeholder, text=ph_title,
+                                 font=(_UI_FONT_FAMILY, 16, "bold"),
+                                 bg=PALETTE["surface"], fg=PALETTE["text"])
+            title_lbl.pack(pady=(0, 6))
+
+            desc_lbl = tk.Label(placeholder, text=ph_desc,
+                                font=(_UI_FONT_FAMILY, 10),
+                                bg=PALETTE["surface"], fg=PALETTE["text_muted"],
+                                wraplength=360, justify="center")
+            desc_lbl.pack(pady=(0, 0))
+
+        # 摘要 Tab 特有: 预创建 Text 控件 (初始隐藏, 占位符可见)
         self._summary_text = tk.Text(
             self._summary_tab, wrap="word",
             font=(_MONO_FONT_FAMILY, 10),
@@ -903,40 +963,31 @@ class BacktestApp(tk.Tk):
             bg=PALETTE["surface_alt"],
             fg=PALETTE["text"],
             relief="flat", borderwidth=0,
-            padx=14, pady=12,
+            padx=16, pady=14,
             insertbackground=PALETTE["primary"],
             selectbackground=PALETTE["selected"],
             selectforeground=PALETTE["text"],
+            spacing1=2, spacing3=2,
         )
-        self._summary_text.pack(fill="both", expand=True, padx=6, pady=6)
-
-        # Tab 2: 图表
-        self._chart_tab = ttk.Frame(self._nb, style="Surface.TFrame")
-        self._nb.add(self._chart_tab, text="  对冲图表  ")
-        self._chart_container = ttk.Frame(self._chart_tab, style="Surface.TFrame")
-        self._chart_container.pack(fill="both", expand=True, padx=4, pady=4)
-
-        # Tab 3: 波动率分析
-        self._vol_tab = ttk.Frame(self._nb, style="Surface.TFrame")
-        self._nb.add(self._vol_tab, text="  波动率分析  ")
-        self._vol_container = ttk.Frame(self._vol_tab, style="Surface.TFrame")
-        self._vol_container.pack(fill="both", expand=True, padx=4, pady=4)
-
-        # Tab 4: 盈亏分布（蒙特卡洛）
-        self._dist_tab = ttk.Frame(self._nb, style="Surface.TFrame")
-        self._nb.add(self._dist_tab, text="  盈亏分布  ")
-        self._dist_container = ttk.Frame(self._dist_tab, style="Surface.TFrame")
-        self._dist_container.pack(fill="both", expand=True, padx=4, pady=4)
-
-        # Tab 5: 结构分析
-        self._struct_tab = ttk.Frame(self._nb, style="Surface.TFrame")
-        self._nb.add(self._struct_tab, text="  结构分析  ")
-        self._struct_container = ttk.Frame(self._struct_tab, style="Surface.TFrame")
-        self._struct_container.pack(fill="both", expand=True, padx=4, pady=4)
-
-        # Tab 6: 明细表
-        self._table_tab = ttk.Frame(self._nb, style="Surface.TFrame")
-        self._nb.add(self._table_tab, text="  每日明细  ")
+        # 定义 Text 样式标签 (用于 _show_summary 中分段上色)
+        self._summary_text.tag_configure(
+            "header", foreground=PALETTE["primary"],
+            font=(_MONO_FONT_FAMILY, 11, "bold"), spacing1=6, spacing3=4)
+        self._summary_text.tag_configure(
+            "separator", foreground=PALETTE["gold"],
+            font=(_MONO_FONT_FAMILY, 10))
+        self._summary_text.tag_configure(
+            "section", foreground=PALETTE["accent"],
+            font=(_MONO_FONT_FAMILY, 10, "bold"), spacing1=4)
+        self._summary_text.tag_configure(
+            "value_pos", foreground=PALETTE["success"])
+        self._summary_text.tag_configure(
+            "value_neg", foreground=PALETTE["danger"])
+        self._summary_text.tag_configure(
+            "label", foreground=PALETTE["text_muted"])
+        self._summary_text.tag_configure(
+            "monte_header", foreground="#7C3AED",
+            font=(_MONO_FONT_FAMILY, 11, "bold"), spacing1=8, spacing3=4)
 
         # 底部状态栏
         status_bar = ttk.Frame(self, style="Surface.TFrame")
@@ -1264,6 +1315,35 @@ class BacktestApp(tk.Tk):
         }
         return bt
 
+    # ---- 隐藏占位符工具方法 ----
+    def _hide_placeholder(self, suffix):
+        """隐藏指定 tab 的占位符 (place_forget), 以便展示真正的内容控件."""
+        ph = getattr(self, f"_{suffix}_placeholder", None)
+        if ph is not None:
+            ph.place_forget()
+
+    # ---- 动态 Figure 尺寸计算 ----
+    _CHART_DPI = 96
+
+    def _container_figsize(self, container, fallback=(10, 7), min_w=6, min_h=4):
+        """根据容器的实际像素尺寸返回 (width_inch, height_inch).
+
+        若容器尚未布局 (winfo_width()==1), 则用 Notebook 的已知尺寸估算.
+        """
+        self.update_idletasks()
+        pw = container.winfo_width()
+        ph = container.winfo_height()
+        # 容器未布局时回退到 Notebook 尺寸 (减去 tab 栏和 padding 的大致高度)
+        if pw <= 1 or ph <= 1:
+            nb = self._nb
+            pw = nb.winfo_width() - 16   # padding 左右各 ~8
+            ph = nb.winfo_height() - 52  # tab 栏 + padding 约 52px
+            if pw <= 1 or ph <= 1:
+                return fallback
+        w_inch = max(pw / self._CHART_DPI, min_w)
+        h_inch = max(ph / self._CHART_DPI, min_h)
+        return (w_inch, h_inch)
+
     # ---- 结果展示 ----
     def _show_results(self, bt, multi_stats=None):
         self._show_summary(bt, multi_stats)
@@ -1274,6 +1354,9 @@ class BacktestApp(tk.Tk):
         self._nb.select(0)
 
     def _show_summary(self, bt, multi_stats=None):
+        self._hide_placeholder("summary")
+        self._summary_text.pack(fill="both", expand=True, padx=8, pady=8)
+
         r = bt._results
         n = r['n_days']
         meta = bt._gui_meta
@@ -1295,68 +1378,104 @@ class BacktestApp(tk.Tk):
                 f"  对冲策略          :  fixed_freq",
                 f"  调仓频率          :  每 {bt.hedge_freq} 天",
             ]
-        lines = [
-            "═" * 54,
-            "            动态对冲回测结果摘要",
-            "═" * 54,
-            "",
-            f"  期权类型          :  {meta['cls_name']}",
-            f"  子类型            :  {meta['subtype']}",
-            f"  数据来源          :  {meta['source']}",
-            "",
-            "─" * 54,
-            f"  回测天数          :  {n:>10d}",
-            *strategy_lines,
-            f"  交易成本率        :  {bt.tc_rate * 100:.2f}%",
-            f"  头寸方向          :  {'卖出(short)' if bt.position == 1 else '买入(long)'}",
-            f"  交易数量          :  {bt.quantity:>12.2f}",
-            f"  合约乘数          :  {bt.multiplier if bt.multiplier > 0 else '不取整':>12}",
-            "─" * 54,
-            f"  标的初始价格      :  {r['prices'][0]:>12.4f}",
-            f"  标的到期价格      :  {r['prices'][-1]:>12.4f}",
-            f"  标的涨跌幅        :  {(r['prices'][-1] / r['prices'][0] - 1) * 100:>11.2f}%",
-            "─" * 54,
-        ]
+
+        # ---- 使用富文本 tag 插入, 实现分段上色 ----
+        tw = self._summary_text
+        tw.configure(state="normal")
+        tw.delete("1.0", "end")
+
+        def _ins(text, tag=None):
+            tw.insert("end", text, (tag,) if tag else ())
+
+        def _sep(char="─", width=54):
+            _ins(char * width + "\n", "separator")
+
+        def _section(title):
+            _ins(f"  {title}\n", "section")
+
+        def _kv(label_text, value_text, val_tag=None):
+            _ins(f"  {label_text}  :  ", "label")
+            _ins(f"{value_text}\n", val_tag)
+
+        def _val_color(v):
+            """根据数值正负返回 tag 名."""
+            try:
+                return "value_pos" if float(v) >= 0 else "value_neg"
+            except (ValueError, TypeError):
+                return None
+
+        _ins("═" * 54 + "\n", "separator")
+        _ins("            动态对冲回测结果摘要\n", "header")
+        _ins("═" * 54 + "\n", "separator")
+        _ins("\n")
+
+        _kv("期权类型        ", meta['cls_name'])
+        _kv("子类型          ", meta['subtype'])
+        _kv("数据来源        ", meta['source'])
+        _ins("\n")
+        _sep()
+
+        _kv("回测天数        ", f"{n:>10d}")
+        for sl in strategy_lines:
+            _ins(sl + "\n", "label")
+        _kv("交易成本率      ", f"{bt.tc_rate * 100:.2f}%")
+        _kv("头寸方向        ", '卖出(short)' if bt.position == 1 else '买入(long)')
+        _kv("交易数量        ", f"{bt.quantity:>12.2f}")
+        _kv("合约乘数        ", f"{bt.multiplier if bt.multiplier > 0 else '不取整':>12}")
+        _sep()
+
+        _kv("标的初始价格    ", f"{r['prices'][0]:>12.4f}")
+        _kv("标的到期价格    ", f"{r['prices'][-1]:>12.4f}")
+        chg = (r['prices'][-1] / r['prices'][0] - 1) * 100
+        _kv("标的涨跌幅      ", f"{chg:>11.2f}%", _val_color(chg))
+        _sep()
+
         # 真实数据回测时附加期权要素伸缩明细
         rescale_info = getattr(bt, "_rescale_info", None)
         if rescale_info is not None:
-            lines.append("  【期权要素伸缩 (S_ref → S_real)】")
-            lines.append(
+            _section("【期权要素伸缩 (S_ref → S_real)】")
+            _ins(
                 f"  S_ref={rescale_info['s_ref']:.4f}   "
                 f"S_real={rescale_info['s_real']:.4f}   "
-                f"ratio={rescale_info['ratio']:.6f}"
+                f"ratio={rescale_info['ratio']:.6f}\n", "label"
             )
             for name, (old, new) in rescale_info["fields"].items():
                 if name in ("s0", "sr"):
                     continue
-                lines.append(f"    {name:<8s}: {old:>12.4f}  →  {new:.4f}")
-            lines.append("─" * 54)
-        lines += [
-            f"  期权初始价值      :  {r['opt_value'][0]:>12.4f}",
-            f"  期权到期价值      :  {r['opt_value'][-1]:>12.4f}",
-            "─" * 54,
-            "  【单路径盈亏分解（种子路径）】",
-            f"  标的对冲盈亏      :  {np.sum(r['hedge_daily']):>12.4f}",
-            f"  期权 MtM 盈亏     :  {np.sum(r['option_daily']):>12.4f}",
-            f"  累计交易成本      :  {r['total_tc']:>12.4f}",
-            f"  对冲误差          :  {r['hedging_error']:>12.4f}",
-            "─" * 54,
-            "  【波动率分析】",
-            f"  成交隐含波动率    :  {r['implied_vol'] * 100:>11.2f}%",
-            f"  已实现波动率      :  {r['realized_vol'] * 100:>11.2f}%",
-            f"  波动率价差        :  {r['vol_spread'] * 100:>11.2f}%  (正=卖方优势)",
-            "─" * 54,
-            "  【Greeks 统计】",
-            f"  {'':15s}  {'初始值':>10s}  {'均值':>10s}  {'最大|值|':>10s}",
-            f"  {'Delta':15s}  {r['delta'][0]:>10.4f}  {np.mean(r['delta']):>10.4f}  {np.max(np.abs(r['delta'])):>10.4f}",
-            f"  {'Gamma':15s}  {r['gamma'][0]:>10.4f}  {np.mean(r['gamma']):>10.4f}  {np.max(np.abs(r['gamma'])):>10.4f}",
-            f"  {'Vega':15s}  {r['vega'][0]:>10.4f}  {np.mean(r['vega']):>10.4f}  {np.max(np.abs(r['vega'])):>10.4f}",
-            f"  {'Theta':15s}  {r['theta'][0]:>10.4f}  {np.mean(r['theta']):>10.4f}  {np.max(np.abs(r['theta'])):>10.4f}",
-            f"  {'Rho':15s}  {r['rho'][0]:>10.4f}  {np.mean(r['rho']):>10.4f}  {np.max(np.abs(r['rho'])):>10.4f}",
-            "─" * 54,
-            f"  调仓次数          :  {int(np.sum(np.abs(np.diff(r['shares'])) > 1e-10)):>10d}",
-            "═" * 54,
-        ]
+                _ins(f"    {name:<8s}: {old:>12.4f}  →  {new:.4f}\n")
+            _sep()
+
+        _kv("期权初始价值    ", f"{r['opt_value'][0]:>12.4f}")
+        _kv("期权到期价值    ", f"{r['opt_value'][-1]:>12.4f}")
+        _sep()
+
+        _section("【单路径盈亏分解（种子路径）】")
+        hedge_pnl = np.sum(r['hedge_daily'])
+        opt_pnl   = np.sum(r['option_daily'])
+        _kv("标的对冲盈亏    ", f"{hedge_pnl:>12.4f}", _val_color(hedge_pnl))
+        _kv("期权 MtM 盈亏   ", f"{opt_pnl:>12.4f}", _val_color(opt_pnl))
+        _kv("累计交易成本    ", f"{r['total_tc']:>12.4f}", "value_neg")
+        _kv("对冲误差        ", f"{r['hedging_error']:>12.4f}",
+            _val_color(r['hedging_error']))
+        _sep()
+
+        _section("【波动率分析】")
+        _kv("成交隐含波动率  ", f"{r['implied_vol'] * 100:>11.2f}%")
+        _kv("已实现波动率    ", f"{r['realized_vol'] * 100:>11.2f}%")
+        vs = r['vol_spread'] * 100
+        _kv("波动率价差      ", f"{vs:>11.2f}%  (正=卖方优势)", _val_color(vs))
+        _sep()
+
+        _section("【Greeks 统计】")
+        _ins(f"  {'':15s}  {'初始值':>10s}  {'均值':>10s}  {'最大|值|':>10s}\n", "label")
+        for gn in ("delta", "gamma", "vega", "theta", "rho"):
+            gv = r[gn]
+            _ins(f"  {gn.capitalize():15s}  {gv[0]:>10.4f}  {np.mean(gv):>10.4f}  {np.max(np.abs(gv)):>10.4f}\n")
+        _sep()
+
+        rebal = int(np.sum(np.abs(np.diff(r['shares'])) > 1e-10))
+        _kv("调仓次数        ", f"{rebal:>10d}")
+        _ins("═" * 54 + "\n", "separator")
 
         # 蒙特卡洛多路径统计
         if multi_stats is not None:
@@ -1364,45 +1483,47 @@ class BacktestApp(tk.Tk):
             pnl = ms['total_pnl']
             n_p = ms['n_paths']
             pct = lambda arr, q: np.percentile(arr, q)
-            lines += [
-                "",
-                "═" * 54,
-                f"       蒙特卡洛多路径统计 ({n_p} 条路径)",
-                "═" * 54,
-                "",
-                "  【总盈亏分布】",
-                f"  期望盈亏(均值)    :  {np.mean(pnl):>12.4f}",
-                f"  盈亏标准差        :  {np.std(pnl):>12.4f}",
-                f"  盈亏中位数        :  {np.median(pnl):>12.4f}",
-                f"  盈利概率          :  {np.mean(pnl > 0) * 100:>11.2f}%",
-                "─" * 54,
-                "  【分位数】",
-                f"  1%  分位          :  {pct(pnl, 1):>12.4f}",
-                f"  5%  分位          :  {pct(pnl, 5):>12.4f}",
-                f"  25% 分位          :  {pct(pnl, 25):>12.4f}",
-                f"  75% 分位          :  {pct(pnl, 75):>12.4f}",
-                f"  95% 分位          :  {pct(pnl, 95):>12.4f}",
-                f"  99% 分位          :  {pct(pnl, 99):>12.4f}",
-                "─" * 54,
-                f"  最大盈利          :  {np.max(pnl):>12.4f}",
-                f"  最大亏损          :  {np.min(pnl):>12.4f}",
-                "─" * 54,
-                "  【波动率】",
-                f"  隐含波动率        :  {ms['implied_vol'] * 100:>11.2f}%",
-                f"  已实现波动率均值  :  {np.mean(ms['realized_vols']) * 100:>11.2f}%",
-                f"  已实现波动率标准差:  {np.std(ms['realized_vols']) * 100:>11.2f}%",
-                "─" * 54,
-                f"  平均交易成本      :  {np.mean(ms['total_tc']):>12.4f}",
-                "═" * 54,
-            ]
 
-        self._summary_text.configure(state="normal")
-        self._summary_text.delete("1.0", "end")
-        self._summary_text.insert("1.0", "\n".join(lines))
-        self._summary_text.configure(state="disabled")
+            _ins("\n")
+            _ins("═" * 54 + "\n", "separator")
+            _ins(f"       蒙特卡洛多路径统计 ({n_p} 条路径)\n", "monte_header")
+            _ins("═" * 54 + "\n", "separator")
+            _ins("\n")
+
+            _section("【总盈亏分布】")
+            mean_pnl = np.mean(pnl)
+            _kv("期望盈亏(均值)  ", f"{mean_pnl:>12.4f}", _val_color(mean_pnl))
+            _kv("盈亏标准差      ", f"{np.std(pnl):>12.4f}")
+            _kv("盈亏中位数      ", f"{np.median(pnl):>12.4f}",
+                _val_color(np.median(pnl)))
+            _kv("盈利概率        ", f"{np.mean(pnl > 0) * 100:>11.2f}%",
+                "value_pos" if np.mean(pnl > 0) > 0.5 else "value_neg")
+            _sep()
+
+            _section("【分位数】")
+            for q_val in (1, 5, 25, 75, 95, 99):
+                pv = pct(pnl, q_val)
+                _kv(f"{q_val}%{'':2s}分位        ",
+                    f"{pv:>12.4f}", _val_color(pv))
+            _sep()
+
+            _kv("最大盈利        ", f"{np.max(pnl):>12.4f}", "value_pos")
+            _kv("最大亏损        ", f"{np.min(pnl):>12.4f}", "value_neg")
+            _sep()
+
+            _section("【波动率】")
+            _kv("隐含波动率      ", f"{ms['implied_vol'] * 100:>11.2f}%")
+            _kv("已实现波动率均值", f"{np.mean(ms['realized_vols']) * 100:>11.2f}%")
+            _kv("已实现波动率标准差", f"{np.std(ms['realized_vols']) * 100:>11.2f}%")
+            _sep()
+            _kv("平均交易成本    ", f"{np.mean(ms['total_tc']):>12.4f}", "value_neg")
+            _ins("═" * 54 + "\n", "separator")
+
+        tw.configure(state="disabled")
 
     def _show_chart(self, bt):
-        # 清除旧图表
+        # 隐藏占位 + 清除旧图表
+        self._hide_placeholder("chart")
         for w in self._chart_container.winfo_children():
             w.destroy()
 
@@ -1420,7 +1541,8 @@ class BacktestApp(tk.Tk):
             days = np.arange(n)
             x_label = '交易日'
 
-        fig = Figure(figsize=(10, 9), dpi=96)
+        fig = Figure(figsize=self._container_figsize(self._chart_container, fallback=(10, 9)),
+                     dpi=self._CHART_DPI)
 
         # (1) 标的价格
         ax1 = fig.add_subplot(3, 2, 1)
@@ -1494,6 +1616,7 @@ class BacktestApp(tk.Tk):
 
     def _show_vol_chart(self, bt):
         """波动率分析图表"""
+        self._hide_placeholder("vol")
         for w in self._vol_container.winfo_children():
             w.destroy()
 
@@ -1514,7 +1637,8 @@ class BacktestApp(tk.Tk):
         rolling = r['rolling_realized']
         cum_real = r['cumulative_realized']
 
-        fig = Figure(figsize=(10, 7), dpi=96)
+        fig = Figure(figsize=self._container_figsize(self._vol_container),
+                     dpi=self._CHART_DPI)
 
         # (1) 滚动已实现波动率 vs 隐含波动率
         ax1 = fig.add_subplot(2, 2, 1)
@@ -1596,12 +1720,21 @@ class BacktestApp(tk.Tk):
             w.destroy()
 
         if multi_stats is None:
-            lbl = ttk.Label(self._dist_container,
-                            text="盈亏分布仅在模拟数据模式下显示（需路径数 > 1）",
-                            style="SurfaceMuted.TLabel",
-                            font=(_UI_FONT_FAMILY, 11))
-            lbl.pack(expand=True)
+            # 显示优雅的空状态提示 (不隐藏占位符, 让它保持可见)
+            hint = ttk.Frame(self._dist_container, style="Surface.TFrame")
+            hint.place(relx=0.5, rely=0.45, anchor="center")
+            tk.Label(hint, text="🎲", font=(_UI_FONT_FAMILY, 36),
+                     bg=PALETTE["surface"]).pack(pady=(0, 8))
+            tk.Label(hint, text="暂无分布数据",
+                     font=(_UI_FONT_FAMILY, 14, "bold"),
+                     bg=PALETTE["surface"], fg=PALETTE["text"]).pack(pady=(0, 4))
+            tk.Label(hint,
+                     text="盈亏分布仅在模拟数据模式下显示（需路径数 > 1）",
+                     font=(_UI_FONT_FAMILY, 10),
+                     bg=PALETTE["surface"], fg=PALETTE["text_muted"],
+                     wraplength=340, justify="center").pack()
             return
+        self._hide_placeholder("dist")
 
         from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
         from matplotlib.figure import Figure
@@ -1613,7 +1746,8 @@ class BacktestApp(tk.Tk):
         iv = ms['implied_vol']
         n_paths = ms['n_paths']
 
-        fig = Figure(figsize=(10, 7), dpi=96)
+        fig = Figure(figsize=self._container_figsize(self._dist_container),
+                     dpi=self._CHART_DPI)
 
         # (1) 总盈亏分布直方图
         ax1 = fig.add_subplot(2, 2, 1)
@@ -1682,18 +1816,27 @@ class BacktestApp(tk.Tk):
         canvas.get_tk_widget().pack(fill="both", expand=True)
 
     def _show_table(self, bt):
+        self._hide_placeholder("table")
         for w in self._table_tab.winfo_children():
             w.destroy()
 
         df = bt.to_dataframe()
 
-        # 顶部工具栏 (导出 + 行数提示)
+        # 顶部工具栏 (导出 + 行数提示 + 统计信息)
         toolbar = ttk.Frame(self._table_tab, style="Surface.TFrame")
-        toolbar.pack(fill="x", padx=8, pady=(8, 4))
-        ttk.Label(toolbar,
-                  text=f"共 {len(df)} 行 × {len(df.columns)} 列",
-                  style="SurfaceMuted.TLabel").pack(side="left")
-        ttk.Button(toolbar, text="导出 CSV", style="Accent.TButton",
+        toolbar.pack(fill="x", padx=10, pady=(10, 6))
+
+        info_frame = ttk.Frame(toolbar, style="Surface.TFrame")
+        info_frame.pack(side="left", fill="x")
+        tk.Label(info_frame, text="📃",
+                 font=(_UI_FONT_FAMILY, 14),
+                 bg=PALETTE["surface"]).pack(side="left", padx=(0, 6))
+        tk.Label(info_frame,
+                 text=f"共 {len(df)} 行 × {len(df.columns)} 列",
+                 font=(_UI_FONT_FAMILY, 10, "bold"),
+                 bg=PALETTE["surface"], fg=PALETTE["text"]).pack(side="left")
+
+        ttk.Button(toolbar, text="💾 导出 CSV", style="Accent.TButton",
                    command=lambda: self._export_csv(df)).pack(side="right")
 
         # Treeview
@@ -1830,6 +1973,7 @@ class BacktestApp(tk.Tk):
 
     def _show_structure(self, gui_state, s_grid, prices, deltas,
                         gammas, vegas, thetas):
+        self._hide_placeholder("struct")
         for w in self._struct_container.winfo_children():
             w.destroy()
 
@@ -1887,7 +2031,8 @@ class BacktestApp(tk.Tk):
         chart_frame = ttk.Frame(self._struct_container, style="Surface.TFrame")
         chart_frame.pack(fill="both", expand=True, padx=8, pady=(4, 8))
 
-        fig = Figure(figsize=(10, 6.2), dpi=96)
+        fig = Figure(figsize=self._container_figsize(chart_frame, fallback=(10, 6.2)),
+                     dpi=self._CHART_DPI)
 
         def _has(key):
             v = params.get(key)
