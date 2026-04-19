@@ -266,11 +266,23 @@ def _format_rescale_info(info):
 # ---- 多线程工作函数 ----
 
 def _run_single_path(args):
-    """线程池工作函数：对单条路径执行回测"""
+    """线程池工作函数：对单条路径执行回测
+
+    注入 per-path mc_seed，避免所有路径共用同一批 MC 随机数、
+    人为压窄多路径统计分布。base_seed=None 时走 OS 熵，完全独立。
+    """
     (option_init, price_path, hedge_freq, tc_rate, position, quantity, multiplier,
-     strategy, steps_per_day, slippage_bps) = args
+     strategy, steps_per_day, slippage_bps, path_idx, base_seed) = args
+
+    # 为本路径构造独立的 option 副本并注入 per-path seed
+    opt_local = copy.deepcopy(option_init)
+    if base_seed is None:
+        opt_local.mc_seed = None
+    else:
+        opt_local.mc_seed = int(base_seed) + int(path_idx)
+
     bt = HedgeBacktest(
-        option_init, price_path,
+        opt_local, price_path,
         hedge_freq=hedge_freq, tc_rate=tc_rate,
         position=position, quantity=quantity, multiplier=multiplier,
         strategy=copy.deepcopy(strategy) if strategy is not None else None,
@@ -329,7 +341,8 @@ class HedgeBacktest:
                  quantity=1.0, multiplier=5,
                  path_source="gbm", external_path=None, detrend=False,
                  is_future=False, contract_multiplier=1.0,
-                 strategy=None, steps_per_day=1, slippage_bps=0.0):
+                 strategy=None, steps_per_day=1, slippage_bps=0.0,
+                 base_seed=20):
         """
         Parameters
         ----------
@@ -345,6 +358,10 @@ class HedgeBacktest:
             并在结果中给出理论 Δ 手数与离散化误差分项。
         contract_multiplier : float
             期货合约乘数（每张合约对应的标的数量），`is_future=True` 时生效。
+        base_seed : int | None
+            run_multi 多路径 MC 采样的基础种子。每条路径实际使用的 option.mc_seed
+            = base_seed + path_idx，实现路径间独立采样的同时保持整体可复现。
+            传 None 时所有路径走 OS 熵（完全随机）。默认 20 与旧行为兼容。
         """
         self.option_init = copy.deepcopy(option)
         self._path_source = str(path_source).lower()
@@ -384,6 +401,7 @@ class HedgeBacktest:
         self.slippage_bps = float(slippage_bps)
         # strategy=None 时回退到旧的 FixedFreqStrategy(hedge_freq) 以保持兼容。
         self.strategy = strategy if strategy is not None else FixedFreqStrategy(self.hedge_freq)
+        self.base_seed = base_seed
         self._results = None
 
         # ---- 价格序列长度校正：严格裁剪到期权剩余期限 ----
@@ -732,12 +750,16 @@ class HedgeBacktest:
         ax.grid(True, alpha=0.3)
 
         # (2) Delta 与实际持仓
+        # 注意：r['shares'] 已经把 position (+1 卖出 / -1 买入) 的方向吸收在里面，
+        # 正负号即对冲方向；过去版本做过 shares/position 的归一化，但会使 short
+        # 情形下曲线与标题/图例意图相反，这里直接展示 shares 的原始符号。
         ax = axes[0, 1]
         ax.plot(days, r['delta'], 'r-', label='Delta', linewidth=1.2)
-        ax.plot(days, r['shares'] / self.position if self.position != 0 else r['shares'],
-                'b--', label='实际持仓/pos', linewidth=1.0, alpha=0.7)
+        ax.plot(days, r['shares'], 'b--', label='实际持仓 (shares)',
+                linewidth=1.0, alpha=0.7)
         ax.set_title('Delta 与对冲持仓', fontsize=12)
         ax.set_xlabel('交易日')
+        ax.set_ylabel('Delta / shares')
         ax.legend()
         ax.grid(True, alpha=0.3)
 
@@ -853,7 +875,8 @@ class HedgeBacktest:
         paths[:, 1:] = s0 * np.exp(np.cumsum(log_returns, axis=1))
         return paths
 
-    def run_multi(self, paths, progress_callback=None, max_workers=None):
+    def run_multi(self, paths, progress_callback=None, max_workers=None,
+                  base_seed=None):
         """
         对多条价格路径批量回测，返回详细统计（多线程并行）
 
@@ -866,6 +889,10 @@ class HedgeBacktest:
             每完成一条路径后调用，用于更新进度
         max_workers : int, optional
             并行线程数，默认 min(cpu_count, n_paths)
+        base_seed : int | None, optional
+            覆盖 self.base_seed 用于本次调用的 MC 种子基准；
+            实际每路径 seed = base_seed + path_idx，保证 MC 采样在路径间
+            不同但可复现。传 None 使用 self.base_seed。
 
         Returns
         -------
@@ -889,10 +916,14 @@ class HedgeBacktest:
         if max_workers is None:
             max_workers = min(os.cpu_count() or 4, n)
 
+        # base_seed 解析：显式参数优先，否则用实例字段
+        effective_seed = base_seed if base_seed is not None else self.base_seed
+
         task_args = [
             (self.option_init, paths[i], self.hedge_freq,
              self.tc_rate, self.position, self.quantity, self.multiplier,
-             self.strategy, self.steps_per_day, self.slippage_bps)
+             self.strategy, self.steps_per_day, self.slippage_bps,
+             i, effective_seed)
             for i in range(n)
         ]
 

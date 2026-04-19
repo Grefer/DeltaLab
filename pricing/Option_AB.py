@@ -91,7 +91,8 @@ class Option_AB(OptionBase):
 
         elif self.T_days >= 0:
             discount_factor = np.exp(-self.r * self.T_days * dt)
-            S = McGbmQ(self.s0, self.r - self.q, self.sigma, T, self.nPath, nStep)
+            S = McGbmQ(self.s0, self.r - self.q, self.sigma, T, self.nPath, nStep,
+                       seed=self.mc_seed)
             ss = np.c_[np.tile(sr, (self.nPath, 1)), S]
             if self.cp == 1:
                 condition_ki = np.any(ss[:, observ] <= self.KI, axis=1)

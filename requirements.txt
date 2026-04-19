@@ -1,4 +1,6 @@
+# Requires Python >= 3.10 (uses match/case and PEP 604 unions)
 numpy>=1.21
 scipy>=1.7
 pandas>=1.3
 matplotlib>=3.5
+pyarrow>=14.0

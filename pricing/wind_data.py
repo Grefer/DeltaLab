@@ -244,14 +244,23 @@ def get_intraday_bars(code, start_date, end_date, bar_size="60",
     return df.dropna(how="all")
 
 
-def _intraday_cache_path(code, start, end, bar_size):
-    """intraday 缓存文件路径"""
+def _intraday_cache_path(code, start, end, bar_size, adjust="F"):
+    """intraday 缓存文件路径
+
+    key 必须包含 adjust：F/B/'' 三种复权口径不能混用同一缓存，否则后续
+    读回来的序列复权方式与调用方预期不一致。adjust='' 的无复权在文件名
+    里固化为 'NA'，避免空串被 OS 文件系统解释出奇怪结果。
+    """
     os.makedirs(_CACHE_DIR, exist_ok=True)
     safe_code = code.replace("/", "_").replace("\\", "_")
     # 起止日期保留 YYYY-MM-DD 部分，避免 HH:MM 写进文件名
     safe_start = str(start)[:10]
     safe_end = str(end)[:10]
-    fname = f"{safe_code}_{safe_start}_{safe_end}_intraday_{bar_size}.parquet"
+    safe_adj = str(adjust).strip() or "NA"
+    fname = (
+        f"{safe_code}_{safe_start}_{safe_end}_intraday_"
+        f"{bar_size}_{safe_adj}.parquet"
+    )
     return os.path.join(_CACHE_DIR, fname)
 
 
@@ -276,7 +285,7 @@ def get_intraday_close(code, start, end, bar_size="60", adjust="F"):
     pd.Series
         index=DatetimeIndex (精确到分钟), values=close
     """
-    path = _intraday_cache_path(code, start, end, bar_size)
+    path = _intraday_cache_path(code, start, end, bar_size, adjust=adjust)
     if os.path.exists(path):
         df = pd.read_parquet(path)
         ser = df["close"] if "close" in df.columns else df.iloc[:, 0]
@@ -373,12 +382,23 @@ def get_hist_vol(code, start_date, end_date, window=20, adjust="F"):
 # 滚动历史回测：缓存 / 收益 / rebase / 合约规格
 # =============================================================================
 
-def _cache_path(code, start, end, asset_type):
-    """返回 parquet 缓存文件路径"""
+def _cache_path(code, start, end, asset_type, adjust=None):
+    """返回 parquet 缓存文件路径
+
+    key 在 asset_type 之外再拼入 adjust：当前 load_history_cached 内部对
+    equity 写死 PriceAdj=B、future 写死不复权，但把这两个"事实上的复权口径"
+    也编码进文件名可以避免以后暴露 adjust 参数后缓存污染。
+    TODO: 若后续把 adjust 提成 load_history_cached 的显式入参，调用方必须
+    同步把值传到此 key，以免跨口径读到旧缓存。
+    """
     os.makedirs(_CACHE_DIR, exist_ok=True)
     # 文件名中不能有冒号等特殊字符
     safe_code = code.replace("/", "_").replace("\\", "_")
-    fname = f"{safe_code}_{start}_{end}_{asset_type}.parquet"
+    if adjust is None:
+        # 按 asset_type 回退到内部默认值，保证 key 唯一
+        adjust = "B" if asset_type == "equity" else ""
+    safe_adj = str(adjust).strip() or "NA"
+    fname = f"{safe_code}_{start}_{end}_{asset_type}_{safe_adj}.parquet"
     return os.path.join(_CACHE_DIR, fname)
 
 

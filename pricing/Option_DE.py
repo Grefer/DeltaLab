@@ -108,7 +108,8 @@ class Option_DE(OptionBase):
         else:
             flag_N = np.ones([self.nPath, le], dtype=int)
             discount_factor = np.tile(np.exp(-self.r * (np.maximum(observ - self.T_over, 0)) * dt), (self.nPath, 1))
-            S = McGbmQ(self.s0, self.r - self.q, self.sigma, T, self.nPath, nStep)
+            S = McGbmQ(self.s0, self.r - self.q, self.sigma, T, self.nPath, nStep,
+                       seed=self.mc_seed)
             ss = np.c_[np.tile(sr, (self.nPath, 1)), S]
             if self.cp == 1:
                 flag_N[ss >= self.H] = 0
@@ -153,7 +154,8 @@ class Option_DE(OptionBase):
             flag_N = np.ones([self.nPath, le], dtype=int)
             idx_N = np.zeros((self.nPath, le), dtype=bool)
             discount_factor = np.tile(np.exp(-self.r * (np.maximum(observ - self.T_over, 0)) * dt), (self.nPath, 1))
-            S = McGbmQ(self.s0, self.r - self.q, self.sigma, T, self.nPath, nStep)
+            S = McGbmQ(self.s0, self.r - self.q, self.sigma, T, self.nPath, nStep,
+                       seed=self.mc_seed)
             ss = np.c_[np.tile(sr, (self.nPath, 1)), S]
             if self.cp == 1:
                 idx_N[ss <= self.K] = 1
@@ -203,7 +205,8 @@ class Option_DE(OptionBase):
             condition_ki = np.zeros([self.nPath, le], dtype=int)
             condition_ko = np.zeros([self.nPath, le], dtype=int)
             discount_factor = np.tile(np.exp(-self.r * (np.maximum(observ - self.T_over, 0)) * dt), (self.nPath, 1))
-            S = McGbmQ(self.s0, self.r - self.q, self.sigma, T, self.nPath, nStep)
+            S = McGbmQ(self.s0, self.r - self.q, self.sigma, T, self.nPath, nStep,
+                       seed=self.mc_seed)
             ss = np.c_[np.tile(sr, (self.nPath, 1)), S]
             if self.cp == 1:
                 condition_ko[ss >= self.H] = 1
@@ -255,7 +258,8 @@ class Option_DE(OptionBase):
             condition_ki = np.zeros([self.nPath, le], dtype=int)
             condition_ko = np.zeros([self.nPath, le], dtype=int)
             discount_factor = np.tile(np.exp(-self.r * (np.maximum(observ - self.T_over, 0)) * dt), (self.nPath, 1))
-            S = McGbmQ(self.s0, self.r - self.q, self.sigma, T, self.nPath, nStep)
+            S = McGbmQ(self.s0, self.r - self.q, self.sigma, T, self.nPath, nStep,
+                       seed=self.mc_seed)
             ss = np.c_[np.tile(sr, (self.nPath, 1)), S]
             if self.cp == 1:
                 condition_ko[ss >= self.H] = 1
@@ -314,7 +318,8 @@ class Option_DE(OptionBase):
             condition_ko = np.zeros([self.nPath, le], dtype=bool)
             flag_N = np.zeros([self.nPath, le], dtype=bool)
             discount_factor = np.tile(np.exp(-self.r * (np.maximum(observ - self.T_over, 0)) * dt), (self.nPath, 1))
-            S = McGbmQ(self.s0, self.r - self.q, self.sigma, T, self.nPath, nStep)
+            S = McGbmQ(self.s0, self.r - self.q, self.sigma, T, self.nPath, nStep,
+                       seed=self.mc_seed)
             ss = np.c_[np.tile(sr, (self.nPath, 1)), S]
             if self.cp == 1:
                 # 对逻辑值累加以实现找到第一个满足条件的值后，之后的条件全为True
@@ -377,7 +382,8 @@ class Option_DE(OptionBase):
             condition_ko = np.zeros([self.nPath, le], dtype=bool)
             flag_N = np.zeros([self.nPath, le], dtype=bool)
             discount_factor = np.tile(np.exp(-self.r * (np.maximum(observ - self.T_over, 0)) * dt), (self.nPath, 1))
-            S = McGbmQ(self.s0, self.r - self.q, self.sigma, T, self.nPath, nStep)
+            S = McGbmQ(self.s0, self.r - self.q, self.sigma, T, self.nPath, nStep,
+                       seed=self.mc_seed)
             ss = np.c_[np.tile(sr, (self.nPath, 1)), S]
             if self.cp == 1:
                 # 对逻辑值累加以实现找到第一个满足条件的值后，之后的条件全为True
@@ -432,7 +438,8 @@ class Option_DE(OptionBase):
             condition_ko = np.zeros([self.nPath, le], dtype=bool)
             flag_N = np.zeros([self.nPath, le], dtype=bool)
             discount_factor = np.tile(np.exp(-self.r * (np.maximum(observ - self.T_over, 0)) * dt), (self.nPath, 1))
-            S = McGbmQ(self.s0, self.r - self.q, self.sigma, T, self.nPath, nStep)
+            S = McGbmQ(self.s0, self.r - self.q, self.sigma, T, self.nPath, nStep,
+                       seed=self.mc_seed)
             ss = np.c_[np.tile(sr, (self.nPath, 1)), S]
             if self.cp == 1:
                 # 对逻辑值累加以实现找到第一个满足条件的值后，之后的条件全为True
@@ -491,7 +498,8 @@ class Option_DE(OptionBase):
             condition_ko = np.zeros([self.nPath, le], dtype=bool)
             flag_N = np.zeros([self.nPath, le], dtype=bool)
             discount_factor = np.tile(np.exp(-self.r * (np.maximum(observ - self.T_over, 0)) * dt), (self.nPath, 1))
-            S = McGbmQ(self.s0, self.r - self.q, self.sigma, T, self.nPath, nStep)
+            S = McGbmQ(self.s0, self.r - self.q, self.sigma, T, self.nPath, nStep,
+                       seed=self.mc_seed)
             ss = np.c_[np.tile(sr, (self.nPath, 1)), S]
             if self.cp == 1:
                 # 对逻辑值累加以实现找到第一个满足条件的值后，之后的条件全为True
@@ -547,7 +555,8 @@ class Option_DE(OptionBase):
             condition_ko = np.zeros([self.nPath, le], dtype=bool)
             flag_N = np.zeros([self.nPath, le], dtype=bool)
             discount_factor = np.tile(np.exp(-self.r * (np.maximum(observ - self.T_over, 0)) * dt), (self.nPath, 1))
-            S = McGbmQ(self.s0, self.r - self.q, self.sigma, T, self.nPath, nStep)
+            S = McGbmQ(self.s0, self.r - self.q, self.sigma, T, self.nPath, nStep,
+                       seed=self.mc_seed)
             ss = np.c_[np.tile(sr, (self.nPath, 1)), S]
             if self.cp == 1:
                 # 对逻辑值累加以实现找到第一个满足条件的值后，之后的条件全为True

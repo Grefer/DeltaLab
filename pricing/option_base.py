@@ -20,12 +20,29 @@ class OptionBase:
         - _time_remaining (property) -> float/int : 剩余到期时间（交易日数）
         - _theta_overrides(dt) -> dict : theta bump 所需的参数覆盖
         - _decrement_time() : 时间推进一天
+
+    MC Greeks 说明：
+        对 MC 定价的子类（Option_AB / Option_AS / Option_DE），get_greeks
+        在有限差分 bump-and-reprice 过程中会复用 self.mc_seed 以实现
+        Common Random Numbers (CRN)：所有 bump 路径共享同一组随机数，
+        以保证不同 bump 的定价差由真实参数敏感性产生，而不是 MC 噪声。
+        解析定价的 Option_Vanilla 不受这条约束。
     """
 
     # 日内已流逝比例（0~1，单位=日）。bump copy 里用它把 T 方向的剩余时间
     # 按小数日衰减；默认 0 不影响现有行为。目前仅 Option_Vanilla 在 get_price
     # 里消费这个字段，MC 类的 T_days 需要整数 nStep，暂不支持 intraday 衰减。
     _intraday_elapsed = 0.0
+
+    # MC 采样种子：子类实例可单独覆盖。None = 每次调用 McGbmQ 都用 OS 熵
+    # 重新抽样；int = 确定性序列，bump 之间共享即为 CRN。默认 20 保持
+    # 与 Review 前行为一致（所有 MC 期权共用一组路径）。
+    mc_seed = 20
+
+    # Greeks bump 时使用的路径数；None = 与 self.nPath 一致。某些 MC 期权
+    # 路径很重，bump 五个方向（±ds, ±2ds, ±sigma, ±r, theta）可能明显变慢，
+    # 这里允许外部覆盖为更小值（例如 max(nPath//4, 5000)），以换取性能。
+    greeks_nPath = None
 
     @property
     def _time_remaining(self):
@@ -69,7 +86,13 @@ class OptionBase:
         return val if val is not None else 0.0
 
     def get_greeks(self):
-        """有限差分法计算 Greeks: [delta, gamma, vega, theta, rho]"""
+        """有限差分法计算 Greeks: [delta, gamma, vega, theta, rho]
+
+        对 MC 期权（self 有 nPath 属性时），在 bump 期间临时将 self.nPath
+        切换为 self.greeks_nPath（若已设置），并保持 self.mc_seed 不变，
+        以实现 CRN：所有 bump 共享同一批随机数路径，bump 定价差仅反映
+        参数敏感性而非 MC 噪声。Option_Vanilla 走解析路径，不受影响。
+        """
 
         if self._time_remaining <= 0:
             return [0, 0, 0, 0, 0]
@@ -79,30 +102,40 @@ class OptionBase:
         dt = 1
         dr = 0.01
 
-        price0 = self._safe_price(self.get_price())
+        # ---- MC 期权：bump 前临时压路径数，bump 结束后恢复 ----
+        _npath_saved = None
+        if hasattr(self, "nPath") and getattr(self, "greeks_nPath", None):
+            _npath_saved = self.nPath
+            self.nPath = int(self.greeks_nPath)
 
-        # delta（中心差分）
-        price_up = self._safe_price(self._bumped_copy(s0=self.s0 + ds).get_price())
-        price_dn = self._safe_price(self._bumped_copy(s0=self.s0 - ds).get_price())
-        delta = (price_up - price_dn) / (2 * ds)
+        try:
+            price0 = self._safe_price(self.get_price())
 
-        # gamma（二阶中心差分，步长 2*ds）
-        price_up2 = self._safe_price(self._bumped_copy(s0=self.s0 + 2 * ds).get_price())
-        price_dn2 = self._safe_price(self._bumped_copy(s0=self.s0 - 2 * ds).get_price())
-        gamma = (price_up2 - 2 * price0 + price_dn2) / (4 * ds ** 2)
+            # delta（中心差分）
+            price_up = self._safe_price(self._bumped_copy(s0=self.s0 + ds).get_price())
+            price_dn = self._safe_price(self._bumped_copy(s0=self.s0 - ds).get_price())
+            delta = (price_up - price_dn) / (2 * ds)
 
-        # vega
-        price_vup = self._safe_price(self._bumped_copy(sigma=self.sigma + dz).get_price())
-        price_vdn = self._safe_price(self._bumped_copy(sigma=self.sigma - dz).get_price())
-        vega = (price_vup - price_vdn) / (2 * dz)
+            # gamma（二阶中心差分，步长 2*ds）
+            price_up2 = self._safe_price(self._bumped_copy(s0=self.s0 + 2 * ds).get_price())
+            price_dn2 = self._safe_price(self._bumped_copy(s0=self.s0 - 2 * ds).get_price())
+            gamma = (price_up2 - 2 * price0 + price_dn2) / (4 * ds ** 2)
 
-        # theta
-        price_theta = self._safe_price(self._bumped_copy(**self._theta_overrides(dt)).get_price())
-        theta = (price_theta - price0) / (dt / ANNUAL_DAYS)
+            # vega
+            price_vup = self._safe_price(self._bumped_copy(sigma=self.sigma + dz).get_price())
+            price_vdn = self._safe_price(self._bumped_copy(sigma=self.sigma - dz).get_price())
+            vega = (price_vup - price_vdn) / (2 * dz)
 
-        # rho
-        price_rup = self._safe_price(self._bumped_copy(r=self.r + dr).get_price())
-        price_rdn = self._safe_price(self._bumped_copy(r=self.r - dr).get_price())
-        rho = (price_rup - price_rdn) / 2
+            # theta
+            price_theta = self._safe_price(self._bumped_copy(**self._theta_overrides(dt)).get_price())
+            theta = (price_theta - price0) / (dt / ANNUAL_DAYS)
+
+            # rho
+            price_rup = self._safe_price(self._bumped_copy(r=self.r + dr).get_price())
+            price_rdn = self._safe_price(self._bumped_copy(r=self.r - dr).get_price())
+            rho = (price_rup - price_rdn) / 2
+        finally:
+            if _npath_saved is not None:
+                self.nPath = _npath_saved
 
         return [delta, gamma, vega, theta, rho]
