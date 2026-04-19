@@ -1,6 +1,6 @@
 # _*_ coding: utf-8 _*_
 """
-期权对冲回测 GUI 应用
+DeltaLab - 期权对冲回测 GUI 应用
 
 基于 tkinter 构建，支持选择不同期权类型、回测方式（模拟/历史数据），
 并以图表和表格形式展示回测结果。
@@ -316,7 +316,7 @@ class BacktestApp(tk.Tk):
 
     def __init__(self):
         super().__init__()
-        self.title("期权对冲回测系统")
+        self.title("DeltaLab - 期权对冲回测系统")
         self.geometry("1600x1000")
         # 左侧面板已启用垂直滚动, 这里可以给一个更宽容的最小尺寸,
         # 即便在高 DPI / 小分辨率屏幕下也不会裁掉底部按钮.
@@ -560,10 +560,10 @@ class BacktestApp(tk.Tk):
 
         title_row = ttk.Frame(header)
         title_row.pack(fill="x", padx=18, pady=(14, 4))
-        ttk.Label(title_row, text="期权动态对冲回测系统",
+        ttk.Label(title_row, text="DeltaLab",
                   style="Title.TLabel").pack(side="left")
         ttk.Label(title_row,
-                  text="Derivatives Hedging Backtest Studio",
+                  text="期权动态对冲回测系统",
                   style="Subtitle.TLabel").pack(side="left", padx=(12, 0), pady=(8, 0))
 
         ttk.Separator(header, orient="horizontal").pack(fill="x", padx=0, pady=(6, 0))

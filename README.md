@@ -1,6 +1,6 @@
-# 期权动态对冲回测系统
+# DeltaLab
 
-> Derivatives Hedging Backtest Studio — 基于 Python / tkinter 的期权 Delta 对冲回测框架，支持多种奇异期权、多数据源接入与蒙特卡洛分析。
+> DeltaLab — 基于 Python / tkinter 的期权 Delta 对冲回测框架，支持多种奇异期权、多数据源接入与蒙特卡洛分析。
 
 ---
 
@@ -47,7 +47,7 @@ python gui_app.py
 ## 📁 项目结构
 
 ```
-Quant/
+DeltaLab/
 ├── gui_app.py                  # GUI 入口（tkinter + matplotlib）
 ├── pricing/                    # 核心定价与回测引擎
 │   ├── __init__.py

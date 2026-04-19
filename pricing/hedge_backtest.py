@@ -1,6 +1,6 @@
 # _*_ coding: utf-8 _*_
 """
-期权动态对冲回测框架
+DeltaLab - 期权动态对冲回测框架
 
 支持对任意继承自 OptionBase 的期权进行 Delta 对冲回测，
 追踪每日盈亏分解、累计对冲误差和 Greeks 变动。
