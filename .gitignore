@@ -35,3 +35,4 @@ data/cache/
 # AI assistants
 .gemini/
 .claude/
+CLAUDE.md

@@ -23,7 +23,7 @@
 ### 安装依赖
 
 ```bash
-pip install numpy scipy pandas matplotlib
+pip install -r requirements.txt
 ```
 
 > Wind 数据源为可选依赖，需安装 Wind 终端 + Python 插件（`WindPy`）。模拟和 CSV 模式无需 Wind。
