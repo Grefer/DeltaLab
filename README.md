@@ -2,6 +2,11 @@
 
 ![DeltaLab](assets/banner.png)
 
+[![Python](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
+[![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
+[![Last Commit](https://img.shields.io/github/last-commit/Grefer/DeltaLab)](https://github.com/Grefer/DeltaLab/commits/master)
+[![Issues](https://img.shields.io/github/issues/Grefer/DeltaLab)](https://github.com/Grefer/DeltaLab/issues)
+
 > 基于 Python / tkinter 的期权 Delta 动态对冲回测框架，支持多种奇异期权、多数据源接入、日内多频率调仓与蒙特卡洛分析。
 
 ---
@@ -14,7 +19,13 @@
 - **日内多频率**：支持日频 / 60 分 / 5 分 / 1 分级别的对冲模拟（`steps_per_day ∈ {1,4,48,240}`）
 - **独立路径采样**：多路径 MC 采样为每条路径注入独立 `mc_seed`，避免样本相关性压窄分布
 - **完整可视化**：6 宫格对冲图表、波动率分析、蒙特卡洛盈亏分布、结构扫描、每日明细导出
-- **真实行情缩放**：CSV / Wind 模式下自动按 `S_ref → S_real` 比例缩放期权要素，保持结构一致性
+- **真实行情缩放**：CSV / Wind 模式下，以真实首日价为锚点自动缩放期权参数（行权价、障碍、保底等），保持结构一致性
+
+## 📸 界面预览
+
+![DeltaLab GUI 界面预览](assets/screenshot.png)
+
+> 上图：Decumulator 回测运行结果，左侧为参数面板，右侧为回测摘要 / 对冲图表 / 波动率分析 / 盈亏分布等标签页。
 
 ## 🗺️ 工作流概览
 
@@ -55,72 +66,43 @@ python gui_app.py
 
 ```
 DeltaLab/
-├── gui_app.py                  # GUI 入口（tkinter + matplotlib）
-├── pricing/                    # 核心定价与回测引擎
-│   ├── __init__.py
-│   ├── constants.py            # ANNUAL_DAYS = 243.0
-│   ├── option_base.py          # OptionBase 基类（有限差分 Greeks）
-│   ├── Option_Vanilla.py       # 香草期权（Black-Scholes 封闭解）
-│   ├── Option_AS.py            # 亚式期权（蒙特卡洛）
-│   ├── Option_AB.py            # 气囊期权（蒙特卡洛）
-│   ├── Option_DE.py            # 累计/熔断累计系列（蒙特卡洛）
-│   ├── mc_engine.py            # GBM 路径生成引擎
-│   ├── hedge_backtest.py       # HedgeBacktest + 对冲策略
-│   ├── rolling_backtest.py     # 滚动回测（多窗口）
-│   └── wind_data.py            # Wind 数据接口（可选）
-├── tests/                      # 测试
-├── data/cache/                 # Wind 数据缓存（运行时生成）
-├── assets/                     # 图标 / banner / 工作流示意图
-│   ├── deltalab.png            # 主图标 (512×512)
-│   ├── deltalab.ico            # Windows 多尺寸 (16/32/48/64/128/256)
-│   ├── banner.png              # README 顶部 banner
-│   └── workflow.png            # 工作流示意图
-├── tools/
-│   ├── make_icon.py            # 生成 deltalab.png / .ico
-│   ├── make_banner.py          # 生成 banner.png
-│   └── make_workflow.py        # 生成 workflow.png
-└── docs/
-    └── GUI_USAGE.md            # 完整 GUI 操作手册
+├── gui_app.py        # GUI 入口 (tkinter + matplotlib)
+├── pricing/          # 核心定价与回测引擎 (期权类 / MC / HedgeBacktest)
+├── tests/            # 测试
+├── data/cache/       # Wind 数据缓存 (运行时生成)
+├── assets/           # 图标 / banner / 工作流示意图
+├── tools/            # 资源生成脚本 (make_icon / make_banner / make_workflow)
+└── docs/             # 深度文档 (GUI_USAGE.md)
 ```
+
+文件级结构、各 `Option_*` 的定价方式、引擎内部接口等细节见 [docs/GUI_USAGE.md](docs/GUI_USAGE.md)。
 
 ## 📊 支持的期权类型
 
 可以通过点击 **📊 绘制结构图** 查看期权结构说明与 Greeks 扫描曲线。
 
-| 大类 | 子类型 | 定价方式 |
+| 大类 | 子类型数 | 定价方式 |
 |---|---|---|
-| 香草期权 (Vanilla) | `Eu` | Black-Scholes 封闭解 |
-| 累计期权 (Decumulator) | `Opt_Decumulator_Back`, `Opt_Decumulator_Fix`, `Opt_EnDecumulator`, `Opt_EnDecumulator_Fix`, `Opt_ASGQ_call_put`, `Opt_ASGQ_EP`, `Opt_ASGQ_EF`, `Opt_ASGQ_DP`, `Opt_ASGQ_DF` | 蒙特卡洛 |
-| 亚式期权 (Asian) | `Asian`, `EnhanceAsian` | 蒙特卡洛 |
-| 气囊期权 (Airbag) | `Opt_Airbag` | 蒙特卡洛 |
+| 香草期权 (Vanilla) | 1（`Eu`） | Black-Scholes 封闭解 |
+| 累计期权 (Decumulator) | 9（回归 / 增强 / ASGQ 系列） | 蒙特卡洛 |
+| 亚式期权 (Asian) | 2（`Asian`, `EnhanceAsian`） | 蒙特卡洛 |
+| 气囊期权 (Airbag) | 1（`Opt_Airbag`） | 蒙特卡洛 |
+
+子类型完整清单与 payoff 公式见 [docs/GUI_USAGE.md §4.1](docs/GUI_USAGE.md)。
 
 ## 🔧 技术栈
 
-| 组件 | 技术 |
-|---|---|
-| GUI 框架 | tkinter + ttk（自定义现代扁平主题） |
-| 图表 | matplotlib（TkAgg 后端） |
-| 定价引擎 | numpy / scipy（BS 封闭解 + 蒙特卡洛） |
-| 数据处理 | pandas |
-| 实时行情 | WindPy（可选） |
-| 并发 | threading + ThreadPoolExecutor（多路径 MC） |
-| 图像生成 | Pillow（图标 / banner） |
-
-## 🖼️ 重新生成图标与示意图
-
-```bash
-python tools/make_icon.py      # deltalab.png / .ico
-python tools/make_banner.py    # banner.png
-python tools/make_workflow.py  # workflow.png
-```
-
-三个脚本互不依赖（banner 会读取 icon，需要先生成 icon）。改调色板或布局时，直接编辑对应脚本顶部的常量即可。
+**Python 3.10+** · **tkinter + ttk** (GUI) · **matplotlib** (图表) · **numpy / scipy** (定价) · **pandas** (数据) · **WindPy** (实时行情, 可选) · **ThreadPoolExecutor** (多路径 MC)
 
 ## 📖 详细文档
 
 完整的 GUI 操作手册（含每个参数的含义、单位、默认值与对结果的影响）请参阅：
 
 👉 [**docs/GUI_USAGE.md**](docs/GUI_USAGE.md)
+
+## 💬 反馈与贡献
+
+发现 bug、想提需求或想贡献代码，欢迎开 [GitHub Issue](https://github.com/Grefer/DeltaLab/issues) 或直接提 PR。
 
 ## 📄 License
 

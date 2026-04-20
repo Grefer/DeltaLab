@@ -121,7 +121,7 @@ OPTION_CLASSES = {
             ("K",      "行权价",        float, 100.0),
             ("T_days", "期限(交易日)",   int,   22),
             ("sigma",  "波动率",        float, 0.18),
-            ("cp",     "方向(1看涨/-1看跌)", int, 1),
+            ("cp",     "方向",          int,   1, {"看涨 (Call)": 1, "看跌 (Put)": -1}),
             ("r",      "无风险利率",     float, 0.03),
             ("q",      "分红率",        float, 0.03),
         ],
@@ -147,7 +147,7 @@ OPTION_CLASSES = {
             ("sigma",  "波动率",        float, 0.18),
             ("H",      "障碍价格",       float, 110.0),
             ("N",      "杠杆倍数",       int,   2),
-            ("cp",     "方向(1看涨/-1看跌)", int, 1),
+            ("cp",     "方向",          int,   1, {"看涨 (Call)": 1, "看跌 (Put)": -1}),
             ("fix",    "固定赔付(可选)",  float, 0.0),
             ("P",      "保障价格(可选)",  float, 0.0),
             ("amount", "固定金额(可选)",  float, 0.0),
@@ -175,7 +175,7 @@ OPTION_CLASSES = {
             ("T",      "期限(交易日)",   int,   22),
             ("N",      "观察日数",       int,   22),
             ("sigma",  "波动率",        float, 0.15),
-            ("cp",     "方向(1看涨/-1看跌)", int, 1),
+            ("cp",     "方向",          int,   1, {"看涨 (Call)": 1, "看跌 (Put)": -1}),
             ("minPay", "最低赔付",       float, 0.0),
             ("maxPay", "最高赔付",       float, 999999.0),
             ("r",      "无风险利率",     float, 0.03),
@@ -199,7 +199,7 @@ OPTION_CLASSES = {
             ("sigma", "波动率",        float, 0.18),
             ("pr",    "参与率",        float, 0.8),
             ("pr_ki", "敲入参与率",     float, 1.0),
-            ("cp",    "方向(1看涨/-1看跌)", int, 1),
+            ("cp",    "方向",          int,   1, {"看涨 (Call)": 1, "看跌 (Put)": -1}),
             ("r",     "无风险利率",     float, 0.03),
             ("q",     "分红率",        float, 0.03),
             ("nPath", "定价路径数 (MC)", int,   100000),
@@ -1074,14 +1074,25 @@ class BacktestApp(tk.Tk):
         for w in self._param_frame.winfo_children():
             w.destroy()
         self._param_entries = {}
-        for i, (key, label, dtype, default) in enumerate(params):
+        for i, spec in enumerate(params):
+            key, label, dtype, default = spec[:4]
+            choices = spec[4] if len(spec) > 4 else None
             ttk.Label(self._param_frame, text=f"{label}:",
                       style="Surface.TLabel").grid(
                 row=i, column=0, sticky="w", padx=(2, 8), pady=3)
-            var = tk.StringVar(value=str(default))
-            entry = ttk.Entry(self._param_frame, textvariable=var, width=16)
-            entry.grid(row=i, column=1, sticky="ew", pady=3, padx=(0, 2))
-            self._param_entries[key] = (var, dtype)
+            if choices:
+                val_to_display = {v: k for k, v in choices.items()}
+                default_display = val_to_display.get(default, next(iter(choices)))
+                var = tk.StringVar(value=default_display)
+                cb = ttk.Combobox(self._param_frame, textvariable=var,
+                                  values=list(choices.keys()),
+                                  state="readonly", width=14)
+                cb.grid(row=i, column=1, sticky="ew", pady=3, padx=(0, 2))
+            else:
+                var = tk.StringVar(value=str(default))
+                entry = ttk.Entry(self._param_frame, textvariable=var, width=16)
+                entry.grid(row=i, column=1, sticky="ew", pady=3, padx=(0, 2))
+            self._param_entries[key] = (var, dtype, choices)
         self._param_frame.columnconfigure(1, weight=1)
 
     def _toggle_source(self):
@@ -1166,9 +1177,11 @@ class BacktestApp(tk.Tk):
         subtype = SUBTYPE_FROM_DISPLAY.get(subtype_display, subtype_display)
 
         params = {}
-        for key, (var, dtype) in self._param_entries.items():
+        for key, (var, dtype, choices) in self._param_entries.items():
             val_str = var.get().strip()
-            if not val_str:
+            if choices:
+                params[key] = choices[val_str]
+            elif not val_str:
                 params[key] = 0
             elif dtype == float:
                 params[key] = float(val_str)
