@@ -153,7 +153,7 @@ OPTION_CLASSES = {
             ("amount", "固定金额(可选)",  float, 0.0),
             ("r",      "无风险利率",     float, 0.03),
             ("q",      "分红率",        float, 0.03),
-            ("nPath",  "模拟路径数",     int,   100000),
+            ("nPath",  "定价路径数 (MC)", int,   100000),
         ],
         "build": lambda st, p: Option_DE(
             st, p["s0"], [], p["K"], p["T_over"], p["T_days"],
@@ -180,7 +180,7 @@ OPTION_CLASSES = {
             ("maxPay", "最高赔付",       float, 999999.0),
             ("r",      "无风险利率",     float, 0.03),
             ("q",      "分红率",        float, 0.03),
-            ("nPath",  "模拟路径数",     int,   100000),
+            ("nPath",  "定价路径数 (MC)", int,   100000),
         ],
         "build": lambda st, p: Option_AS(
             st, p["s0"], [], p["K"], p["E"], p["T"], p["N"],
@@ -202,7 +202,7 @@ OPTION_CLASSES = {
             ("cp",    "方向(1看涨/-1看跌)", int, 1),
             ("r",     "无风险利率",     float, 0.03),
             ("q",     "分红率",        float, 0.03),
-            ("nPath", "模拟路径数",     int,   100000),
+            ("nPath", "定价路径数 (MC)", int,   100000),
         ],
         "build": lambda st, p: Option_AB(
             st, p["s0"], [], p["K"], p["KI"], p["T_days"],
@@ -212,6 +212,43 @@ OPTION_CLASSES = {
         ),
     },
 }
+
+
+# ============================================================
+#  GUI 显示名 ↔ 后端内部键 映射
+#  说明：后端 (hedge_backtest / Option_* 类) 使用英文/方法名做字符串匹配，
+#  这里仅影响界面显示；读取 Combobox 值后需通过 *_FROM_DISPLAY 反向映射
+#  还原为内部键再传给后端。
+# ============================================================
+
+SUBTYPE_DISPLAY = {
+    "Eu":                    "欧式 (Eu)",
+    "Opt_Decumulator_Back":  "回归累计 (Opt_Decumulator_Back)",
+    "Opt_Decumulator_Fix":   "固定赔付回归累计 (Opt_Decumulator_Fix)",
+    "Opt_EnDecumulator":     "增强回归累计 (Opt_EnDecumulator)",
+    "Opt_EnDecumulator_Fix": "固定赔付增强累计 (Opt_EnDecumulator_Fix)",
+    "Opt_ASGQ_call_put":     "到期熔断保障累计 (Opt_ASGQ_call_put)",
+    "Opt_ASGQ_EP":           "熔断每日保障累计 (Opt_ASGQ_EP)",
+    "Opt_ASGQ_EF":           "熔断每日固赔累计 (Opt_ASGQ_EF)",
+    "Opt_ASGQ_DP":           "每日熔断保障累计 (Opt_ASGQ_DP)",
+    "Opt_ASGQ_DF":           "每日熔断固赔累计 (Opt_ASGQ_DF)",
+    "Asian":                 "标准亚式 (Asian)",
+    "EnhanceAsian":          "增强亚式 (EnhanceAsian)",
+    "Opt_Airbag":            "气囊 (Opt_Airbag)",
+}
+SUBTYPE_FROM_DISPLAY = {v: k for k, v in SUBTYPE_DISPLAY.items()}
+
+STRATEGY_DISPLAY = {
+    "fixed_freq": "固定频率调仓",
+    "sigma_band": "σ 带宽调仓",
+}
+STRATEGY_FROM_DISPLAY = {v: k for k, v in STRATEGY_DISPLAY.items()}
+
+SIGMA_SOURCE_DISPLAY = {
+    "implied":  "隐含波动率",
+    "realized": "已实现波动率",
+}
+SIGMA_SOURCE_FROM_DISPLAY = {v: k for k, v in SIGMA_SOURCE_DISPLAY.items()}
 
 
 # ============================================================
@@ -329,10 +366,33 @@ class BacktestApp(tk.Tk):
         # 即便在高 DPI / 小分辨率屏幕下也不会裁掉底部按钮.
         self.minsize(1200, 720)
         self.configure(bg=PALETTE["bg"])
+        self._apply_window_icon()
         self._setup_styles()
         self._build_ui()
         self._param_entries = {}
         self._on_option_class_change(None)
+
+    # ---- 窗口图标 ----
+    def _apply_window_icon(self):
+        assets_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets")
+        ico_path = os.path.join(assets_dir, "deltalab.ico")
+        png_path = os.path.join(assets_dir, "deltalab.png")
+
+        # Windows: .ico 在任务栏/标题栏表现最佳
+        if _SYSTEM == "Windows" and os.path.exists(ico_path):
+            try:
+                self.iconbitmap(default=ico_path)
+                return
+            except tk.TclError:
+                pass
+
+        # 其它平台 (macOS / Linux) 或 Windows 回退: iconphoto + PNG
+        if os.path.exists(png_path):
+            try:
+                self._icon_photo = tk.PhotoImage(file=png_path)
+                self.iconphoto(True, self._icon_photo)
+            except tk.TclError:
+                pass
 
     # ---- 样式 ----
     def _setup_styles(self):
@@ -699,7 +759,7 @@ class BacktestApp(tk.Tk):
         rv_frame.grid(row=1, column=1, columnspan=3, sticky="w", padx=(6, 0), pady=2)
         ttk.Entry(rv_frame, textvariable=self._real_vol_var, width=10).pack(side="left")
         ttk.Label(rv_frame, text=" 空=同隐含", style="SurfaceMuted.TLabel").pack(side="left")
-        ttk.Label(self._sim_frame, text="模拟路径数:", style="Surface.TLabel").grid(
+        ttk.Label(self._sim_frame, text="回测路径数 (MC):", style="Surface.TLabel").grid(
             row=2, column=0, sticky="w", pady=2)
         self._npaths_var = tk.StringVar(value="10")
         ttk.Entry(self._sim_frame, textvariable=self._npaths_var, width=10).grid(
@@ -809,12 +869,12 @@ class BacktestApp(tk.Tk):
         row_h += 1
         ttk.Label(sec3, text="对冲策略:", style="Surface.TLabel").grid(
             row=row_h, column=0, sticky="w", pady=4)
-        self._strategy_var = tk.StringVar(value="fixed_freq")
+        self._strategy_var = tk.StringVar(value=STRATEGY_DISPLAY["fixed_freq"])
         strat_frame = ttk.Frame(sec3, style="Surface.TFrame")
         strat_frame.grid(row=row_h, column=1, sticky="w", padx=(8, 0), pady=4)
         self._strategy_combo = ttk.Combobox(
-            strat_frame, textvariable=self._strategy_var, width=14,
-            values=("fixed_freq", "sigma_band"), state="readonly",
+            strat_frame, textvariable=self._strategy_var, width=16,
+            values=tuple(STRATEGY_DISPLAY.values()), state="readonly",
         )
         self._strategy_combo.pack(side="left")
         self._strategy_combo.bind("<<ComboboxSelected>>", lambda e: self._toggle_strategy())
@@ -824,18 +884,18 @@ class BacktestApp(tk.Tk):
         self._sigma_band_frame = ttk.Frame(sec3, style="Surface.TFrame")
         self._sigma_band_frame.grid(row=row_h, column=0, columnspan=2, sticky="ew",
                                     padx=(0, 0), pady=2)
-        ttk.Label(self._sigma_band_frame, text="σ 带 k:",
+        ttk.Label(self._sigma_band_frame, text="调仓带宽 k·σ:",
                   style="Surface.TLabel").grid(row=0, column=0, sticky="w", pady=2)
         self._k_var = tk.StringVar(value="0.5")
         ttk.Entry(self._sigma_band_frame, textvariable=self._k_var, width=8).grid(
             row=0, column=1, padx=(6, 12), pady=2, sticky="w")
         ttk.Label(self._sigma_band_frame, text="σ 来源:",
                   style="Surface.TLabel").grid(row=0, column=2, sticky="w", pady=2)
-        self._sigma_src_var = tk.StringVar(value="implied")
-        ttk.Combobox(self._sigma_band_frame, textvariable=self._sigma_src_var, width=10,
-                     values=("implied", "realized"), state="readonly").grid(
+        self._sigma_src_var = tk.StringVar(value=SIGMA_SOURCE_DISPLAY["implied"])
+        ttk.Combobox(self._sigma_band_frame, textvariable=self._sigma_src_var, width=14,
+                     values=tuple(SIGMA_SOURCE_DISPLAY.values()), state="readonly").grid(
             row=0, column=3, padx=(6, 12), pady=2, sticky="w")
-        ttk.Label(self._sigma_band_frame, text="HV 窗口 N 日:",
+        ttk.Label(self._sigma_band_frame, text="历史波动率窗口 N (日):",
                   style="Surface.TLabel").grid(row=0, column=4, sticky="w", pady=2)
         self._sigma_win_var = tk.StringVar(value="20")
         ttk.Entry(self._sigma_band_frame, textvariable=self._sigma_win_var, width=6).grid(
@@ -1004,7 +1064,9 @@ class BacktestApp(tk.Tk):
     def _on_option_class_change(self, event):
         cls_name = self._class_var.get()
         cfg = OPTION_CLASSES[cls_name]
-        self._subtype_cb.configure(values=cfg["subtypes"])
+        display_values = [SUBTYPE_DISPLAY[s] if s in SUBTYPE_DISPLAY else str(s)
+                          for s in cfg["subtypes"]]
+        self._subtype_cb.configure(values=display_values)
         self._subtype_cb.current(0)
         self._rebuild_params(cfg["params"])
 
@@ -1067,7 +1129,9 @@ class BacktestApp(tk.Tk):
 
     def _toggle_strategy(self):
         """对冲策略切换：sigma_band 显示 k / σ 源 / N，fixed_freq 隐藏。"""
-        if self._strategy_var.get() == "sigma_band":
+        strategy_key = STRATEGY_FROM_DISPLAY.get(
+            self._strategy_var.get(), self._strategy_var.get())
+        if strategy_key == "sigma_band":
             self._sigma_band_frame.grid()
         else:
             self._sigma_band_frame.grid_remove()
@@ -1098,7 +1162,8 @@ class BacktestApp(tk.Tk):
         """在主线程中读取所有 tkinter 变量，返回纯 Python dict"""
         cls_name = self._class_var.get()
         cfg = OPTION_CLASSES[cls_name]
-        subtype = self._subtype_var.get()
+        subtype_display = self._subtype_var.get()
+        subtype = SUBTYPE_FROM_DISPLAY.get(subtype_display, subtype_display)
 
         params = {}
         for key, (var, dtype) in self._param_entries.items():
@@ -1134,9 +1199,11 @@ class BacktestApp(tk.Tk):
             "wind_end": self._wind_end_var.get().strip(),
             "wind_bar_size": self._wind_bar_size_var.get().strip(),
             # --- 新增：对冲策略与 intraday / 滑点 ---
-            "strategy_name": self._strategy_var.get(),
+            "strategy_name": STRATEGY_FROM_DISPLAY.get(
+                self._strategy_var.get(), self._strategy_var.get()),
             "k_band": float(self._k_var.get() or 0.5),
-            "sigma_source": self._sigma_src_var.get(),
+            "sigma_source": SIGMA_SOURCE_FROM_DISPLAY.get(
+                self._sigma_src_var.get(), self._sigma_src_var.get()),
             "sigma_window": int(self._sigma_win_var.get() or 20),
             "steps_per_day": int(self._spd_var.get() or 1),
             "slippage_bps": float(self._slip_var.get() or 0.0),
@@ -1410,7 +1477,7 @@ class BacktestApp(tk.Tk):
         _ins("\n")
 
         _kv("期权类型        ", meta['cls_name'])
-        _kv("子类型          ", meta['subtype'])
+        _kv("子类型          ", SUBTYPE_DISPLAY.get(meta['subtype'], meta['subtype']))
         _kv("数据来源        ", meta['source'])
         _ins("\n")
         _sep()
@@ -1996,7 +2063,8 @@ class BacktestApp(tk.Tk):
 
         doc_key = (cls_name, subtype)
         doc_text = STRUCTURE_DOCS.get(doc_key, "(暂无结构说明)")
-        header = (f"{cls_name}  /  {subtype}   [视角: {perspective}]\n"
+        subtype_disp = SUBTYPE_DISPLAY.get(subtype, subtype)
+        header = (f"{cls_name}  /  {subtype_disp}   [视角: {perspective}]\n"
                   + "─" * 60 + "\n")
 
         def _fmt(v):
