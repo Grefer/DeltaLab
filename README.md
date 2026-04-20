@@ -1,6 +1,8 @@
 # DeltaLab
 
-> DeltaLab — 基于 Python / tkinter 的期权 Delta 动态对冲回测框架，支持多种奇异期权、多数据源接入与蒙特卡洛分析。
+![DeltaLab](assets/banner.png)
+
+> 基于 Python / tkinter 的期权 Delta 动态对冲回测框架，支持多种奇异期权、多数据源接入、日内多频率调仓与蒙特卡洛分析。
 
 ---
 
@@ -9,9 +11,14 @@
 - **4 大类期权**：香草 (Vanilla)、累计 (Decumulator)、亚式 (Asian)、气囊 (Airbag)，共 13 种子类型
 - **3 种数据源**：蒙特卡洛模拟 / CSV 历史行情 / Wind 实时终端
 - **2 种对冲策略**：固定频率 (`fixed_freq`) / σ-带触发 (`sigma_band`)
-- **日内多频率**：支持日频 / 60 分 / 5 分 / 1 分级别的对冲模拟
+- **日内多频率**：支持日频 / 60 分 / 5 分 / 1 分级别的对冲模拟（`steps_per_day ∈ {1,4,48,240}`）
+- **独立路径采样**：多路径 MC 采样为每条路径注入独立 `mc_seed`，避免样本相关性压窄分布
 - **完整可视化**：6 宫格对冲图表、波动率分析、蒙特卡洛盈亏分布、结构扫描、每日明细导出
 - **真实行情缩放**：CSV / Wind 模式下自动按 `S_ref → S_real` 比例缩放期权要素，保持结构一致性
+
+## 🗺️ 工作流概览
+
+![DeltaLab 工作流](assets/workflow.png)
 
 ## 🚀 快速开始
 
@@ -34,9 +41,9 @@ pip install -r requirements.txt
 python gui_app.py
 ```
 
-窗口默认大小 1600×1000，最小 1200×720。
+窗口默认大小 1600×1000，最小 1200×720。启动后会自动加载 [assets/deltalab.ico](assets/deltalab.ico)（Windows）或 [assets/deltalab.png](assets/deltalab.png)（macOS / Linux）作为窗口图标。
 
-### 回测步骤
+### 跑第一次回测
 
 1. **期权类型** → 选 `香草期权 (Vanilla)`
 2. **期权参数** → 保留默认（ATM Call, 22 天, σ=0.18）
@@ -63,13 +70,23 @@ DeltaLab/
 │   └── wind_data.py            # Wind 数据接口（可选）
 ├── tests/                      # 测试
 ├── data/cache/                 # Wind 数据缓存（运行时生成）
-├── docs/
-│   └── GUI_USAGE.md            # 完整 GUI 操作手册
-└── archive/                    # 归档的旧版文件
+├── assets/                     # 图标 / banner / 工作流示意图
+│   ├── deltalab.png            # 主图标 (512×512)
+│   ├── deltalab.ico            # Windows 多尺寸 (16/32/48/64/128/256)
+│   ├── banner.png              # README 顶部 banner
+│   └── workflow.png            # 工作流示意图
+├── tools/
+│   ├── make_icon.py            # 生成 deltalab.png / .ico
+│   ├── make_banner.py          # 生成 banner.png
+│   └── make_workflow.py        # 生成 workflow.png
+└── docs/
+    └── GUI_USAGE.md            # 完整 GUI 操作手册
 ```
 
 ## 📊 支持的期权类型
-可以通过点击 **📊  绘制结构图** 查看期权结构说明
+
+可以通过点击 **📊 绘制结构图** 查看期权结构说明与 Greeks 扫描曲线。
+
 | 大类 | 子类型 | 定价方式 |
 |---|---|---|
 | 香草期权 (Vanilla) | `Eu` | Black-Scholes 封闭解 |
@@ -86,7 +103,18 @@ DeltaLab/
 | 定价引擎 | numpy / scipy（BS 封闭解 + 蒙特卡洛） |
 | 数据处理 | pandas |
 | 实时行情 | WindPy（可选） |
-| 并发 | threading + ThreadPoolExecutor |
+| 并发 | threading + ThreadPoolExecutor（多路径 MC） |
+| 图像生成 | Pillow（图标 / banner） |
+
+## 🖼️ 重新生成图标与示意图
+
+```bash
+python tools/make_icon.py      # deltalab.png / .ico
+python tools/make_banner.py    # banner.png
+python tools/make_workflow.py  # workflow.png
+```
+
+三个脚本互不依赖（banner 会读取 icon，需要先生成 icon）。改调色板或布局时，直接编辑对应脚本顶部的常量即可。
 
 ## 📖 详细文档
 
