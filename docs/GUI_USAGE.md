@@ -1,8 +1,8 @@
 [← 返回项目 README](../README.md)
 
-# DeltaLab GUI 使用文档
+# DeltaLab 使用文档
 
-本文档面向首次使用 `gui_app.py` 的用户，目标是：能够从零启动 GUI、跑通一次完整回测、并理解界面上每一个参数的含义、单位、默认值与对结果的影响。
+本文档面向首次使用 `DeltaLab` 的期权投资者，用户需要对期权 Delta 动态对冲有基本的了解，通过本文档可以快速上手进行各种类型期权的动态对冲回测。
 
 ---
 
@@ -67,7 +67,7 @@ python tools/make_workflow.py  # 生成 assets/workflow.png (工作流示意图)
 python gui_app.py
 ```
 
-入口为 `gui_app.py:2194` 的 `main()`。窗口默认大小 `1600x1000`，最小尺寸 `1200x720`（`gui_app.py:361-372`）。
+入口为 `gui_app.py:2207` 的 `main()`。窗口默认大小 `1600x1000`，最小尺寸 `1200x720`（`gui_app.py:361-372`）。
 
 ### Windows 注意事项
 
@@ -97,7 +97,7 @@ python gui_app.py
 | `对冲图表` | 6 宫格：标的路径、Delta 与持仓、Gamma、Vega、Theta、累计盈亏 |
 | `波动率分析` | 4 宫格：滚动 RV vs IV、累计 RV、价差、日收益分布 |
 | `盈亏分布` | 仅模拟模式且 `n_paths>1` 时显示蒙特卡洛分布 |
-| `结构分析` | 点 `绘制结构图` 后展示价格 / Greeks 对 S 的扫描曲线 |
+| `结构分析` | 点 `绘制结构图` 后展示当前期权结构和价格 / Greeks 对 S 的扫描曲线 |
 | `每日明细` | DataFrame 表格 + `导出 CSV` 按钮 |
 
 底部为状态栏（`gui_app.py:1053-1058`），实时显示「就绪 / 正在运行 / 完成」。
@@ -126,7 +126,7 @@ python gui_app.py
 
 ### 4.2 期权参数（按大类分组）
 
-每个字段都是一个 Entry，初始值取自 `OPTION_CLASSES[...]["params"]` 的 default。空字符串会被解释为 0（见 `_collect_gui_state`，`gui_app.py:1161`）。
+每个字段默认渲染为一个 Entry，初始值取自 `OPTION_CLASSES[...]["params"]` 的 default；空字符串会被解释为 0（见 `_collect_gui_state`，`gui_app.py:1172`）。若参数元组带有第 5 项 `choices` 映射（例如 `cp`），则改渲染为只读 Combobox，`_collect_gui_state` 会按映射将显示文本还原为内部数值。
 
 #### 香草期权 (Vanilla)
 
@@ -136,7 +136,7 @@ python gui_app.py
 | `K` | 行权价 | float | `100.0` |
 | `T_days` | 期限（交易日） | int | `22` |
 | `sigma` | 波动率（年化，小数） | float | `0.18` |
-| `cp` | 方向，`1`=Call，`-1`=Put | int | `1` |
+| `cp` | 方向，下拉选择 `看涨 (Call)` / `看跌 (Put)`，内部映射为 `1` / `-1` | int | `1`（看涨） |
 | `r` | 无风险利率 | float | `0.03` |
 | `q` | 分红率 | float | `0.03` |
 
@@ -153,7 +153,7 @@ python gui_app.py
 | `sigma` | 波动率 | float | `0.18` |
 | `H` | 障碍价格（敲出/熔断） | float | `110.0` |
 | `N` | 杠杆倍数（跌破 K 后） | int | `2` |
-| `cp` | 方向 | int | `1` |
+| `cp` | 方向，下拉选择 `看涨 (Call)` / `看跌 (Put)`，内部映射为 `1` / `-1` | int | `1`（看涨） |
 | `fix` | 固定赔付（`*_Fix` 子类型用） | float | `0.0`，传 0 → 视为未设置（None） |
 | `P` | 保障价格（`ASGQ_*P` 用） | float | `0.0`，传 0 → None |
 | `amount` | 固定金额（`ASGQ_*F` 用） | float | `0.0`，传 0 → None |
@@ -172,7 +172,7 @@ python gui_app.py
 | `T` | 期限（交易日） | int | `22` |
 | `N` | 观察日数（取末 N 日均价） | int | `22` |
 | `sigma` | 波动率 | float | `0.15` |
-| `cp` | 方向 | int | `1` |
+| `cp` | 方向，下拉选择 `看涨 (Call)` / `看跌 (Put)`，内部映射为 `1` / `-1` | int | `1`（看涨） |
 | `minPay` | 最低赔付 | float | `0.0` |
 | `maxPay` | 最高赔付 | float | `999999.0`（实际充当 `+∞`） |
 | `r` / `q` | 利率 / 分红 | float | `0.03` / `0.03` |
@@ -189,7 +189,7 @@ python gui_app.py
 | `sigma` | 波动率 | float | `0.18` |
 | `pr` | 未敲入参与率 | float | `0.8` |
 | `pr_ki` | 已敲入参与率 | float | `1.0` |
-| `cp` | 方向 | int | `1` |
+| `cp` | 方向，下拉选择 `看涨 (Call)` / `看跌 (Put)`，内部映射为 `1` / `-1` | int | `1`（看涨） |
 | `r` / `q` | 利率 / 分红 | float | `0.03` / `0.03` |
 | `nPath` | MC 路径数 | int | `100000` |
 
@@ -205,7 +205,7 @@ python gui_app.py
 | `csv` | CSV |  |
 | `wind` | Wind |  |
 
-切换数据来源时，`_toggle_source`（`gui_app.py:1087`）会动态显示对应参数子区，并对 csv / wind 强制锁定 `steps_per_day=1`（实盘/CSV 仅支持日频）。
+切换数据来源时，`_toggle_source`（`gui_app.py:1098`）会动态显示对应参数子区，并对 csv / wind 强制锁定 `steps_per_day=1`（实盘/CSV 仅支持日频）。
 
 #### 模拟（simulate）
 
@@ -246,7 +246,7 @@ python gui_app.py
 |---|---|---|---|
 | `调仓频率(天)` | `FixedFreqStrategy` 的 bar 间隔；`sigma_band` 模式下被忽略（但仍会读取），回测摘要中也不再显示 | int ≥ 1 | `1` |
 | `交易成本率(%)` | 单边费率，按成交额收取；GUI 输入百分比，内部除以 100 | float，单位 % | `0.01`（即 0.0001） |
-| `头寸方向` | `1`=卖出（short），`-1`=买入（long） | Radiobutton | `1`（卖出） |
+| `头寸方向` | 单选按钮 `卖出 (short)` / `买入 (long)`，内部映射为 `1` / `-1` | Radiobutton | `卖出 (short)` → `1` |
 | `交易数量` | `quantity`，将 Δ 转换为标的份数 | float | `100` |
 | `合约乘数` | `multiplier`，每手对应的标的数量；`0` = 不取整 | float ≥ 0 | `5` |
 
@@ -258,7 +258,7 @@ python gui_app.py
 |---|---|---|---|
 | `对冲策略` | 调仓触发方式 | `fixed_freq` / `sigma_band` | `fixed_freq` |
 
-切到 `sigma_band` 时，下方多出 3 个字段（`gui_app.py:884-902`），切换由 `_toggle_strategy`（`gui_app.py:1130`）控制：
+切到 `sigma_band` 时，下方多出 3 个字段（`gui_app.py:884-902`），切换由 `_toggle_strategy`（`gui_app.py:1141`）控制：
 
 | 字段 | 含义 | 取值 | 默认 |
 |---|---|---|---|
@@ -314,9 +314,9 @@ python gui_app.py
 | `扫描 ±%` | 结构图扫描幅度，默认 `30`（即 ±30%），合法范围 `(0, 100)` |
 | `点数` | 扫描点数，默认 `31`，合法范围 `5~201` |
 
-> 结构图默认会限制 `nPath ≤ 20000` 以加速扫描（见 `_structure_worker`，`gui_app.py:1983`），原值若大于 20000 仅在结构图时生效，回测主流程仍用原值。
+> 结构图默认会限制 `nPath ≤ 20000` 以加速扫描（见 `_structure_worker`，`gui_app.py:1996`），原值若大于 20000 仅在结构图时生效，回测主流程仍用原值。
 >
-> 结构图视角与 `头寸方向` 联动：卖方（`position=1`）时 `sign=-1`，所有曲线乘以 `sign`（见 `_show_structure`，`gui_app.py:2041`），方便直观判断卖方账户的盈亏方向。
+> 结构图视角与 `头寸方向` 联动：卖方（`position=1`）时 `sign=-1`，所有曲线乘以 `sign`（见 `_show_structure`，`gui_app.py:2054`），方便直观判断卖方账户的盈亏方向。
 
 ---
 
@@ -325,14 +325,14 @@ python gui_app.py
 以「卖出 22 日香草 ATM Call、模拟 500 条路径」为例：
 
 1. 打开 `期权类型` → `大类` 选 `香草期权 (Vanilla)`，`子类型` 自动 `Eu`。
-2. `期权参数` 区保留默认（s0=100, K=100, T_days=22, sigma=0.18, cp=1, r=0.03, q=0.03）。
+2. `期权参数` 区保留默认（s0=100, K=100, T_days=22, sigma=0.18, `方向=看涨 (Call)`，r=0.03, q=0.03）。
 3. `回测设置`：
    - `数据来源` 选 `模拟`
    - `种子` `42`
    - `已实现波动率` 留空（=隐含）
    - `模拟路径数` 改为 `500`
    - `调仓频率(天)` `1`，`交易成本率(%)` `0.01`
-   - `头寸方向` `卖出 (short)`
+   - `头寸方向` 选 `卖出 (short)`（内部 position=1）
    - `交易数量` `100`，`合约乘数` `0`（连续对冲）
    - `对冲策略` `fixed_freq`，`每日 bar 数` `1`，`滑点 (bps)` `0`
 4. 点 `▶  运行回测`。底部状态栏显示「正在运行回测…」，进度条先显示不定模式，进入 MC 阶段后切换为确定模式（带 `蒙特卡洛模拟: x/500` 文字）。
@@ -350,7 +350,7 @@ python gui_app.py
 
 ## 6. 结果解读
 
-### 6.1 回测摘要（`gui_app.py:1423`，`_show_summary`）
+### 6.1 回测摘要（`gui_app.py:1436`，`_show_summary`）
 
 - **单路径盈亏分解**：
   - `标的对冲盈亏` = `Σ H[i-1]·(S[i]-S[i-1])` —— 标的腿浮动盈亏
@@ -360,20 +360,20 @@ python gui_app.py
 - **波动率分析**：`成交隐含波动率` 直接来自 `option.sigma`；`已实现波动率` 用全样本 bar 级对数收益年化。
 - **Greeks 统计**：表格列出 Delta/Gamma/Vega/Theta/Rho 的初始值、序列均值、最大绝对值。
 
-### 6.2 对冲图表（`gui_app.py:1591`，`_show_chart`）
+### 6.2 对冲图表（`gui_app.py:1604`，`_show_chart`）
 
 6 宫格，从左上到右下：标的价格、Delta 持仓目标 vs 实际持仓、Gamma、Vega、Theta、累计盈亏（绿/红填色表示正负）。
 
 > Delta 持仓目标 = `delta × quantity × position`，实际持仓 `shares` 受 `multiplier` 取整影响，会出现明显阶梯。
 
-### 6.3 波动率分析（`gui_app.py:1684`，`_show_vol_chart`）
+### 6.3 波动率分析（`gui_app.py:1697`，`_show_vol_chart`）
 
 - (1) 滚动 RV(20d) vs IV，填色表示 RV 与 IV 大小关系（红=RV>IV）。
 - (2) 累计 RV 与 IV 的收敛对比。
 - (3) 价差时间序列 = IV − 滚动 RV，正值（绿色）表示卖方相对有利。
 - (4) 日收益直方图叠 IV 正态、RV 正态；其中日 IV σ = `IV / sqrt(ANNUAL_DAYS)` 转换为百分比（`ANNUAL_DAYS=243`，见 `pricing/constants.py`）。
 
-### 6.4 盈亏分布（`gui_app.py:1784`，`_show_dist_chart`）
+### 6.4 盈亏分布（`gui_app.py:1797`，`_show_dist_chart`）
 
 仅 `simulate + n_paths>1` 时有内容，否则显示提示文字。
 
@@ -382,11 +382,11 @@ python gui_app.py
 - (3) 已实现波动率分布
 - (4) 总盈亏 vs (IV−RV) 散点 + 线性拟合（斜率正常应为正：RV 比 IV 低越多，卖方赚得越多）
 
-### 6.5 结构分析（`gui_app.py:2041`，`_show_structure`）
+### 6.5 结构分析（`gui_app.py:2054`，`_show_structure`）
 
 顶部有 `STRUCTURE_DOCS` 中的中文 payoff 描述 + 当前参数摘要；下方 6 宫格扫描曲线，含 `K/H/KI/E/P` 等关键价位的虚线标记（颜色区分）。视角受头寸方向控制：卖方（`position=1`）时 `sign=-1`，买方（`position=-1`）时 `sign=1`，所有曲线均乘以 `sign`，方便直观判断。
 
-### 6.6 每日明细（`gui_app.py:1885`，`_show_table`）
+### 6.6 每日明细（`gui_app.py:1898`，`_show_table`）
 
 Treeview 形式的每日表格，含 13 列：标的价格 / 期权价值 / Δ/Γ/ν/Θ/ρ / 持仓 / 标的盈亏 / 期权盈亏 / 交易成本 / 每日净盈亏 / 累计盈亏。可点 `导出 CSV` 用 `utf-8-sig` 编码保存（Excel 友好）。
 
@@ -420,7 +420,7 @@ Wind / CSV 真实行情仅支持日频；`_toggle_source` 会强制 `spd_var=1` 
 
 ### 7.6 结构图扫描 nPath 被截断
 
-`_structure_worker`（`gui_app.py:1983`）会把 `nPath > 20000` 强制截断为 20000 以加速扫描。这只影响结构图，不影响主回测中真实的 `nPath`。
+`_structure_worker`（`gui_app.py:1996`）会把 `nPath > 20000` 强制截断为 20000 以加速扫描。这只影响结构图，不影响主回测中真实的 `nPath`。
 
 ### 7.7 `历史波动率窗口 N (日)` 样本不足
 
