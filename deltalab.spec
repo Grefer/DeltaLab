@@ -12,18 +12,34 @@ Outputs:
 
 import sys
 from pathlib import Path
-from PyInstaller.utils.hooks import collect_data_files, collect_submodules
+from PyInstaller.utils.hooks import (
+    collect_data_files,
+    collect_dynamic_libs,
+    collect_submodules,
+)
 
 ROOT = Path(SPECPATH).resolve()
 
 datas = []
 datas += [(str(ROOT / "assets"), "assets")]
 datas += collect_data_files("matplotlib")
+# numpy 2.x 把 numpy.core 改名为 numpy._core, 有些子模块 (如 _exceptions) 需要
+# 显式通过 data 文件形式带上元数据, 避免运行时 "No module named numpy._core._exceptions".
+datas += collect_data_files("numpy")
+
+binaries = []
+# 把 numpy/scipy/pandas/pyarrow 的 C 扩展 (.pyd/.so) 全部收齐, 防止漏掉某个
+# _multiarray_umath / _exceptions 之类的动态库.
+for _pkg in ("numpy", "scipy", "pandas", "pyarrow"):
+    binaries += collect_dynamic_libs(_pkg)
 
 hiddenimports = []
+# numpy 2.x 的私有子模块在模块图里常被遗漏, 强制全收.
+hiddenimports += collect_submodules("numpy")
 # scipy 有大量子模块通过字符串间接导入, 一次性收齐避免运行时 ImportError.
 hiddenimports += collect_submodules("scipy")
 # pandas / pyarrow 的 IO 后端
+hiddenimports += collect_submodules("pandas")
 hiddenimports += ["pyarrow", "pyarrow.parquet", "pyarrow.vendored.version"]
 # 项目内部的定价子模块 (通过字符串/懒加载使用)
 hiddenimports += collect_submodules("pricing")
@@ -40,7 +56,7 @@ block_cipher = None
 a = Analysis(
     ["gui_app.py"],
     pathex=[str(ROOT)],
-    binaries=[],
+    binaries=binaries,
     datas=datas,
     hiddenimports=hiddenimports,
     hookspath=[],
