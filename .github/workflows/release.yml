@@ -1,0 +1,99 @@
+name: Build & Release
+
+# 触发条件:
+#   - 推送形如 v1.2.3 的 tag 时自动构建并发布
+#   - 也支持在 Actions 页面手动触发 (workflow_dispatch) 做构建冒烟, 不发布
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write  # 创建 Release / 上传 Assets 需要
+
+jobs:
+  build:
+    name: Build ${{ matrix.label }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            label: windows-x86_64
+            artifact_glob: dist/DeltaLab
+            archive_ext: zip
+          - os: macos-14          # Apple Silicon (arm64)
+            label: macos-arm64
+            artifact_glob: dist/DeltaLab.app
+            archive_ext: zip
+          - os: macos-13          # Intel (x86_64)
+            label: macos-x86_64
+            artifact_glob: dist/DeltaLab.app
+            archive_ext: zip
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller==6.11.1
+
+      - name: Build with PyInstaller
+        run: pyinstaller --noconfirm deltalab.spec
+
+      # Windows: 压缩 dist/DeltaLab 整个目录为 zip
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $name = "DeltaLab-${{ github.ref_name }}-${{ matrix.label }}.zip"
+          Compress-Archive -Path dist/DeltaLab/* -DestinationPath $name
+          echo "ASSET_PATH=$name" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      # macOS: 对 .app 打 zip (用 ditto 保留 Bundle 权限)
+      - name: Package (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          NAME="DeltaLab-${{ github.ref_name }}-${{ matrix.label }}.zip"
+          # 去除 Gatekeeper 隔离标记 (用户侧首次打开时仍可能需要右键打开)
+          xattr -cr dist/DeltaLab.app || true
+          ditto -c -k --sequesterRsrc --keepParent dist/DeltaLab.app "$NAME"
+          echo "ASSET_PATH=$NAME" >> "$GITHUB_ENV"
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: DeltaLab-${{ matrix.label }}
+          path: ${{ env.ASSET_PATH }}
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub Release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: List downloaded artifacts
+        run: find artifacts -maxdepth 3 -type f
+
+      - name: Create / Update GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/**/*.zip
+          draft: false
+          prerelease: false
+          generate_release_notes: true

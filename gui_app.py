@@ -20,6 +20,12 @@ matplotlib.use("TkAgg")
 import matplotlib.pyplot as plt
 from matplotlib import font_manager
 
+
+def _resource_path(*parts: str) -> str:
+    # PyInstaller 解压到 sys._MEIPASS; 开发态以源文件所在目录为根.
+    base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(base, *parts)
+
 # ---- 跨平台中文字体设置 ----
 _SYSTEM = platform.system()
 if _SYSTEM == "Darwin":
@@ -374,9 +380,8 @@ class BacktestApp(tk.Tk):
 
     # ---- 窗口图标 ----
     def _apply_window_icon(self):
-        assets_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets")
-        ico_path = os.path.join(assets_dir, "deltalab.ico")
-        png_path = os.path.join(assets_dir, "deltalab.png")
+        ico_path = _resource_path("assets", "deltalab.ico")
+        png_path = _resource_path("assets", "deltalab.png")
 
         # Windows: .ico 在任务栏/标题栏表现最佳
         if _SYSTEM == "Windows" and os.path.exists(ico_path):

@@ -62,6 +62,28 @@ python gui_app.py
 4. 点击 **▶ 运行回测**
 5. 查看 `回测摘要` / `对冲图表` / `波动率分析` / `盈亏分布` 等标签页
 
+### 📦 下载预编译版本
+
+Windows / macOS 用户可直接从 [Releases](https://github.com/Grefer/DeltaLab/releases) 下载免安装包（无需 Python 环境）：
+
+- `DeltaLab-vX.Y.Z-windows-x86_64.zip` — 解压后双击 `DeltaLab.exe`
+- `DeltaLab-vX.Y.Z-macos-arm64.zip` — Apple Silicon (M 系列)
+- `DeltaLab-vX.Y.Z-macos-x86_64.zip` — Intel Mac
+
+> macOS 首次打开若提示"未知开发者"，请在 `访达 → 应用程序` 中 **右键 → 打开**，或在 `系统设置 → 隐私与安全性` 中允许。
+
+### 🔨 本地打包（可选）
+
+如需本地构建桌面分发包：
+
+```bash
+pip install pyinstaller
+pyinstaller --noconfirm deltalab.spec
+# 产物: dist/DeltaLab/ (Windows/Linux onedir) 或 dist/DeltaLab.app (macOS)
+```
+
+推送 `vX.Y.Z` 形式的 tag 会自动触发 [.github/workflows/release.yml](.github/workflows/release.yml)，在 Windows + macOS (arm64/x86_64) 三平台构建并发布到 GitHub Releases。
+
 ## 📁 项目结构
 
 ```

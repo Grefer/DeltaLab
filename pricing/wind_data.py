@@ -9,17 +9,25 @@ Wind 数据接口模块
 import functools
 import os
 import re
+import sys
 
 import numpy as np
 import pandas as pd
 
 
-# 缓存目录：data/cache
-_CACHE_DIR = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-    "data",
-    "cache",
-)
+# 缓存目录：开发态为 <repo>/data/cache; 打包后(PyInstaller 冻结)切换到
+# 用户主目录 ~/.deltalab/cache, 避免写入只读的 .app 包/安装目录.
+def _default_cache_dir() -> str:
+    if getattr(sys, "frozen", False):
+        return os.path.join(os.path.expanduser("~"), ".deltalab", "cache")
+    return os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        "data",
+        "cache",
+    )
+
+
+_CACHE_DIR = _default_cache_dir()
 
 
 # =============================================================================
