@@ -89,7 +89,13 @@ if _has_windpy:
     except Exception as _e:
         print(f"[deltalab.spec] collect_data_files(WindPy) 跳过: {_e!r}")
 
-    # (a) Wind 终端单文件形态: 手工扫 WindPy.__file__ 同目录里的原生库和附属 .py
+    # (a) Wind 终端单文件形态: 手工扫 WindPy.__file__ 同目录里的所有依赖
+    # 除 .exe (不要带 Wind 客户端本体) 外全部打入; 包括:
+    #   - *.dll / *.pyd : 原生库 -> binaries (放 bundle 根以便 DLL 搜索)
+    #   - WindPy.py     : 由 hiddenimports + module_collection_mode 处理, 跳过
+    #   - 其它 *.py     : WindPyEx / WindCommon 等附属模块 -> datas
+    #   - *.pth         : Wind 自定义路径配置, WindPy.py 初始化会读 -> datas
+    #   - *.ini/.dat/.cfg/.txt/.json/.xml 等杂项 -> 统一 datas
     _windpy_dir = _os.path.dirname(_os.path.abspath(_windpy_file)) if _windpy_file else None
     if _windpy_dir and _os.path.isdir(_windpy_dir):
         import glob as _glob
@@ -99,21 +105,35 @@ if _has_windpy:
                 continue
             _name = _os.path.basename(_path)
             _lower = _name.lower()
+            if _lower.endswith(".exe"):
+                continue  # 跳过 Wind 客户端可执行文件, 不该打进发布包
+            if _lower == "windpy.py":
+                continue  # 由 hiddenimports + module_collection_mode 处理
             if _lower.endswith((".dll", ".pyd", ".so", ".dylib")):
                 # 放 bundle 根目录; frozen 运行时 bundle 根在 DLL 搜索路径里,
                 # ctypes.CDLL("XxxCom.dll") 这种裸文件名才能找到.
                 binaries.append((_path, "."))
                 _extra_bins += 1
-            elif _lower.endswith(".py") and _lower != "windpy.py":
-                # WindPy.py 已由 hiddenimports=["WindPy"] 处理; 同目录其它附属
-                # 模块 (WindPyEx / WindCommon 之类) 作为数据文件放 bundle 根,
-                # 以便 WindPy.py 内部相对 import 能解析到.
+            else:
+                # 其它 .py / .pth / .ini / .dat / .cfg / .txt / .json 等全部
+                # 作为数据文件放 bundle 根. 和 WindPy.py 同目录, 相对路径解析
+                # (os.path.dirname(__file__)) 能找到.
                 datas.append((_path, "."))
                 _extra_datas += 1
         print(
             f"[deltalab.spec] 从 {_windpy_dir} 手工补齐: "
-            f"{_extra_bins} 个原生库 / {_extra_datas} 个附属 .py"
+            f"{_extra_bins} 个原生库 / {_extra_datas} 个附属资源"
         )
+
+    # 强制 WindPy.py 以 "松散 .py + PYZ .pyc" 两份形式存在:
+    # 默认 PyInstaller 只把 .py 编译进 PYZ 归档, 导致 WindPy.__file__ 指向的
+    # _MEIPASS/WindPy.py 在磁盘上并不存在, 内部 open(os.path.join(
+    # os.path.dirname(__file__), "WindPy.pth")) 会拿到一个不存在的路径.
+    # 用 "pyz+py" 让 PyInstaller 在 _MEIPASS 里同时放一份真实 WindPy.py,
+    # 相对路径解析与 Wind 安装目录里的行为一致.
+    _module_collection_mode = {"WindPy": "pyz+py"}
+else:
+    _module_collection_mode = {}
 
 excludes = [
     # 减小体积: 这些在 GUI 里用不到
@@ -124,6 +144,18 @@ excludes = [
 
 block_cipher = None
 
+# WindPy 专用 runtime hook: 在 import WindPy 之前在 _MEIPASS/site-packages/ 伪造
+# 一份 WindPy.pth, 让 WindPy.py 的 bootstrap 能定位到 WindPy.dll.
+# 仅当构建机检测到 WindPy 时才加载; 否则 runtime hook 本身是 no-op, 加不加无所谓,
+# 但为免 CI 打到不存在的文件, 还是按需加入.
+_runtime_hooks = []
+if _has_windpy:
+    _rthook = str(ROOT / "pyi_rth_windpy.py")
+    if _os.path.isfile(_rthook):
+        _runtime_hooks.append(_rthook)
+    else:
+        print(f"[deltalab.spec] 警告: {_rthook} 不存在, WindPy 可能无法在运行时加载 DLL")
+
 a = Analysis(
     ["gui_app.py"],
     pathex=[str(ROOT)],
@@ -132,12 +164,13 @@ a = Analysis(
     hiddenimports=hiddenimports,
     hookspath=[],
     hooksconfig={},
-    runtime_hooks=[],
+    runtime_hooks=_runtime_hooks,
     excludes=excludes,
     win_no_prefer_redirects=False,
     win_private_assemblies=False,
     cipher=block_cipher,
     noarchive=False,
+    module_collection_mode=_module_collection_mode,
 )
 
 pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
