@@ -27,9 +27,28 @@
 
 | 库 | 触发条件 | 不装时的影响 |
 |---|---|---|
-| `WindPy` | 在「数据来源」选 `Wind` | 选 Wind 模式运行时会抛 `ImportError`（提示见 `pricing/wind_data.py:125-129`），需安装 Wind 终端 + Python 插件，并已登录 |
+| `WindPy` | 在「数据来源」选 `Wind` | 选 Wind 模式运行时会抛 `ImportError`（提示见 [`pricing/wind_data.py`](../pricing/wind_data.py) 的 `_ensure_wind`），需安装 Wind 终端 + Python 插件，并已登录 |
 
 CSV 与模拟模式无 Wind 依赖，可在普通环境下完整使用。
+
+#### 让 PyInstaller 发布包支持 Wind
+
+默认 CI 产出的 zip 不带 WindPy（GitHub runners 上没有 Wind 终端）。若要让发布包支持 Wind 数据源，需要**在装有 Wind 终端且能 `python -c "import WindPy"` 的机器上本地打包**：
+
+```bash
+# 确认 WindPy 可用
+python -c "import WindPy; print(WindPy.__file__)"
+
+# 本地打包
+pyinstaller --noconfirm deltalab.spec
+```
+
+[deltalab.spec](../deltalab.spec) 的 WindPy 段会自动探测：
+
+- import 成功 → 打印 `[deltalab.spec] WindPy 已安装, 打入发布包`，并通过 `collect_submodules / collect_dynamic_libs / collect_data_files` 把 WindPy 一并收入 `dist/DeltaLab/`
+- import 失败 → 打印跳过原因，发布包仍可产出，只是 Wind 模式运行时会在 `_ensure_wind()` 里报错
+
+冻结构建运行时，`_ensure_wind()` 会把原始 ImportError / DLL 加载错误拼进异常文本，并在 `sys.frozen=True` 时追加一句"请在装有 Wind 终端的机器上重新打包"的提示，方便定位到底是 DLL 丢了还是终端没登录。
 
 ### 1.4 字体
 

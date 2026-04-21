@@ -128,18 +128,39 @@ def get_trading_minutes_per_day(code: str) -> int | None:
 
 
 def _ensure_wind():
-    """启动 Wind 连接，若未安装则抛出提示"""
+    """启动 Wind 连接，若未安装则抛出提示
+
+    在 PyInstaller 冻结构建里 WindPy 的导入报错往往是 DLL 加载失败
+    (Windows) 或 dylib 找不到 (macOS), 而非"模块缺失". 把原始异常接进
+    提示文本里, 让用户 / 开发者能直接看到底层错误再对症处理.
+    """
+    frozen = bool(getattr(sys, "frozen", False))
     try:
         from WindPy import w
-    except ImportError:
+    except Exception as e:
+        frozen_hint = ""
+        if frozen:
+            frozen_hint = (
+                "\n  [frozen build] 此发布包在构建时未成功打入 WindPy, 或者"
+                "运行机上缺少 Wind 终端 / 原生动态库. 请在装有 Wind 终端 + "
+                "`pip install WindPy` 的机器上重新执行 `pyinstaller "
+                "--noconfirm deltalab.spec`."
+            )
         raise ImportError(
             "未安装 WindPy，请安装 Wind 金融终端并配置 Python 插件。\n"
             "  pip install WindPy  或在 Wind 终端中设置 Python 接口。"
-        )
+            f"{frozen_hint}\n  原始错误: {type(e).__name__}: {e}"
+        ) from e
     if not w.isconnected():
         result = w.start()
-        if result.ErrorCode != 0:
-            raise ConnectionError(f"Wind 连接失败: {result.Data}")
+        if getattr(result, "ErrorCode", -1) != 0:
+            raise ConnectionError(
+                f"Wind 连接失败: ErrorCode={result.ErrorCode}, Data={result.Data}"
+                + (
+                    "\n  [frozen build] 请确认 Wind 终端已在本机启动并已登录."
+                    if frozen else ""
+                )
+            )
     return w
 
 
