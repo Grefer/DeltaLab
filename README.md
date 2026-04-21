@@ -73,18 +73,6 @@ Windows / macOS (Apple Silicon) 用户可直接从 [Releases](https://github.com
 >
 > Intel Mac 用户请从源码运行（见上方"启动 GUI"），仅需 `pip install -r requirements.txt && python gui_app.py`。
 
-### 🔨 本地打包（可选）
-
-如需本地构建桌面分发包：
-
-```bash
-pip install pyinstaller
-pyinstaller --noconfirm deltalab.spec
-# 产物: dist/DeltaLab/ (Windows/Linux onedir) 或 dist/DeltaLab.app (macOS)
-```
-
-推送 `vX.Y.Z` 形式的 tag 会自动触发 [.github/workflows/release.yml](.github/workflows/release.yml)，在 Windows + macOS (arm64/x86_64) 三平台构建并发布到 GitHub Releases。
-
 ## 📁 项目结构
 
 ```
