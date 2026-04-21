@@ -27,17 +27,13 @@ jobs:
             label: macos-arm64
             artifact_glob: dist/DeltaLab.app
             archive_ext: zip
-          - os: macos-13          # Intel (x86_64)
-            label: macos-x86_64
-            artifact_glob: dist/DeltaLab.app
-            archive_ext: zip
     runs-on: ${{ matrix.os }}
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Setup Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: "3.11"
           cache: pip
@@ -71,7 +67,7 @@ jobs:
           echo "ASSET_PATH=$NAME" >> "$GITHUB_ENV"
 
       - name: Upload workflow artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: DeltaLab-${{ matrix.label }}
           path: ${{ env.ASSET_PATH }}
@@ -83,7 +79,7 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v6
         with:
           path: artifacts
 

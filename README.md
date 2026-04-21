@@ -64,13 +64,14 @@ python gui_app.py
 
 ### 📦 下载预编译版本
 
-Windows / macOS 用户可直接从 [Releases](https://github.com/Grefer/DeltaLab/releases) 下载免安装包（无需 Python 环境）：
+Windows / macOS (Apple Silicon) 用户可直接从 [Releases](https://github.com/Grefer/DeltaLab/releases) 下载免安装包（无需 Python 环境）：
 
 - `DeltaLab-vX.Y.Z-windows-x86_64.zip` — 解压后双击 `DeltaLab.exe`
 - `DeltaLab-vX.Y.Z-macos-arm64.zip` — Apple Silicon (M 系列)
-- `DeltaLab-vX.Y.Z-macos-x86_64.zip` — Intel Mac
 
 > macOS 首次打开若提示"未知开发者"，请在 `访达 → 应用程序` 中 **右键 → 打开**，或在 `系统设置 → 隐私与安全性` 中允许。
+>
+> Intel Mac 用户请从源码运行（见上方"启动 GUI"），仅需 `pip install -r requirements.txt && python gui_app.py`。
 
 ### 🔨 本地打包（可选）
 
