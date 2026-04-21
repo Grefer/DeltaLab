@@ -12,6 +12,11 @@ on:
 permissions:
   contents: write  # 创建 Release / 上传 Assets 需要
 
+# 强制所有 JavaScript action 用 Node 24 运行, 消除 Node 20 弃用警告
+# (部分 action 如 upload-artifact@v5 内部仍用 Node 20, GitHub 2026-06 起默认切 Node 24)
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
 jobs:
   build:
     name: Build ${{ matrix.label }}
