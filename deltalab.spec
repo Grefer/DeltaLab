@@ -11,6 +11,15 @@ Outputs:
 """
 
 import sys
+
+# 让 spec 内的中文 print 在任意平台都可输出：Windows runner 默认 stdout 用
+# cp1252/charmap，遇中文会抛 UnicodeEncodeError 直接中断构建。强制切到 UTF-8。
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
+
 from pathlib import Path
 from PyInstaller.utils.hooks import (
     collect_data_files,
