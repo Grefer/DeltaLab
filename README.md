@@ -13,7 +13,7 @@
 
 ## ✨ 功能特性
 
-- **4 大类期权**：香草 (Vanilla)、累计 (Decumulator)、亚式 (Asian)、气囊 (Airbag)，共 13 种子类型
+- **5 大类期权**：香草 (Vanilla)、累计 (Decumulator)、亚式 (Asian)、气囊 (Airbag)、雪球 (Snowball)，共 14 种子类型
 - **3 种数据源**：蒙特卡洛模拟 / CSV 历史行情 / Wind API
 - **2 种对冲策略**：固定频率 (`fixed_freq`) / 波动率触发 (`sigma_band`)
 - **日内多频率**：支持 Daily / 60 min / 5 min / 1 min 级别的对冲模拟（`steps_per_day ∈ {1,4,48,240}`）
@@ -80,7 +80,7 @@ DeltaLab/
 ├── gui_app.py        # GUI 入口 (tkinter + matplotlib)
 ├── pricing/          # 核心定价与回测引擎 (期权类 / MC / HedgeBacktest)
 ├── tests/            # 测试
-├── data/cache/       # Wind 数据缓存 (运行时生成)
+├── data/             # 交易日历与 Wind 数据缓存 (运行时生成)
 ├── assets/           # 图标 / banner / 工作流示意图
 ├── tools/            # 资源生成脚本 (make_icon / make_banner / make_workflow)
 └── docs/             # 深度文档 (GUI_USAGE.md)
@@ -98,6 +98,7 @@ DeltaLab/
 | 累计期权 (Decumulator) | 9（回归 / 增强 / 固赔 等系列） | 蒙特卡洛 |
 | 亚式期权 (Asian) | 2（亚式, 增强亚式） | 蒙特卡洛 |
 | 气囊期权 (Airbag) | 1（气囊） | 蒙特卡洛 |
+| 雪球期权 (Snowball) | 1（雪球 / 反雪球） | 蒙特卡洛 |
 
 子类型完整清单与 payoff 公式见 [docs/GUI_USAGE.md §4.1](docs/GUI_USAGE.md)。
 

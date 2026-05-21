@@ -4,3 +4,7 @@ scipy>=1.7
 pandas>=1.3
 matplotlib>=3.5
 pyarrow>=14.0
+
+# 可选：仅用于刷新交易日历 data/tradingday.csv（缺失/过期时联网获取，非 Wind 接口）。
+# 仓库已预置该文件，日常离线运行无需安装。
+# akshare>=1.12

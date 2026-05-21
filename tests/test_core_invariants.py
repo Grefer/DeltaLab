@@ -27,12 +27,14 @@ from pricing.constants import ANNUAL_DAYS
 from pricing.hedge_backtest import (
     HedgeBacktest,
     _rescale_option_to_real_s0,
+    _format_rescale_info,
     _PRICE_FIELDS_BY_CLS,
 )
 from pricing.mc_engine import McGbmQ
 from pricing.Option_AB import Option_AB
 from pricing.Option_AS import Option_AS
 from pricing.Option_DE import Option_DE
+from pricing.Option_SNB import Option_SNB
 from pricing.Option_Vanilla import Option_Vanilla, blsprice
 
 
@@ -228,6 +230,130 @@ def test_rescale_option_ab_whitelist():
     # 白名单里声明的字段都在 info 里（s0 额外注入）
     for f in _PRICE_FIELDS_BY_CLS["Option_AB"]:
         assert f in info["fields"], f"白名单字段 {f} 未出现在 info"
+
+
+def test_rescale_option_snb_whitelist_scales_ko_vector():
+    """Snowball 实盘 rebase 应缩放 s00/K/KI/KO；KO 支持降敲序列。"""
+    opt = Option_SNB(
+        "Opt_Snowball", s00=100.0, s0=100.0, K=100.0, KI=80.0,
+        KO=[103.0, 102.0, 101.0], T=60, sigma=0.20,
+        coupon=0.15, coupon_ko=0.15, margin=1.0, act=1, cp=-1,
+        r=0.03, q=0.03, sr=[], ko_observ=[20, 40, 60], nPath=1000,
+    )
+
+    scaled, info = _rescale_option_to_real_s0(opt, real_s0=50.0)
+
+    assert abs(scaled.s0 - 50.0) < 1e-12
+    assert abs(scaled.s00 - 50.0) < 1e-12
+    assert abs(scaled.K - 50.0) < 1e-12
+    assert abs(scaled.KI - 40.0) < 1e-12
+    assert scaled.KO == [51.5, 51.0, 50.5]
+    assert opt.KO == [103.0, 102.0, 101.0]
+
+    for f in _PRICE_FIELDS_BY_CLS["Option_SNB"]:
+        assert f in info["fields"], f"白名单字段 {f} 未出现在 info"
+
+    text = _format_rescale_info(info)
+    assert "KO" in text and "[103.000000" in text and "[51.500000" in text
+
+
+def test_option_snb_first_observation_knockout_coupon_counts_one_day():
+    """第 1 个交易日敲出时应结算 1 天票息，而不是 0。"""
+    opt = Option_SNB(
+        "Opt_Snowball", s00=100.0, s0=100.0, K=100.0, KI=80.0,
+        KO=99.0, T=1, sigma=0.0, coupon=0.243, coupon_ko=0.243,
+        margin=1.0, act=1, cp=-1, r=0.0, q=0.0, sr=[],
+        ko_observ=[1], nPath=1000,
+    )
+
+    expected = 100.0 * 0.243 / ANNUAL_DAYS
+
+    assert abs(opt.get_price() - expected) < 1e-12
+    assert opt.knockout_event([100.0, 100.0], steps_per_day=1) == (1, expected)
+
+
+def test_option_snb_margin_call_mode_controls_knockin_loss_cap():
+    """追保不按保证金封顶；不追保才按 margin*s00 封顶，普通雪球/反雪球均一致。"""
+
+    def _price(cp, s0, ki, ko, margin, margin_call):
+        opt = Option_SNB(
+            "Opt_Snowball", s00=100.0, s0=s0, K=100.0, KI=ki, KO=ko,
+            T=1, sigma=0.0, coupon=0.0, coupon_ko=0.0,
+            margin=margin, act=1, cp=cp, r=0.0, q=0.0, sr=[],
+            ko_observ=[1], nPath=1000, margin_call=margin_call,
+        )
+        return opt.get_price()
+
+    # 雪球：终价 50，敲入且未敲出，原始亏损 = 50 - 100 = -50。
+    assert abs(_price(cp=-1, s0=50.0, ki=80.0, ko=999.0, margin=0.2, margin_call=True) + 50.0) < 1e-12
+    assert abs(_price(cp=-1, s0=50.0, ki=80.0, ko=999.0, margin=0.2, margin_call=False) + 20.0) < 1e-12
+
+    # 反雪球：终价 150，敲入且未敲出，原始亏损 = 100 - 150 = -50。
+    assert abs(_price(cp=1, s0=150.0, ki=120.0, ko=-999.0, margin=0.2, margin_call=True) + 50.0) < 1e-12
+    assert abs(_price(cp=1, s0=150.0, ki=120.0, ko=-999.0, margin=0.2, margin_call=False) + 20.0) < 1e-12
+
+
+def test_option_snb_negative_margin_raises():
+    """负保证金会把亏损错误封成收益，必须拒绝。"""
+    with pytest.raises(ValueError):
+        Option_SNB(
+            "Opt_Snowball", s00=100.0, s0=100.0, K=100.0, KI=80.0,
+            KO=103.0, T=1, sigma=0.0, coupon=0.0, coupon_ko=0.0,
+            margin=-0.2, act=1, cp=-1, r=0.0, q=0.0, sr=[],
+            ko_observ=[1], nPath=1000,
+        )
+
+
+def test_option_snb_no_margin_call_requires_positive_margin():
+    """不追保是有限损失结构，必须有正保证金比例定义封顶金额。"""
+    with pytest.raises(ValueError):
+        Option_SNB(
+            "Opt_Snowball", s00=100.0, s0=100.0, K=100.0, KI=80.0,
+            KO=103.0, T=1, sigma=0.0, coupon=0.0, coupon_ko=0.0,
+            margin=0.0, act=1, cp=-1, r=0.0, q=0.0, sr=[],
+            ko_observ=[1], nPath=1000, margin_call=False,
+        )
+
+
+def test_option_snb_validates_mc_path_count_and_observation_range():
+    """Snowball 参数错误应给出业务错误，而不是 NumPy 维度/下标异常。"""
+    odd_npath = Option_SNB(
+        "Opt_Snowball", s00=100.0, s0=100.0, K=100.0, KI=80.0,
+        KO=103.0, T=3, sigma=0.0, coupon=0.0, coupon_ko=0.0,
+        margin=0.2, act=1, cp=-1, r=0.0, q=0.0, sr=[],
+        ko_observ=[1, 2, 3], nPath=999, margin_call=False,
+    )
+    with pytest.raises(ValueError):
+        odd_npath.get_price()
+
+    bad_observ = Option_SNB(
+        "Opt_Snowball", s00=100.0, s0=100.0, K=100.0, KI=80.0,
+        KO=103.0, T=3, sigma=0.0, coupon=0.0, coupon_ko=0.0,
+        margin=0.2, act=1, cp=-1, r=0.0, q=0.0, sr=[],
+        ko_observ=[1, 4], nPath=1000, margin_call=False,
+    )
+    with pytest.raises(ValueError):
+        bad_observ.get_price()
+
+
+def test_run_multi_snowball_final_price_uses_knockout_endpoint():
+    """多路径统计中，雪球提前敲出路径的 final_price 应是敲出日价格。"""
+    opt = Option_SNB(
+        "Opt_Snowball", s00=100.0, s0=100.0, K=100.0, KI=80.0,
+        KO=101.0, T=3, sigma=0.0, coupon=0.0, coupon_ko=0.0,
+        margin=0.2, act=1, cp=-1, r=0.0, q=0.0, sr=[],
+        ko_observ=[1, 2, 3], nPath=1000, margin_call=False,
+    )
+    opt.greeks_nPath = 100
+    paths = np.array([[100.0, 100.0, 105.0, 80.0]])
+
+    bt = HedgeBacktest(opt, paths[0], hedge_freq=1, tc_rate=0.0,
+                       position=1, quantity=1.0, multiplier=0)
+    res = bt.run_multi(paths, max_workers=1)
+
+    assert res["knocked_out"][0]
+    assert res["ko_days"][0] == 2
+    assert abs(res["final_prices"][0] - 105.0) < 1e-12
 
 
 # ---------------------------------------------------------------------------

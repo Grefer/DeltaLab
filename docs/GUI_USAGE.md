@@ -131,7 +131,7 @@ python gui_app.py
 
 | 控件 | 选项 | 默认 | 说明 |
 |---|---|---|---|
-| `大类` | `香草期权 (Vanilla)` / `累计期权 (Decumulator)` / `亚式期权 (Asian)` / `气囊期权 (Airbag)` | `香草期权 (Vanilla)` | 见 `OPTION_CLASSES`，`gui_app.py:115` |
+| `大类` | `香草期权 (Vanilla)` / `累计期权 (Decumulator)` / `亚式期权 (Asian)` / `气囊期权 (Airbag)` / `雪球期权 (Snowball)` | `香草期权 (Vanilla)` | 见 `OPTION_CLASSES` |
 | `子类型` | 跟随大类切换 | 各大类的第一个 | 子类型驱动 `optiontype` 字段，决定走哪一种 payoff |
 
 各大类的子类型集（`gui_app.py:116-213`）：
@@ -140,6 +140,7 @@ python gui_app.py
 - **Decumulator**：`Opt_Decumulator_Back` / `Opt_Decumulator_Fix` / `Opt_EnDecumulator` / `Opt_EnDecumulator_Fix` / `Opt_ASGQ_call_put` / `Opt_ASGQ_EP` / `Opt_ASGQ_EF` / `Opt_ASGQ_DP` / `Opt_ASGQ_DF`
 - **Asian**：`Asian` / `EnhanceAsian`
 - **Airbag**：`Opt_Airbag`
+- **Snowball**：`Opt_Snowball`
 
 每个子类型的 payoff 公式见 `STRUCTURE_DOCS`（`gui_app.py:258` 起），也会在「结构分析」Tab 顶部展示。
 
@@ -214,6 +215,30 @@ python gui_app.py
 
 观察日默认取 `range(1, T_days+1)`（每日观察），见 `OPTION_CLASSES["气囊期权"]["build"]`（`gui_app.py:207`）。
 
+#### 雪球期权 (Snowball)
+
+| 参数 | 含义 | 类型 | 默认 |
+|---|---|---|---|
+| `s00` | 入场价 / 期初名义价格，票息与亏损封顶基准 | float | `100.0` |
+| `s0` | 当前价格 / 回测参考价 | float | `100.0` |
+| `K` | 敲入后到期亏损参考价，通常等于 `s00` | float | `100.0` |
+| `KI` | 敲入价，雪球向下敲入，反雪球向上敲入 | float | `80.0` |
+| `KO` | 期初敲出价，配合 `ko_step` 可形成降敲序列 | float | `103.0` |
+| `T` | 剩余期限（交易日） | int | `243` |
+| `first_obs_d` | 首次敲出观察日，支持预设或手填交易日数 | int | `63` |
+| `obs_period_d` | 敲出观察间隔，支持预设或手填交易日数 | int | `21` |
+| `ko_step` | 每个观察期 KO 递减点数，`0` 表示平敲 | float | `0.0` |
+| `sigma` | 波动率 | float | `0.15` |
+| `coupon` | 未敲入未敲出到期票息率（年化） | float | `0.15` |
+| `coupon_ko` | 敲出票息率（年化） | float | `0.15` |
+| `margin_call` | 保证金模式，下拉选择 `追保(亏损不封顶)` / `不追保(有限亏损)` | int | `1`（追保） |
+| `margin` | 不追保模式下最大亏损封顶比例，亏损封顶为 `margin × s00` | float | `0.2` |
+| `cp` | 方向，下拉选择 `雪球 (卖看跌)` / `反雪球 (卖看涨)`，内部映射为 `-1` / `1` | int | `-1` |
+| `r` / `q` | 利率 / 分红 | float | `0.03` / `0.03` |
+| `nPath` | MC 路径数，需为正偶数 | int | `20000` |
+
+GUI 当前使用交易日计息 (`act=1`)；敲入逐日观察，敲出按 `first_obs_d + obs_period_d` 生成观察日，并强制最后一次观察落在到期日。回测路径已知时，若观察日触发 KO，`HedgeBacktest` 会在敲出日提前截断并以敲出票息结算。
+
 ### 4.3 回测设置 — 数据来源
 
 `数据来源` 是单选 Radiobutton（`gui_app.py:740-745`），三选一：
@@ -257,7 +282,7 @@ python gui_app.py
 
 底层走 `HedgeBacktest.from_wind`（`hedge_backtest.py:977`），复权方式硬编码为 `"F"`（前复权）。
 
-> 真实行情模式下，期权参数中的 `s0` 视为「参考价 S_ref」；GUI/底层会按 `ratio = 真实首日价 / S_ref` 自动缩放 `K / KI / H / P / fix / amount` 等价格量纲字段，保证期权结构不被破坏。详细缩放表会展示在「回测摘要」Tab 中（由 `_show_summary` 渲染），逻辑在 `hedge_backtest.py:_rescale_option_to_real_s0`（`hedge_backtest.py:181`）。
+> 真实行情模式下，期权参数中的 `s0` 视为「参考价 S_ref」；GUI/底层会按 `ratio = 真实首日价 / S_ref` 自动缩放 `K / KI / H / P / fix / amount` 等价格量纲字段；雪球还会缩放 `s00 / K / KI / KO`，保证结构相对位置不被破坏。详细缩放表会展示在「回测摘要」Tab 中（由 `_show_summary` 渲染），逻辑在 `hedge_backtest.py:_rescale_option_to_real_s0`。
 
 ### 4.4 回测设置 — 对冲参数
 
@@ -460,6 +485,8 @@ GUI 与底层 `HedgeBacktest.__init__` 均默认 `合约乘数 = 5`（`hedge_bac
 - [`pricing/Option_AS.py`](../pricing/Option_AS.py) — 亚式期权
 - [`pricing/Option_AB.py`](../pricing/Option_AB.py) — 气囊期权
 - [`pricing/Option_DE.py`](../pricing/Option_DE.py) — 累计/熔断累计系列
+- [`pricing/Option_SNB.py`](../pricing/Option_SNB.py) — 雪球 / 反雪球
+- [`pricing/trade_calendar.py`](../pricing/trade_calendar.py) — 雪球自然日计息与观察日换算使用的离线优先交易日历
 - [`pricing/wind_data.py`](../pricing/wind_data.py) — Wind 数据接口（可选）
 - [`pricing/mc_engine.py`](../pricing/mc_engine.py) — GBM 路径生成引擎（`McGbmQ`，quasi-MC 反对称采样）
 - [`pricing/rolling_backtest.py`](../pricing/rolling_backtest.py) — 滚动回测（Phase 3）：按窗口滑动跑多期回测并汇总盈亏分布

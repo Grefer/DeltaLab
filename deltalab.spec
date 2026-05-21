@@ -22,6 +22,9 @@ ROOT = Path(SPECPATH).resolve()
 
 datas = []
 datas += [(str(ROOT / "assets"), "assets")]
+# 离线交易日历, 供雪球(Option_SNB)自然日计息/日期换算使用, 避免运行时依赖 Wind/akshare.
+if (ROOT / "data" / "tradingday.csv").exists():
+    datas += [(str(ROOT / "data" / "tradingday.csv"), "data")]
 datas += collect_data_files("matplotlib")
 # numpy 2.x 把 numpy.core 改名为 numpy._core, 有些子模块 (如 _exceptions) 需要
 # 显式通过 data 文件形式带上元数据, 避免运行时 "No module named numpy._core._exceptions".

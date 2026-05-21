@@ -109,7 +109,7 @@ plt.rcParams['axes.spines.right'] = False
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from pricing import (
-    Option_AB, Option_AS, Option_DE, Option_Vanilla, HedgeBacktest,
+    Option_AB, Option_AS, Option_DE, Option_SNB, Option_Vanilla, HedgeBacktest,
     FixedFreqStrategy, SigmaBandStrategy,
 )
 from pricing.constants import ANNUAL_DAYS
@@ -117,6 +117,36 @@ from pricing.constants import ANNUAL_DAYS
 # ============================================================
 #  期权类型注册表
 # ============================================================
+
+def _snowball_ko_observ(T, first_obs, period):
+    """按"锁定期 + 固定间隔 + 末次=到期"生成敲出观察交易日序号（1-based）。
+
+    全用交易日：首个观察在第 first_obs 日，其后每 period 个交易日一次，并
+    强制最后一次落在到期日 T（与到期不齐时末段为短桩）。返回升序去重列表。
+    """
+    T = int(T)
+    first_obs = max(1, int(first_obs))
+    period = max(1, int(period))
+    days = list(range(first_obs, T + 1, period))
+    if not days or days[-1] != T:
+        days.append(T)                         # 末次观察 = 到期
+    return sorted({d for d in days if 1 <= d <= T})
+
+
+def _build_snowball(st, p):
+    """构造雪球（act=1 交易日计息）。观察日按锁定期+固定间隔生成（全交易日口径）；
+    ko_step>0 时为降敲，KO 自期初值每观察日递减 ko_step 个点，得逐观察日 KO 向量。"""
+    T = int(p["T"])
+    ko_observ = _snowball_ko_observ(T, p["first_obs_d"], p["obs_period_d"])
+    step = float(p.get("ko_step", 0.0) or 0.0)
+    KO = [p["KO"] - step * i for i in range(len(ko_observ))] if step else p["KO"]
+    return Option_SNB(
+        st, p["s00"], p["s0"], p["K"], p["KI"], KO, T,
+        p["sigma"], p["coupon"], p["coupon_ko"], p["margin"], 1, p["cp"],
+        r=p["r"], q=p["q"], sr=[], ko_observ=ko_observ, nPath=p["nPath"],
+        margin_call=bool(p["margin_call"]),
+    )
+
 
 OPTION_CLASSES = {
     "香草期权 (Vanilla)": {
@@ -217,6 +247,39 @@ OPTION_CLASSES = {
             r=p["r"], q=p["q"], nPath=p["nPath"]
         ),
     },
+    "雪球期权 (Snowball)": {
+        "class": Option_SNB,
+        "subtypes": ["Opt_Snowball"],
+        "params": [
+            ("s00",        "入场价 S00",        float, 100.0),
+            ("s0",         "最新价 S0",         float, 100.0),
+            ("K",          "行权价",            float, 100.0),
+            ("KI",         "敲入价",            float, 80.0),
+            ("KO",         "期初敲出价",         float, 103.0),
+            ("T",          "剩余期限(交易日)",    int,   243),
+            # 锁定期/观察间隔：值用交易日(与引擎一致)，下拉给月度预设辅助输入，
+            # 可编辑——既能选预设也能手填自定义交易日数（21 交易日 ≈ 1 个月）。
+            ("first_obs_d","首次敲出观察",        int,   63,
+             {"锁1月 (21)": 21, "锁2月 (42)": 42, "锁3月 (63)": 63, "锁6月 (126)": 126},
+             {"editable": True}),
+            ("obs_period_d","观察间隔",          int,   21,
+             {"月度 (21)": 21, "双月 (42)": 42, "季度 (63)": 63, "半年 (126)": 126},
+             {"editable": True}),
+            ("ko_step",    "每期降敲(点,0=平敲)", float, 0.0),
+            ("sigma",      "波动率",            float, 0.15),
+            ("coupon",     "未敲出票息率(年化)",  float, 0.15),
+            ("coupon_ko",  "敲出票息率(年化)",    float, 0.15),
+            ("margin_call", "保证金模式",          int,   1, {"追保(亏损不封顶)": 1, "不追保(有限亏损)": 0}),
+            ("margin",     "保证金比例(不追保封顶)", float, 0.2),
+            ("cp",         "方向",             int,   -1, {"雪球 (卖看跌)": -1, "反雪球 (卖看涨)": 1}),
+            ("r",          "无风险利率",        float, 0.03),
+            ("q",          "分红率",            float, 0.03),
+            ("nPath",      "定价路径数 (MC)",    int,   20000),
+        ],
+        # act 固定为 1（交易日计息，无需交易日历）；观察日=锁定期+固定间隔+末次到期，
+        # ko_step>0 时为降敲（逐观察日 KO 递减），见 _build_snowball。
+        "build": _build_snowball,
+    },
 }
 
 
@@ -241,6 +304,7 @@ SUBTYPE_DISPLAY = {
     "Asian":                 "标准亚式 (Asian)",
     "EnhanceAsian":          "增强亚式 (EnhanceAsian)",
     "Opt_Airbag":            "气囊 (Opt_Airbag)",
+    "Opt_Snowball":          "雪球 (Opt_Snowball)",
 }
 SUBTYPE_FROM_DISPLAY = {v: k for k, v in SUBTYPE_DISPLAY.items()}
 
@@ -354,6 +418,18 @@ STRUCTURE_DOCS = {
         "  • 已敲入                    : pr_ki × (S_T − K)\n\n"
         "小幅下行时买方有软垫保护 (payoff=0 而非负);\n"
         "一旦跌破 KI, 转为线性承担下行, 即'气囊爆掉'."
+    ),
+    ("雪球期权 (Snowball)", "Opt_Snowball"): (
+        "【雪球期权 Opt_Snowball】 (cp=-1 雪球 / cp=1 反雪球)\n"
+        "MC 定价, 路径依赖, 四种到期情形:\n"
+        "  • 未敲入未敲出: 全期票息 s00 × coupon × 期限\n"
+        "  • 敲出 (观察日触 KO): 敲出票息 × 持有期, 提前了结\n"
+        "  • 敲入且敲出: 同敲出 (敲出优先)\n"
+        "  • 敲入未敲出: 追保=承担完整亏损; 不追保=亏损按 margin × s00 封顶\n\n"
+        "敲入逐日监测; 敲出按固定间隔观察 (首次=锁定期后, 末次=到期日).\n"
+        "每期降敲(ko_step>0)时 KO 自期初值逐期递减, 越往后越易敲出.\n"
+        "卖方 (持有者) 短 vega/gamma、正 theta; 现价 ↗ 近 KO 时\n"
+        "Delta 与 Gamma 易出现剧烈跳变 (敲出悬崖)."
     ),
 }
 
@@ -1079,26 +1155,70 @@ class BacktestApp(tk.Tk):
         for w in self._param_frame.winfo_children():
             w.destroy()
         self._param_entries = {}
+        self._param_widgets = {}
         for i, spec in enumerate(params):
             key, label, dtype, default = spec[:4]
             choices = spec[4] if len(spec) > 4 else None
-            ttk.Label(self._param_frame, text=f"{label}:",
-                      style="Surface.TLabel").grid(
+            meta = spec[5] if len(spec) > 5 else None
+            editable = bool(meta and meta.get("editable"))  # 可编辑下拉=预设+手填
+            label_widget = ttk.Label(self._param_frame, text=f"{label}:",
+                                     style="Surface.TLabel")
+            label_widget.grid(
                 row=i, column=0, sticky="w", padx=(2, 8), pady=3)
             if choices:
                 val_to_display = {v: k for k, v in choices.items()}
-                default_display = val_to_display.get(default, next(iter(choices)))
+                default_display = val_to_display.get(
+                    default, str(default) if editable else next(iter(choices)))
                 var = tk.StringVar(value=default_display)
                 cb = ttk.Combobox(self._param_frame, textvariable=var,
                                   values=list(choices.keys()),
-                                  state="readonly", width=14)
+                                  state="normal" if editable else "readonly",
+                                  width=14)
                 cb.grid(row=i, column=1, sticky="ew", pady=3, padx=(0, 2))
+                input_widget = cb
+                if key == "margin_call":
+                    cb.bind("<<ComboboxSelected>>",
+                            lambda _event: self._sync_snowball_margin_controls())
             else:
                 var = tk.StringVar(value=str(default))
                 entry = ttk.Entry(self._param_frame, textvariable=var, width=16)
                 entry.grid(row=i, column=1, sticky="ew", pady=3, padx=(0, 2))
+                input_widget = entry
             self._param_entries[key] = (var, dtype, choices)
+            self._param_widgets[key] = {
+                "label": label_widget,
+                "input": input_widget,
+                "base_label": label,
+                "choices": choices,
+            }
         self._param_frame.columnconfigure(1, weight=1)
+        self._sync_snowball_margin_controls()
+
+    def _sync_snowball_margin_controls(self):
+        """雪球保证金模式联动：追保时保证金比例不参与封顶，置灰避免误读。"""
+        if not hasattr(self, "_param_entries"):
+            return
+        if "margin_call" not in self._param_entries or "margin" not in self._param_entries:
+            return
+
+        mode_var, _, mode_choices = self._param_entries["margin_call"]
+        selected = mode_var.get().strip()
+        margin_call = bool(mode_choices.get(selected, 1)) if mode_choices else True
+
+        margin_widgets = getattr(self, "_param_widgets", {}).get("margin", {})
+        label_widget = margin_widgets.get("label")
+        input_widget = margin_widgets.get("input")
+        if input_widget is None:
+            return
+
+        if margin_call:
+            input_widget.configure(state="disabled")
+            if label_widget is not None:
+                label_widget.configure(text="保证金比例(追保下不封顶):")
+        else:
+            input_widget.configure(state="normal")
+            if label_widget is not None:
+                label_widget.configure(text="保证金比例(最大亏损):")
 
     def _toggle_source(self):
         src = self._source_var.get()
@@ -1184,8 +1304,11 @@ class BacktestApp(tk.Tk):
         params = {}
         for key, (var, dtype, choices) in self._param_entries.items():
             val_str = var.get().strip()
-            if choices:
-                params[key] = choices[val_str]
+            if choices and val_str in choices:
+                params[key] = choices[val_str]          # 选了预设项
+            elif choices:
+                # 可编辑下拉里手填的自定义值：按 dtype 解析
+                params[key] = float(val_str) if dtype == float else int(val_str)
             elif not val_str:
                 params[key] = 0
             elif dtype == float:
@@ -1194,6 +1317,13 @@ class BacktestApp(tk.Tk):
                 params[key] = int(val_str)
             else:
                 params[key] = val_str
+
+        if cls_name == "雪球期权 (Snowball)":
+            margin = float(params.get("margin", 0.0))
+            if margin < 0:
+                raise ValueError("保证金比例必须 >= 0。")
+            if not bool(params.get("margin_call", 1)) and margin <= 0:
+                raise ValueError("不追保模式必须设置正的保证金比例，用于定义最大亏损封顶。")
 
         return {
             "cls_name": cls_name,
@@ -1501,6 +1631,9 @@ class BacktestApp(tk.Tk):
         _sep()
 
         _kv("回测天数        ", f"{n:>10d}")
+        if r.get("knocked_out"):
+            _kv("敲出了结        ", f"第 {r['ko_day']} 日敲出, 结算票息 {r['ko_settle']:.4f}",
+                "value_pos")
         for sl in strategy_lines:
             _ins(sl + "\n", "label")
         _kv("交易成本率      ", f"{bt.tc_rate * 100:.2f}%")
@@ -1524,10 +1657,21 @@ class BacktestApp(tk.Tk):
                 f"S_real={rescale_info['s_real']:.4f}   "
                 f"ratio={rescale_info['ratio']:.6f}\n", "label"
             )
+
+            def _fmt_rescale(v):
+                if isinstance(v, (list, tuple, np.ndarray)):
+                    arr = np.asarray(v, dtype=float).reshape(-1)
+                    if arr.size > 6:
+                        head = ", ".join(f"{x:.4f}" for x in arr[:3])
+                        tail = ", ".join(f"{x:.4f}" for x in arr[-2:])
+                        return f"[{head}, ..., {tail}]"
+                    return "[" + ", ".join(f"{x:.4f}" for x in arr) + "]"
+                return f"{float(v):.4f}"
+
             for name, (old, new) in rescale_info["fields"].items():
                 if name in ("s0", "sr"):
                     continue
-                _ins(f"    {name:<8s}: {old:>12.4f}  →  {new:.4f}\n")
+                _ins(f"    {name:<8s}: {_fmt_rescale(old):>12s}  →  {_fmt_rescale(new)}\n")
             _sep()
 
         _kv("期权初始价值    ", f"{r['opt_value'][0]:>12.4f}")
@@ -1601,6 +1745,13 @@ class BacktestApp(tk.Tk):
             _kv("已实现波动率均值", f"{np.mean(ms['realized_vols']) * 100:>11.2f}%")
             _kv("已实现波动率标准差", f"{np.std(ms['realized_vols']) * 100:>11.2f}%")
             _sep()
+            if meta.get("cls_name") == "雪球期权 (Snowball)" and "knocked_out" in ms:
+                ko_flags = np.asarray(ms["knocked_out"], dtype=bool)
+                _section("【雪球敲出】")
+                _kv("敲出路径占比    ", f"{np.mean(ko_flags) * 100:>11.2f}%")
+                if np.any(ko_flags) and "ko_days" in ms:
+                    _kv("平均敲出日      ", f"{np.nanmean(ms['ko_days']):>12.2f}")
+                _sep()
             _kv("平均交易成本    ", f"{np.mean(ms['total_tc']):>12.4f}", "value_neg")
             _ins("═" * 54 + "\n", "separator")
 

@@ -67,6 +67,16 @@ class OptionBase:
         # 跨日后重置日内 elapsed，避免 bump copy 继承残值
         self._intraday_elapsed = 0.0
 
+    def knockout_event(self, prices, steps_per_day=1):
+        """提前了结（敲出）检测钩子，供对冲回测在已知价格路径时截断存续期。
+
+        默认返回 None（普通期权不会提前了结）。路径依赖且带敲出观察的结构
+        （如雪球 Option_SNB）可重写：给定回测价格路径 prices（prices[0]=今日）
+        与 steps_per_day，返回 (i_ko, settle_value)——i_ko 为 prices 中触发敲出
+        的索引，settle_value 为敲出当日的结算价值（之后不再有现金流）。
+        """
+        return None
+
     def _bumped_copy(self, **overrides):
         """创建参数副本用于 bump-and-reprice，不修改原对象状态。
 

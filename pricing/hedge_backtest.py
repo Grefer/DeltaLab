@@ -175,6 +175,7 @@ _PRICE_FIELDS_BY_CLS = {
     "Option_AB":      ("K", "KI"),
     "Option_AS":      ("K", "E", "minPay", "maxPay"),
     "Option_DE":      ("K", "H", "P", "fix", "amount"),
+    "Option_SNB":     ("s00", "K", "KI", "KO"),
 }
 
 
@@ -234,6 +235,21 @@ def _rescale_option_to_real_s0(option, real_s0):
         old = getattr(opt, name)
         if old is None:
             continue
+        if isinstance(old, (list, tuple, np.ndarray)):
+            try:
+                old_arr = np.asarray(old, dtype=float)
+            except (TypeError, ValueError):
+                continue
+            if old_arr.size == 0 or not np.all(np.isfinite(old_arr)):
+                continue
+            new_arr = old_arr * ratio
+            if isinstance(old, np.ndarray):
+                new = new_arr
+            else:
+                new = new_arr.tolist()
+            setattr(opt, name, new)
+            info["fields"][name] = (old, new)
+            continue
         # maxPay 用 float('inf') 占位时无需缩放
         try:
             old_f = float(old)
@@ -250,6 +266,16 @@ def _rescale_option_to_real_s0(option, real_s0):
 
 def _format_rescale_info(info):
     """把 _rescale_option_to_real_s0 返回的 info 渲染成可读多行字符串。"""
+    def _fmt(v):
+        if isinstance(v, (list, tuple, np.ndarray)):
+            arr = np.asarray(v, dtype=float).reshape(-1)
+            if arr.size > 6:
+                head = ", ".join(f"{x:.6f}" for x in arr[:3])
+                tail = ", ".join(f"{x:.6f}" for x in arr[-2:])
+                return f"[{head}, ..., {tail}]"
+            return "[" + ", ".join(f"{x:.6f}" for x in arr) + "]"
+        return f"{float(v):.6f}"
+
     lines = [
         f"[期权要素伸缩] {info['cls']}  S_ref={info['s_ref']:.4f} -> "
         f"S_real={info['s_real']:.4f}  ratio={info['ratio']:.6f}"
@@ -259,7 +285,7 @@ def _format_rescale_info(info):
             n = len(old) if hasattr(old, "__len__") else 0
             lines.append(f"  - sr (历史 {n} 个) 已按比例搬运")
             continue
-        lines.append(f"  - {name:<8s}: {old:>14.6f} -> {new:.6f}")
+        lines.append(f"  - {name:<8s}: {_fmt(old):>14s} -> {_fmt(new)}")
     return "\n".join(lines)
 
 
@@ -294,8 +320,10 @@ def _run_single_path(args):
         'hedging_error': res['hedging_error'],
         'final_pnl': res['cumulative_pnl'][-1],
         'total_tc': res['total_tc'],
-        'final_price': price_path[-1],
+        'final_price': res['prices'][-1],
         'realized_vol': res['realized_vol'],
+        'knocked_out': res.get('knocked_out', False),
+        'ko_day': res.get('ko_day'),
     }
 
 
@@ -439,6 +467,19 @@ class HedgeBacktest:
         dt = 1.0 / ANNUAL_DAYS  # 日粒度（兼容旧字段）
         pos = self.position
 
+        # ---- 敲出提前了结：路径已知时把存续期截断到敲出日 ----
+        # 仅当期权实现了 knockout_event 且检测到敲出时生效（默认 None=不截断），
+        # 普通期权行为完全不变。截断后该日即为新"到期日"，结算价值取敲出票息。
+        ko_settle = None
+        ko_event = None
+        ko_fn = getattr(option, "knockout_event", None)
+        if callable(ko_fn):
+            ko_event = ko_fn(S, spd)
+        if ko_event is not None:
+            i_ko, ko_settle = ko_event
+            S = S[:i_ko + 1]
+            n = len(S) - 1
+
         # 存储数组
         V = np.zeros(n + 1)        # 期权理论价值
         delta = np.zeros(n + 1)    # Delta
@@ -546,6 +587,12 @@ class HedgeBacktest:
                 delta[i] = gamma[i] = vega[i] = theta[i] = rho[i] = 0.0
             else:
                 V[i] = delta[i] = gamma[i] = vega[i] = theta[i] = rho[i] = 0.0
+
+            # 敲出日（截断后的末日）：用敲出结算票息覆盖 MC 价值，Greeks 归零
+            # （期权已了结，下方 i==n 分支会平掉对冲头寸）。
+            if ko_settle is not None and i == n:
+                V[i] = ko_settle
+                delta[i] = gamma[i] = vega[i] = theta[i] = rho[i] = 0.0
 
             H[i] = H[i - 1]
 
@@ -656,6 +703,11 @@ class HedgeBacktest:
             'n_bars': n,
             'steps_per_day': spd,
             'n_trade_days': n // spd if spd > 0 else n,
+            # 敲出提前了结标记：knocked_out=True 时回测在 ko_day（交易日）截断，
+            # ko_settle 为敲出当日结算票息（普通期权恒为 False/None）。
+            'knocked_out': ko_settle is not None,
+            'ko_day': (n // spd if spd > 0 else n) if ko_settle is not None else None,
+            'ko_settle': ko_settle,
             'hedge_triggered': hedge_triggered,
             'strategy_name': getattr(self.strategy, 'name', 'unknown'),
             'prices': S,
@@ -904,6 +956,8 @@ class HedgeBacktest:
             final_prices   : ndarray — 每条路径的到期标的价格
             implied_vol    : float   — 隐含波动率
             realized_vols  : ndarray — 每条路径的已实现波动率（年化）
+            knocked_out    : ndarray — 每条路径是否提前敲出
+            ko_days        : ndarray — 提前敲出路径的敲出日，否则 NaN
         """
         n = len(paths)
         errors = np.zeros(n)
@@ -911,6 +965,8 @@ class HedgeBacktest:
         total_tc = np.zeros(n)
         final_prices = np.zeros(n)
         realized_vols = np.zeros(n)
+        knocked_out = np.zeros(n, dtype=bool)
+        ko_days = np.full(n, np.nan)
         implied_vol = self.option_init.sigma
 
         if max_workers is None:
@@ -939,6 +995,9 @@ class HedgeBacktest:
                 total_tc[idx] = res['total_tc']
                 final_prices[idx] = res['final_price']
                 realized_vols[idx] = res['realized_vol']
+                knocked_out[idx] = bool(res.get('knocked_out', False))
+                if res.get('ko_day') is not None:
+                    ko_days[idx] = float(res['ko_day'])
                 completed += 1
                 if progress_callback:
                     progress_callback(completed, n)
@@ -951,6 +1010,8 @@ class HedgeBacktest:
             'final_prices': final_prices,
             'implied_vol': implied_vol,
             'realized_vols': realized_vols,
+            'knocked_out': knocked_out,
+            'ko_days': ko_days,
         }
 
     def plot_error_dist(self, errors, figsize=(10, 5)):
