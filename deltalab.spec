@@ -179,7 +179,8 @@ a = Analysis(
 pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
 
 _is_windows = sys.platform.startswith("win")
-_icon_path = str(ROOT / "assets" / ("deltalab.ico" if _is_windows else "deltalab.png"))
+_is_macos = sys.platform == "darwin"
+_icon_path = str(ROOT / "assets" / ("deltalab.ico" if _is_windows else "deltalab.icns" if _is_macos else "deltalab.png"))
 
 exe = EXE(
     pyz,
@@ -216,7 +217,7 @@ if sys.platform == "darwin":
     app = BUNDLE(
         coll,
         name="DeltaLab.app",
-        icon=str(ROOT / "assets" / "deltalab.png"),
+        icon=str(ROOT / "assets" / "deltalab.icns"),
         bundle_identifier="com.deltalab.app",
         info_plist={
             "CFBundleName": "DeltaLab",

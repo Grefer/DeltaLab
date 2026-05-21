@@ -457,7 +457,9 @@ class BacktestApp(tk.Tk):
     # ---- 窗口图标 ----
     def _apply_window_icon(self):
         ico_path = _resource_path("assets", "deltalab.ico")
-        png_path = _resource_path("assets", "deltalab.png")
+        # 带透明边距的图标 (符合 macOS 网格), 直接运行脚本时 Dock 图标不会过大
+        padded_path = _resource_path("assets", "deltalab_padded.png")
+        png_path = padded_path if os.path.exists(padded_path) else _resource_path("assets", "deltalab.png")
 
         # Windows: .ico 在任务栏/标题栏表现最佳
         if _SYSTEM == "Windows" and os.path.exists(ico_path):
