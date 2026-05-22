@@ -170,10 +170,11 @@ OPTION_CLASSES = {
     "累计期权 (Decumulator)": {
         "class": Option_DE,
         "subtypes": [
-            "Opt_Decumulator_Back", "Opt_Decumulator_Fix",
+            "Opt_Decumulator", "Opt_Decumulator_Back",
+            "Opt_Decumulator_Fix", "Opt_Decumulator_Fix_E",
             "Opt_EnDecumulator", "Opt_EnDecumulator_Fix",
-            "Opt_ASGQ_call_put", "Opt_ASGQ_EP", "Opt_ASGQ_EF",
-            "Opt_ASGQ_DP", "Opt_ASGQ_DF",
+            "Opt_ASGQ_call_put", "Opt_ASGQ_EP", "Opt_ASGQ_EF", "Opt_ASGQ_EFF",
+            "Opt_ASGQ_DP", "Opt_ASGQ_DF", "Opt_ASGQ_DFF",
         ],
         "params": [
             ("s0",     "初始价格 S0",    float, 100.0),
@@ -292,15 +293,19 @@ OPTION_CLASSES = {
 
 SUBTYPE_DISPLAY = {
     "Eu":                    "欧式 (Eu)",
+    "Opt_Decumulator":       "普通累计 (Opt_Decumulator)",
     "Opt_Decumulator_Back":  "回归累计 (Opt_Decumulator_Back)",
     "Opt_Decumulator_Fix":   "固定赔付回归累计 (Opt_Decumulator_Fix)",
+    "Opt_Decumulator_Fix_E": "固赔到期结算累计 (Opt_Decumulator_Fix_E)",
     "Opt_EnDecumulator":     "增强回归累计 (Opt_EnDecumulator)",
     "Opt_EnDecumulator_Fix": "固定赔付增强累计 (Opt_EnDecumulator_Fix)",
     "Opt_ASGQ_call_put":     "到期熔断保障累计 (Opt_ASGQ_call_put)",
     "Opt_ASGQ_EP":           "熔断每日保障累计 (Opt_ASGQ_EP)",
     "Opt_ASGQ_EF":           "熔断每日固赔累计 (Opt_ASGQ_EF)",
+    "Opt_ASGQ_EFF":          "熔断每日双固赔累计 (Opt_ASGQ_EFF)",
     "Opt_ASGQ_DP":           "每日熔断保障累计 (Opt_ASGQ_DP)",
     "Opt_ASGQ_DF":           "每日熔断固赔累计 (Opt_ASGQ_DF)",
+    "Opt_ASGQ_DFF":          "每日熔断双固赔累计 (Opt_ASGQ_DFF)",
     "Asian":                 "标准亚式 (Asian)",
     "EnhanceAsian":          "增强亚式 (EnhanceAsian)",
     "Opt_Airbag":            "气囊 (Opt_Airbag)",
@@ -336,6 +341,15 @@ STRUCTURE_DOCS = {
         "  Vega 对 ATM 最敏感, 随 √T 增长\n"
         "  Theta 为买方持续付出的时间价值"
     ),
+    ("累计期权 (Decumulator)", "Opt_Decumulator"): (
+        "【普通累计 Opt_Decumulator】\n"
+        "每日观察 + 每日结算, 敲出即终止存续:\n"
+        "  • 首次 S ≥ H (敲出): 当日及之后均停止累计\n"
+        "  • K < S < H       :  1 倍 (S − K) 结算\n"
+        "  • S ≤ K           :  N 倍杠杆 (S − K) 结算\n\n"
+        "与 Back 的差异: Back 敲出仅当日计 0、后续仍继续观察;\n"
+        "本结构敲出即彻底了结, 路径依赖更强."
+    ),
     ("累计期权 (Decumulator)", "Opt_Decumulator_Back"): (
         "【回归累计 Opt_Decumulator_Back】\n"
         "每日观察 + 每日结算, 三段式 cashflow:\n"
@@ -351,6 +365,14 @@ STRUCTURE_DOCS = {
         "  • K < S < H 区间按固定金额 `fix` 结算, 而非 (S−K)\n"
         "  • 敲出段/杠杆段逻辑不变\n\n"
         "锁定中间段现金流, 便于账务管理."
+    ),
+    ("累计期权 (Decumulator)", "Opt_Decumulator_Fix_E"): (
+        "【固赔到期结算累计 Opt_Decumulator_Fix_E】\n"
+        "结构同 Fix, 差异在杠杆段结算方式:\n"
+        "  • K ≤ S < H 区间: 每日固定金额 `fix`\n"
+        "  • 杠杆段 (S ≤ K): 不每日结算, 仅按到期日收盘价\n"
+        "    一次性结算 (S_T − K) × 累计天数 × N\n\n"
+        "适合到期一次性交割杠杆腿的固赔回归累计."
     ),
     ("累计期权 (Decumulator)", "Opt_EnDecumulator"): (
         "【增强回归累计 Opt_EnDecumulator】\n"
@@ -383,6 +405,15 @@ STRUCTURE_DOCS = {
         "  • 未熔断部分: 按日 (S − K) 累加\n"
         "  • 熔断日起  : 每日固定金额 `amount`"
     ),
+    ("累计期权 (Decumulator)", "Opt_ASGQ_EFF"): (
+        "【熔断每日双固赔累计 ASGQ_EFF】\n"
+        "到期观察 + 每日结算, 双固定赔付:\n"
+        "  • K < S < H (区间): 每日固定金额 `fix`\n"
+        "  • S ≤ K           : 每日 (S − K) 1 倍\n"
+        "  • 熔断日起        : 每日固定金额 `amount`\n"
+        "  • 到期 S_T ≤ K 且未熔断: 额外结算\n"
+        "    (S_T − K) × 累计天数 × (N − 1) 杠杆腿"
+    ),
     ("累计期权 (Decumulator)", "Opt_ASGQ_DP"): (
         "【每日观察熔断保障累计 ASGQ_DP】\n"
         "每日观察 + 每日结算:\n"
@@ -394,6 +425,13 @@ STRUCTURE_DOCS = {
         "【每日观察熔断固定赔付累计 ASGQ_DF】\n"
         "  • 未熔断: (S − K), S ≤ K 时 N 倍\n"
         "  • 熔断日起: 每日固定金额 `amount`"
+    ),
+    ("累计期权 (Decumulator)", "Opt_ASGQ_DFF"): (
+        "【每日熔断双固赔累计 ASGQ_DFF】\n"
+        "每日观察 + 每日结算, 双固定赔付:\n"
+        "  • K < S < H (区间): 每日固定金额 `fix`\n"
+        "  • S ≤ K           : (S − K) N 倍\n"
+        "  • 熔断日起        : 每日固定金额 `amount`"
     ),
     ("亚式期权 (Asian)", "Asian"): (
         "【亚式期权 Asian】\n"

@@ -83,6 +83,51 @@ class Option_DE(OptionBase):
         self.T_days -= 1
         self.T_over += 1
 
+    # 普通累计（非回归，敲出即终止存续）
+    def Opt_Decumulator(self) -> float:
+
+        T = self.T_days / annual_days
+        nStep = self.T_days
+        dt = 1 / annual_days
+        sr = np.array(self.sr)
+        observ = np.array(self.observ)
+        le = len(observ)
+        if self.T_days == 0:
+            condition_ko = np.zeros(le, dtype=bool)
+            flag_N = np.ones(le, dtype=int)
+            if self.cp == 1:
+                # 敲出当日及之后均不再累计（对应 MATLAB 中的 break）
+                condition_ko[np.cumsum(sr >= self.H) > 0] = 1
+                flag_N[sr <= self.K] = self.N
+                cashflow = (sr - self.K) * flag_N * ~condition_ko
+            else:
+                condition_ko[np.cumsum(sr <= self.H) > 0] = 1
+                flag_N[sr >= self.K] = self.N
+                cashflow = (self.K - sr) * flag_N * ~condition_ko
+
+            price = np.sum(cashflow)
+
+        else:
+            condition_ko = np.zeros([self.nPath, le], dtype=bool)
+            flag_N = np.ones([self.nPath, le], dtype=int)
+            discount_factor = np.tile(np.exp(-self.r * (np.maximum(observ - self.T_over, 0)) * dt), (self.nPath, 1))
+            S = McGbmQ(self.s0, self.r - self.q, self.sigma, T, self.nPath, nStep,
+                       seed=self.mc_seed)
+            ss = np.c_[np.tile(sr, (self.nPath, 1)), S]
+            if self.cp == 1:
+                condition_ko[np.cumsum(ss >= self.H, axis=1) > 0] = 1
+                flag_N[ss <= self.K] = self.N
+                cashflow = (ss - self.K) * flag_N * ~condition_ko * discount_factor
+            else:
+                condition_ko[np.cumsum(ss <= self.H, axis=1) > 0] = 1
+                flag_N[ss >= self.K] = self.N
+                cashflow = (self.K - ss) * flag_N * ~condition_ko * discount_factor
+
+            price_ls = np.sum(cashflow, 1)
+            price = np.mean(price_ls, 0)
+
+        return price
+
     # 回归累计
     def Opt_Decumulator_Back(self) -> float:
 
@@ -167,6 +212,58 @@ class Option_DE(OptionBase):
                 flag_N[ss <= self.H] = 0
                 flag_N[ss >= self.K] = self.N
                 cashflow = (self.fix * flag_N * ~idx_N + (self.K - ss) * flag_N * idx_N) * discount_factor
+
+            price_ls = np.sum(cashflow, 1)
+            price = np.mean(price_ls, 0)
+
+        return price
+
+    # 区间固定赔付回归累计（杠杆腿到期日观察、到期结算）
+    def Opt_Decumulator_Fix_E(self) -> float:
+
+        T = self.T_days / annual_days
+        nStep = self.T_days
+        dt = 1 / annual_days
+        sr = np.array(self.sr)
+        observ = np.array(self.observ)
+        le = len(observ)
+        if self.T_days == 0:
+            flag = np.ones(le)
+            flag_ki = np.zeros(le)
+            if self.cp == 1:
+                flag[sr >= self.H] = 0
+                flag[sr < self.K] = 0
+                flag_ki[-1] = sr[-1] < self.K
+                cashflow = self.fix * flag + (sr[-1] - self.K) * le * flag_ki * self.N
+            else:
+                flag[sr <= self.H] = 0
+                flag[sr > self.K] = 0
+                flag_ki[-1] = sr[-1] > self.K
+                cashflow = self.fix * flag + (self.K - sr[-1]) * le * flag_ki * self.N
+
+            price = np.sum(cashflow)
+
+        else:
+            flag = np.ones([self.nPath, le])
+            flag_ki = np.zeros([self.nPath, le])
+            discount_factor = np.tile(np.exp(-self.r * (np.maximum(observ - self.T_over, 0)) * dt), (self.nPath, 1))
+            S = McGbmQ(self.s0, self.r - self.q, self.sigma, T, self.nPath, nStep,
+                       seed=self.mc_seed)
+            ss = np.c_[np.tile(sr, (self.nPath, 1)), S]
+            if self.cp == 1:
+                flag[ss >= self.H] = 0
+                flag[ss < self.K] = 0
+                flag_ki[:, -1] = ss[:, -1] < self.K
+                cashflow = (self.fix * flag
+                            + (ss[:, -1] - self.K).reshape(self.nPath, 1) * le * flag_ki * self.N) * discount_factor
+            else:
+                # 注意：MATLAB 原版此处 cp==-1 分支与 cp==1 条件完全一致（疑似复制粘贴遗漏），
+                # 会导致累沽（cp==-1）的 fix 永不赔付。此处按到期分支与 cp==1 对称修正。
+                flag[ss <= self.H] = 0
+                flag[ss > self.K] = 0
+                flag_ki[:, -1] = ss[:, -1] > self.K
+                cashflow = (self.fix * flag
+                            + (self.K - ss[:, -1]).reshape(self.nPath, 1) * le * flag_ki * self.N) * discount_factor
 
             price_ls = np.sum(cashflow, 1)
             price = np.mean(price_ls, 0)
@@ -570,6 +667,136 @@ class Option_DE(OptionBase):
                 flag_N[(ss >= self.K) * ~condition_ko] = 1
                 cashflow = ((self.amount * condition_ko + (self.K - ss) * ~condition_ko) * (
                         flag_N * self.N + ~flag_N * 1)) * discount_factor
+
+            price_ls = np.sum(cashflow, 1)
+            price = np.mean(price_ls, 0)
+
+        return price
+
+
+    # 每日观察熔断·区间固定赔付 + 熔断后固定赔付累计（每日结算）
+    # fix    : 区间内（K~H）每日固定赔付
+    # amount : 熔断后每日固定赔付
+    def Opt_ASGQ_DFF(self) -> float:
+
+        T = self.T_days / annual_days
+        nStep = self.T_days
+        dt = 1 / annual_days
+        sr = np.array(self.sr)
+        observ = np.array(self.observ)
+        le = len(observ)
+
+        # 是否熔断提前结束
+        if self.cp == 1 and any(sr >= self.H):
+            idx = np.where(sr >= self.H)[0][0]
+            flag_N = sr[:idx] <= self.K
+            price = np.sum((sr[:idx] - self.K) * flag_N * self.N + self.fix * ~flag_N) + self.amount * (le - idx)
+            return price
+        elif self.cp == -1 and any(sr <= self.H):
+            idx = np.where(sr <= self.H)[0][0]
+            flag_N = sr[:idx] >= self.K
+            price = np.sum((self.K - sr[:idx]) * flag_N * self.N + self.fix * ~flag_N) + self.amount * (le - idx)
+            return price
+
+        # 交易是否到期
+        if self.T_days == 0:
+
+            if self.cp == 1:
+                flag_N = sr <= self.K
+                price = np.sum((sr - self.K) * flag_N * self.N + self.fix * ~flag_N)
+            else:
+                flag_N = sr >= self.K
+                price = np.sum((self.K - sr) * flag_N * self.N + self.fix * ~flag_N)
+
+        else:
+            condition_ko = np.zeros([self.nPath, le], dtype=bool)
+            discount_factor = np.tile(np.exp(-self.r * (np.maximum(observ - self.T_over, 0)) * dt), (self.nPath, 1))
+            S = McGbmQ(self.s0, self.r - self.q, self.sigma, T, self.nPath, nStep,
+                       seed=self.mc_seed)
+            ss = np.c_[np.tile(sr, (self.nPath, 1)), S]
+            if self.cp == 1:
+                condition_ko[np.cumsum(ss >= self.H, axis=1) > 0] = 1
+                flag_N = (ss <= self.K) & ~condition_ko
+                cashflow = ((ss - self.K) * flag_N * self.N
+                            + self.fix * ~flag_N * ~condition_ko
+                            + self.amount * condition_ko) * discount_factor
+            else:
+                condition_ko[np.cumsum(ss <= self.H, axis=1) > 0] = 1
+                flag_N = (ss >= self.K) & ~condition_ko
+                cashflow = ((self.K - ss) * flag_N * self.N
+                            + self.fix * ~flag_N * ~condition_ko
+                            + self.amount * condition_ko) * discount_factor
+
+            price_ls = np.sum(cashflow, 1)
+            price = np.mean(price_ls, 0)
+
+        return price
+
+    # 到期观察熔断·区间固定赔付 + 熔断后固定赔付累计（每日结算）
+    # fix    : 区间内（K~H）每日固定赔付（fixed_payout1）
+    # amount : 熔断后每日固定赔付（fixed_payout2）
+    # 杠杆腿到期日观察：到期收盘价穿越执行价时，按累计天数 le 结算 (N-1) 倍杠杆
+    def Opt_ASGQ_EFF(self) -> float:
+
+        T = self.T_days / annual_days
+        nStep = self.T_days
+        dt = 1 / annual_days
+        sr = np.array(self.sr)
+        observ = np.array(self.observ)
+        le = len(observ)
+
+        # 是否熔断提前结束
+        if self.cp == 1 and any(sr >= self.H):
+            idx = np.where(sr >= self.H)[0][0]
+            flag_ko = np.cumsum(sr >= self.H) > 0
+            band = (sr > self.K) & (sr < self.H)
+            price = np.sum(((sr - self.K) * ~band + self.fix * band) * ~flag_ko) + self.amount * (le - idx)
+            return price
+        elif self.cp == -1 and any(sr <= self.H):
+            idx = np.where(sr <= self.H)[0][0]
+            flag_ko = np.cumsum(sr <= self.H) > 0
+            band = (sr < self.K) & (sr > self.H)
+            price = np.sum(((self.K - sr) * ~band + self.fix * band) * ~flag_ko) + self.amount * (le - idx)
+            return price
+
+        # 交易是否到期
+        if self.T_days == 0:
+
+            if self.cp == 1:
+                band = (sr > self.K) & (sr < self.H)
+                price = np.sum((sr - self.K) * ~band + self.fix * band)
+                if sr[-1] <= self.K:
+                    price = price + (sr[-1] - self.K) * le * (self.N - 1)
+            else:
+                band = (sr < self.K) & (sr > self.H)
+                price = np.sum((self.K - sr) * ~band + self.fix * band)
+                if sr[-1] >= self.K:
+                    price = price + (self.K - sr[-1]) * le * (self.N - 1)
+
+        else:
+            flag_N = np.zeros([self.nPath, le], dtype=bool)
+            condition_ko = np.zeros([self.nPath, le], dtype=bool)
+            discount_factor = np.tile(np.exp(-self.r * (np.maximum(observ - self.T_over, 0)) * dt), (self.nPath, 1))
+            S = McGbmQ(self.s0, self.r - self.q, self.sigma, T, self.nPath, nStep,
+                       seed=self.mc_seed)
+            ss = np.c_[np.tile(sr, (self.nPath, 1)), S]
+            if self.cp == 1:
+                condition_ko[np.cumsum(ss >= self.H, axis=1) > 0] = 1
+                # 未熔断且到期收盘 <= K 的路径，到期日结算杠杆腿
+                flag_N[(ss[:, -1] <= self.K) & (np.all(condition_ko == 0, axis=1)), -1] = 1
+                # 注意：MATLAB 原版杠杆腿误用剩余天数 T_Days（到期分支恒为 0），
+                # 此处按代码注释「累计天数」及同族 Opt_ASGQ_EF/EP 的口径改用 le。
+                cashflow = (self.fix * ((ss > self.K) & (ss < self.H)) * ~condition_ko
+                            + (ss - self.K) * (ss <= self.K) * ~condition_ko
+                            + self.amount * condition_ko
+                            + (ss[:, -1] - self.K).reshape(self.nPath, 1) * le * (self.N - 1) * flag_N) * discount_factor
+            else:
+                condition_ko[np.cumsum(ss <= self.H, axis=1) > 0] = 1
+                flag_N[(ss[:, -1] >= self.K) & (np.all(condition_ko == 0, axis=1)), -1] = 1
+                cashflow = (self.fix * ((ss < self.K) & (ss > self.H)) * ~condition_ko
+                            + (self.K - ss) * (ss >= self.K) * ~condition_ko
+                            + self.amount * condition_ko
+                            + (self.K - ss[:, -1]).reshape(self.nPath, 1) * le * (self.N - 1) * flag_N) * discount_factor
 
             price_ls = np.sum(cashflow, 1)
             price = np.mean(price_ls, 0)
