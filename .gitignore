@@ -32,6 +32,11 @@ data/cache/
 # Test cache
 .pytest_cache/
 
+# Marketing / promo assets (not part of the product)
+tools/make_xhs_cards.py
+assets/xhs_dark/
+assets/xhs_light/
+
 # AI assistants
 .gemini/
 .claude/
