@@ -108,7 +108,8 @@ class OptionBase:
             return [0, 0, 0, 0, 0]
 
         ds = min(20.0, self.s0 / 100.0)
-        dz = 0.01
+        sigma0 = float(self.sigma)
+        dz = max(0.005, abs(sigma0) * 0.01)
         dt = 1
         dr = 0.01
 
@@ -132,9 +133,11 @@ class OptionBase:
             gamma = (price_up2 - 2 * price0 + price_dn2) / (4 * ds ** 2)
 
             # vega
-            price_vup = self._safe_price(self._bumped_copy(sigma=self.sigma + dz).get_price())
-            price_vdn = self._safe_price(self._bumped_copy(sigma=self.sigma - dz).get_price())
-            vega = (price_vup - price_vdn) / (2 * dz)
+            sigma_up = sigma0 + dz
+            sigma_dn = max(sigma0 - dz, 1e-8)
+            price_vup = self._safe_price(self._bumped_copy(sigma=sigma_up).get_price())
+            price_vdn = self._safe_price(self._bumped_copy(sigma=sigma_dn).get_price())
+            vega = (price_vup - price_vdn) / (sigma_up - sigma_dn)
 
             # theta
             price_theta = self._safe_price(self._bumped_copy(**self._theta_overrides(dt)).get_price())
@@ -143,7 +146,7 @@ class OptionBase:
             # rho
             price_rup = self._safe_price(self._bumped_copy(r=self.r + dr).get_price())
             price_rdn = self._safe_price(self._bumped_copy(r=self.r - dr).get_price())
-            rho = (price_rup - price_rdn) / 2
+            rho = (price_rup - price_rdn) / (2 * dr)
         finally:
             if _npath_saved is not None:
                 self.nPath = _npath_saved

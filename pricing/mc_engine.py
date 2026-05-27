@@ -34,6 +34,11 @@ def McGbmQ(
     -------
     s : shape (nPath, nStep) 的价格路径矩阵
     """
+    if nPath <= 0 or nPath % 2 != 0:
+        raise ValueError(f"nPath must be a positive even integer, got {nPath}")
+    if nStep <= 0:
+        raise ValueError(f"nStep must be positive, got {nStep}")
+
     # seed=None 由 np.random.default_rng 自动走 OS 熵，保证每次采样独立。
     rng = np.random.default_rng(seed)
     W1 = rng.standard_normal((nPath // 2, nStep))

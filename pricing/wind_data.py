@@ -561,15 +561,22 @@ def get_contract_spec(code):
 
     try:
         w = _ensure_wind()
+    except ImportError:
+        # WindPy 不可用时返回占位，调用方需自行处理
+        mult = 1.0
+    else:
         data = w.wsd(code, "contractmultiplier")
         if data.ErrorCode != 0:
             raise RuntimeError(
                 f"Wind contractmultiplier 查询失败 [{code}]: "
                 f"ErrorCode={data.ErrorCode}"
             )
-        mult = float(data.Data[0][0])
-    except ImportError:
-        # WindPy 不可用时返回占位，调用方需自行处理
-        mult = 1.0
+        try:
+            mult = float(data.Data[0][0])
+        except (IndexError, TypeError, ValueError) as exc:
+            raise RuntimeError(
+                f"Wind contractmultiplier 返回数据异常 [{code}]: "
+                f"{getattr(data, 'Data', None)!r}"
+            ) from exc
 
     return {"multiplier": mult, "is_future": True}

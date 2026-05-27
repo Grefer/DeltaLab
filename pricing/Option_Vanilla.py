@@ -50,7 +50,7 @@ class Option_Vanilla(OptionBase):
         if self.exe_mode == "Eu":
             t_years = t_eff / ANNUAL_DAYS
             return blsprice(self.s0, self.K, self.r, self.q, t_years, self.sigma, self.cp)
-        return None
+        raise NotImplementedError(f"Unsupported exe_mode: {self.exe_mode}")
 
     @property
     def _time_remaining(self):

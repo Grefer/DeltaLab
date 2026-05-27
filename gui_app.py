@@ -801,11 +801,24 @@ class BacktestApp(tk.Tk):
             self._left_canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
             return "break"
 
+        def _on_left_mousewheel_linux(event):
+            units = -3 if event.num == 4 else 3
+            self._left_canvas.yview_scroll(units, "units")
+            return "break"
+
         def _bind_left_wheel(_event=None):
-            self._left_canvas.bind_all("<MouseWheel>", _on_left_mousewheel)
+            if _SYSTEM == "Linux":
+                self._left_canvas.bind_all("<Button-4>", _on_left_mousewheel_linux)
+                self._left_canvas.bind_all("<Button-5>", _on_left_mousewheel_linux)
+            else:
+                self._left_canvas.bind_all("<MouseWheel>", _on_left_mousewheel)
 
         def _unbind_left_wheel(_event=None):
-            self._left_canvas.unbind_all("<MouseWheel>")
+            if _SYSTEM == "Linux":
+                self._left_canvas.unbind_all("<Button-4>")
+                self._left_canvas.unbind_all("<Button-5>")
+            else:
+                self._left_canvas.unbind_all("<MouseWheel>")
 
         # 保留引用, 其它地方如需手动启停滚轮可复用
         self._left_wheel_bind = _bind_left_wheel
@@ -1342,15 +1355,16 @@ class BacktestApp(tk.Tk):
         subtype = SUBTYPE_FROM_DISPLAY.get(subtype_display, subtype_display)
 
         params = {}
+        param_labels = {spec[0]: spec[1] for spec in cfg["params"]}
         for key, (var, dtype, choices) in self._param_entries.items():
             val_str = var.get().strip()
+            if not val_str:
+                raise ValueError(f"{param_labels.get(key, key)} 不能为空。")
             if choices and val_str in choices:
                 params[key] = choices[val_str]          # 选了预设项
             elif choices:
                 # 可编辑下拉里手填的自定义值：按 dtype 解析
                 params[key] = float(val_str) if dtype == float else int(val_str)
-            elif not val_str:
-                params[key] = 0
             elif dtype == float:
                 params[key] = float(val_str)
             elif dtype == int:
@@ -1749,8 +1763,12 @@ class BacktestApp(tk.Tk):
         # 蒙特卡洛多路径统计
         if multi_stats is not None:
             ms = multi_stats
-            pnl = ms['total_pnl']
+            pnl_all = np.asarray(ms['total_pnl'], dtype=float)
+            valid = np.isfinite(pnl_all)
+            pnl = pnl_all[valid]
             n_p = ms['n_paths']
+            n_valid = int(np.sum(valid))
+            n_failed = len(ms.get("failed_paths", []))
             pct = lambda arr, q: np.percentile(arr, q)
 
             _ins("\n")
@@ -1758,6 +1776,14 @@ class BacktestApp(tk.Tk):
             _ins(f"       蒙特卡洛多路径统计 ({n_p} 条路径)\n", "monte_header")
             _ins("═" * 54 + "\n", "separator")
             _ins("\n")
+            if n_failed:
+                _kv("成功路径        ", f"{n_valid:>10d}/{n_p}")
+                _kv("失败路径        ", f"{n_failed:>10d}", "value_neg")
+                _sep()
+            if pnl.size == 0:
+                _ins("  无可用成功路径，无法统计分布。\n", "value_neg")
+                tw.configure(state="disabled")
+                return
 
             _section("【总盈亏分布】")
             mean_pnl = np.mean(pnl)
@@ -1781,18 +1807,19 @@ class BacktestApp(tk.Tk):
             _sep()
 
             _section("【波动率】")
+            rv = np.asarray(ms['realized_vols'], dtype=float)[valid]
             _kv("隐含波动率      ", f"{ms['implied_vol'] * 100:>11.2f}%")
-            _kv("已实现波动率均值", f"{np.mean(ms['realized_vols']) * 100:>11.2f}%")
-            _kv("已实现波动率标准差", f"{np.std(ms['realized_vols']) * 100:>11.2f}%")
+            _kv("已实现波动率均值", f"{np.mean(rv) * 100:>11.2f}%")
+            _kv("已实现波动率标准差", f"{np.std(rv) * 100:>11.2f}%")
             _sep()
             if meta.get("cls_name") == "雪球期权 (Snowball)" and "knocked_out" in ms:
-                ko_flags = np.asarray(ms["knocked_out"], dtype=bool)
+                ko_flags = np.asarray(ms["knocked_out"], dtype=bool)[valid]
                 _section("【雪球敲出】")
                 _kv("敲出路径占比    ", f"{np.mean(ko_flags) * 100:>11.2f}%")
                 if np.any(ko_flags) and "ko_days" in ms:
-                    _kv("平均敲出日      ", f"{np.nanmean(ms['ko_days']):>12.2f}")
+                    _kv("平均敲出日      ", f"{np.nanmean(np.asarray(ms['ko_days'], dtype=float)[valid]):>12.2f}")
                 _sep()
-            _kv("平均交易成本    ", f"{np.mean(ms['total_tc']):>12.4f}", "value_neg")
+            _kv("平均交易成本    ", f"{np.mean(np.asarray(ms['total_tc'], dtype=float)[valid]):>12.4f}", "value_neg")
             _ins("═" * 54 + "\n", "separator")
 
         tw.configure(state="disabled")
@@ -2016,11 +2043,23 @@ class BacktestApp(tk.Tk):
         from matplotlib.figure import Figure
 
         ms = multi_stats
-        pnl = ms['total_pnl']
-        errors = ms['errors']
-        rv = ms['realized_vols']
+        pnl_all = np.asarray(ms['total_pnl'], dtype=float)
+        errors_all = np.asarray(ms['errors'], dtype=float)
+        rv_all = np.asarray(ms['realized_vols'], dtype=float)
+        valid = np.isfinite(pnl_all) & np.isfinite(errors_all) & np.isfinite(rv_all)
+        if not np.any(valid):
+            hint = ttk.Frame(self._dist_container, style="Surface.TFrame")
+            hint.place(relx=0.5, rely=0.45, anchor="center")
+            tk.Label(hint, text="无可用成功路径",
+                     font=(_UI_FONT_FAMILY, 13),
+                     bg=PALETTE["surface"], fg=PALETTE["text"]).pack()
+            return
+
+        pnl = pnl_all[valid]
+        errors = errors_all[valid]
+        rv = rv_all[valid]
         iv = ms['implied_vol']
-        n_paths = ms['n_paths']
+        n_paths = len(pnl)
 
         fig = Figure(figsize=self._container_figsize(self._dist_container),
                      dpi=self._CHART_DPI)

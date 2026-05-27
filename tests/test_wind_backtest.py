@@ -66,7 +66,11 @@ def test_rolling_backtest_smoke():
         exe_mode="Eu",
     )
 
-    with patch("pricing.rolling_backtest.get_log_returns", return_value=fake_ret):
+    with (
+        patch("pricing.rolling_backtest.get_log_returns", return_value=fake_ret),
+        patch("pricing.wind_data.load_history_cached",
+              side_effect=RuntimeError("offline unit test")),
+    ):
         df = run_rolling_backtest(
             option_cfg=option_cfg,
             option_class=Option_Vanilla,

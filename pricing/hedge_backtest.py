@@ -300,6 +300,18 @@ def _run_single_path(args):
     (option_init, price_path, hedge_freq, tc_rate, position, quantity, multiplier,
      strategy, steps_per_day, slippage_bps, path_idx, base_seed) = args
 
+    price_path = np.asarray(price_path, dtype=float)
+    if price_path.ndim != 1:
+        price_path = price_path.reshape(-1)
+    if price_path.size < 2:
+        raise ValueError(f"path {path_idx}: price path length must be >= 2")
+    if not np.all(np.isfinite(price_path)) or np.any(price_path <= 0):
+        raise ValueError(f"path {path_idx}: price path must contain positive finite prices")
+
+    npath = getattr(option_init, "nPath", None)
+    if npath is not None and (int(npath) <= 0 or int(npath) % 2 != 0):
+        raise ValueError(f"path {path_idx}: nPath must be a positive even integer, got {npath}")
+
     # 为本路径构造独立的 option 副本并注入 per-path seed
     opt_local = copy.deepcopy(option_init)
     if base_seed is None:
@@ -958,16 +970,20 @@ class HedgeBacktest:
             realized_vols  : ndarray — 每条路径的已实现波动率（年化）
             knocked_out    : ndarray — 每条路径是否提前敲出
             ko_days        : ndarray — 提前敲出路径的敲出日，否则 NaN
+            failed_paths   : list[int] — 失败路径索引；失败路径对应数值列为 NaN
+            path_errors    : dict[int, str] — 失败路径错误摘要
         """
         n = len(paths)
-        errors = np.zeros(n)
-        total_pnl = np.zeros(n)
-        total_tc = np.zeros(n)
-        final_prices = np.zeros(n)
-        realized_vols = np.zeros(n)
+        errors = np.full(n, np.nan)
+        total_pnl = np.full(n, np.nan)
+        total_tc = np.full(n, np.nan)
+        final_prices = np.full(n, np.nan)
+        realized_vols = np.full(n, np.nan)
         knocked_out = np.zeros(n, dtype=bool)
         ko_days = np.full(n, np.nan)
         implied_vol = self.option_init.sigma
+        failed_paths = []
+        path_errors = {}
 
         if max_workers is None:
             max_workers = min(os.cpu_count() or 4, n)
@@ -989,18 +1005,24 @@ class HedgeBacktest:
                        for i, a in enumerate(task_args)}
             for future in as_completed(futures):
                 idx = futures[future]
-                res = future.result()
-                errors[idx] = res['hedging_error']
-                total_pnl[idx] = res['final_pnl']
-                total_tc[idx] = res['total_tc']
-                final_prices[idx] = res['final_price']
-                realized_vols[idx] = res['realized_vol']
-                knocked_out[idx] = bool(res.get('knocked_out', False))
-                if res.get('ko_day') is not None:
-                    ko_days[idx] = float(res['ko_day'])
-                completed += 1
-                if progress_callback:
-                    progress_callback(completed, n)
+                try:
+                    res = future.result()
+                except Exception as exc:
+                    failed_paths.append(idx)
+                    path_errors[idx] = f"{type(exc).__name__}: {exc}"
+                else:
+                    errors[idx] = res['hedging_error']
+                    total_pnl[idx] = res['final_pnl']
+                    total_tc[idx] = res['total_tc']
+                    final_prices[idx] = res['final_price']
+                    realized_vols[idx] = res['realized_vol']
+                    knocked_out[idx] = bool(res.get('knocked_out', False))
+                    if res.get('ko_day') is not None:
+                        ko_days[idx] = float(res['ko_day'])
+                finally:
+                    completed += 1
+                    if progress_callback:
+                        progress_callback(completed, n)
 
         return {
             'n_paths': n,
@@ -1012,11 +1034,20 @@ class HedgeBacktest:
             'realized_vols': realized_vols,
             'knocked_out': knocked_out,
             'ko_days': ko_days,
+            'failed_paths': sorted(failed_paths),
+            'path_errors': path_errors,
         }
 
     def plot_error_dist(self, errors, figsize=(10, 5)):
         """绘制对冲误差分布直方图"""
         fig, ax = plt.subplots(figsize=figsize)
+        errors = np.asarray(errors, dtype=float)
+        errors = errors[np.isfinite(errors)]
+        if errors.size == 0:
+            ax.set_title("对冲误差分布 (无成功路径)", fontsize=12)
+            ax.set_xlabel('对冲误差')
+            ax.set_ylabel('频数')
+            return fig
         ax.hist(errors, bins=50, edgecolor='black', alpha=0.7, color='steelblue')
         ax.axvline(np.mean(errors), color='red', linestyle='--',
                    label=f'均值={np.mean(errors):.4f}')

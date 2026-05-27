@@ -51,35 +51,51 @@ class Option_AS(OptionBase):
         self.q = q
         self.nPath = nPath
 
+    def _payoff_from_observations(self, observations):
+        obs = np.asarray(observations, dtype=float)
+        if obs.size == 0:
+            raise ValueError("Asian option requires at least one observation")
+        if self.N <= 0:
+            raise ValueError(f"N must be positive, got {self.N}")
+
+        window = obs[..., -self.N:]
+        if self.cp == 1:
+            match self.optiontype:
+                case "Asian":
+                    payoff = np.mean(window, axis=-1) - self.K
+                case "EnhanceAsian":
+                    payoff = np.mean(np.maximum(window, self.E), axis=-1) - self.K
+                case _:
+                    raise ValueError(f"Unsupported optiontype: {self.optiontype}")
+        elif self.cp == -1:
+            match self.optiontype:
+                case "Asian":
+                    payoff = self.K - np.mean(window, axis=-1)
+                case "EnhanceAsian":
+                    payoff = self.K - np.mean(np.minimum(window, self.E), axis=-1)
+                case _:
+                    raise ValueError(f"Unsupported optiontype: {self.optiontype}")
+        else:
+            raise ValueError(f"Unsupported cp: {self.cp} (需要 1=call 或 -1=put)")
+
+        return np.minimum(np.maximum(payoff, self.minPay), self.maxPay)
+
     def get_price(self):
         dt = 1 / ANNUAL_DAYS
         nStep = self.T
         sr = np.array(self.sr)
-        if self.T > 0:
-            S = McGbmQ(self.s0, self.r - self.q, self.sigma, self.T * dt, self.nPath, nStep,
-                       seed=self.mc_seed)
-            ss = np.c_[np.tile(sr, (self.nPath, 1)), S]
-            if self.cp == 1:
-                match self.optiontype:
-                    case "Asian":
-                        cashflow = np.minimum(np.maximum(np.mean(ss[:, -self.N:], axis=1) - self.K, self.minPay), self.maxPay) * np.exp(-self.r * self.T * dt)
-                    case "EnhanceAsian":
-                        cashflow = np.minimum(np.maximum(np.mean(np.maximum(ss[:, -self.N:], self.E), axis=1) - self.K, self.minPay), self.maxPay) * np.exp(-self.r * self.T * dt)
-                    case _:
-                        raise ValueError(f"Unsupported optiontype: {self.optiontype}")
-            elif self.cp == -1:
-                match self.optiontype:
-                    case "Asian":
-                        cashflow = np.minimum(np.maximum(self.K - np.mean(ss[:, -self.N:], axis=1), self.minPay), self.maxPay) * np.exp(-self.r * self.T * dt)
-                    case "EnhanceAsian":
-                        cashflow = np.minimum(np.maximum(self.K - np.mean(np.minimum(ss[:, -self.N:], self.E), axis=1), self.minPay), self.maxPay) * np.exp(-self.r * self.T * dt)
-                    case _:
-                        raise ValueError(f"Unsupported optiontype: {self.optiontype}")
-            else:
-                raise ValueError(f"Unsupported cp: {self.cp} (需要 1=call 或 -1=put)")
+        if self.T < 0:
+            raise ValueError(f"T must be non-negative, got {self.T}")
+        if self.T == 0:
+            observations = np.r_[sr, float(self.s0)]
+            return float(self._payoff_from_observations(observations))
 
-            price = np.mean(cashflow, 0)
-            return price
+        S = McGbmQ(self.s0, self.r - self.q, self.sigma, self.T * dt, self.nPath, nStep,
+                   seed=self.mc_seed)
+        ss = np.c_[np.tile(sr, (self.nPath, 1)), S]
+        cashflow = self._payoff_from_observations(ss) * np.exp(-self.r * self.T * dt)
+        price = np.mean(cashflow, 0)
+        return price
 
     @property
     def _time_remaining(self):
@@ -105,7 +121,6 @@ class Option_AS(OptionBase):
 #     print('price = %.2f' % p)
 #     print('greeks = {}'.format(greeks_list))
 #     print('历时%.2f秒！' % (end - start))
-
 
 
 

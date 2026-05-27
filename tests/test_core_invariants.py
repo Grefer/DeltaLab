@@ -86,6 +86,49 @@ def test_vanilla_blsprice_matches_closed_form():
     assert abs(actual - expected) < 1e-12
 
 
+def test_vanilla_greeks_match_bs_closed_form():
+    """Vanilla Greeks 应与 BS 解析解一致，特别覆盖 rho 的 dr 分母。"""
+    from scipy.stats import norm
+    from math import log, sqrt, exp
+
+    s, K, r, q, sigma, cp = 100.0, 103.0, 0.025, 0.01, 0.22, 1
+    T_days = 180
+    t = T_days / ANNUAL_DAYS
+    d1 = (log(s / K) + (r - q + sigma ** 2 / 2) * t) / (sigma * sqrt(t))
+    d2 = d1 - sigma * sqrt(t)
+
+    expected = {
+        "delta": exp(-q * t) * norm.cdf(d1),
+        "gamma": exp(-q * t) * norm.pdf(d1) / (s * sigma * sqrt(t)),
+        "vega": s * exp(-q * t) * norm.pdf(d1) * sqrt(t),
+        "theta": (
+            -s * exp(-q * t) * norm.pdf(d1) * sigma / (2 * sqrt(t))
+            - r * K * exp(-r * t) * norm.cdf(d2)
+            + q * s * exp(-q * t) * norm.cdf(d1)
+        ),
+        "rho": K * t * exp(-r * t) * norm.cdf(d2),
+    }
+
+    opt = Option_Vanilla("Vanilla", s0=s, sr=[], K=K,
+                         T=T_days, sigma=sigma, cp=cp, r=r, q=q)
+    actual = dict(zip(("delta", "gamma", "vega", "theta", "rho"), opt.get_greeks()))
+
+    assert abs(actual["delta"] - expected["delta"]) < 2e-4
+    assert abs(actual["gamma"] - expected["gamma"]) < 2e-4
+    assert abs(actual["vega"] - expected["vega"]) < 1e-3
+    assert abs(actual["theta"] - expected["theta"]) < 5e-2
+    assert abs(actual["rho"] - expected["rho"]) < 2e-2
+
+
+def test_vanilla_unsupported_exe_mode_raises():
+    """非欧式 Vanilla 暂未实现时应明确报错，而不是返回 None。"""
+    opt = Option_Vanilla("Vanilla", s0=100.0, sr=[], K=100.0,
+                         T=10, sigma=0.20, cp=1, r=0.03, q=0.0,
+                         exe_mode="Am")
+    with pytest.raises(NotImplementedError):
+        opt.get_price()
+
+
 # ---------------------------------------------------------------------------
 # 2) Option_AB 到期 payoff
 # ---------------------------------------------------------------------------
@@ -135,6 +178,31 @@ def test_option_as_invalid_optiontype_raises():
                     r=0.03, q=0.03, nPath=1000)
     with pytest.raises(ValueError):
         opt.get_price()
+
+
+def test_option_as_expiry_payoff_uses_realized_observations_and_spot():
+    """Asian / EnhanceAsian 在 T=0 时应返回到期 payoff，而不是 None。"""
+    opt = Option_AS(optiontype="Asian", s0=115.0, sr=[100.0, 105.0, 110.0],
+                    K=106.0, E=108.0, T=0, N=3, sigma=0.15, cp=1,
+                    minPay=0.0, maxPay=999999.0, r=0.03, q=0.03, nPath=1000)
+    # T=0 时当前 s0 是最新观察价；last 3 = [105, 110, 115]，均值 110。
+    assert abs(opt.get_price() - 4.0) < 1e-12
+
+    enhanced_put = Option_AS(optiontype="EnhanceAsian", s0=115.0,
+                             sr=[100.0, 105.0, 110.0], K=110.0, E=108.0,
+                             T=0, N=3, sigma=0.15, cp=-1,
+                             minPay=0.0, maxPay=999999.0,
+                             r=0.03, q=0.03, nPath=1000)
+    # put 增强腿先对观察价做 min(S, E)：[105, 108, 108]，均值 107。
+    assert abs(enhanced_put.get_price() - 3.0) < 1e-12
+
+    stepped = Option_AS(optiontype="Asian", s0=100.0, sr=[], K=100.0,
+                        E=100.0, T=2, N=2, sigma=0.15, cp=1,
+                        minPay=0.0, maxPay=999999.0,
+                        r=0.0, q=0.0, nPath=1000)
+    stepped.step_forward(110.0)
+    stepped.step_forward(120.0)
+    assert abs(stepped.get_price() - 15.0) < 1e-12
 
 
 # ---------------------------------------------------------------------------
@@ -398,6 +466,12 @@ def test_mc_engine_seed_none_produces_different_samples():
     assert np.array_equal(s3, s4), "seed=42 两次调用结果不一致，确定性采样失效"
 
 
+def test_mc_engine_rejects_odd_npath():
+    """对偶变量 MC 引擎必须拒绝奇数路径数，避免静默少生成一条路径。"""
+    with pytest.raises(ValueError):
+        McGbmQ(100.0, 0.03, 0.2, T=1.0, nPath=999, nStep=20, seed=42)
+
+
 # ---------------------------------------------------------------------------
 # 8) get_greeks 使用 CRN：bump 之间共享 mc_seed（P1-1 回归）
 # ---------------------------------------------------------------------------
@@ -430,3 +504,24 @@ def test_mc_greeks_uses_crn_with_shared_seed():
     before = opt.nPath
     _ = opt.get_greeks()
     assert opt.nPath == before, "get_greeks 退出后 nPath 未被恢复"
+
+
+def test_run_multi_keeps_successful_paths_when_one_path_fails():
+    """单条路径异常不应导致已完成路径结果全部丢失。"""
+    opt = Option_Vanilla("Vanilla", s0=100.0, sr=[], K=100.0,
+                         T=2, sigma=0.20, cp=1, r=0.03, q=0.0)
+    paths = np.array([
+        [100.0, 101.0, 102.0],
+        [100.0, 0.0, 102.0],
+        [100.0, 99.0, 98.0],
+    ])
+
+    bt = HedgeBacktest(opt, paths[0], hedge_freq=1, tc_rate=0.0,
+                       position=1, quantity=1.0, multiplier=0)
+    res = bt.run_multi(paths, max_workers=1)
+
+    assert res["failed_paths"] == [1]
+    assert 1 in res["path_errors"]
+    assert np.isnan(res["errors"][1])
+    assert np.isfinite(res["errors"][0])
+    assert np.isfinite(res["errors"][2])
