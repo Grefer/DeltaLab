@@ -8,6 +8,7 @@ DeltaLab - 期权动态对冲回测框架
 
 import copy
 import os
+import datetime as _datetime
 import numpy as np
 import matplotlib.pyplot as plt
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -32,6 +33,9 @@ except ImportError:
 #   S_last       : 上一次触发对冲时的标的价（Day 0 或上次 hedge）
 #   i_last       : 上一次触发对冲时的 bar 索引
 #   dt_bar       : 单 bar 的年化时长
+#   timestamp    : 当前 bar 时间（仅真实 DatetimeIndex 行情）
+#   next_timestamp: 下一根 bar 时间；末 bar 为 None
+#   is_day_close : 当前 bar 是否为真实交易日的最后一根 bar
 #   sigma_impl   : 期权隐含波动率（option.sigma）
 #   log_ret_hist : 截至当前 bar 的对数收益序列（长度 = i），np.ndarray
 
@@ -55,6 +59,322 @@ class FixedFreqStrategy(HedgeStrategy):
 
     def should_hedge(self, ctx):
         return (ctx["i"] % self.hedge_freq) == 0
+
+
+class CloseToCloseStrategy(HedgeStrategy):
+    """每个交易日收盘对冲一次（close-to-close）。"""
+
+    name = "close_to_close"
+
+    def should_hedge(self, ctx):
+        # 真实时间索引下以交易日边界为准；无时间戳的 GBM /
+        # ndarray 路径仍保留 steps_per_day 取模的历史兼容逻辑。
+        if ctx.get("timestamp") is not None:
+            return bool(ctx.get("is_day_close", False))
+        return bool(ctx.get("crosses_day", False))
+
+
+class FixedTimeStrategy(HedgeStrategy):
+    """在每天指定时刻对冲；每个时刻每天最多触发一次。"""
+
+    name = "fixed_times"
+
+    def __init__(self, times):
+        if isinstance(times, str):
+            times = [x.strip() for x in times.split(",") if x.strip()]
+        parsed = []
+        for value in times or []:
+            if isinstance(value, _datetime.time):
+                parsed.append(value.replace(second=0, microsecond=0))
+            else:
+                try:
+                    parsed.append(_datetime.datetime.strptime(str(value), "%H:%M").time())
+                except ValueError as exc:
+                    raise ValueError(f"固定对冲时刻格式错误: {value!r}，应为 HH:MM") from exc
+        if not parsed:
+            raise ValueError("fixed_times 至少需要一个 HH:MM 时刻")
+        self.times = tuple(sorted(set(parsed)))
+        self._triggered = set()
+
+    def should_hedge(self, ctx):
+        timestamp = ctx.get("timestamp")
+        if timestamp is None:
+            raise ValueError("fixed_times 策略需要带 DatetimeIndex 的历史分钟行情")
+        if hasattr(timestamp, "to_pydatetime"):
+            timestamp = timestamp.to_pydatetime()
+        if not isinstance(timestamp, _datetime.datetime):
+            raise ValueError("fixed_times 策略需要真实 datetime 时间戳")
+        current_time = timestamp.time().replace(second=0, microsecond=0)
+        if current_time not in self.times:
+            return False
+        key = (timestamp.date(), current_time)
+        if key in self._triggered:
+            return False
+        self._triggered.add(key)
+        return True
+
+
+_EVENING_SESSION_START = _datetime.time(18, 0)
+_DAY_SESSION_START = _datetime.time(6, 0)
+
+
+def _trading_day_groups(timestamps):
+    """把 DatetimeIndex 映射为连续的交易日组。
+
+    日盘品种按 calendar date 分组。若出现 18:00 以后的夜盘，该夜盘会
+    开启新交易日，并一直延续到后续日盘结束；因此 21:00 -> 次日
+    02:30 -> 09:00 -> 15:00 属于同一组。这里依据观测到的 session
+    顺序而不是简单的日历加一，因而也能正确跨越周末。
+    """
+    if len(timestamps) == 0:
+        return np.array([], dtype=int)
+
+    groups = np.zeros(len(timestamps), dtype=int)
+    group = 0
+    first = timestamps[0]
+    first_time = first.time().replace(tzinfo=None)
+    observed_times = {
+        ts.time().replace(tzinfo=None) for ts in timestamps
+    }
+    # 日频 DatetimeIndex 通常全部落在 00:00（也可能统一为其它固定时刻）。
+    # 只有观测到多个日内时刻时，<06:00 才能作为“夜盘跨午夜尾段”的证据。
+    daily_like_single_time = len(observed_times) == 1
+
+    def _is_night_session_time(value):
+        return (
+            value >= _EVENING_SESSION_START
+            or (value < _DAY_SESSION_START and not daily_like_single_time)
+        )
+
+    # 查询可能从夜盘跨午夜后的尾段开始，未包含前一晚 21:00 opener。
+    # 00:00~06:00 仍应视为夜盘延续，才能与周末/假期后的下一日盘
+    # 合并为同一交易日组。
+    has_evening = _is_night_session_time(first_time)
+    day_session_seen = _DAY_SESSION_START <= first_time < _EVENING_SESSION_START
+    previous = first
+
+    for i in range(1, len(timestamps)):
+        current = timestamps[i]
+        current_time = current.time().replace(tzinfo=None)
+        previous_time = previous.time().replace(tzinfo=None)
+        date_changed = current.date() != previous.date()
+        starts_new_group = False
+
+        if current_time >= _EVENING_SESSION_START:
+            # 日盘 -> 夜盘是下一个交易日的开始。夜盘内部多根
+            # bar 仍属于同一组。
+            starts_new_group = previous_time < _EVENING_SESSION_START or date_changed
+        elif has_evening:
+            # 夜盘已开始但日盘尚未出现时，允许跨午夜、周末/休市日
+            # 继续到下一个日盘。日盘已出现后再跨日则开启新组。
+            starts_new_group = date_changed and day_session_seen
+        else:
+            starts_new_group = date_changed
+
+        if starts_new_group:
+            group += 1
+            has_evening = _is_night_session_time(current_time)
+            day_session_seen = (
+                _DAY_SESSION_START <= current_time < _EVENING_SESSION_START
+            )
+        else:
+            if _is_night_session_time(current_time):
+                has_evening = True
+            elif current_time >= _DAY_SESSION_START:
+                day_session_seen = True
+
+        groups[i] = group
+        previous = current
+
+    return groups
+
+
+def _trading_day_close_indices(timestamps):
+    """返回每个连续交易日组在当前样本中的最后一根 bar 下标。"""
+    if len(timestamps) == 0:
+        return np.array([], dtype=int)
+    groups = _trading_day_groups(timestamps)
+    return np.flatnonzero(
+        np.r_[groups[:-1] != groups[1:], True]
+    ).astype(int, copy=False)
+
+
+def _expiry_terminal_index(timestamps, term_days, steps_per_day):
+    """验证真实日内组完整性并返回第 ``term_days`` 个收盘下标。
+
+    连续分组本身只能说明“这是样本里最后一根”，不能证明最后一组真的
+    已收盘。这里用声明/推导的典型 bar 数和完整组的常见收盘时刻共同
+    判定；期限内出现盘中残段时明确拒绝，避免强制到期。
+    """
+    close_indices = _trading_day_close_indices(timestamps)
+    bounds = []
+    start = 0
+    for end_value in close_indices:
+        end = int(end_value)
+        bounds.append((start, end))
+        start = end + 1
+
+    actionable = [(start, end) for start, end in bounds if end > 0]
+    if len(actionable) < term_days:
+        raise ValueError(
+            f"价格序列交易日组不足：期权剩余 {term_days} 日，"
+            f"Day 0 后仅观测到 {len(actionable)} 个交易日组。"
+        )
+
+    inferred_steps = _infer_intraday_steps(timestamps)
+    expected_steps = max(1, int(steps_per_day), int(inferred_steps))
+
+    # 只用 bar 数达到典型水平的组估计正常收盘时刻；盘中残段不会
+    # 反过来污染预期。平票时取更晚时刻，对日盘/含夜盘数据更稳健。
+    close_time_counts = {}
+    for group_start, group_end in bounds:
+        if group_end - group_start + 1 < expected_steps:
+            continue
+        close_time = timestamps[group_end].time().replace(
+            second=0, microsecond=0, tzinfo=None)
+        close_time_counts[close_time] = close_time_counts.get(close_time, 0) + 1
+    expected_close = None
+    if close_time_counts:
+        max_frequency = max(close_time_counts.values())
+        expected_close = max(
+            time_value for time_value, frequency in close_time_counts.items()
+            if frequency == max_frequency
+        )
+
+    for ordinal, (group_start, group_end) in enumerate(
+            actionable[:term_days], start=1):
+        count = group_end - group_start + 1
+        actual_close = timestamps[group_end].time().replace(
+            second=0, microsecond=0, tzinfo=None)
+
+        # 缺少中间 bar 不代表没有收盘：只要能由典型组确认末时刻就是
+        # 正常收盘，仍可用于 close-to-close。若无法判断正常收盘时刻，
+        # 才退回到典型 bar 数作为完整性证据。
+        count_complete = count >= expected_steps
+        time_complete = (
+            expected_close is not None and actual_close == expected_close
+        )
+        if expected_close is not None:
+            complete = time_complete
+        else:
+            complete = count_complete
+
+        if not complete:
+            first_ts = timestamps[group_start]
+            last_ts = timestamps[group_end]
+            expected_text = (
+                expected_close.strftime("%H:%M")
+                if expected_close is not None else "无法从完整组判定"
+            )
+            raise ValueError(
+                f"价格序列第{ordinal}个纳入期限的交易日组不完整："
+                f"[{first_ts.strftime('%Y-%m-%d %H:%M')} ~ "
+                f"{last_ts.strftime('%Y-%m-%d %H:%M')}] 仅 {count} 根 bar，"
+                f"典型/声明为 {expected_steps} 根，末时刻 "
+                f"{actual_close.strftime('%H:%M')}，预期收盘 {expected_text}。"
+            )
+
+    return int(actionable[term_days - 1][1])
+
+
+def _infer_intraday_steps(timestamps):
+    """由真实时间索引推导典型每交易日 bar 数；日频返回 1。"""
+    if len(timestamps) < 2:
+        return 1
+    try:
+        groups = _trading_day_groups(timestamps)
+    except (AttributeError, TypeError, ValueError):
+        # 非 datetime 索引无法证明日内 session；调用方可回退到
+        # 交易所元数据或显式 steps_per_day。
+        return 1
+    counts = np.bincount(groups)
+    complete = counts[counts > 1]
+    if complete.size == 0:
+        return 1
+    # 首尾交易日常因查询边界而不完整；众数比 max 对偶发
+    # 缺 bar 更稳健，平票时取较大值。
+    values, frequencies = np.unique(complete, return_counts=True)
+    max_frequency = frequencies.max()
+    return int(values[frequencies == max_frequency].max())
+
+
+def _validate_fixed_time_data(strategy, timestamps):
+    """在进入定价循环前验证 fixed_times 所需的时间粒度。"""
+    if timestamps is None:
+        raise ValueError(
+            "fixed_times 策略需要真实 pandas.DatetimeIndex 的日内行情；"
+            "RangeIndex、整数索引或无时间戳路径不受支持。"
+        )
+    if _infer_intraday_steps(timestamps) <= 1:
+        raise ValueError(
+            "fixed_times 策略仅支持真实日内行情；当前 DatetimeIndex "
+            "每交易日只有一根 bar（日频）。"
+        )
+
+    close_indices = _trading_day_close_indices(timestamps)
+    problems = []
+    checked_group = 0
+    start = 0
+    requested_times = set(strategy.times)
+    for end in close_indices:
+        end = int(end)
+        # 只有下标 0 的单点组只是 Day 0 建仓观测，不会进入策略循环，
+        # 不要求它补齐当天早先的固定时刻。其余组都实际纳入回测。
+        if end > 0:
+            checked_group += 1
+            group_timestamps = timestamps[start:end + 1]
+            available = {
+                ts.time().replace(second=0, microsecond=0, tzinfo=None)
+                for ts in group_timestamps
+            }
+            missing = requested_times.difference(available)
+            if missing:
+                first_ts = group_timestamps[0]
+                last_ts = group_timestamps[-1]
+                missing_text = ",".join(
+                    t.strftime("%H:%M") for t in sorted(missing)
+                )
+                sample = ",".join(
+                    t.strftime("%H:%M") for t in sorted(available)[:12]
+                )
+                problems.append(
+                    f"第{checked_group}个交易日组 "
+                    f"[{first_ts.strftime('%Y-%m-%d %H:%M')} ~ "
+                    f"{last_ts.strftime('%Y-%m-%d %H:%M')}] "
+                    f"缺失 [{missing_text}]（可用: [{sample}]）"
+                )
+        start = end + 1
+
+    if problems:
+        requested = ",".join(t.strftime("%H:%M") for t in strategy.times)
+        raise ValueError(
+            f"fixed_times 目标时刻 [{requested}] 未逐交易日组完整匹配；"
+            + "；".join(problems)
+            + "。"
+        )
+
+
+class PriceIntervalStrategy(HedgeStrategy):
+    """相对上次实际对冲价，按绝对价格或相对百分比间隔触发。"""
+
+    name = "price_interval"
+
+    def __init__(self, interval, interval_type="absolute"):
+        self.interval = float(interval)
+        self.interval_type = str(interval_type).lower()
+        if self.interval <= 0:
+            raise ValueError("价格间隔必须大于 0")
+        if self.interval_type not in ("absolute", "relative"):
+            raise ValueError("interval_type 仅支持 'absolute' 或 'relative'")
+
+    def should_hedge(self, ctx):
+        current = float(ctx["S"])
+        last = float(ctx["S_last"])
+        if self.interval_type == "absolute":
+            return abs(current - last) >= self.interval
+        if last <= 0:
+            return False
+        return abs(current / last - 1.0) >= self.interval
 
 
 class SigmaBandStrategy(HedgeStrategy):
@@ -152,6 +472,98 @@ class SigmaBandStrategy(HedgeStrategy):
         triggered = move >= threshold
         if triggered:
             self._last_trigger_i = int(ctx["i"])
+        return triggered
+
+
+class HedgeBandStrategy(HedgeStrategy):
+    """同一价格带宽的三种等价表达：绝对值、相对值或日波动 σ 倍数。"""
+
+    name = "hedge_band"
+
+    def __init__(self, band_type="relative", threshold=None, k=0.5,
+                 sigma_source="implied", window_days=20):
+        self.band_type = str(band_type).lower()
+        if self.band_type not in ("absolute", "relative", "sigma"):
+            raise ValueError("band_type 仅支持 'absolute'、'relative' 或 'sigma'")
+        # threshold 始终使用 band_type 对应的本单位。k 仅为旧调用兼容参数。
+        if threshold is None:
+            threshold = k if self.band_type == "sigma" else 0.01
+        self.threshold = float(threshold)
+        if not np.isfinite(self.threshold) or self.threshold <= 0:
+            raise ValueError("带宽阈值必须是大于 0 的有限数值")
+        self.sigma_source = str(sigma_source).lower()
+        self.window_days = window_days
+        # absolute / relative 触发只需要价格，不应因无关的 sigma
+        # 配置缺失或非法而失败。仅 sigma 模式实例化波动率估计器。
+        self._sigma_strategy = None
+        if self.band_type == "sigma":
+            self._sigma_strategy = SigmaBandStrategy(
+                k=self.threshold,
+                sigma_source=self.sigma_source,
+                window_days=self.window_days,
+            )
+
+    @staticmethod
+    def convert_threshold(value, from_type, reference_price, sigma_annual):
+        """返回同一带宽的 absolute / relative / sigma 三种等价值。"""
+        value = float(value)
+        price = float(reference_price)
+        sigma = float(sigma_annual)
+        if not np.isfinite(value) or value <= 0:
+            raise ValueError("带宽值必须是大于 0 的有限数值")
+        if (not np.isfinite(price) or not np.isfinite(sigma)
+                or price <= 0 or sigma <= 0):
+            raise ValueError(
+                "reference_price 与 sigma_annual 必须是大于 0 的有限数值")
+        daily_relative_sigma = sigma / np.sqrt(ANNUAL_DAYS)
+        kind = str(from_type).lower()
+        if kind == "absolute":
+            absolute = value
+        elif kind == "relative":
+            absolute = value * price
+        elif kind == "sigma":
+            absolute = value * price * daily_relative_sigma
+        else:
+            raise ValueError("from_type 仅支持 'absolute'、'relative' 或 'sigma'")
+        relative = absolute / price
+        return {
+            "absolute": absolute,
+            "relative": relative,
+            "sigma": relative / daily_relative_sigma,
+        }
+
+    def equivalent_thresholds(self, ctx):
+        # 该方法显式要求返回 sigma 等价值，因而会计算 sigma；
+        # should_hedge 的 absolute / relative 路径不会调用它。
+        sigma_strategy = self._sigma_strategy
+        if sigma_strategy is None:
+            sigma_strategy = SigmaBandStrategy(
+                k=self.threshold,
+                sigma_source=self.sigma_source,
+                window_days=self.window_days,
+            )
+        sigma = sigma_strategy._sigma_ref(ctx)
+        return self.convert_threshold(
+            self.threshold, self.band_type, ctx["S_last"], sigma)
+
+    def should_hedge(self, ctx):
+        current, last = float(ctx["S"]), float(ctx["S_last"])
+        if last <= 0:
+            return False
+        if self.band_type == "absolute":
+            absolute_band = self.threshold
+        elif self.band_type == "relative":
+            absolute_band = self.threshold * last
+        else:
+            sigma = self._sigma_strategy._sigma_ref(ctx)
+            if not np.isfinite(sigma) or sigma <= 0:
+                return False
+            absolute_band = (
+                self.threshold * last * sigma / np.sqrt(ANNUAL_DAYS)
+            )
+        triggered = abs(current - last) >= absolute_band
+        if triggered and self.band_type == "sigma":
+            self._sigma_strategy._last_trigger_i = int(ctx["i"])
         return triggered
 
 
@@ -262,6 +674,29 @@ def _rescale_option_to_real_s0(option, real_s0):
         info["fields"][name] = (old_f, new_f)
 
     return opt, info
+
+
+def _rescale_strategy_to_real_s0(strategy, ratio):
+    """按标的价格重定基比例复制并缩放策略中的绝对价格阈值。
+
+    absolute 带宽带有价格量纲，必须与期权要素一起乘以
+    ``real_s0 / reference_s0``；relative / sigma 以及时间类策略不变。
+    无论策略类型如何都返回独立副本，绝不修改调用方对象。
+    """
+    if strategy is None:
+        return None
+    ratio = float(ratio)
+    if not np.isfinite(ratio) or ratio <= 0:
+        raise ValueError("策略重定基 ratio 必须是大于 0 的有限数值")
+
+    scaled = copy.deepcopy(strategy)
+    if (isinstance(scaled, HedgeBandStrategy)
+            and scaled.band_type == "absolute"):
+        scaled.threshold *= ratio
+    elif (isinstance(scaled, PriceIntervalStrategy)
+          and scaled.interval_type == "absolute"):
+        scaled.interval *= ratio
+    return scaled
 
 
 def _format_rescale_info(info):
@@ -406,6 +841,7 @@ class HedgeBacktest:
         self.option_init = copy.deepcopy(option)
         self._path_source = str(path_source).lower()
         self._external_path = external_path
+        source_index = getattr(external_path, "index", None)
         self._detrend = bool(detrend)  # 占位，本 Phase 不使用
         self.is_future = bool(is_future)
         self.contract_multiplier = float(contract_multiplier)
@@ -427,6 +863,7 @@ class HedgeBacktest:
             if prices is None:
                 raise ValueError("path_source='gbm' 时必须传 prices")
             self.prices = np.asarray(prices, dtype=float)
+            source_index = getattr(prices, "index", None)
         else:
             raise ValueError(f"未知 path_source: {path_source}，仅支持 'gbm' | 'historical'")
 
@@ -441,36 +878,80 @@ class HedgeBacktest:
         self.slippage_bps = float(slippage_bps)
         # strategy=None 时回退到旧的 FixedFreqStrategy(hedge_freq) 以保持兼容。
         self.strategy = strategy if strategy is not None else FixedFreqStrategy(self.hedge_freq)
+        self.timestamps = None
+        if source_index is not None:
+            try:
+                import pandas as pd
+                # 只接受数据源本身就是 DatetimeIndex 的情形。不再把
+                # RangeIndex / 任意整数索引当作 Unix ns 强制转时间，
+                # 否则 fixed_times 会在 1970-01-01 上静默运行。
+                if isinstance(source_index, pd.DatetimeIndex):
+                    idx = source_index.copy()
+                    if len(idx) == len(self.prices):
+                        if idx.hasnans:
+                            raise ValueError("DatetimeIndex 包含 NaT，无法判定交易日边界")
+                        if not idx.is_monotonic_increasing:
+                            raise ValueError("DatetimeIndex 必须按时间升序排列")
+                        if idx.has_duplicates:
+                            raise ValueError("DatetimeIndex 包含重复时间戳")
+                        self.timestamps = idx
+            except ImportError:
+                self.timestamps = None
         self.base_seed = base_seed
         self._results = None
 
         # ---- 价格序列长度校正：严格裁剪到期权剩余期限 ----
         #
-        # 口径：Day 0 = 建仓日，Day T = 到期日，共 T+1 个价格点。
-        # 如果外部价格序列（historical / from_wind / from_csv）长度 > T+1，
-        # 必须裁剪；否则主循环会跑到到期日之后，此时 V[i]=0 与 V[T] 之间会
-        # 产生一次伪 MtM 盈亏跳变，对冲头寸平仓分支（i==n）也会错位到非到
-        # 期日上，整段盈亏分解失真。长度不足 T+1 时直接报错，避免静默截断
-        # 期权期限。
+        # 无真实时间戳时，口径仍为 Day 0 建仓、之后 T*spd 根 bar 到期。
+        # 真实 DatetimeIndex 则不能假设每组恰好 spd 根：从 i>0 的第一个
+        # 可完成交易日组收盘开始计数，严格截到第 T 个组收盘。这样首日从
+        # 盘中开始、夜盘或偶发缺 bar 时，都不会把下一组 bar 带到到期后并
+        # 制造伪 MtM 盈亏。
         try:
             t_rem = int(option._time_remaining)
         except Exception:
             t_rem = None
+        fixed_time_validated = False
         if t_rem is not None and t_rem > 0:
-            # intraday 模式下 prices 每日有 steps_per_day 个 bar，总长 T*spd + 1。
-            need = t_rem * self.steps_per_day + 1
-            have = len(self.prices)
-            if have < need:
-                raise ValueError(
-                    f"价格序列长度不足：期权剩余 {t_rem} 日 x steps_per_day="
-                    f"{self.steps_per_day} 需要 {need} 个价格点，实际仅 {have} 个。"
-                )
-            if have > need:
-                self.prices = self.prices[:need]
+            if self.timestamps is not None:
+                # fixed_times 先在原始第 T 个组边界内逐组检查目标时刻，
+                # 这样缺某根目标 bar 时能给出比“组 bar 数不足”更精确的错误。
+                if isinstance(self.strategy, FixedTimeStrategy):
+                    raw_closes = _trading_day_close_indices(self.timestamps)
+                    raw_actionable = raw_closes[raw_closes > 0]
+                    if len(raw_actionable) >= t_rem:
+                        provisional_end = int(raw_actionable[t_rem - 1])
+                        _validate_fixed_time_data(
+                            self.strategy,
+                            self.timestamps[:provisional_end + 1],
+                        )
+                        fixed_time_validated = True
+                terminal_index = _expiry_terminal_index(
+                    self.timestamps, t_rem, self.steps_per_day)
+                self.prices = self.prices[:terminal_index + 1]
+                self.timestamps = self.timestamps[:terminal_index + 1]
+            else:
+                need = t_rem * self.steps_per_day + 1
+                have = len(self.prices)
+                if have < need:
+                    raise ValueError(
+                        f"价格序列长度不足：期权剩余 {t_rem} 日 x "
+                        f"steps_per_day={self.steps_per_day} 需要 {need} 个"
+                        f"价格点，实际仅 {have} 个。"
+                    )
+                if have > need:
+                    self.prices = self.prices[:need]
+
+        # fixed_times 的数据问题在构造阶段直接报错，避免完成费时
+        # Greeks / MC 计算后才发现全程没有任何可触发时刻。
+        if (isinstance(self.strategy, FixedTimeStrategy)
+                and not fixed_time_validated):
+            _validate_fixed_time_data(self.strategy, self.timestamps)
 
     def run(self):
         """执行回测，返回结果字典"""
         option = copy.deepcopy(self.option_init)
+        strategy = copy.deepcopy(self.strategy)
         S = self.prices
         n = len(S) - 1
         r = option.r
@@ -491,6 +972,14 @@ class HedgeBacktest:
             i_ko, ko_settle = ko_event
             S = S[:i_ko + 1]
             n = len(S) - 1
+
+        run_timestamps = (
+            self.timestamps[:n + 1] if self.timestamps is not None else None
+        )
+        trading_day_groups = (
+            _trading_day_groups(run_timestamps)
+            if run_timestamps is not None else None
+        )
 
         # 存储数组
         V = np.zeros(n + 1)        # 期权理论价值
@@ -566,21 +1055,52 @@ class HedgeBacktest:
         hedge_triggered[0] = True  # Day 0 建仓视为一次触发
 
         sl_rate = self.slippage_bps * 1e-4  # bps -> ratio
+        bars_since_day_close = 0
 
         # ---- Day 1 ~ n ----
+        # Day 0 始终是建仓观测点，本身不消耗期限（即使它恰好
+        # 是某个收盘 bar）。只有 i>=1 的真实交易日末 bar 才会
+        # step_forward；无时间戳路径则继续每 spd 根推进一天。
         for i in range(1, n + 1):
-            # 日粒度划分：i % spd == 0 时是"跨日收盘"，需要 step_forward；
-            # 其他 bar 为日内 bar，仅用临时 bumped copy 重算 Δ，不污染 option 内部状态。
-            crosses_day = (i % spd == 0)
+            timestamp = run_timestamps[i] if run_timestamps is not None else None
+            next_timestamp = (
+                run_timestamps[i + 1]
+                if run_timestamps is not None and i < n else None
+            )
+            if trading_day_groups is not None:
+                # 真实行情按交易日组的末 bar 推进一天，而不是用
+                # bar 序号取模。末 bar 没有 next_timestamp；若期权仍剩
+                # 一天，将它视为回测到期观测并完成最后一次时间推进。
+                is_day_close = (
+                    i == n or
+                    trading_day_groups[i] != trading_day_groups[i + 1]
+                )
+                crosses_day = bool(is_day_close)
+            else:
+                # 无时间戳 GBM / ndarray 路径保留历史行为。
+                crosses_day = (i % spd == 0)
+                is_day_close = crosses_day
 
-            if crosses_day:
+            # 防止时间索引与期限参数不一致时将 option 推到负剩余
+            # 期限。交易日边界 is_day_close 仍保留在策略 context 中。
+            advances_option_day = crosses_day and option._time_remaining > 0
+            bars_since_day_close += 1
+
+            if advances_option_day:
                 option.step_forward(S[i])
                 eval_opt = option
+                bars_since_day_close = 0
             else:
                 # 日内：用临时副本评估 price / Δ，option 本体状态保持到当日收盘。
-                # intraday_elapsed = (i % spd)/spd ∈ [1/spd, (spd-1)/spd]，
+                # intraday_elapsed ∈ [1/spd, (spd-1)/spd]，
                 # 让 Δ 在日内也按 bar 比例消耗 T，避免跨日 bar 单次跳变掉一天 Θ。
-                elapsed = (i % spd) / spd
+                if trading_day_groups is None:
+                    elapsed = (i % spd) / spd
+                else:
+                    elapsed = min(
+                        bars_since_day_close / spd,
+                        max(0.0, (spd - 1) / spd),
+                    )
                 eval_opt = option._bumped_copy(
                     s0=float(S[i]), _intraday_elapsed=elapsed
                 )
@@ -639,11 +1159,15 @@ class HedgeBacktest:
                     "i_last": i_last,
                     "dt_bar": dt_bar,
                     "steps_per_day": spd,
+                    "crosses_day": crosses_day,
+                    "is_day_close": is_day_close,
+                    "timestamp": timestamp,
+                    "next_timestamp": next_timestamp,
                     "sigma_impl": float(option.sigma),
                     # 对数收益历史（到当前 bar 为止），仅 realized σ 时用到
                     "log_ret_hist": np.log(S[1:i + 1] / S[0:i]) if i >= 1 else np.array([]),
                 }
-                if self.strategy.should_hedge(ctx):
+                if strategy.should_hedge(ctx):
                     target, theo, real = _compute_target(delta[i])
                     trade = target - H[i]
                     if trade != 0:
@@ -709,19 +1233,34 @@ class HedgeBacktest:
         for i in range(2, n + 1):
             cumulative_realized[i] = np.std(log_ret[:i], ddof=1) * np.sqrt(ann_factor)
 
-        # intraday 下 n 是 bar 数，真正的日数 = n // spd。
+        # 真实时间索引按实际完成的交易日组计数；无时间戳路径才使用
+        # 固定 spd 换算。Day 0 若单独成组（收盘基准点）不计入期限。
+        if run_timestamps is not None:
+            completed_days = int(np.count_nonzero(
+                _trading_day_close_indices(run_timestamps) > 0
+            ))
+        else:
+            completed_days = n // spd if spd > 0 else n
+
         self._results = {
-            'n_days': n // spd if spd > 0 else n,
+            'n_days': completed_days,
             'n_bars': n,
             'steps_per_day': spd,
-            'n_trade_days': n // spd if spd > 0 else n,
+            'n_trade_days': completed_days,
             # 敲出提前了结标记：knocked_out=True 时回测在 ko_day（交易日）截断，
             # ko_settle 为敲出当日结算票息（普通期权恒为 False/None）。
             'knocked_out': ko_settle is not None,
-            'ko_day': (n // spd if spd > 0 else n) if ko_settle is not None else None,
+            'ko_day': completed_days if ko_settle is not None else None,
             'ko_settle': ko_settle,
             'hedge_triggered': hedge_triggered,
-            'strategy_name': getattr(self.strategy, 'name', 'unknown'),
+            'strategy_name': getattr(strategy, 'name', 'unknown'),
+            'timestamps': run_timestamps,
+            # 与 timestamps 一一对齐的交易日组编号；夜盘、跨午夜
+            # 与后续日盘保持在同一组，便于分析层按交易日聚合 PnL。
+            'trading_day_groups': (
+                trading_day_groups.copy()
+                if trading_day_groups is not None else None
+            ),
             'prices': S,
             'opt_value': V,
             'delta': delta,
@@ -1097,12 +1636,10 @@ class HedgeBacktest:
             None（默认）走 `w.wsd` 日频分支，行为与旧版一致；
             非 None 走 `w.wsi` intraday 分支，取值如 "1"/"5"/"15"/"30"/"60"。
         steps_per_day : int | None
-            日频模式下强制为 1；intraday 模式下若未指定则按 A 股日盘 240
-            分钟自动推导：`spd = 240 // int(bar_size)`（60min→4, 5min→48,
-            1min→240）。显式传入时以传入值为准并打印告警。
-            注意：240 分钟假设仅适用于 A 股 / 沪深 300 股指期货日盘；
-            对含夜盘的商品/能源期货（.SHF/.DCE/.CZC/.INE/.GFE）会打印
-            警告，建议手动传入 steps_per_day。
+            日频模式下强制为 1；intraday 模式下若未指定，优先按返回的
+            DatetimeIndex 统计典型交易日组 bar 数。实际索引无法推导时，
+            再按 Wind 品种交易分钟元数据与 bar_size 计算；两者均不可用才
+            使用 A 股 240 分钟备用口径。显式传入时以传入值为准并打印告警。
 
         Returns
         -------
@@ -1136,6 +1673,8 @@ class HedgeBacktest:
             # 按真实起始价缩放期权要素
             real_s0 = float(prices[0])
             opt, rescale_info = _rescale_option_to_real_s0(option, real_s0)
+            scaled_strategy = _rescale_strategy_to_real_s0(
+                strategy, rescale_info['ratio'])
             try:
                 print(_format_rescale_info(rescale_info))
             except Exception:
@@ -1148,9 +1687,9 @@ class HedgeBacktest:
                       f"收到 {spd_final} 已置 1")
                 spd_final = 1
 
-            bt = cls(opt, prices, hedge_freq=hedge_freq, tc_rate=tc_rate,
+            bt = cls(opt, series, hedge_freq=hedge_freq, tc_rate=tc_rate,
                      position=position, quantity=quantity, multiplier=multiplier,
-                     strategy=strategy, steps_per_day=spd_final,
+                     strategy=scaled_strategy, steps_per_day=spd_final,
                      slippage_bps=slippage_bps)
             used_len = len(bt.prices)
             bt._wind_meta = {
@@ -1161,6 +1700,7 @@ class HedgeBacktest:
                 'n_trade_days': used_len - 1,
                 'bar_size': None,
             }
+            bt._full_price_history = series.copy()
             bt._rescale_info = rescale_info
             return bt
 
@@ -1199,16 +1739,41 @@ class HedgeBacktest:
             from wind_data import get_trading_minutes_per_day
 
         total_min = get_trading_minutes_per_day(code)
+        metadata_spd = None
         if total_min is not None:
             if total_min % bar_min != 0:
                 print(f"[from_wind] 警告：{code} 日内 {total_min} 分钟无法被 "
-                      f"bar_size={bar_min} 整除，spd 取整可能引入偏差。")
-            auto_spd = max(1, total_min // bar_min)
+                      f"bar_size={bar_min} 整除；将优先使用实际时间索引推导。")
+            # 非整除时 Wind 会保留最后一个不足 bar_size 的尾 bar，必须向上
+            # 取整；floor 会让恰好少最后一根的盘中残段自证为完整。
+            metadata_spd = max(1, (total_min + bar_min - 1) // bar_min)
         else:
-            auto_spd = max(1, 240 // bar_min)
-            print(f"[from_wind] 警告：无法从 Wind 获取 {code} 的交易分钟数，"
-                  f"按 240 分钟（A 股/股指）推导 spd={auto_spd}。"
-                  f"如该合约含夜盘，请显式传入 steps_per_day。")
+            metadata_spd = max(1, (240 + bar_min - 1) // bar_min)
+
+        # Wind 的分钟 bar 可能包含不足一个 bar_size 的尾 bar，例如
+        # 570 分钟 / 60min 理论 floor=9，但实际索引每天会返回 10 根。
+        # 因此优先相信真实 DatetimeIndex 的典型交易日组 bar 数，交易分钟
+        # 元数据只做交叉校验和无法推导时的兜底。
+        index_spd = _infer_intraday_steps(series.index)
+        if index_spd > 1:
+            # 索引只有一个或多个同样的盘中残段时，众数会把残段 bar 数
+            # 自证成“完整日”。自动模式取索引与交易时长元数据中更保守的
+            # 较大值：可保留 10>9 的尾 bar 场景，同时让 3<4 的上午残段
+            # 在期限完整性检查中被拒绝。
+            auto_spd = max(index_spd, metadata_spd)
+            if metadata_spd != index_spd:
+                source = ("交易分钟元数据" if total_min is not None
+                          else "240 分钟备用口径")
+                print(f"[from_wind] 实际时间索引推导 steps_per_day={index_spd}，"
+                      f"与{source}推导值 {metadata_spd} 不同；"
+                      f"自动模式采用保守值 {auto_spd}。")
+        else:
+            auto_spd = metadata_spd
+            if total_min is None:
+                print(f"[from_wind] 警告：实际索引无法推导日内 bar 数，且无法从 "
+                      f"Wind 获取 {code} 的交易分钟数；按 240 分钟备用口径"
+                      f"推导 spd={metadata_spd}。含夜盘品种请显式传入 "
+                      "steps_per_day。")
 
         if steps_per_day is None:
             spd_final = auto_spd
@@ -1221,14 +1786,16 @@ class HedgeBacktest:
         # 按真实起始价缩放期权要素
         real_s0 = float(prices[0])
         opt, rescale_info = _rescale_option_to_real_s0(option, real_s0)
+        scaled_strategy = _rescale_strategy_to_real_s0(
+            strategy, rescale_info['ratio'])
         try:
             print(_format_rescale_info(rescale_info))
         except Exception:
             pass
 
-        bt = cls(opt, prices, hedge_freq=hedge_freq, tc_rate=tc_rate,
+        bt = cls(opt, series, hedge_freq=hedge_freq, tc_rate=tc_rate,
                  position=position, quantity=quantity, multiplier=multiplier,
-                 strategy=strategy, steps_per_day=spd_final,
+                 strategy=scaled_strategy, steps_per_day=spd_final,
                  slippage_bps=slippage_bps)
         used_len = len(bt.prices)
         used_index = series.index[:used_len]
@@ -1241,6 +1808,7 @@ class HedgeBacktest:
             'n_trade_days': max(0, (used_len - 1) // max(1, spd_final)),
             'bar_size': bar_size_str,
         }
+        bt._full_price_history = series.copy()
         bt._rescale_info = rescale_info
         return bt
 
@@ -1248,7 +1816,7 @@ class HedgeBacktest:
     def from_csv(cls, option, filepath, price_col='close',
                  date_col=None, hedge_freq=1, tc_rate=0.0, position=1,
                  quantity=1.0, multiplier=5,
-                 strategy=None, steps_per_day=1, slippage_bps=0.0):
+                 strategy=None, steps_per_day=None, slippage_bps=0.0):
         """
         从 CSV 文件加载价格数据创建回测实例（无需 Wind 终端）
 
@@ -1276,21 +1844,47 @@ class HedgeBacktest:
 
         series = df[price_col].dropna()
         prices = series.values
+        if len(series) < 2:
+            raise ValueError(f"CSV 价格数据不足：需要 >= 2 条，实际 {len(series)} 条")
+
+        # CSV 同时支持日频和真实日内 DatetimeIndex。日内数据
+        # 按交易日组（含夜盘）的典型 bar 数推导 spd；显式传入
+        # 非 1 值时会与推导值核对，避免时间衰减与行情粒度错位。
+        is_datetime_index = isinstance(series.index, pd.DatetimeIndex)
+        inferred_spd = _infer_intraday_steps(series.index) if is_datetime_index else 1
+        if inferred_spd > 1:
+            if steps_per_day is None or int(steps_per_day) == 1:
+                steps_per_day = inferred_spd
+            else:
+                requested_spd = max(1, int(steps_per_day))
+                if requested_spd != inferred_spd:
+                    raise ValueError(
+                        f"CSV 日内行情推导 steps_per_day={inferred_spd}，"
+                        f"与显式传入值 {requested_spd} 不一致。"
+                    )
+                steps_per_day = requested_spd
+        else:
+            requested_spd = 1 if steps_per_day is None else int(steps_per_day)
+            if requested_spd != 1:
+                print(
+                    f"[from_csv] CSV 日频数据仅支持 spd=1，"
+                    f"steps_per_day={requested_spd} 已置 1"
+                )
+            steps_per_day = 1
 
         # 按真实起始价缩放期权要素，逻辑与 from_wind 一致。
         real_s0 = float(prices[0])
         opt, rescale_info = _rescale_option_to_real_s0(option, real_s0)
+        scaled_strategy = _rescale_strategy_to_real_s0(
+            strategy, rescale_info['ratio'])
         try:
             print(_format_rescale_info(rescale_info))
         except Exception:
             pass
 
-        if int(steps_per_day) != 1:
-            print(f"[from_csv] CSV 日频数据仅支持 spd=1，steps_per_day={steps_per_day} 已置 1")
-            steps_per_day = 1
-        bt = cls(opt, prices, hedge_freq=hedge_freq, tc_rate=tc_rate, position=position,
+        bt = cls(opt, series, hedge_freq=hedge_freq, tc_rate=tc_rate, position=position,
                  quantity=quantity, multiplier=multiplier,
-                 strategy=strategy, steps_per_day=steps_per_day,
+                 strategy=scaled_strategy, steps_per_day=steps_per_day,
                  slippage_bps=slippage_bps)
         used_len = len(bt.prices)
         used_index = series.index[:used_len]
@@ -1299,8 +1893,9 @@ class HedgeBacktest:
             'start_date': str(used_index[0].date()),
             'end_date': str(used_index[-1].date()),
             'dates': used_index,
-            'n_trade_days': used_len - 1,
+            'n_trade_days': max(0, (used_len - 1) // max(1, int(steps_per_day))),
         }
+        bt._full_price_history = series.copy()
         bt._rescale_info = rescale_info
         return bt
 

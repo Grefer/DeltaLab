@@ -15,8 +15,9 @@
 
 - **5 大类期权**：香草 (Vanilla)、累计 (Decumulator)、亚式 (Asian)、气囊 (Airbag)、雪球 (Snowball)，共 14 种子类型
 - **3 种数据源**：蒙特卡洛模拟 / CSV 历史行情 / Wind API
-- **2 种对冲策略**：固定频率 (`fixed_freq`) / 波动率触发 (`sigma_band`)
-- **日内多频率**：支持 Daily / 60 min / 5 min / 1 min 级别的对冲模拟（`steps_per_day ∈ {1,4,48,240}`）
+- **4 种对冲触发方式**：固定 bar 间隔 / 每日收盘 / 每日固定时刻 / 价格或日波动 σ 带宽
+- **日内多频率**：支持 Daily / 60 min / 5 min / 1 min 等粒度；真实行情会按交易日组自动推导每日 bar 数，也可显式覆盖
+- **策略对比与历史推荐**：同路径并列比较多种策略，并基于滚动历史给出近周、月、季度、年的推荐与样本诊断
 - **独立路径采样**：独立 `mc_seed` 多路径采样，避免样本相关性过高
 - **完整可视化**：6 宫格对冲图表、波动率分析、蒙特卡洛盈亏分布、结构扫描，支持每日明细导出
 - **真实行情缩放**：CSV / Wind 模式下，以首日价为锚点等比例自动缩放期权参数（行权价、障碍价、赔付金额等），保持结构的相对一致性
@@ -105,6 +106,33 @@ DeltaLab/
 ## 🔧 技术栈
 
 **Python 3.10+** · **tkinter + ttk** (GUI) · **matplotlib** (图表) · **numpy / scipy** (定价) · **pandas** (数据) · **WindPy** (实时行情, 可选) · **ThreadPoolExecutor** (多路径 MC)
+
+## 对冲模式与策略比较
+
+回测引擎支持每日收盘 `CloseToCloseStrategy`、每天多个固定时刻
+`FixedTimeStrategy(["11:30", "15:00"])`，以及统一带宽策略。
+`HedgeBandStrategy` 可选择绝对价格、相对百分比或动态 σ 三种阈值；
+例如 `HedgeBandStrategy("absolute", threshold=50)`、
+`HedgeBandStrategy("relative", threshold=0.01)` 或
+`HedgeBandStrategy("sigma", k=0.5)`。旧的 `PriceIntervalStrategy` 与
+`SigmaBandStrategy` 仍作为兼容入口保留。
+三种单位会统一换算为绝对价格带：`relative = absolute / S_last`，
+`sigma_multiple = absolute / (S_last × sigma_annual / √ANNUAL_DAYS)`，因此也有
+`sigma_multiple = relative / (sigma_annual / √ANNUAL_DAYS)`；当前项目统一使用
+`ANNUAL_DAYS=243`。
+GUI 会同时显示绝对间隔、相对间隔和日波动 σ 倍数；编辑任意一项后按回车或
+移出输入框，即会根据当前期权的 `s0` 与年化 `sigma` 自动反推另外两项；
+修改参考参数也会自动刷新。CSV/Wind 将期权从参考价伸缩到真实首价时，绝对
+带宽也按同一比例伸缩，确保它与相对值、σ 倍数在单次回测、策略对比和每个
+滚动历史窗口中保持同一口径。固定时刻模式要求真实日内 `DatetimeIndex`，且每个
+纳入回测的交易日组都必须覆盖配置的全部时刻，因此适用于完整的 Wind 分钟行情
+或带完整时间戳的日内 CSV。
+
+`pricing.hedge_analysis` 提供 `compare_strategies` 批量运行和选择多个策略，
+并用 `recommend_by_rolling_history` 在多个相同期权期限的真实历史窗口上输出
+近一周、月、季度、年的推荐与完整排名。所有 bar 损益会先按真实交易日聚合，
+默认分数为日净 PnL RMS（已包含交易成本），越低越优；样本不足时仅保留诊断
+排名，不生成正式推荐。GUI 的“多策略对比 / 历史推荐”页支持多选策略查看差异。
 
 ## 📖 详细文档
 

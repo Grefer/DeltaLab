@@ -11,7 +11,18 @@ from .hedge_backtest import (
     HedgeBacktest,
     HedgeStrategy,
     FixedFreqStrategy,
+    CloseToCloseStrategy,
+    FixedTimeStrategy,
+    PriceIntervalStrategy,
     SigmaBandStrategy,
+    HedgeBandStrategy,
+)
+from .hedge_analysis import (
+    StrategyCase,
+    compare_strategies,
+    recommend_by_lookback,
+    recommend_by_rolling_history,
+    LOOKBACK_DAYS,
 )
 
 # Wind 数据接口（仅在安装了 WindPy 时可用）

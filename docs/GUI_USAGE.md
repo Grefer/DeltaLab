@@ -279,6 +279,7 @@ GUI 当前使用交易日计息 (`act=1`)；敲入逐日观察，敲出按 `firs
 | `代码` | Wind 标的代码 | `510050.SH` |
 | `起始日` | 建仓日（含） | 启动当日往前推 90 天，格式 `YYYY-MM-DD` |
 | `结束日` | 结束日（含） | 启动当日，格式 `YYYY-MM-DD` |
+| `频率` | 日频或 Wind 分钟 bar 大小 | `日频` |
 
 底层走 `HedgeBacktest.from_wind`（`hedge_backtest.py:977`），复权方式硬编码为 `"F"`（前复权）。
 
@@ -288,7 +289,7 @@ GUI 当前使用交易日计息 (`act=1`)；敲入逐日观察，敲出按 `firs
 
 | 字段 | 含义 | 单位 / 取值 | 默认 |
 |---|---|---|---|
-| `调仓频率(天)` | `FixedFreqStrategy` 的 bar 间隔；`sigma_band` 模式下被忽略（但仍会读取），回测摘要中也不再显示 | int ≥ 1 | `1` |
+| `调仓间隔(bar)` | `FixedFreqStrategy` 的 bar 间隔；其它策略下不参与回测 | int ≥ 1 | `1` |
 | `交易成本率(%)` | 单边费率，按成交额收取；GUI 输入百分比，内部除以 100 | float，单位 % | `0.01`（即 0.0001） |
 | `头寸方向` | 单选按钮 `卖出 (short)` / `买入 (long)`，内部映射为 `1` / `-1` | Radiobutton | `卖出 (short)` → `1` |
 | `交易数量` | `quantity`，将 Δ 转换为标的份数 | float | `100` |
@@ -300,31 +301,33 @@ GUI 当前使用交易日计息 (`act=1`)；敲入逐日观察，敲出按 `firs
 
 | 字段 | 含义 | 选项 | 默认 |
 |---|---|---|---|
-| `对冲策略` | 调仓触发方式 | `fixed_freq` / `sigma_band` | `fixed_freq` |
+| `对冲策略` | 调仓触发方式 | 固定频率 / 每日收盘 / 每日固定时刻 / 价格或 σ 带宽 | 固定频率 |
 
-切到 `sigma_band` 时，下方多出 3 个字段（`gui_app.py:884-902`），切换由 `_toggle_strategy`（`gui_app.py:1141`）控制：
+- `fixed_freq`：每 N 根 bar 调仓，N 取自调仓频率。
+- `close_to_close`：有真实时间戳时按每个交易 session 的最后一根 bar 调仓；含夜盘时夜盘、跨午夜和次日日盘属于同一交易日。无时间戳模拟路径回退到 `steps_per_day` 取模。
+- `fixed_times`：每天在用户输入的 `HH:MM` 时刻调仓。必须使用每个纳入回测的交易日组都覆盖全部目标时刻的真实日内 `DatetimeIndex`；模拟、Wind 日频、仅日期 CSV 或任一交易日缺 bar 都会明确报错。
+- `hedge_band`：相对上次实际对冲价达到统一带宽后调仓。三个输入框联动，最后编辑的字段是权威输入：
 
-| 字段 | 含义 | 取值 | 默认 |
-|---|---|---|---|
-| `调仓带宽 k·σ` | 触发阈值倍数 | float > 0 | `0.5` |
-| `σ 来源` | 用什么 σ 估计触发阈值 | `implied` / `realized` | `implied` |
-| `历史波动率窗口 N (日)` | `realized` 时滚动窗口长度（单位=日） | int ≥ 2 | `20` |
+| 带宽字段 | 换算关系 |
+|---|---|
+| 绝对间隔 | `absolute` |
+| 相对间隔 | `relative = absolute / S_last`，界面中 `0.01 = 1%` |
+| 日波动 σ 倍数 | `k = relative / (sigma_annual / sqrt(ANNUAL_DAYS))` |
 
-触发条件（来自 `SigmaBandStrategy.should_hedge`，`hedge_backtest.py:140` 起）：
+编辑任意一项并按回车或移出输入框，会根据当前 `s0`、年化 `sigma` 和
+`ANNUAL_DAYS=243` 反推另外两项；修改 `s0` 或 `sigma` 也会自动刷新。运行前
+会再次严格校验当前可见输入，避免沿用隐藏的旧值。σ 表达模式还可选择
+`implied` / `realized` 及历史波动率窗口（至少 2 日）。
 
-```
-|ln(S / S_last)| >= k * σ_ref * sqrt(dt_since_last)
-```
-
-其中 `σ_ref` 取 `option.sigma`（implied）或最近 `window_days` 个交易日对数收益的年化 std；`realized` 模式下样本不足时回退到 implied。
-
-`fixed_freq` 模式下，`SigmaBandStrategy` 控件被隐藏，调仓频率取自 `调仓频率(天)`（每 N 个 bar 调一次仓，`FixedFreqStrategy`，类定义于 `hedge_backtest.py:48`）。
+CSV/Wind 若把期权参考价 `S_ref` 伸缩到真实首价 `S_real`，绝对间隔会同步乘以
+`S_real / S_ref`；相对间隔和 σ 倍数保持不变。当前路径对比使用一份已重定基的
+策略副本，滚动推荐则按每个窗口各自的首价重新计算，因此不会重复伸缩。
 
 #### 4.4.2 每日 bar 数（intraday）
 
 | 字段 | 含义 | 选项 | 默认 |
 |---|---|---|---|
-| `每日 bar 数` | `steps_per_day`，把 1 个交易日切成 N 根 bar | `1` / `4` / `48` / `240` | `1` |
+| `每日 bar 数` | `steps_per_day`，把 1 个交易日切成 N 根 bar | 常用值 `1` / `4` / `48` / `240`，真实行情可手填 | `1` |
 
 下拉提示文字：`1=日频 / 4=60分 / 48=5分 / 240=1分`（`gui_app.py:914`）。
 
@@ -333,7 +336,12 @@ GUI 当前使用交易日计息 (`act=1`)；敲入逐日观察，敲出按 `firs
 - `48` → 每日 48 根 5 分 bar。
 - `240` → 每日 240 根 1 分 bar。
 
-> CSV / Wind 模式下该控件被禁用并强制为 `1`（实盘/CSV 仅支持日频，`gui_app.py:_toggle_source`、`hedge_backtest.py:1055`（`from_wind`）/ `hedge_backtest.py:1197`（`from_csv`））。
+> Wind 日频强制为 `1`；Wind 分钟行情默认由后端直接统计实际时间索引中典型
+> 交易日组的 bar 数，品种交易分钟元数据仅用于交叉校验和兜底。界面显示的
+> A 股估值不会自动覆盖该结果；只有用户手动编辑
+> 「每日 bar 数」后才使用显式值，因此含夜盘的商品期货不会被误当成 240 分钟日盘。CSV 若带真实日内
+> `DatetimeIndex`，底层按交易日组自动推导并校验每日 bar 数；仅日期 CSV
+> 按日频处理。
 
 跨日 bar 上 `option.step_forward` 被调用；日内 bar 仅用 `_bumped_copy(_intraday_elapsed=…)` 临时评估 Δ，不污染 option 内部状态（`hedge_backtest.py:531-532`）。年化口径 `dt_bar = 1 / (ANNUAL_DAYS * spd)`，已实现波动率年化因子 `ANNUAL_DAYS * spd`。
 
@@ -354,9 +362,16 @@ GUI 当前使用交易日计息 (`act=1`)；敲入逐日观察，敲出按 `firs
 | 按钮 | 行为 |
 |---|---|
 | `▶  运行回测` | 主流程：构建期权 → 生成/读取价格 → 执行 `HedgeBacktest.run()`，模拟模式 `n_paths>1` 时还会跑 `run_multi` 并显示进度条 |
+| `⚖  多策略对比 / 历史推荐` | 在相同行情、期权、成本与头寸假设下比较固定频率、每日收盘、固定间隔，以及数据支持时的固定时刻策略；结果页支持多选明细。CSV/Wind 还会按多个相同期权期限的滚动历史窗口给出近周/月/季度/年推荐，样本不足时仅显示诊断，不生成正式推荐 |
 | `📊  绘制结构图` | 不依赖回测结果，扫描 S 在 `[s0×(1−r), s0×(1+r)]` 区间，展示 Price / Δ / Γ / ν / Θ 曲线 |
 | `扫描 ±%` | 结构图扫描幅度，默认 `30`（即 ±30%），合法范围 `(0, 100)` |
 | `点数` | 扫描点数，默认 `31`，合法范围 `5~201` |
+
+滚动历史推荐只把已完成的真实交易日组作为候选终点。若 Wind/CSV 查询截止在
+当天盘中，能由前序完整 session 明确识别的尾部残组会被剔除；其它异常端点
+会保留诊断并跳过，不会让此前完整窗口或其它可运行策略的推荐整体失败。固定
+时刻策略若仅在个别窗口缺少目标 bar，会被标为不完整，而每日收盘、固定间隔
+等策略仍可继续排名。
 
 > 结构图默认会限制 `nPath ≤ 20000` 以加速扫描（见 `_structure_worker`，`gui_app.py:1996`），原值若大于 20000 仅在结构图时生效，回测主流程仍用原值。
 >
@@ -375,7 +390,7 @@ GUI 当前使用交易日计息 (`act=1`)；敲入逐日观察，敲出按 `firs
    - `种子` `42`
    - `已实现波动率` 留空（=隐含）
    - `模拟路径数` 改为 `500`
-   - `调仓频率(天)` `1`，`交易成本率(%)` `0.01`
+   - `调仓间隔(bar)` `1`，`交易成本率(%)` `0.01`
    - `头寸方向` 选 `卖出 (short)`（内部 position=1）
    - `交易数量` `100`，`合约乘数` `0`（连续对冲）
    - `对冲策略` `fixed_freq`，`每日 bar 数` `1`，`滑点 (bps)` `0`
@@ -454,9 +469,10 @@ Treeview 形式的每日表格，含 13 列：标的价格 / 期权价值 / Δ/�
 
 CSV / Wind 模式下若期权 `s0` 设为 0 或负数，会触发 `_rescale_option_to_real_s0` 抛错（`hedge_backtest.py:201`）。请填入正的参考价。
 
-### 7.4 `每日 bar 数` 在 CSV / Wind 模式下被锁死
+### 7.4 固定时刻提示行情不是日内数据
 
-Wind / CSV 真实行情仅支持日频；`_toggle_source` 会强制 `spd_var=1` 并禁用下拉框，UI 提示文字变为「实盘/CSV 模式仅支持日频 (spd=1)」。即便用户绕过 GUI 直接调用 `from_wind(steps_per_day=4)`，底层也会强制改为 1 并打印日志（`hedge_backtest.py:1055`）。
+固定时刻策略要求每个交易日至少两根 bar，并且行情必须覆盖配置的全部
+`HH:MM`。请在 Wind 中选择分钟频率，或提供第一列为完整日期时间的日内 CSV。
 
 ### 7.5 蒙特卡洛盈亏分布 Tab 一片空白
 
@@ -479,7 +495,8 @@ GUI 与底层 `HedgeBacktest.__init__` 均默认 `合约乘数 = 5`（`hedge_bac
 ## 相关源码
 
 - [`gui_app.py`](../gui_app.py) — GUI 入口与全部控件
-- [`pricing/hedge_backtest.py`](../pricing/hedge_backtest.py) — `HedgeBacktest` / `HedgeStrategy` / `FixedFreqStrategy` / `SigmaBandStrategy`
+- [`pricing/hedge_backtest.py`](../pricing/hedge_backtest.py) — `HedgeBacktest` 及固定频率、每日收盘、固定时刻、统一带宽策略
+- [`pricing/hedge_analysis.py`](../pricing/hedge_analysis.py) — 多策略日频聚合比较、完整窗口诊断与滚动历史推荐
 - [`pricing/option_base.py`](../pricing/option_base.py) — `OptionBase`，统一定价/Greeks 接口
 - [`pricing/Option_Vanilla.py`](../pricing/Option_Vanilla.py) — 香草期权 + `blsprice`
 - [`pricing/Option_AS.py`](../pricing/Option_AS.py) — 亚式期权
