@@ -20,6 +20,8 @@ from .hedge_backtest import (
 from .hedge_analysis import (
     StrategyCase,
     compare_strategies,
+    result_daily_frame,
+    summarize_strategy_result,
     recommend_by_lookback,
     recommend_by_rolling_history,
     LOOKBACK_DAYS,

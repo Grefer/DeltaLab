@@ -154,6 +154,31 @@ def _aggregate_result_by_day(result, steps_per_day):
     return daily
 
 
+def result_daily_frame(result, steps_per_day=None):
+    """把单次回测结果转换为可直接展示的日级净 PnL 曲线数据。
+
+    Parameters
+    ----------
+    result : dict
+        :meth:`HedgeBacktest.run` 返回的单策略结果。
+    steps_per_day : int, optional
+        仅供旧结果缺少 ``steps_per_day`` 时回退使用；若结果自身已有该字段，
+        显式值必须与其一致。
+
+    Returns
+    -------
+    pandas.DataFrame
+        索引沿用真实交易 session 分组（无时间戳旧结果则为顺序日组），列为
+        ``net_pnl``、``tc_paid`` 和 ``cumulative_net_pnl``。最后一列等于前两列
+        中 ``net_pnl`` 的逐日累加，可直接供 GUI 绘制累计净 PnL 曲线。
+    """
+    spd = _result_steps_per_day({"result": result}, steps_per_day)
+    daily = _aggregate_result_by_day(result, spd).copy()
+    daily["cumulative_net_pnl"] = daily["net_pnl"].cumsum()
+    daily.index.name = "trade_day"
+    return daily
+
+
 def _daily_metrics(daily):
     net = np.asarray(daily["net_pnl"], dtype=float)
     tc = np.asarray(daily["tc_paid"], dtype=float)
@@ -186,15 +211,94 @@ def _rank_rows(rows):
     ranking = pd.DataFrame(rows)
     if ranking.empty:
         return ranking
-    # 完整窗口永远优先于不完整窗口；同一完整性内再按 score 和策略名稳定
-    # 排序。这样 incomplete 结果仍可诊断，但不会挤掉正式推荐。
+    # 完整窗口永远优先于不完整窗口；同一完整性内先按 score，再按总成本、
+    # 策略名稳定排序。这样分数相同的推荐可复现，也自然偏向成本更低的策略。
     ranking = ranking.sort_values(
-        ["lookback_days", "complete_window", "score", "strategy"],
-        ascending=[True, False, True, True],
+        [
+            "lookback_days", "complete_window", "score", "window_tc",
+            "strategy",
+        ],
+        ascending=[True, False, True, True, True],
         kind="stable",
     ).reset_index(drop=True)
     ranking["rank"] = ranking.groupby("lookback", sort=False).cumcount() + 1
     return ranking
+
+
+def _strategy_activity_metrics(result):
+    """区分策略触发、再调仓与真实成交，保留旧触发计数口径。"""
+    if "hedge_triggered" not in result:
+        raise KeyError("回测结果缺少字段 'hedge_triggered'")
+    triggered = np.asarray(result["hedge_triggered"])
+    if triggered.ndim != 1:
+        raise ValueError("回测结果 'hedge_triggered' 必须是一维数组")
+    triggered = triggered.astype(bool)
+
+    shares = _result_series(result, "shares")
+    prices = _result_series(result, "prices")
+    if len(triggered) != len(shares) or len(shares) != len(prices):
+        raise ValueError(
+            "回测结果 hedge_triggered、shares 与 prices 长度必须一致: "
+            f"{len(triggered)}, {len(shares)}, {len(prices)}"
+        )
+
+    trades = np.empty_like(shares)
+    if len(shares):
+        trades[0] = shares[0]
+        trades[1:] = np.diff(shares)
+    actual_trade_mask = np.abs(trades) > 1e-10
+    effective_trades = np.where(actual_trade_mask, trades, 0.0)
+
+    return {
+        # 兼容旧展示：包括 Day 0 建仓触发与到期平仓触发，即使目标持仓未变。
+        "trade_count": int(np.count_nonzero(triggered)),
+        # 新口径：只统计策略在存续期内的触发，不含首尾两个引擎端点。
+        "rehedge_count": int(np.count_nonzero(triggered[1:-1])),
+        # 真实成交以持仓确实发生变化为准，包括首仓和到期平仓。
+        "actual_trade_count": int(np.count_nonzero(actual_trade_mask)),
+        "turnover": float(np.sum(np.abs(effective_trades) * prices)),
+    }
+
+
+def summarize_strategy_result(
+        result, display_name, metadata=None, steps_per_day=None):
+    """把单次回测结果汇总为与策略对比排名兼容的一行指标。
+
+    该函数不运行回测、也不修改 ``result`` 或 ``metadata``。日级 RMS、成本、
+    净 PnL 与回撤使用 :func:`result_daily_frame` 相同的交易 session 聚合口径；
+    触发与成交指标则直接从单次结果的持仓轨迹计算。
+
+    Parameters
+    ----------
+    result : dict
+        :meth:`HedgeBacktest.run` 返回的单策略结果。
+    display_name : str
+        排名表中展示的策略名，可包含参数说明。
+    metadata : mapping, optional
+        展示元数据。为避免覆盖正式指标，输出键统一添加 ``meta_`` 前缀。
+    steps_per_day : int, optional
+        仅供旧结果缺少 ``steps_per_day`` 时回退使用；若结果已有该字段，显式值
+        必须与其一致。
+
+    Returns
+    -------
+    dict
+        可直接用于构造 :func:`compare_strategies` summary 的指标行；不含只有
+        多策略排序后才能确定的 ``rank``。
+    """
+    spd = _result_steps_per_day({"result": result}, steps_per_day)
+    daily = _aggregate_result_by_day(result, spd)
+    metadata_copy = (
+        {} if metadata is None else copy.deepcopy(dict(metadata))
+    )
+    return {
+        "strategy": display_name,
+        "strategy_type": result["strategy_name"],
+        "hedging_error": float(result["hedging_error"]),
+        **_strategy_activity_metrics(result),
+        **_daily_metrics(daily),
+        **{f"meta_{key}": value for key, value in metadata_copy.items()},
+    }
 
 
 def compare_strategies(option, prices, cases, backtest_kwargs=None):
@@ -224,22 +328,14 @@ def compare_strategies(option, prices, cases, backtest_kwargs=None):
 
     spd = _result_steps_per_day(results, kwargs.get("steps_per_day"))
     for case in cases:
-        result = results[case.name]
-        daily = _aggregate_result_by_day(result, spd)
-        metrics = _daily_metrics(daily)
-        rows.append({
-            "strategy": case.name,
-            "strategy_type": result["strategy_name"],
-            "hedging_error": float(result["hedging_error"]),
-            "trade_count": int(np.count_nonzero(result["hedge_triggered"])),
-            **metrics,
-            **{f"meta_{k}": v for k, v in case.metadata.items()},
-        })
+        rows.append(summarize_strategy_result(
+            results[case.name], case.name, case.metadata, spd,
+        ))
 
     summary = pd.DataFrame(rows)
     if not summary.empty:
         summary = summary.sort_values(
-            ["score", "strategy"], kind="stable"
+            ["score", "total_tc", "strategy"], kind="stable"
         ).reset_index(drop=True)
         summary.insert(0, "rank", np.arange(1, len(summary) + 1))
     return summary, results

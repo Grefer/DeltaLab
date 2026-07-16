@@ -785,7 +785,8 @@ class HedgeBacktest:
     prices : array-like
         标的资产每日价格序列，prices[0] = 期初价格，长度 = 总交易日数 + 1
     hedge_freq : int
-        调仓频率（每隔几个交易日调仓），默认 1（每日调仓）
+        旧版固定 bar 频率，仅在 ``strategy=None`` 时生效；为后端 API
+        兼容保留。新调用应显式传入 ``strategy``。
     tc_rate : float
         单边交易成本率，默认 0
     position : int
@@ -1301,12 +1302,37 @@ class HedgeBacktest:
         r = self._results
         n = r['n_days']
 
+        strategy = self.strategy
+        if isinstance(strategy, FixedFreqStrategy):
+            strategy_text = f"固定 bar 频率（每 {strategy.hedge_freq} bar）"
+        elif isinstance(strategy, CloseToCloseStrategy):
+            strategy_text = "每日收盘（close-to-close）"
+        elif isinstance(strategy, FixedTimeStrategy):
+            times = ",".join(t.strftime("%H:%M") for t in strategy.times)
+            strategy_text = f"每日固定时刻（{times}）"
+        elif isinstance(strategy, HedgeBandStrategy):
+            unit = {
+                "absolute": "绝对价格",
+                "relative": "相对价格",
+                "sigma": "日波动 σ",
+            }.get(strategy.band_type, strategy.band_type)
+            strategy_text = f"固定间隔（{unit}={strategy.threshold:g}）"
+        elif isinstance(strategy, PriceIntervalStrategy):
+            strategy_text = (
+                f"旧版价格间隔（{strategy.interval_type}={strategy.interval:g}）"
+            )
+        elif isinstance(strategy, SigmaBandStrategy):
+            strategy_text = f"旧版 σ 带宽（k={strategy.k:g}）"
+        else:
+            strategy_text = getattr(strategy, "name", type(strategy).__name__)
+
         lines = [
             "=" * 52,
             "          动态对冲回测结果摘要",
             "=" * 52,
             f"  回测天数          :  {n:>10d}   (Day 0=建仓, Day {n}=到期)",
-            f"  调仓频率          :  每 {self.hedge_freq} 天",
+            f"  对冲策略          :  {strategy_text}",
+            f"  实际采样 bar/日   :  {self.steps_per_day:>10d}",
             f"  交易成本率        :  {self.tc_rate * 100:.2f}%",
             "-" * 52,
             f"  标的初始价格      :  {r['prices'][0]:>12.4f}",
@@ -1625,7 +1651,8 @@ class HedgeBacktest:
         end_date : str
             回测结束日 "YYYY-MM-DD"（含当日）；intraday 同上。
         hedge_freq : int
-            调仓频率（bar 数），默认 1
+            旧版固定 bar 频率，仅在 ``strategy=None`` 时生效；为后端 API
+            兼容保留。
         tc_rate : float
             单边交易成本率
         position : int

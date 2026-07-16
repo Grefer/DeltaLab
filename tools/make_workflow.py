@@ -3,7 +3,7 @@
 三列布局 (从左到右):
   1. 输入 (Inputs):    期权类型 / 参数 / 数据源 / 对冲策略
   2. 引擎 (Engine):    HedgeBacktest + MC 路径生成 + 策略调度
-  3. 输出 (Outputs):   6 个结果 Tab (摘要/对冲图表/波动率/盈亏分布/结构/明细)
+  3. 输出 (Outputs):   单次回测 / 回测结果对比 / 历史择优三条独立结果路径
 
 使用 matplotlib 手绘, 与项目整体风格 (PALETTE) 保持一致.
 用法: python tools/make_workflow.py
@@ -127,7 +127,7 @@ def render_workflow() -> plt.Figure:
             ha="center", va="center", fontsize=19, fontweight="bold",
             color=TEXT)
     ax.text(16, 17.2,
-            "参数配置 → 价格序列 → 动态对冲引擎 → 多维结果可视化",
+            "参数配置 → 动态对冲引擎 → 单次结果 / 快照对比 / 历史择优",
             ha="center", va="center", fontsize=12, color=TEXT_MUTED)
 
     # 三列顶栏标签
@@ -153,16 +153,17 @@ def render_workflow() -> plt.Figure:
     # 数据源
     _card(ax, (LEFT_X, 6.2), (CARD_W, 4.0),
           "数据来源",
-          ["• 模拟 (MC) — 种子可控",
-           "• CSV — 本地历史行情",
-           "• Wind — 实时终端接入"],
+          ["• 模拟 (MC) — 种子与采样粒度可选",
+           "• CSV / Wind — 真实历史行情",
+           "• 真实行情 bar/日按时间戳自动推导"],
           edge=ACCENT)
 
     # 对冲设置
     _card(ax, (LEFT_X, 1.4), (CARD_W, 4.0),
-          "对冲策略 & 频率",
-          ["• fixed_freq / sigma_band",
-           "• 日频 · 60 分 · 5 分 · 1 分",
+          "对冲策略 & 触发条件",
+          ["• 每日收盘 (close-to-close)",
+           "• 每日固定时刻 (真实日内行情)",
+           "• 固定间隔：绝对 / 相对 / σ 执行口径",
            "• 滑点 / 手续费 / 乘数取整"],
           edge=GOLD)
 
@@ -174,8 +175,9 @@ def render_workflow() -> plt.Figure:
           ["• GBM 路径 + 反对称采样",
            "• per-path MC seed",
            "• Δ / Γ / ν / Θ / ρ (有限差分)",
-           "• fixed_freq / sigma_band 策略调度",
-           "• 日频 / 日内多频率 (spd ∈ 1·4·48·240)",
+           "• 每日收盘 / 固定时刻 / 固定间隔调度",
+           "• 绝对价 / 相对价 / σ 参考点换算",
+           "• 模拟可选采样；真实行情自动推导 bar/日",
            "• 滑点 · 手续费 · 乘数取整",
            "• run() 单路径 + run_multi() 并行",
            "• S_ref → S_real 自动缩放"],
@@ -184,24 +186,27 @@ def render_workflow() -> plt.Figure:
     # ================== 右列: 输出 ==================
     RIGHT_X = 22.5
     _card(ax, (RIGHT_X, 11.0), (CARD_W, 4.0),
-          "单路径结果",
+          "单次回测结果",
           ["• 回测摘要 (盈亏分解 + Greeks)",
            "• 对冲图表 (6 宫格)",
-           "• 波动率分析 (RV vs IV)"],
+           "• 波动率 / 多路径 / 结构 / 明细",
+           "• 可显式保留为普通快照"],
           edge=SUCCESS)
 
     _card(ax, (RIGHT_X, 6.2), (CARD_W, 4.0),
-          "多路径分析",
-          ["• 盈亏 / 对冲误差分布",
-           "• RV 分布 · 5% VaR",
-           "• 盈亏 vs (IV − RV) 回归"],
+          "回测结果对比",
+          ["• 只管理已保存的普通回测快照",
+           "• 勾选曲线 · 排名 · 实时差异",
+           "• 不混入历史滚动汇总"],
           edge=SUCCESS)
 
     _card(ax, (RIGHT_X, 1.4), (CARD_W, 4.0),
-          "结构 & 明细",
-          ["• 价格 / Greeks 扫描曲线",
-           "• 关键价位标记 (K / H / KI / E / P)",
-           "• 每日明细表格 · CSV 导出"],
+          "历史择优 (独立页)",
+          ["• 仅 CSV / Wind 真实历史",
+           "• 策略开关 · 时刻 / σ 候选独立配置",
+           "• 近周 / 月 / 季 / 年滚动排名",
+           "• 应用选中策略到回测",
+           "• 当前路径验证并保留到对比"],
           edge=SUCCESS)
 
     # ================== 箭头 ==================
@@ -218,6 +223,11 @@ def render_workflow() -> plt.Figure:
     for y_src, y_dst in [(12.5, 13.0), (9.75, 8.2), (7.0, 3.4)]:
         _arrow(ax, (engine_right_x + 0.1, y_src),
                (right_left_x - 0.1, y_dst))
+
+    # 历史推荐必须先在当前路径验证，成功后才进入普通快照结果池。
+    _arrow(ax, (26.75, 5.45), (26.75, 6.15), color=GOLD, lw=1.6)
+    ax.text(29.0, 5.8, "验证后保留", ha="center", va="center",
+            fontsize=8.5, color=GOLD)
 
     # 底部脚注
     ax.text(16, 0.55,

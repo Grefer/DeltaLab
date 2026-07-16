@@ -6,6 +6,7 @@ import pytest
 
 from pricing import (
     CloseToCloseStrategy,
+    FixedFreqStrategy,
     FixedTimeStrategy,
     HedgeBacktest,
     HedgeBandStrategy,
@@ -14,6 +15,8 @@ from pricing import (
     PriceIntervalStrategy,
     StrategyCase,
     compare_strategies,
+    result_daily_frame,
+    summarize_strategy_result,
     recommend_by_lookback,
     recommend_by_rolling_history,
 )
@@ -35,6 +38,35 @@ def test_close_to_close_triggers_at_each_day_end():
         strategy=CloseToCloseStrategy(),
     ).run()
     assert np.flatnonzero(result["hedge_triggered"]).tolist() == [0, 2, 4, 6, 8]
+
+
+def test_legacy_fixed_frequency_remains_backend_api_compatibility_only():
+    prices = np.array([100, 101, 102, 103, 104], dtype=float)
+    bt = HedgeBacktest(
+        _option(), prices, hedge_freq=2, multiplier=0, strategy=None)
+    assert isinstance(bt.strategy, FixedFreqStrategy)
+    result = bt.run()
+    assert np.flatnonzero(result["hedge_triggered"]).tolist() == [0, 2, 4]
+
+
+@pytest.mark.parametrize(
+    ("strategy", "expected"),
+    [
+        (FixedFreqStrategy(2), "固定 bar 频率（每 2 bar）"),
+        (CloseToCloseStrategy(), "每日收盘（close-to-close）"),
+        (HedgeBandStrategy("relative", 0.01), "固定间隔（相对价格=0.01）"),
+    ],
+)
+def test_backend_summary_reports_active_strategy_instead_of_legacy_frequency(
+        capsys, strategy, expected):
+    prices = np.array([100, 101, 102, 103, 104], dtype=float)
+    bt = HedgeBacktest(
+        _option(), prices, hedge_freq=99, multiplier=0, strategy=strategy)
+    bt.summary()
+    output = capsys.readouterr().out
+    assert expected in output
+    assert "每 99 天" not in output
+    assert "实际采样 bar/日" in output
 
 
 def test_close_to_close_uses_actual_intraday_day_end():
@@ -342,6 +374,181 @@ def test_compare_and_recommend_multiple_strategies():
     assert len(recommendations) == 1
     assert set(ranking["strategy"]) == {"daily", "move_2"}
     assert recommendations.iloc[0]["rank"] == 1
+
+
+def test_comparison_distinguishes_triggers_rehedges_and_actual_trades():
+    prices = np.array([100, 101, 103, 102, 105], dtype=float)
+    summary, results = compare_strategies(
+        _option(), prices,
+        [StrategyCase("daily", CloseToCloseStrategy())],
+        {"steps_per_day": 1, "multiplier": 0, "tc_rate": 0.001},
+    )
+    row = summary.iloc[0]
+    result = results["daily"]
+    triggered = np.asarray(result["hedge_triggered"], dtype=bool)
+    shares = np.asarray(result["shares"], dtype=float)
+    trades = np.r_[shares[0], np.diff(shares)]
+
+    # 旧 trade_count 保持“首仓 + 策略触发 + 末端平仓”的兼容定义。
+    assert row["trade_count"] == np.count_nonzero(triggered)
+    # 新 rehedge_count 只统计存续期内的策略触发。
+    assert row["rehedge_count"] == np.count_nonzero(triggered[1:-1])
+    assert row["actual_trade_count"] == np.count_nonzero(
+        np.abs(trades) > 1e-10)
+    assert row["turnover"] == pytest.approx(
+        np.sum(np.where(np.abs(trades) > 1e-10, np.abs(trades), 0.0)
+               * result["prices"])
+    )
+
+
+def test_result_daily_frame_exposes_cumulative_net_pnl():
+    result = {
+        "net_daily": np.array([-1.0, 2.0, 3.0, -2.0, 1.0]),
+        "tc_paid": np.array([1.0, 0.2, 0.3, 0.4, 0.1]),
+        "steps_per_day": 2,
+    }
+    daily = result_daily_frame(result)
+
+    assert daily.index.name == "trade_day"
+    assert daily.columns.tolist() == [
+        "net_pnl", "tc_paid", "cumulative_net_pnl",
+    ]
+    assert daily["net_pnl"].tolist() == pytest.approx([4.0, -1.0])
+    assert daily["tc_paid"].tolist() == pytest.approx([1.5, 0.5])
+    assert daily["cumulative_net_pnl"].tolist() == pytest.approx([4.0, 3.0])
+
+
+def test_summarize_strategy_result_returns_comparison_compatible_metrics():
+    result = {
+        "net_daily": np.array([-1.0, 2.0, 3.0, -2.0, 1.0]),
+        "tc_paid": np.array([1.0, 0.2, 0.3, 0.4, 0.1]),
+        "steps_per_day": 2,
+        "hedge_triggered": np.array([True, True, False, True, True]),
+        "shares": np.array([1.0, 1.0, 2.0, 2.0, 0.0]),
+        "prices": np.array([100.0, 101.0, 102.0, 103.0, 104.0]),
+        "strategy_name": "hedge_band",
+        "hedging_error": 3.0,
+    }
+    metadata = {"description": "绝对间隔=2", "nested": {"items": [1]}}
+
+    row = summarize_strategy_result(result, "固定间隔(绝对=2)", metadata)
+
+    assert row["strategy"] == "固定间隔(绝对=2)"
+    assert row["strategy_type"] == "hedge_band"
+    assert row["hedging_error"] == pytest.approx(3.0)
+    assert row["n_trade_days"] == 2
+    assert row["daily_net_pnl_rms"] == pytest.approx(np.sqrt(8.5))
+    assert row["score"] == pytest.approx(np.sqrt(8.5))
+    assert row["mean_daily_pnl"] == pytest.approx(1.5)
+    assert row["pnl_volatility"] == pytest.approx(np.std([4.0, -1.0], ddof=1))
+    assert row["avg_daily_tc"] == pytest.approx(1.0)
+    assert row["total_tc"] == pytest.approx(2.0)
+    assert row["total_net_pnl"] == pytest.approx(3.0)
+    assert row["max_drawdown"] == pytest.approx(1.0)
+    assert row["trade_count"] == 4
+    assert row["rehedge_count"] == 2
+    assert row["actual_trade_count"] == 3
+    assert row["turnover"] == pytest.approx(410.0)
+    assert row["meta_description"] == "绝对间隔=2"
+    assert row["meta_nested"] == {"items": [1]}
+    assert "rank" not in row
+
+    # 输出元数据与调用方解耦；修改摘要不能反向污染输入。
+    row["meta_nested"]["items"].append(2)
+    assert metadata["nested"] == {"items": [1]}
+
+
+def test_compare_strategies_reuses_single_result_summary_helper(monkeypatch):
+    import pricing.hedge_analysis as hedge_analysis
+
+    original = hedge_analysis.summarize_strategy_result
+    calls = []
+
+    def spy(result, display_name, metadata=None, steps_per_day=None):
+        calls.append((display_name, metadata, steps_per_day))
+        return original(result, display_name, metadata, steps_per_day)
+
+    monkeypatch.setattr(hedge_analysis, "summarize_strategy_result", spy)
+    cases = [
+        StrategyCase(
+            "daily", CloseToCloseStrategy(), {"description": "每日收盘"}),
+        StrategyCase(
+            "band", HedgeBandStrategy("absolute", 2.0),
+            {"description": "绝对间隔=2"},
+        ),
+    ]
+    summary, _ = compare_strategies(
+        _option(), np.array([100, 101, 103, 102, 105], dtype=float), cases,
+        {"steps_per_day": 1, "multiplier": 0, "tc_rate": 0.001},
+    )
+
+    assert [name for name, _metadata, _spd in calls] == ["daily", "band"]
+    assert all(spd == 1 for _name, _metadata, spd in calls)
+    assert set(summary["meta_description"]) == {"每日收盘", "绝对间隔=2"}
+
+
+def test_equal_scores_rank_by_total_cost_then_strategy_name(monkeypatch):
+    import pricing.hedge_analysis as hedge_analysis
+
+    costs = {
+        "close_to_close": 2.0,
+        "fixed_freq": 1.0,
+        "hedge_band": 1.0,
+    }
+
+    class FakeBacktest:
+        def __init__(self, option, prices, strategy, **kwargs):
+            self.strategy = strategy
+
+        def run(self):
+            strategy_name = self.strategy.name
+            cost = costs[strategy_name]
+            return {
+                "steps_per_day": 1,
+                "net_daily": np.array([0.0, 1.0]),
+                "tc_paid": np.array([0.0, cost]),
+                "hedge_triggered": np.array([True, True]),
+                "shares": np.array([1.0, 0.0]),
+                "prices": np.array([100.0, 101.0]),
+                "strategy_name": strategy_name,
+                "hedging_error": 1.0,
+            }
+
+    monkeypatch.setattr(hedge_analysis, "HedgeBacktest", FakeBacktest)
+    summary, _ = compare_strategies(
+        _option(), np.array([100.0, 101.0]),
+        [
+            StrategyCase("z_costly", CloseToCloseStrategy()),
+            StrategyCase("b_low", HedgeBandStrategy("absolute", 1.0)),
+            StrategyCase("a_low", FixedFreqStrategy(1)),
+        ],
+    )
+
+    assert summary["strategy"].tolist() == ["a_low", "b_low", "z_costly"]
+    assert summary["total_tc"].tolist() == pytest.approx([1.0, 1.0, 2.0])
+
+
+def test_equal_lookback_scores_rank_by_window_cost_then_strategy_name():
+    results = {
+        "z_costly": {
+            **_fake_intraday_result([0.0, 1.0], steps_per_day=1),
+            "tc_paid": np.array([0.0, 2.0]),
+        },
+        "b_low": {
+            **_fake_intraday_result([0.0, 1.0], steps_per_day=1),
+            "tc_paid": np.array([0.0, 1.0]),
+        },
+        "a_low": {
+            **_fake_intraday_result([0.0, 1.0], steps_per_day=1),
+            "tc_paid": np.array([0.0, 1.0]),
+        },
+    }
+    recommendations, ranking = recommend_by_lookback(
+        results, lookbacks={"day": 1},
+    )
+
+    assert ranking["strategy"].tolist() == ["a_low", "b_low", "z_costly"]
+    assert recommendations["strategy"].tolist() == ["a_low"]
 
 
 def _fake_intraday_result(net, steps_per_day=2):
