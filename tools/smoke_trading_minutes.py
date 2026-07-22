@@ -8,13 +8,13 @@ Smoke 测试：验证 get_trading_minutes_per_day 在 Wind 终端下返回值是
 预期输出（每行两列：code -> minutes）：
     510050.SH  -> 240
     IF2412.CFE -> 240
-    au2412.SHF -> 570
-    cu2412.SHF -> 480
-    rb2412.SHF -> 360
-    i2501.DCE  -> 360
-    MA501.CZC  -> 360
-    sc2412.INE -> 570
-    si2501.GFE -> 240
+    au2412.SHF -> 555
+    cu2412.SHF -> 465
+    rb2412.SHF -> 345
+    i2501.DCE  -> 345
+    MA501.CZC  -> 345
+    sc2412.INE -> 555
+    si2501.GFE -> 225
 
 如果某行返回 None 或与预期不符，很可能是 Wind wss 返回的 sec_type 中文字符串
 与常量表里预设的差了一点（例如"指数"vs"指数类"、"ETF"vs"基金"等），请按实测
@@ -35,13 +35,13 @@ from pricing.wind_data import get_trading_minutes_per_day
 TEST_CASES = [
     ("510050.SH", 240),
     ("IF2412.CFE", 240),
-    ("au2412.SHF", 570),
-    ("cu2412.SHF", 480),
-    ("rb2412.SHF", 360),
-    ("i2501.DCE", 360),
-    ("MA501.CZC", 360),
-    ("sc2412.INE", 570),
-    ("si2501.GFE", 240),
+    ("au2412.SHF", 555),
+    ("cu2412.SHF", 465),
+    ("rb2412.SHF", 345),
+    ("i2501.DCE", 345),
+    ("MA501.CZC", 345),
+    ("sc2412.INE", 555),
+    ("si2501.GFE", 225),
 ]
 
 

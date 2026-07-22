@@ -19,12 +19,17 @@ from .hedge_backtest import (
 )
 from .hedge_analysis import (
     StrategyCase,
+    ContractHistoryPool,
     compare_strategies,
+    history_window_summary,
     result_daily_frame,
     summarize_strategy_result,
     recommend_by_lookback,
     recommend_by_rolling_history,
+    recommend_by_contract_history_pool,
     LOOKBACK_DAYS,
+    HISTORY_SELECTION_METRIC,
+    HISTORY_TARGET_ENDPOINTS,
 )
 
 # Wind 数据接口（仅在安装了 WindPy 时可用）

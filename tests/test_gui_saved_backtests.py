@@ -28,7 +28,8 @@ def _result(*, strategy="close_to_close", price_shift=0.0):
     }
 
 
-def _state(*, strategy="close_to_close", threshold=1.0):
+def _state(*, strategy="close_to_close", threshold=1.0,
+           force_day_close_hedge=False):
     return {
         "cls_name": "香草期权 (Vanilla)",
         "subtype": "Eu",
@@ -44,6 +45,7 @@ def _state(*, strategy="close_to_close", threshold=1.0):
         "multiplier": 100.0,
         "tc_rate": 0.001,
         "slippage_bps": 1.5,
+        "force_day_close_hedge": force_day_close_hedge,
     }
 
 
@@ -83,6 +85,40 @@ def test_saved_backtest_is_compact_deep_copy_with_run_time_parameters():
     assert snapshot.source_label == "模拟 · seed 42"
 
 
+@pytest.mark.parametrize(
+    ("enabled", "expected"),
+    [(False, "收盘兜底：关闭"), (True, "收盘兜底：开启")],
+)
+def test_saved_snapshot_parameter_summary_records_close_fallback_rule(
+        enabled, expected):
+    snapshot = _snapshot(state=_state(
+        strategy="hedge_band", threshold=2.0,
+        force_day_close_hedge=enabled,
+    ), result=_result(strategy="hedge_band"))
+
+    assert expected in snapshot.parameter_summary
+
+
+def test_saved_wind_snapshot_records_resolved_dates_and_actual_bar_size():
+    state = _state(strategy="hedge_band", threshold=1.5)
+    state.update({
+        "source": "wind",
+        "wind_code": "510050.SH",
+        "wind_start": "2025-01-02",
+        "wind_end": "2025-02-28",
+        "wind_bar_size_requested": gui_app.WIND_AUTO_BAR_SIZE,
+        "wind_bar_size": "15min",
+        "wind_date_mode": "custom_range",
+    })
+
+    snapshot = _snapshot(
+        state=state, result=_result(strategy="hedge_band"))
+
+    assert snapshot.source_label == (
+        "Wind · 510050.SH · 2025-01-02 至 2025-02-28 · 15min"
+    )
+
+
 def test_saved_payload_uses_cached_results_without_running_backtest(monkeypatch):
     first = _snapshot()
     second_state = _state(strategy="hedge_band", threshold=2.0)
@@ -105,6 +141,74 @@ def test_saved_payload_uses_cached_results_without_running_backtest(monkeypatch)
     assert summary["rank"].tolist() == [1, 2]
     assert set(summary["strategy"]) == {"结果 A", "结果 B"}
     assert set(summary["actual_trade_count"]) == {3}
+
+
+def test_saved_payload_keeps_score_ranking_but_marks_close_to_close_baseline():
+    baseline = _snapshot("result-0001", "每日收盘 · 基准")
+    candidate = _snapshot(
+        "result-0002", "固定间隔 · 更优",
+        state=_state(strategy="hedge_band", threshold=2.0),
+        result=_result(strategy="hedge_band"),
+    )
+    baseline.summary_row["score"] = 12.0
+    candidate.summary_row["score"] = 8.0
+
+    summary, _curves = BacktestApp._saved_comparison_payload(
+        [candidate, baseline])
+    headline = BacktestApp._comparison_headline(summary)
+    fixed = BacktestApp._comparison_baseline(summary)
+
+    assert headline["best"]["meta_result_id"] == candidate.result_id
+    assert summary.iloc[0]["meta_result_id"] == candidate.result_id
+    assert fixed["meta_result_id"] == baseline.result_id
+    assert fixed["score"] == pytest.approx(12.0)
+
+    baseline.name = "已重命名的每日策略"
+    candidate.name = "close-to-close（只是名称）"
+    renamed, _curves = BacktestApp._saved_comparison_payload(
+        [candidate, baseline])
+    assert BacktestApp._comparison_baseline(
+        renamed)["meta_result_id"] == baseline.result_id
+
+
+def test_multiple_close_to_close_results_use_oldest_stable_id_as_baseline():
+    first = _snapshot("result-0001", "较晚显示名称")
+    second = _snapshot("result-0002", "较早显示名称")
+    first.summary_row["score"] = 15.0
+    second.summary_row["score"] = 5.0
+    second.saved_at = first.saved_at - datetime.timedelta(days=1)
+
+    summary, _curves = BacktestApp._saved_comparison_payload([second, first])
+    baseline = BacktestApp._comparison_baseline(summary)
+    warnings = BacktestApp._saved_comparison_warnings([second, first])
+
+    assert baseline["meta_result_id"] == "result-0001"
+    assert summary.iloc[0]["meta_result_id"] == "result-0002"
+    assert any("多条 close-to-close" in warning for warning in warnings)
+    assert any("较晚显示名称" in warning for warning in warnings)
+
+
+def test_missing_close_to_close_keeps_absolute_ranking_without_fake_baseline():
+    band = _snapshot(
+        "result-0001", "固定间隔",
+        state=_state(strategy="hedge_band"),
+        result=_result(strategy="hedge_band"),
+    )
+    fixed = _snapshot(
+        "result-0002", "固定时刻",
+        state=_state(strategy="fixed_times"),
+        result=_result(strategy="fixed_times"),
+    )
+
+    summary, _curves = BacktestApp._saved_comparison_payload([band, fixed])
+
+    assert BacktestApp._comparison_headline(summary)["best"] is not None
+    assert BacktestApp._comparison_baseline(summary) is None
+    assert not summary["meta_is_comparison_baseline"].any()
+    assert any(
+        "未包含 close-to-close 基准" in warning
+        for warning in BacktestApp._saved_comparison_warnings([band, fixed])
+    )
 
 
 def test_path_signature_ignores_timestamps_after_early_termination():
@@ -199,7 +303,44 @@ def test_rename_and_delete_use_stable_ids_and_keep_selection_consistent():
     assert deleted.name == "新名称"
     assert first.result_id not in fake._saved_backtests
     assert first.result_id not in fake._saved_comparison_selection
+    assert fake._saved_comparison_baseline_id == second.result_id
+    assert second.result_id in fake._saved_comparison_selection
     assert fake._latest_retained_result_id is None
+
+
+def test_selected_candidates_automatically_keep_fixed_baseline_in_view():
+    baseline = _snapshot("result-0001", "每日收盘")
+    candidate = _snapshot(
+        "result-0002", "固定间隔",
+        state=_state(strategy="hedge_band"),
+        result=_result(strategy="hedge_band"),
+    )
+    statuses = []
+    fake = SimpleNamespace(
+        _saved_backtests={
+            baseline.result_id: baseline,
+            candidate.result_id: candidate,
+        },
+        _saved_comparison_selection={candidate.result_id},
+        _saved_comparison_baseline_id=None,
+        _set_status=statuses.append,
+        _refresh_saved_pool_tree=lambda: None,
+        _refresh_saved_comparison_view=lambda: None,
+    )
+
+    selected = BacktestApp._selected_saved_backtests(fake)
+    assert [snapshot.result_id for snapshot in selected] == [
+        baseline.result_id, candidate.result_id,
+    ]
+    assert fake._saved_comparison_selection == {
+        baseline.result_id, candidate.result_id,
+    }
+
+    BacktestApp._toggle_saved_backtest_selection(fake, baseline.result_id)
+    assert fake._saved_comparison_selection == {
+        baseline.result_id, candidate.result_id,
+    }
+    assert statuses and "固定基准" in statuses[-1]
 
 
 def test_busy_result_pool_actions_do_not_touch_selection_or_open_dialogs(

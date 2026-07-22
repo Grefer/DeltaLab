@@ -6,6 +6,7 @@ Wind 数据接口模块
 供对冲回测和期权定价使用。
 """
 
+import datetime as _datetime
 import functools
 import os
 import re
@@ -30,43 +31,235 @@ def _default_cache_dir() -> str:
 _CACHE_DIR = _default_cache_dir()
 
 
+_FUTURES_HISTORY_SUFFIXES = ("CFE", "SHF", "DCE", "CZC", "INE", "GFE")
+_FUTURES_PRODUCT_CODE_RE = re.compile(
+    rf"^(?P<product>[A-Z]+)\.(?P<exchange>{'|'.join(_FUTURES_HISTORY_SUFFIXES)})$"
+)
+_FUTURES_CONTRACT_CODE_RE = re.compile(
+    rf"^(?P<product>[A-Z]+)(?P<delivery>\d{{3,4}})\."
+    rf"(?P<exchange>{'|'.join(_FUTURES_HISTORY_SUFFIXES)})$"
+)
+
+
+def classify_wind_history_code(code):
+    """判定历史择优代码是具体标的还是期货品种样本池。
+
+    ``P.DCE`` 这类“字母品种 + 期货交易所”代码返回 ``product_pool``；
+    ``P2609.DCE`` 以及股票、ETF 等其它 Wind 代码返回 ``single``。具体
+    期货合约必须带 3 或 4 位交割年月数字，避免把 ``P00.DCE`` 等连续
+    合约别名误识别为可跨合约汇集的品种入口。
+    """
+    normalized = str(code or "").strip().upper()
+    if not normalized:
+        raise ValueError("Wind 代码不能为空")
+    product_match = _FUTURES_PRODUCT_CODE_RE.fullmatch(normalized)
+    if product_match:
+        return {
+            "mode": "product_pool",
+            "code": normalized,
+            "product": product_match.group("product"),
+            "exchange": product_match.group("exchange"),
+        }
+    contract_match = _FUTURES_CONTRACT_CODE_RE.fullmatch(normalized)
+    if contract_match:
+        return {
+            "mode": "single",
+            "code": normalized,
+            "product": contract_match.group("product"),
+            "exchange": contract_match.group("exchange"),
+            "delivery": contract_match.group("delivery"),
+            "is_futures_contract": True,
+        }
+    return {
+        "mode": "single",
+        "code": normalized,
+        "is_futures_contract": False,
+    }
+
+
+def get_main_contract_history(product_code, start_date, end_date):
+    """返回品种连续代码在各历史交易日实际对应的主力合约。
+
+    Wind 的 ``trade_hiscode`` 字段按查询日期返回当时可见的历史主力代码，
+    因而截止日之后才成为主力的合约不会进入结果。返回值索引是交易日期，
+    值是标准化后的具体合约 Wind 代码。
+    """
+    classification = classify_wind_history_code(product_code)
+    if classification["mode"] != "product_pool":
+        raise ValueError(
+            "主力合约历史只能查询品种代码，例如 P.DCE；"
+            f"当前为 {classification['code']!r}"
+        )
+    start_ts, end_ts, _, _ = _validate_intraday_range(start_date, end_date)
+    w = _ensure_wind()
+    data = w.wsd(
+        classification["code"], "trade_hiscode",
+        start_date, end_date, "",
+    )
+    if getattr(data, "ErrorCode", -1) != 0:
+        raise RuntimeError(
+            f"Wind 主力合约历史获取失败 [{classification['code']}]: "
+            f"ErrorCode={getattr(data, 'ErrorCode', None)}"
+        )
+    try:
+        values = data.Data[0]
+        index = pd.to_datetime(data.Times)
+    except (AttributeError, IndexError, TypeError, ValueError) as exc:
+        raise RuntimeError(
+            f"Wind 主力合约历史返回结构异常 [{classification['code']}]"
+        ) from exc
+
+    series = pd.Series(values, index=index, name="main_contract")
+    normalized_index = pd.DatetimeIndex(series.index).normalize()
+    series = series.loc[
+        (normalized_index >= start_ts.normalize())
+        & (normalized_index <= end_ts.normalize())
+    ]
+    series = series.dropna().map(lambda value: str(value).strip().upper())
+    series = series[series.ne("")]
+    valid = []
+    for value in series:
+        parsed = classify_wind_history_code(value)
+        valid.append(bool(
+            parsed.get("is_futures_contract")
+            and parsed.get("product") == classification["product"]
+            and parsed.get("exchange") == classification["exchange"]
+        ))
+    series = series.loc[np.asarray(valid, dtype=bool)]
+    if series.empty:
+        raise ValueError(
+            f"{classification['code']} 在 {start_date} 至 {end_date} "
+            "没有可用的历史主力合约映射"
+        )
+    if not series.index.is_monotonic_increasing:
+        series = series.sort_index()
+    return series[~series.index.duplicated(keep="last")]
+
+
 # =============================================================================
-# 日内可交易分钟数常量表
+# 日内连续交易段常量表
 # =============================================================================
-# (exch_eng, sec_type) -> 日内总交易分钟数
-# 数据基于常规交易所时段（日盘 + 夜盘，不含集合竞价），用于由 bar_size 推导
-# 每日 bar 数（steps_per_day）。sec_type 为 Wind wss 返回的中文字段，实测可能与
-# 此表略有差异，如命中失败请按实测值修正。
-_TRADING_MINUTES_TABLE: dict[tuple[str, str], int] = {
-    # A 股 / ETF（沪深两市 9:30-11:30, 13:00-15:00 共 240 分钟）
-    ("SSE", "基金"): 240,
-    ("SSE", "股票"): 240,
-    ("SZSE", "基金"): 240,
-    ("SZSE", "股票"): 240,
-    # 金融期货（中金所日盘 9:30-11:30, 13:00-15:00 共 240 分钟，无夜盘）
-    ("CFFEX", "指数类"): 240,
-    ("CFFEX", "国债类"): 240,
-    # 上期所
-    ("SHFE", "贵金属"): 570,    # au / ag 夜盘 21:00-02:30，日盘 4h -> 330+240=570
-    ("SHFE", "有色"): 480,      # cu/al/zn/pb/ni/sn 夜盘 21:00-01:00 -> 240+240=480
-    ("SHFE", "煤焦钢矿"): 360,  # rb/hc/bu 夜盘 21:00-23:00 -> 120+240=360
-    # 上海国际能源交易中心
-    ("INE", "能源"): 570,       # sc 夜盘 21:00-02:30（lu 例外，见 overrides）
-    # 大商所
-    ("DCE", "煤焦钢矿"): 360,
-    ("DCE", "农产品"): 360,
-    ("DCE", "化工"): 360,
-    # 郑商所
-    ("CZCE", "化工"): 360,
-    ("CZCE", "农产品"): 360,
-    # 广期所（无夜盘，日盘 4h）
-    ("GFEX", "有色"): 240,      # si / lc
+# Wind 的 BarSize 会在每个连续 session 结束时保留不足一个 BarSize 的尾
+# bar，因此每日 bar 数必须按 sum(ceil(segment / bar_size)) 计算，不能只
+# 对总分钟数做一次 ceil。sec_type 是 Wind wss 的实测中文值。
+_SECURITY_DAY_SESSIONS = (120, 120)
+_COMMODITY_DAY_SESSIONS = (75, 60, 90)
+_COMMODITY_NIGHT_120_SESSIONS = (120, *_COMMODITY_DAY_SESSIONS)
+_COMMODITY_NIGHT_240_SESSIONS = (240, *_COMMODITY_DAY_SESSIONS)
+_COMMODITY_NIGHT_330_SESSIONS = (330, *_COMMODITY_DAY_SESSIONS)
+_CFFEX_BOND_SESSIONS = (120, 135)
+
+# 与上面的连续交易段分钟数一一对应的墙钟时段。这里不另建一套
+# ``(exchange, sec_type)`` 分类表；公开查询函数先走现有的分钟段分类，
+# 再由该映射取得时钟范围，避免 bar 数和“某时刻是否交易”逐渐漂移。
+_SECURITY_DAY_CLOCK_RANGES = (
+    (_datetime.time(9, 30), _datetime.time(11, 30)),
+    (_datetime.time(13, 0), _datetime.time(15, 0)),
+)
+_COMMODITY_DAY_CLOCK_RANGES = (
+    (_datetime.time(9, 0), _datetime.time(10, 15)),
+    (_datetime.time(10, 30), _datetime.time(11, 30)),
+    (_datetime.time(13, 30), _datetime.time(15, 0)),
+)
+_CFFEX_BOND_CLOCK_RANGES = (
+    (_datetime.time(9, 30), _datetime.time(11, 30)),
+    (_datetime.time(13, 0), _datetime.time(15, 15)),
+)
+_TRADING_SESSION_CLOCK_RANGES_BY_MINUTES = {
+    _SECURITY_DAY_SESSIONS: _SECURITY_DAY_CLOCK_RANGES,
+    _COMMODITY_DAY_SESSIONS: _COMMODITY_DAY_CLOCK_RANGES,
+    _COMMODITY_NIGHT_120_SESSIONS: (
+        (_datetime.time(21, 0), _datetime.time(23, 0)),
+        *_COMMODITY_DAY_CLOCK_RANGES,
+    ),
+    _COMMODITY_NIGHT_240_SESSIONS: (
+        (_datetime.time(21, 0), _datetime.time(1, 0)),
+        *_COMMODITY_DAY_CLOCK_RANGES,
+    ),
+    _COMMODITY_NIGHT_330_SESSIONS: (
+        (_datetime.time(21, 0), _datetime.time(2, 30)),
+        *_COMMODITY_DAY_CLOCK_RANGES,
+    ),
+    _CFFEX_BOND_SESSIONS: _CFFEX_BOND_CLOCK_RANGES,
 }
 
-# 个别品种细分 override（按 code 前缀字母，不区分大小写）
-# 用于"同 (exch_eng, sec_type) 但夜盘时长不同"的情况
+_TRADING_SESSION_MINUTES_TABLE: dict[tuple[str, str], tuple[int, ...]] = {
+    # A 股 / ETF：9:30-11:30、13:00-15:00。
+    ("SSE", "基金"): _SECURITY_DAY_SESSIONS,
+    ("SSE", "股票"): _SECURITY_DAY_SESSIONS,
+    ("SZSE", "基金"): _SECURITY_DAY_SESSIONS,
+    ("SZSE", "股票"): _SECURITY_DAY_SESSIONS,
+    # 中金所：指数类下午到 15:00，国债/利率类到 15:15。
+    ("CFFEX", "指数类"): _SECURITY_DAY_SESSIONS,
+    ("CFFEX", "国债类"): _CFFEX_BOND_SESSIONS,
+    ("CFFEX", "利率类"): _CFFEX_BOND_SESSIONS,
+    # 少数 Wind 版本返回交易所简称 CFE。
+    ("CFE", "指数类"): _SECURITY_DAY_SESSIONS,
+    ("CFE", "国债类"): _CFFEX_BOND_SESSIONS,
+    ("CFE", "利率类"): _CFFEX_BOND_SESSIONS,
+    # 商品期货日盘：09:00-10:15、10:30-11:30、13:30-15:00。
+    ("SHFE", "贵金属"): _COMMODITY_NIGHT_330_SESSIONS,
+    ("SHFE", "有色"): _COMMODITY_NIGHT_240_SESSIONS,
+    ("SHFE", "煤焦钢矿"): _COMMODITY_NIGHT_120_SESSIONS,
+    ("INE", "能源"): _COMMODITY_NIGHT_330_SESSIONS,
+    ("DCE", "煤焦钢矿"): _COMMODITY_NIGHT_120_SESSIONS,
+    ("DCE", "农产品"): _COMMODITY_NIGHT_120_SESSIONS,
+    ("DCE", "油脂油料"): _COMMODITY_NIGHT_120_SESSIONS,
+    ("DCE", "化工"): _COMMODITY_NIGHT_120_SESSIONS,
+    ("CZCE", "化工"): _COMMODITY_NIGHT_120_SESSIONS,
+    ("CZCE", "农产品"): _COMMODITY_NIGHT_120_SESSIONS,
+    ("GFEX", "有色"): _COMMODITY_DAY_SESSIONS,
+}
+
+# 个别品种细分 override（按 code 前缀字母，不区分大小写）。这些信息本地
+# 即可确定，Wind 静态字段不可用时仍能返回可靠 session。
+_SYMBOL_SESSION_OVERRIDES: dict[str, tuple[int, ...]] = {
+    "LU": _COMMODITY_NIGHT_120_SESSIONS,
+    "P": _COMMODITY_NIGHT_120_SESSIONS,
+    # 上期能源同一大类下的连续交易长度并不相同；EC 没有夜盘。
+    "SC": _COMMODITY_NIGHT_330_SESSIONS,
+    "NR": _COMMODITY_NIGHT_120_SESSIONS,
+    "BC": _COMMODITY_NIGHT_240_SESSIONS,
+    "EC": _COMMODITY_DAY_SESSIONS,
+    # 上期所线材没有夜盘；胶版印刷纸为 21:00-23:00。
+    "WR": _COMMODITY_DAY_SESSIONS,
+    "OP": _COMMODITY_NIGHT_120_SESSIONS,
+    # 大商所 / 郑商所中明确仅有日盘的品种。交易所大类 sec_type 较宽，
+    # 若不在品种层覆盖，会被同类中存在夜盘的合约误判。
+    "JD": _COMMODITY_DAY_SESSIONS,
+    "FB": _COMMODITY_DAY_SESSIONS,
+    "BB": _COMMODITY_DAY_SESSIONS,
+    "LH": _COMMODITY_DAY_SESSIONS,
+    "AP": _COMMODITY_DAY_SESSIONS,
+    "CJ": _COMMODITY_DAY_SESSIONS,
+    "PK": _COMMODITY_DAY_SESSIONS,
+    "SF": _COMMODITY_DAY_SESSIONS,
+    "SM": _COMMODITY_DAY_SESSIONS,
+    "UR": _COMMODITY_DAY_SESSIONS,
+    "PM": _COMMODITY_DAY_SESSIONS,
+    "WH": _COMMODITY_DAY_SESSIONS,
+    "RI": _COMMODITY_DAY_SESSIONS,
+    "JR": _COMMODITY_DAY_SESSIONS,
+    "LR": _COMMODITY_DAY_SESSIONS,
+    "RS": _COMMODITY_DAY_SESSIONS,
+    # 广期所当前常用品种均为商品日盘，无固定夜盘。
+    "SI": _COMMODITY_DAY_SESSIONS,
+    "LC": _COMMODITY_DAY_SESSIONS,
+    "PS": _COMMODITY_DAY_SESSIONS,
+    "T": _CFFEX_BOND_SESSIONS,
+    "TF": _CFFEX_BOND_SESSIONS,
+    "TS": _CFFEX_BOND_SESSIONS,
+    "TL": _CFFEX_BOND_SESSIONS,
+}
+
+# 旧常量仍供诊断工具与兼容调用读取；权威 bar 数使用连续交易段表。
+_TRADING_MINUTES_TABLE: dict[tuple[str, str], int] = {
+    key: sum(segments)
+    for key, segments in _TRADING_SESSION_MINUTES_TABLE.items()
+}
 _SYMBOL_OVERRIDES: dict[str, int] = {
-    "LU": 360,  # 低硫燃油，INE 但夜盘 21:00-23:00，共 120+240=360
+    prefix: sum(segments)
+    for prefix, segments in _SYMBOL_SESSION_OVERRIDES.items()
 }
 
 
@@ -77,21 +270,8 @@ def _extract_symbol_prefix(code: str) -> str:
 
 
 @functools.lru_cache(maxsize=512)
-def get_trading_minutes_per_day(code: str) -> int | None:
-    """通过 Wind wss 查 exch_eng+sec_type，结合本地常量表返回日内可交易分钟数。
-
-    Wind 不可用 / 字段缺失 / 表里无匹配 -> 返回 None，由调用方决定降级策略。
-
-    Parameters
-    ----------
-    code : str
-        Wind 代码，例如 "510050.SH" / "au2412.SHF"。
-
-    Returns
-    -------
-    int or None
-        日内总交易分钟数；无法判定时返回 None。
-    """
+def _get_wind_market_classification(code: str):
+    """返回 Wind ``(exch_eng, sec_type)``；无法识别时返回 None。"""
     try:
         w = _ensure_wind()
     except Exception:
@@ -114,17 +294,136 @@ def get_trading_minutes_per_day(code: str) -> int | None:
     except Exception:
         return None
 
-    if not exch or not sec_type:
+    return (exch, sec_type) if exch and sec_type else None
+
+
+@functools.lru_cache(maxsize=512)
+def _get_trading_session_minutes(code: str):
+    """按代码返回连续交易段分钟数；未知元数据返回 None。"""
+    local = _get_local_trading_session_minutes(code)
+    if local is not None:
+        return local
+
+    classification = _get_wind_market_classification(str(code))
+    if classification is None:
         return None
+    return _TRADING_SESSION_MINUTES_TABLE.get(classification)
 
-    minutes = _TRADING_MINUTES_TABLE.get((exch, sec_type))
 
-    # 代码前缀 override（高于 (exch, sec_type)）
+def _get_local_trading_session_minutes(code: str):
+    """仅用代码本身可确定的规则返回交易段，不连接 Wind。"""
+    normalized = str(code).strip().upper()
     prefix = _extract_symbol_prefix(code)
-    if prefix and prefix in _SYMBOL_OVERRIDES:
-        minutes = _SYMBOL_OVERRIDES[prefix]
+    override = _SYMBOL_SESSION_OVERRIDES.get(prefix)
+    if override is not None:
+        return override
 
-    return minutes
+    # 沪深证券和中金所指数代码的交易所后缀足以判定。中金所国债品种
+    # T/TF/TS/TL 已在上面的 prefix override 中优先识别。
+    if normalized.endswith((".SH", ".SZ", ".CFE")):
+        return _SECURITY_DAY_SESSIONS
+    return None
+
+
+@functools.lru_cache(maxsize=1024)
+def get_trading_session_clock_ranges(code: str, *, allow_wind: bool = True):
+    """返回代码的常规交易墙钟时段；未知元数据返回 ``None``。
+
+    每一项均为 ``(start_time, end_time)``，端点属于交易时段。夜盘结束
+    早于开始（例如 ``21:00 -> 01:00``）表示跨午夜。返回值与
+    :func:`get_trading_bars_per_day` 复用同一份代码分类 / 品种 override。
+    ``allow_wind=False`` 时仅使用代码前缀 / 交易所后缀可确定的本地规则，
+    适合 GUI 主线程的即时参数联动，不会启动 Wind 或调用 ``wss``。调用方
+    在 ``None`` 时应保持原有严格校验，不能把未知误当成休市。
+    """
+    if allow_wind:
+        sessions = _get_trading_session_minutes(str(code))
+    else:
+        sessions = _get_local_trading_session_minutes(str(code))
+    if sessions is None:
+        return None
+    return _TRADING_SESSION_CLOCK_RANGES_BY_MINUTES.get(sessions)
+
+
+def _coerce_session_clock(value) -> _datetime.time:
+    """把 ``time`` / datetime / ``HH:MM[:SS]`` 规范为无时区墙钟。"""
+    if isinstance(value, _datetime.datetime):
+        if value.tzinfo is not None:
+            raise ValueError("target_time 不支持时区信息，请传入本地时间")
+        return value.time()
+    if isinstance(value, _datetime.time):
+        if value.tzinfo is not None:
+            raise ValueError("target_time 不支持时区信息，请传入本地时间")
+        return value
+    if isinstance(value, str):
+        raw = value.strip()
+        for fmt in ("%H:%M", "%H:%M:%S", "%H:%M:%S.%f"):
+            try:
+                return _datetime.datetime.strptime(raw, fmt).time()
+            except ValueError:
+                pass
+    raise ValueError(
+        f"非法 target_time={value!r}，需要 datetime.time 或 HH:MM[:SS]"
+    )
+
+
+def is_time_in_trading_session(
+        code: str, target_time, *, allow_wind: bool = True) -> bool | None:
+    """判断墙钟时刻是否处于代码的常规交易时段。
+
+    已知交易时段时返回布尔值；Wind 元数据 / 本地分类未知时返回
+    ``None``，以便上层继续执行严格的实际 Bar 校验。交易段端点按闭区间
+    处理，所以 11:30、15:00 和夜盘收盘均属于有效目标时刻。
+    """
+    ranges = get_trading_session_clock_ranges(
+        str(code), allow_wind=allow_wind
+    )
+    if ranges is None:
+        return None
+    clock = _coerce_session_clock(target_time)
+    for start, end in ranges:
+        if start <= end:
+            if start <= clock <= end:
+                return True
+        elif clock >= start or clock <= end:
+            return True
+    return False
+
+
+@functools.lru_cache(maxsize=512)
+def get_trading_minutes_per_day(code: str) -> int | None:
+    """返回总交易分钟数；未知元数据返回 None。
+
+    该兼容 API 适合展示，不应直接用于推导粗粒度 bar 数；跨休市段的
+    BarSize 请调用 :func:`get_trading_bars_per_day`。
+    """
+    sessions = _get_trading_session_minutes(str(code))
+    return None if sessions is None else int(sum(sessions))
+
+
+@functools.lru_cache(maxsize=2048)
+def get_trading_bars_per_day(code: str, bar_size) -> int | None:
+    """按连续交易段计算 Wind 每交易日的预期 bar 数。
+
+    每段独立向上取整，以覆盖 10:15、11:30、15:00/15:15 和夜盘收盘
+    等不足完整 BarSize 的尾 bar。未知元数据返回 None，调用方应依赖真实
+    DatetimeIndex，而不是套用某个市场的硬编码下限。
+    """
+    try:
+        bar_minutes = int(str(bar_size).strip())
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(
+            f"bar_size 必须为正整数分钟数，收到 {bar_size!r}") from exc
+    if bar_minutes <= 0:
+        raise ValueError(f"bar_size 必须为正整数分钟数，收到 {bar_size!r}")
+
+    sessions = _get_trading_session_minutes(str(code))
+    if sessions is None:
+        return None
+    return int(sum(
+        (segment + bar_minutes - 1) // bar_minutes
+        for segment in sessions
+    ))
 
 
 def _ensure_wind():
@@ -184,6 +483,8 @@ def get_close_prices(code, start_date, end_date, adjust="F"):
     pd.Series
         index=日期, values=收盘价
     """
+    # 与分钟接口保持一致：无效范围在启动 / 连接 Wind 终端前暴露。
+    _validate_intraday_range(start_date, end_date)
     w = _ensure_wind()
     price_adj = f"PriceAdj={adjust}" if adjust else ""
     data = w.wsd(code, "close", start_date, end_date, price_adj)
@@ -196,6 +497,71 @@ def get_close_prices(code, start_date, end_date, adjust="F"):
     return series
 
 
+_DATE_ONLY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+_ISO_DATETIME_RE = re.compile(r"^\d{4}-\d{2}-\d{2}(?:[ T].+)?$")
+_INTRADAY_LOOKBACK_BUFFER_DAYS = 14
+
+
+def _parse_intraday_boundary(value, *, name):
+    """解析 Wind 日内查询边界，并保留“纯日期”这一调用语义。"""
+    if value is None:
+        raise ValueError(f"{name} 不能为空")
+
+    is_date_only = False
+    if isinstance(value, str):
+        raw = value.strip()
+        if not raw:
+            raise ValueError(f"{name} 不能为空")
+        if not _ISO_DATETIME_RE.fullmatch(raw):
+            raise ValueError(
+                f"非法 {name}={value!r}，需要 YYYY-MM-DD 或精确 datetime"
+            )
+        is_date_only = bool(_DATE_ONLY_RE.fullmatch(raw))
+        value_to_parse = raw
+    elif isinstance(value, _datetime.date) and not isinstance(
+            value, _datetime.datetime):
+        is_date_only = True
+        value_to_parse = value
+    else:
+        if not isinstance(value, (pd.Timestamp, np.datetime64,
+                                  _datetime.datetime)):
+            raise ValueError(
+                f"非法 {name}={value!r}，需要 YYYY-MM-DD 或精确 datetime"
+            )
+        value_to_parse = value
+
+    try:
+        timestamp = pd.Timestamp(value_to_parse)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(
+            f"非法 {name}={value!r}，需要 YYYY-MM-DD 或精确 datetime"
+        ) from exc
+
+    if pd.isna(timestamp):
+        raise ValueError(f"非法 {name}={value!r}")
+    if timestamp.tzinfo is not None:
+        raise ValueError(f"{name} 不支持时区信息，请传入本地时间")
+    return timestamp, is_date_only
+
+
+def _validate_intraday_range(start, end):
+    """校验并解析日内查询范围；必须在连接 Wind 前调用。"""
+    start_ts, start_is_date = _parse_intraday_boundary(
+        start, name="start_date"
+    )
+    end_ts, end_is_date = _parse_intraday_boundary(end, name="end_date")
+    if start_ts > end_ts:
+        raise ValueError(
+            f"start_date 不能晚于 end_date: {start!r} > {end!r}"
+        )
+    return start_ts, end_ts, start_is_date, end_is_date
+
+
+def _format_wind_datetime(timestamp):
+    """格式化为 Wind wsi 接受的本地 datetime 字符串。"""
+    return pd.Timestamp(timestamp).isoformat(sep=" ")
+
+
 def _normalize_intraday_datetime(dt_str, is_start):
     """
     Wind `wsi` 的日期参数格式通常是 "YYYY-MM-DD HH:MM:SS"。
@@ -203,11 +569,102 @@ def _normalize_intraday_datetime(dt_str, is_start):
       - is_start=True  -> 09:30:00
       - is_start=False -> 15:00:00
     """
-    s = str(dt_str).strip()
-    if len(s) <= 10:
-        # 仅有日期部分
-        s = f"{s} 09:30:00" if is_start else f"{s} 15:00:00"
-    return s
+    timestamp, is_date_only = _parse_intraday_boundary(
+        dt_str, name="start_date" if is_start else "end_date"
+    )
+    if is_date_only:
+        clock = _datetime.time(9, 30) if is_start else _datetime.time(15, 0)
+        timestamp = pd.Timestamp.combine(timestamp.date(), clock)
+    return _format_wind_datetime(timestamp)
+
+
+def _intraday_query_plan(start, end):
+    """返回 Wind 实际抓取边界及是否需按交易日筛选。"""
+    start_ts, end_ts, start_is_date, end_is_date = _validate_intraday_range(
+        start, end
+    )
+    whole_trading_dates = start_is_date and end_is_date
+    if whole_trading_dates:
+        # 夜盘属于下一个交易日。向前多抓足够的日历日，可把周末/长假前
+        # 的夜盘 opener 一并交给连续交易日分组，而不是从 00:00 的残段
+        # 开始误切。查询结束覆盖当日全部时间，随后会排除属于下一交易日
+        # 的晚间 session。
+        query_start = (
+            start_ts.normalize()
+            - pd.Timedelta(days=_INTRADAY_LOOKBACK_BUFFER_DAYS)
+        )
+        query_end = end_ts.normalize() + pd.Timedelta(days=1, seconds=-1)
+    else:
+        # 只要调用者给出了具体时刻，就不扩边界。混合输入仍沿用原本对
+        # 纯日期端补 09:30 / 15:00 的兼容行为。
+        query_start = (
+            pd.Timestamp.combine(start_ts.date(), _datetime.time(9, 30))
+            if start_is_date else start_ts
+        )
+        query_end = (
+            pd.Timestamp.combine(end_ts.date(), _datetime.time(15, 0))
+            if end_is_date else end_ts
+        )
+        if query_start > query_end:
+            raise ValueError(
+                "补全日内时间后 start_date 不能晚于 end_date: "
+                f"{_format_wind_datetime(query_start)} > "
+                f"{_format_wind_datetime(query_end)}"
+            )
+    return query_start, query_end, whole_trading_dates, start_ts, end_ts
+
+
+def _filter_complete_trading_date_groups(frame, start_date, end_date):
+    """保留 trading-date 落在闭区间内、且已进入日盘的完整交易日组。"""
+    if frame.empty:
+        return frame
+
+    index = pd.DatetimeIndex(pd.to_datetime(frame.index))
+    if index.hasnans:
+        raise ValueError("Wind intraday 返回了无效时间戳")
+    if not index.is_monotonic_increasing:
+        frame = frame.sort_index()
+        index = pd.DatetimeIndex(frame.index)
+
+    # 局部导入避免 wind_data <-> hedge_backtest 的模块级循环依赖。
+    try:
+        from .hedge_backtest import (
+            _DAY_SESSION_START,
+            _EVENING_SESSION_START,
+            _trading_day_groups,
+        )
+    except ImportError:
+        from hedge_backtest import (  # type: ignore
+            _DAY_SESSION_START,
+            _EVENING_SESSION_START,
+            _trading_day_groups,
+        )
+
+    groups = _trading_day_groups(index)
+    keep = np.zeros(len(index), dtype=bool)
+    lower = pd.Timestamp(start_date).date()
+    upper = pd.Timestamp(end_date).date()
+
+    for group_id in np.unique(groups):
+        positions = np.flatnonzero(groups == group_id)
+        group_times = index[positions]
+        daytime_dates = [
+            timestamp.date()
+            for timestamp in group_times
+            if _DAY_SESSION_START
+            <= timestamp.time().replace(tzinfo=None)
+            < _EVENING_SESSION_START
+        ]
+        # 一个纯晚间的尾组尚未走到其 trading-date 日盘，无法证明组已
+        # 完整，因此必须排除；这也会自然剔除 end_date 当晚属于下一交易
+        # 日的 opener。
+        if not daytime_dates:
+            continue
+        trading_date = max(daytime_dates)
+        if lower <= trading_date <= upper:
+            keep[positions] = True
+
+    return frame.iloc[keep]
 
 
 def get_intraday_bars(code, start_date, end_date, bar_size="60",
@@ -223,10 +680,11 @@ def get_intraday_bars(code, start_date, end_date, bar_size="60",
         Wind 代码，如 "510050.SH"
     start_date : str
         起始日期，"YYYY-MM-DD" 或 "YYYY-MM-DD HH:MM:SS"。
-        仅日期时自动补 "09:30:00"。
+        起止均为纯日期时按交易日取完整 session（含属于该交易日的前夜
+        夜盘）；带具体时刻时严格保留该边界。
     end_date : str
         结束日期，"YYYY-MM-DD" 或 "YYYY-MM-DD HH:MM:SS"。
-        仅日期时自动补 "15:00:00"。
+        起止均为纯日期时按 trading-date 闭区间筛选完整 session。
     bar_size : str
         分钟 bar 大小，"1" / "5" / "15" / "30" / "60" 等（Wind 规范）。
     fields : str
@@ -242,9 +700,17 @@ def get_intraday_bars(code, start_date, end_date, bar_size="60",
     pd.DataFrame
         index=pd.DatetimeIndex（精确到分钟），columns=fields（小写）
     """
+    (
+        query_start,
+        query_end,
+        whole_trading_dates,
+        requested_start,
+        requested_end,
+    ) = _intraday_query_plan(start_date, end_date)
+    # 日期/范围错误必须在连接 Wind 前暴露，避免无效输入触发终端启动。
     w = _ensure_wind()
-    start_dt = _normalize_intraday_datetime(start_date, is_start=True)
-    end_dt = _normalize_intraday_datetime(end_date, is_start=False)
+    start_dt = _format_wind_datetime(query_start)
+    end_dt = _format_wind_datetime(query_end)
 
     opts = [f"BarSize={bar_size}"]
     if adjust:
@@ -270,7 +736,12 @@ def get_intraday_bars(code, start_date, end_date, bar_size="60",
         index=pd.to_datetime(data.Times),
         columns=[f.lower() for f in data.Fields],
     )
-    return df.dropna(how="all")
+    df = df.dropna(how="all")
+    if whole_trading_dates:
+        df = _filter_complete_trading_date_groups(
+            df, requested_start, requested_end
+        )
+    return df
 
 
 def _intraday_cache_path(code, start, end, bar_size, adjust="F"):
@@ -278,16 +749,30 @@ def _intraday_cache_path(code, start, end, bar_size, adjust="F"):
 
     key 必须包含 adjust：F/B/'' 三种复权口径不能混用同一缓存，否则后续
     读回来的序列复权方式与调用方预期不一致。adjust='' 的无复权在文件名
-    里固化为 'NA'，避免空串被 OS 文件系统解释出奇怪结果。
+    里固化为 'NA'，避免空串被 OS 文件系统解释出奇怪结果。起止边界会
+    保留完整时间精度，并区分纯日期的“完整交易日”语义和精确午夜时刻。
     """
+    start_ts, end_ts, start_is_date, end_is_date = _validate_intraday_range(
+        start, end
+    )
     os.makedirs(_CACHE_DIR, exist_ok=True)
     safe_code = code.replace("/", "_").replace("\\", "_")
-    # 起止日期保留 YYYY-MM-DD 部分，避免 HH:MM 写进文件名
-    safe_start = str(start)[:10]
-    safe_end = str(end)[:10]
+
+    def _boundary_token(timestamp, is_date_only):
+        if is_date_only:
+            return f"D{timestamp:%Y%m%d}"
+        # 微秒与剩余纳秒均进入 key，防止不同精确边界共用缓存；T 前缀也
+        # 让“整交易日 2024-01-01”区别于“精确到当日 00:00:00”。
+        return (
+            f"T{timestamp:%Y%m%d_%H%M%S_}{timestamp.microsecond:06d}_"
+            f"{timestamp.nanosecond:03d}"
+        )
+
+    safe_start = _boundary_token(start_ts, start_is_date)
+    safe_end = _boundary_token(end_ts, end_is_date)
     safe_adj = str(adjust).strip() or "NA"
     fname = (
-        f"{safe_code}_{safe_start}_{safe_end}_intraday_"
+        f"{safe_code}_{safe_start}_{safe_end}_intraday_v2_"
         f"{bar_size}_{safe_adj}.parquet"
     )
     return os.path.join(_CACHE_DIR, fname)
@@ -303,7 +788,8 @@ def get_intraday_close(code, start, end, bar_size="60", adjust="F"):
     ----------
     code : str
     start, end : str
-        "YYYY-MM-DD" 或 "YYYY-MM-DD HH:MM:SS"
+        "YYYY-MM-DD" 或 "YYYY-MM-DD HH:MM:SS"。起止均为纯日期时
+        返回 trading-date 闭区间内的完整 session（包括前夜夜盘）。
     bar_size : str
         "1" / "5" / "15" / "30" / "60" 等
     adjust : str

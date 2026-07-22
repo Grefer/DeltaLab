@@ -37,7 +37,8 @@ except ImportError:
 #   next_timestamp: 下一根 bar 时间；末 bar 为 None
 #   is_day_close : 当前 bar 是否为真实交易日的最后一根 bar
 #   sigma_impl   : 期权隐含波动率（option.sigma）
-#   log_ret_hist : 截至当前 bar 的对数收益序列（长度 = i），np.ndarray
+#   log_ret_hist : Day 0 前独立预热收益 + 截至当前 bar 的路径内对数收益
+#   log_ret_warmup_bars: log_ret_hist 前缀中预热收益的根数
 
 
 class HedgeStrategy:
@@ -75,28 +76,109 @@ class CloseToCloseStrategy(HedgeStrategy):
 
 
 class FixedTimeStrategy(HedgeStrategy):
-    """在每天指定时刻对冲；每个时刻每天最多触发一次。"""
+    """在每天指定时刻对冲；每个时刻每天最多触发一次。
+
+    ``trading_sessions`` 是可选的显式交易时段配置，格式为
+    ``[(start, end), ...]``；起止值可以是 ``datetime.time`` 或 ``HH:MM``。
+    只有落在交易时段内（含端点）的请求时刻才参与触发和逐日完整性校验。
+    请求顺序会在去重后保留，便于按“夜盘 -> 次日日盘”的交易日业务顺序
+    展示；实际触发仍严格跟随行情时间戳，不依赖元组排列。
+    跨午夜时段用 ``start > end`` 表示，例如 ``("21:00", "02:30")``。
+
+    不提供交易时段（``None``）时保留历史严格行为：所有请求时刻都必须
+    在每个回测交易日组中存在。调用方在取得具体品种的 session 元数据后，
+    也可以通过 :meth:`set_trading_sessions` 再配置。
+    """
 
     name = "fixed_times"
 
-    def __init__(self, times):
+    def __init__(self, times, trading_sessions=None):
         if isinstance(times, str):
             times = [x.strip() for x in times.split(",") if x.strip()]
         parsed = []
         for value in times or []:
-            if isinstance(value, _datetime.time):
-                parsed.append(value.replace(second=0, microsecond=0))
-            else:
-                try:
-                    parsed.append(_datetime.datetime.strptime(str(value), "%H:%M").time())
-                except ValueError as exc:
-                    raise ValueError(f"固定对冲时刻格式错误: {value!r}，应为 HH:MM") from exc
+            parsed.append(self._parse_time(value, label="固定对冲时刻"))
         if not parsed:
             raise ValueError("fixed_times 至少需要一个 HH:MM 时刻")
-        self.times = tuple(sorted(set(parsed)))
+        # 不能按普通墙钟升序排序：对含夜盘品种，同一交易日的业务顺序是
+        # 前一自然日夜盘 -> 次日日盘，例如 23:00 -> 11:30 -> 15:00。
+        # dict.fromkeys 在去重的同时保留用户输入顺序。
+        self.requested_times = tuple(dict.fromkeys(parsed))
+        self.trading_sessions = None
+        self.effective_times = self.requested_times
+        self.skipped_times = ()
+        # ``times`` 是历史公开属性。现在明确代表实际参与触发的有效时刻，
+        # 让既有校验、深拷贝和策略调用方无需分叉处理。
+        self.times = self.effective_times
         self._triggered = set()
+        if trading_sessions is not None:
+            self.set_trading_sessions(trading_sessions)
+
+    @staticmethod
+    def _parse_time(value, *, label):
+        if isinstance(value, _datetime.time):
+            return value.replace(
+                second=0, microsecond=0, tzinfo=None)
+        try:
+            return _datetime.datetime.strptime(str(value), "%H:%M").time()
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"{label}格式错误: {value!r}，应为 HH:MM") from exc
+
+    @staticmethod
+    def _time_in_session(value, start, end):
+        """按分钟判断时刻是否在 session 内；起止端点都算交易时间。"""
+        if start <= end:
+            return start <= value <= end
+        # 跨午夜，例如 21:00 -> 02:30。
+        return value >= start or value <= end
+
+    def set_trading_sessions(self, trading_sessions):
+        """配置显式交易时段并反推有效/跳过时刻，返回 ``self``。
+
+        ``None`` 会撤销时段过滤并恢复严格校验；显式空列表表示该品种没有
+        可匹配的交易时段，因此全部请求时刻均自动跳过。
+        """
+        if trading_sessions is None:
+            sessions = None
+        else:
+            sessions = []
+            for session in trading_sessions:
+                if (not isinstance(session, (tuple, list))
+                        or len(session) != 2):
+                    raise ValueError(
+                        "固定时刻交易时段应为 (start, end) 二元组")
+                start = self._parse_time(
+                    session[0], label="交易时段起点")
+                end = self._parse_time(
+                    session[1], label="交易时段终点")
+                sessions.append((start, end))
+            sessions = tuple(sessions)
+
+        self.trading_sessions = sessions
+        if sessions is None:
+            effective = self.requested_times
+        else:
+            effective = tuple(
+                value for value in self.requested_times
+                if any(self._time_in_session(value, start, end)
+                       for start, end in sessions)
+            )
+        effective_set = set(effective)
+        self.effective_times = effective
+        self.skipped_times = tuple(
+            value for value in self.requested_times
+            if value not in effective_set
+        )
+        self.times = self.effective_times
+        self._triggered.clear()
+        return self
 
     def should_hedge(self, ctx):
+        # 已由显式 session 证明所有请求都处于非交易时段时，策略是合法
+        # no-op；此时甚至不需要用时间戳来判定触发。
+        if not self.effective_times:
+            return False
         timestamp = ctx.get("timestamp")
         if timestamp is None:
             raise ValueError("fixed_times 策略需要带 DatetimeIndex 的历史分钟行情")
@@ -104,8 +186,9 @@ class FixedTimeStrategy(HedgeStrategy):
             timestamp = timestamp.to_pydatetime()
         if not isinstance(timestamp, _datetime.datetime):
             raise ValueError("fixed_times 策略需要真实 datetime 时间戳")
-        current_time = timestamp.time().replace(second=0, microsecond=0)
-        if current_time not in self.times:
+        current_time = timestamp.time().replace(
+            second=0, microsecond=0, tzinfo=None)
+        if current_time not in self.effective_times:
             return False
         key = (timestamp.date(), current_time)
         if key in self._triggered:
@@ -298,8 +381,52 @@ def _infer_intraday_steps(timestamps):
     return int(values[frequencies == max_frequency].max())
 
 
+def _has_repeated_day_close_evidence(timestamps, typical_steps):
+    """判断真实索引是否足以推翻偏大的交易分钟元数据。
+
+    单个盘中残段的 bar 数也可能形成“众数”，所以只有至少两个交易日组
+    同时达到真实索引的典型 bar 数、并稳定结束在正常日盘收盘区间时，才
+    把它视为完整 session 的直接证据。这样商品期货真实的 23 根 15min
+    bar 可以优先于旧/粗粒度元数据，同时上午 11:30 截止的单个残段仍会
+    继续使用元数据的保守下限并被完整性检查拒绝。
+    """
+    try:
+        typical = int(typical_steps)
+    except (TypeError, ValueError, OverflowError):
+        return False
+    if typical <= 1 or len(timestamps) < typical * 2:
+        return False
+
+    try:
+        groups = _trading_day_groups(timestamps)
+    except (AttributeError, TypeError, ValueError):
+        return False
+
+    close_times = []
+    for group_id in np.unique(groups):
+        positions = np.flatnonzero(groups == group_id)
+        if len(positions) != typical:
+            continue
+        close_time = timestamps[int(positions[-1])].time().replace(
+            second=0, microsecond=0, tzinfo=None)
+        # 当前交易分钟元数据表覆盖的沪深证券和境内期货都在 15:00
+        # 或更晚结束日盘；11:30/14:30 等时刻不能作为完整日证据。
+        if _datetime.time(15, 0) <= close_time < _EVENING_SESSION_START:
+            close_times.append(close_time)
+
+    if len(close_times) < 2:
+        return False
+    _, frequencies = np.unique(np.asarray(close_times, dtype=object),
+                               return_counts=True)
+    return bool(frequencies.max() >= 2)
+
+
 def _validate_fixed_time_data(strategy, timestamps):
     """在进入定价循环前验证 fixed_times 所需的时间粒度。"""
+    # 显式 session 可能证明所有请求时刻均不属于该品种的交易时间。
+    # 这是合法的自动跳过场景，不应再要求分钟索引或伪造缺 Bar 错误。
+    if not strategy.effective_times:
+        return
     if timestamps is None:
         raise ValueError(
             "fixed_times 策略需要真实 pandas.DatetimeIndex 的日内行情；"
@@ -315,7 +442,7 @@ def _validate_fixed_time_data(strategy, timestamps):
     problems = []
     checked_group = 0
     start = 0
-    requested_times = set(strategy.times)
+    requested_times = set(strategy.effective_times)
     for end in close_indices:
         end = int(end)
         # 只有下标 0 的单点组只是 Day 0 建仓观测，不会进入策略循环，
@@ -346,7 +473,8 @@ def _validate_fixed_time_data(strategy, timestamps):
         start = end + 1
 
     if problems:
-        requested = ",".join(t.strftime("%H:%M") for t in strategy.times)
+        requested = ",".join(
+            t.strftime("%H:%M") for t in strategy.effective_times)
         raise ValueError(
             f"fixed_times 目标时刻 [{requested}] 未逐交易日组完整匹配；"
             + "；".join(problems)
@@ -383,8 +511,9 @@ class SigmaBandStrategy(HedgeStrategy):
     时重建 Δ 对冲。sigma_ref 有两种来源：
       - 'implied'  : 使用 option.sigma
       - 'realized' : 过去 window_days 个交易日对数收益的年化 std（intraday
-                     下自动换算为 window_days * spd 根 bar），
-                     不足样本时回退到 option.sigma
+                     下自动换算为 window_days * spd 根 bar）。普通单次回测
+                     为兼容旧行为可在样本不足时回退到 option.sigma；历史
+                     择优会启用严格预热，样本不足时明确失败。
 
     window 参数（旧名）已弃用，保留兼容：若调用方传入 window，按 bar 粒度
     理解并打印 DeprecationWarning；推荐使用 window_days（日单位）。
@@ -433,27 +562,45 @@ class SigmaBandStrategy(HedgeStrategy):
     def _sigma_ref(self, ctx):
         if self.sigma_source == "implied":
             return float(ctx["sigma_impl"])
-        lr = ctx["log_ret_hist"]
-        if lr is None:
+        strict = bool(ctx.get("strict_realized_sigma", False))
+
+        def _fallback_or_raise(reason):
+            if strict:
+                raise ValueError(f"realized sigma 严格预热不可用：{reason}")
             return float(ctx["sigma_impl"])
+
+        lr = ctx.get("log_ret_hist")
+        if lr is None:
+            return _fallback_or_raise("缺少对数收益历史")
+        lr = np.asarray(lr, dtype=float)
+        if lr.ndim != 1 or not np.all(np.isfinite(lr)):
+            return _fallback_or_raise("对数收益历史必须是一维有限数值")
         win_bars = self._window_bars(ctx)
 
         # 剔除"触发当根 bar"的 log return：该 bar 的收益是触发 σ 带的原因，
         # 若回灌到窗口里会系统性抬高 σ 估计，进一步抑制下一次触发（偏差）。
         # log_ret_hist[k] = ln(S[k+1]/S[k])，所以触发 bar i 对应的 return 索引是 i-1。
         i_trig = int(self._last_trigger_i)
+        warmup_bars = int(ctx.get("log_ret_warmup_bars", 0) or 0)
+        if warmup_bars < 0 or warmup_bars > len(lr):
+            return _fallback_or_raise("预热收益长度元数据无效")
         mask = np.ones(len(lr), dtype=bool)
-        if 0 < i_trig <= len(lr):
-            mask[i_trig - 1] = False
+        # 路径内第 i_trig 根 bar 对应的 return 位于预热前缀之后，索引为
+        # warmup_bars + i_trig - 1。不能再沿用未带预热时的 i_trig - 1，
+        # 否则会错误删除一条 Day 0 前收益并保留真正的触发收益。
+        trigger_return_index = warmup_bars + i_trig - 1
+        if i_trig > 0 and 0 <= trigger_return_index < len(lr):
+            mask[trigger_return_index] = False
         clean = lr[mask]
-        if len(clean) < max(2, min(win_bars, 2)):
-            return float(ctx["sigma_impl"])
+        if len(clean) < win_bars and strict:
+            return _fallback_or_raise(
+                f"需要 {win_bars} 根收益，实际仅 {len(clean)} 根")
         tail = clean[-win_bars:]
         if len(tail) < 2:
-            return float(ctx["sigma_impl"])
+            return _fallback_or_raise("有效收益少于 2 根")
         std = float(np.std(tail, ddof=1))
         if not np.isfinite(std) or std <= 0:
-            return float(ctx["sigma_impl"])
+            return _fallback_or_raise("已实现波动率非正或非有限")
         spd = int(ctx.get("steps_per_day", 1))
         return std * np.sqrt(ANNUAL_DAYS * max(1, spd))
 
@@ -565,6 +712,38 @@ class HedgeBandStrategy(HedgeStrategy):
         if triggered and self.band_type == "sigma":
             self._sigma_strategy._last_trigger_i = int(ctx["i"])
         return triggered
+
+
+def _realized_sigma_window_days(strategy):
+    """返回策略实际参与触发的 realized-sigma 日窗口；否则返回 0。
+
+    ``HedgeBandStrategy`` 的 absolute / relative 分支即使保存了
+    ``sigma_source='realized'`` 也不会在触发时读取 sigma，因此不能令历史
+    数据门槛无故增加。该判断同时供回测引擎和历史分析层使用。
+    """
+    sigma_strategy = None
+    if isinstance(strategy, SigmaBandStrategy):
+        sigma_strategy = strategy
+    elif (isinstance(strategy, HedgeBandStrategy)
+          and strategy.band_type == "sigma"):
+        sigma_strategy = strategy._sigma_strategy
+    if (sigma_strategy is None
+            or sigma_strategy.sigma_source != "realized"):
+        return 0
+    return max(2, int(sigma_strategy.window_days))
+
+
+def _realized_sigma_window_bars(strategy, steps_per_day):
+    """返回策略严格预热所需 bar 数；非 realized-sigma 策略返回 0。"""
+    if not _realized_sigma_window_days(strategy):
+        return 0
+    if isinstance(strategy, SigmaBandStrategy):
+        sigma_strategy = strategy
+    else:
+        sigma_strategy = strategy._sigma_strategy
+    return int(sigma_strategy._window_bars({
+        "steps_per_day": max(1, int(steps_per_day)),
+    }))
 
 
 # ============================================================
@@ -733,7 +912,8 @@ def _run_single_path(args):
     人为压窄多路径统计分布。base_seed=None 时走 OS 熵，完全独立。
     """
     (option_init, price_path, hedge_freq, tc_rate, position, quantity, multiplier,
-     strategy, steps_per_day, slippage_bps, path_idx, base_seed) = args
+     strategy, steps_per_day, slippage_bps, force_day_close_hedge,
+     path_idx, base_seed) = args
 
     price_path = np.asarray(price_path, dtype=float)
     if price_path.ndim != 1:
@@ -761,6 +941,7 @@ def _run_single_path(args):
         strategy=copy.deepcopy(strategy) if strategy is not None else None,
         steps_per_day=steps_per_day,
         slippage_bps=slippage_bps,
+        force_day_close_hedge=force_day_close_hedge,
     )
     res = bt.run()
     return {
@@ -818,7 +999,9 @@ class HedgeBacktest:
                  path_source="gbm", external_path=None, detrend=False,
                  is_future=False, contract_multiplier=1.0,
                  strategy=None, steps_per_day=1, slippage_bps=0.0,
-                 base_seed=20):
+                 base_seed=20, force_day_close_hedge=False,
+                 sigma_warmup_log_returns=None,
+                 strict_sigma_warmup=False):
         """
         Parameters
         ----------
@@ -834,6 +1017,17 @@ class HedgeBacktest:
             并在结果中给出理论 Δ 手数与离散化误差分项。
         contract_multiplier : float
             期货合约乘数（每张合约对应的标的数量），`is_future=True` 时生效。
+        force_day_close_hedge : bool
+            公共的每日收盘兜底开关。开启后，非到期交易日的最后一根 bar
+            至少执行一次 Delta 对齐；若当前策略已在同一 bar 触发，引擎
+            自动去重。到期或敲出末 bar 始终直接平仓，不先做兜底调仓。
+        sigma_warmup_log_returns : array-like | None
+            Day 0 前、与 ``external_path`` 独立的对数收益预热种子。它只进入
+            realized-sigma 的滚动估计，不会改变期权期限、价格路径、PnL
+            起止点或回测时间戳。
+        strict_sigma_warmup : bool
+            要求 realized-sigma 策略在首个可交易 bar 前已具备完整窗口。
+            历史择优使用 True；不足或波动率无效时明确失败，不回退 implied。
         base_seed : int | None
             run_multi 多路径 MC 采样的基础种子。每条路径实际使用的 option.mc_seed
             = base_seed + path_idx，实现路径间独立采样的同时保持整体可复现。
@@ -877,8 +1071,30 @@ class HedgeBacktest:
         # steps_per_day=1 时行为与旧代码一致。
         self.steps_per_day = max(1, int(steps_per_day))
         self.slippage_bps = float(slippage_bps)
+        self.force_day_close_hedge = bool(force_day_close_hedge)
         # strategy=None 时回退到旧的 FixedFreqStrategy(hedge_freq) 以保持兼容。
         self.strategy = strategy if strategy is not None else FixedFreqStrategy(self.hedge_freq)
+        if sigma_warmup_log_returns is None:
+            warmup_returns = np.array([], dtype=float)
+        else:
+            warmup_returns = np.asarray(
+                sigma_warmup_log_returns, dtype=float)
+            if warmup_returns.ndim != 1:
+                raise ValueError("sigma_warmup_log_returns 必须是一维数组")
+            if not np.all(np.isfinite(warmup_returns)):
+                raise ValueError(
+                    "sigma_warmup_log_returns 必须全部为有限数值")
+            warmup_returns = warmup_returns.copy()
+        self.sigma_warmup_log_returns = warmup_returns
+        self.strict_sigma_warmup = bool(strict_sigma_warmup)
+        required_warmup_bars = _realized_sigma_window_bars(
+            self.strategy, self.steps_per_day)
+        if (self.strict_sigma_warmup and required_warmup_bars
+                and len(warmup_returns) < required_warmup_bars):
+            raise ValueError(
+                "realized sigma 严格预热不足："
+                f"需要 Day 0 前 {required_warmup_bars} 根收益，"
+                f"实际仅 {len(warmup_returns)} 根")
         self.timestamps = None
         if source_index is not None:
             try:
@@ -960,6 +1176,8 @@ class HedgeBacktest:
         dt_bar = 1.0 / (ANNUAL_DAYS * spd)  # 单 bar 年化时长
         dt = 1.0 / ANNUAL_DAYS  # 日粒度（兼容旧字段）
         pos = self.position
+        warmup_log_returns = self.sigma_warmup_log_returns
+        path_log_returns = np.log(S[1:] / S[:-1])
 
         # ---- 敲出提前了结：路径已知时把存续期截断到敲出日 ----
         # 仅当期权实现了 knockout_event 且检测到敲出时生效（默认 None=不截断），
@@ -1054,6 +1272,11 @@ class HedgeBacktest:
         S_last = float(S[0])
         hedge_triggered = np.zeros(n + 1, dtype=bool)
         hedge_triggered[0] = True  # Day 0 建仓视为一次触发
+        # 分开记录原策略与公共收盘兜底的触发来源。Day 0 建仓和末 bar
+        # 平仓是引擎端点，不属于任一来源；fallback 数组仅标记“原策略未
+        # 触发、由兜底补充”的 bar，因而同一收盘 bar 天然不会重复计数。
+        strategy_hedge_triggered = np.zeros(n + 1, dtype=bool)
+        day_close_fallback_triggered = np.zeros(n + 1, dtype=bool)
 
         sl_rate = self.slippage_bps * 1e-4  # bps -> ratio
         bars_since_day_close = 0
@@ -1166,9 +1389,23 @@ class HedgeBacktest:
                     "next_timestamp": next_timestamp,
                     "sigma_impl": float(option.sigma),
                     # 对数收益历史（到当前 bar 为止），仅 realized σ 时用到
-                    "log_ret_hist": np.log(S[1:i + 1] / S[0:i]) if i >= 1 else np.array([]),
+                    "log_ret_hist": np.concatenate((
+                        warmup_log_returns,
+                        path_log_returns[:i],
+                    )),
+                    "log_ret_warmup_bars": len(warmup_log_returns),
+                    "strict_realized_sigma": self.strict_sigma_warmup,
                 }
-                if strategy.should_hedge(ctx):
+                # 原策略无论兜底是否开启都只评估一次，确保固定时刻等
+                # 有状态策略按原有逻辑推进。公共规则只对非终止收盘 bar
+                # 做 OR 合并；原策略已触发时不会再产生第二笔交易。
+                strategy_triggered = bool(strategy.should_hedge(ctx))
+                fallback_only = bool(
+                    self.force_day_close_hedge
+                    and is_day_close
+                    and not strategy_triggered
+                )
+                if strategy_triggered or fallback_only:
                     target, theo, real = _compute_target(delta[i])
                     trade = target - H[i]
                     if trade != 0:
@@ -1182,6 +1419,8 @@ class HedgeBacktest:
                     delta_theo_qty[i] = theo
                     delta_real_qty[i] = real
                     hedge_triggered[i] = True
+                    strategy_hedge_triggered[i] = strategy_triggered
+                    day_close_fallback_triggered[i] = fallback_only
                     i_last = i
                     S_last = float(S[i])
 
@@ -1243,6 +1482,45 @@ class HedgeBacktest:
         else:
             completed_days = n // spd if spd > 0 else n
 
+        normalization_schema = "s0_x_multiplier_x_abs_quantity_v1"
+        normalization_s0 = float(S[0])
+        normalization_notional = (
+            normalization_s0 * self.multiplier * abs(self.quantity))
+        normalization_reasons = []
+        if not np.isfinite(normalization_s0) or normalization_s0 <= 0:
+            normalization_reasons.append("S0 必须为有限正数")
+        if not np.isfinite(self.multiplier) or self.multiplier <= 0:
+            normalization_reasons.append("multiplier 必须为有限正数且不能为 0")
+        if not np.isfinite(self.quantity) or self.quantity == 0:
+            normalization_reasons.append("quantity 必须为有限非零数")
+        if (not np.isfinite(normalization_notional)
+                or normalization_notional <= 0):
+            normalization_reasons.append("归一化分母必须为有限正数")
+        normalization_available = not normalization_reasons
+        normalization_reason = "；".join(normalization_reasons)
+
+        if isinstance(strategy, FixedTimeStrategy):
+            fixed_time_requested_times = tuple(
+                value.strftime("%H:%M")
+                for value in strategy.requested_times)
+            fixed_time_effective_times = tuple(
+                value.strftime("%H:%M")
+                for value in strategy.effective_times)
+            fixed_time_skipped_times = tuple(
+                value.strftime("%H:%M")
+                for value in strategy.skipped_times)
+            fixed_time_trading_sessions = (
+                None if strategy.trading_sessions is None else tuple(
+                    (start.strftime("%H:%M"), end.strftime("%H:%M"))
+                    for start, end in strategy.trading_sessions
+                )
+            )
+        else:
+            fixed_time_requested_times = None
+            fixed_time_effective_times = None
+            fixed_time_skipped_times = None
+            fixed_time_trading_sessions = None
+
         self._results = {
             'n_days': completed_days,
             'n_bars': n,
@@ -1254,7 +1532,16 @@ class HedgeBacktest:
             'ko_day': completed_days if ko_settle is not None else None,
             'ko_settle': ko_settle,
             'hedge_triggered': hedge_triggered,
+            'strategy_hedge_triggered': strategy_hedge_triggered,
+            'day_close_fallback_triggered': day_close_fallback_triggered,
+            'force_day_close_hedge': self.force_day_close_hedge,
             'strategy_name': getattr(strategy, 'name', 'unknown'),
+            # fixed_times 请求/过滤结果。非固定时刻策略为 None；空 tuple
+            # 表示显式 session 已证明没有有效目标，而非元数据缺失。
+            'fixed_time_requested_times': fixed_time_requested_times,
+            'fixed_time_effective_times': fixed_time_effective_times,
+            'fixed_time_skipped_times': fixed_time_skipped_times,
+            'fixed_time_trading_sessions': fixed_time_trading_sessions,
             'timestamps': run_timestamps,
             # 与 timestamps 一一对齐的交易日组编号；夜盘、跨午夜
             # 与后续日盘保持在同一组，便于分析层按交易日聚合 PnL。
@@ -1290,6 +1577,20 @@ class HedgeBacktest:
             'path_source': self._path_source,
             'is_future': self.is_future,
             'contract_multiplier': self.contract_multiplier,
+            # 跨合约路径比较的固定口径元数据。分母严格使用
+            # S0 * multiplier * abs(quantity)，绝不以 1 或期货
+            # contract_multiplier 代替无效输入；单次回测金额 PnL 不变。
+            'quantity': self.quantity,
+            'multiplier': self.multiplier,
+            'normalization_schema': normalization_schema,
+            'normalization_s0': normalization_s0,
+            'normalization_notional': normalization_notional,
+            'normalization_available': normalization_available,
+            'normalization_reason': normalization_reason,
+            'normalization_invalid_reason': normalization_reason,
+            'sigma_warmup_log_returns': warmup_log_returns.copy(),
+            'sigma_warmup_bars': int(len(warmup_log_returns)),
+            'strict_sigma_warmup': self.strict_sigma_warmup,
             # 为方便 Phase 3 调用，暴露 total_pnl 标量（= cum_pnl[-1]）
             'total_pnl': float(cum_pnl[-1]) if n > 0 else 0.0,
         }
@@ -1308,8 +1609,22 @@ class HedgeBacktest:
         elif isinstance(strategy, CloseToCloseStrategy):
             strategy_text = "每日收盘（close-to-close）"
         elif isinstance(strategy, FixedTimeStrategy):
-            times = ",".join(t.strftime("%H:%M") for t in strategy.times)
-            strategy_text = f"每日固定时刻（{times}）"
+            requested = ",".join(
+                t.strftime("%H:%M") for t in strategy.requested_times)
+            effective = ",".join(
+                t.strftime("%H:%M") for t in strategy.effective_times)
+            skipped = ",".join(
+                t.strftime("%H:%M") for t in strategy.skipped_times)
+            if not strategy.skipped_times:
+                strategy_text = f"每日固定时刻（{requested}）"
+            elif strategy.effective_times:
+                strategy_text = (
+                    f"每日固定时刻（请求 {requested}；有效 {effective}；"
+                    f"自动跳过非交易时刻 {skipped}）")
+            else:
+                strategy_text = (
+                    f"每日固定时刻（请求 {requested}；全部为非交易时刻，"
+                    "自动跳过）")
         elif isinstance(strategy, HedgeBandStrategy):
             unit = {
                 "absolute": "绝对价格",
@@ -1332,6 +1647,8 @@ class HedgeBacktest:
             "=" * 52,
             f"  回测天数          :  {n:>10d}   (Day 0=建仓, Day {n}=到期)",
             f"  对冲策略          :  {strategy_text}",
+            f"  每日收盘兜底      :  {'开启' if self.force_day_close_hedge else '关闭':>10s}",
+            f"  兜底补充触发      :  {int(np.count_nonzero(r['day_close_fallback_triggered'])):>10d}",
             f"  实际采样 bar/日   :  {self.steps_per_day:>10d}",
             f"  交易成本率        :  {self.tc_rate * 100:.2f}%",
             "-" * 52,
@@ -1560,6 +1877,7 @@ class HedgeBacktest:
             (self.option_init, paths[i], self.hedge_freq,
              self.tc_rate, self.position, self.quantity, self.multiplier,
              self.strategy, self.steps_per_day, self.slippage_bps,
+             self.force_day_close_hedge,
              i, effective_seed)
             for i in range(n)
         ]
@@ -1591,6 +1909,7 @@ class HedgeBacktest:
 
         return {
             'n_paths': n,
+            'force_day_close_hedge': self.force_day_close_hedge,
             'errors': errors,
             'total_pnl': total_pnl,
             'total_tc': total_tc,
@@ -1635,7 +1954,7 @@ class HedgeBacktest:
                   hedge_freq=1, tc_rate=0.0, position=1, adjust="F",
                   quantity=1.0, multiplier=5,
                   strategy=None, steps_per_day=None, slippage_bps=0.0,
-                  bar_size=None):
+                  bar_size=None, force_day_close_hedge=False):
         """
         使用 Wind 历史行情创建回测实例
 
@@ -1664,9 +1983,9 @@ class HedgeBacktest:
             非 None 走 `w.wsi` intraday 分支，取值如 "1"/"5"/"15"/"30"/"60"。
         steps_per_day : int | None
             日频模式下强制为 1；intraday 模式下若未指定，优先按返回的
-            DatetimeIndex 统计典型交易日组 bar 数。实际索引无法推导时，
-            再按 Wind 品种交易分钟元数据与 bar_size 计算；两者均不可用才
-            使用 A 股 240 分钟备用口径。显式传入时以传入值为准并打印告警。
+            DatetimeIndex 统计典型交易日组 bar 数，并用 Wind 品种的连续
+            session 元数据交叉校验。未知品种不套用其它市场的硬编码下限；
+            显式传入时以传入值为准并打印告警。
 
         Returns
         -------
@@ -1702,6 +2021,11 @@ class HedgeBacktest:
             opt, rescale_info = _rescale_option_to_real_s0(option, real_s0)
             scaled_strategy = _rescale_strategy_to_real_s0(
                 strategy, rescale_info['ratio'])
+            # Wind 日频数据无法承载任何盘中时刻。即使调用方此前给策略
+            # 配过 session，也恢复严格目标，继续给出原有“仅支持日内行情”
+            # 错误，避免把日频误解释成合法的固定时刻 no-op。
+            if isinstance(scaled_strategy, FixedTimeStrategy):
+                scaled_strategy.set_trading_sessions(None)
             try:
                 print(_format_rescale_info(rescale_info))
             except Exception:
@@ -1717,7 +2041,8 @@ class HedgeBacktest:
             bt = cls(opt, series, hedge_freq=hedge_freq, tc_rate=tc_rate,
                      position=position, quantity=quantity, multiplier=multiplier,
                      strategy=scaled_strategy, steps_per_day=spd_final,
-                     slippage_bps=slippage_bps)
+                     slippage_bps=slippage_bps,
+                     force_day_close_hedge=force_day_close_hedge)
             used_len = len(bt.prices)
             bt._wind_meta = {
                 'code': code,
@@ -1758,49 +2083,50 @@ class HedgeBacktest:
                 f"bar_size={bar_size_str}min 仅 {len(prices)} 条"
             )
 
-        # 通过 Wind wss(exch_eng, sec_type) 查本地常量表，得到日内可交易分钟数；
-        # 无法判定时兜底按 A 股/股指的 240 分钟推导，并打印警告。
+        # 按每段连续 session 独立 ceil(bar_size) 得到元数据预期 bar 数；
+        # 不能用 ceil(总分钟/bar_size)，否则 60min 会漏掉休市前的尾 bar。
         try:
-            from .wind_data import get_trading_minutes_per_day
+            from .wind_data import (
+                get_trading_bars_per_day,
+                get_trading_session_clock_ranges,
+            )
         except ImportError:
-            from wind_data import get_trading_minutes_per_day
+            from wind_data import (
+                get_trading_bars_per_day,
+                get_trading_session_clock_ranges,
+            )
 
-        total_min = get_trading_minutes_per_day(code)
-        metadata_spd = None
-        if total_min is not None:
-            if total_min % bar_min != 0:
-                print(f"[from_wind] 警告：{code} 日内 {total_min} 分钟无法被 "
-                      f"bar_size={bar_min} 整除；将优先使用实际时间索引推导。")
-            # 非整除时 Wind 会保留最后一个不足 bar_size 的尾 bar，必须向上
-            # 取整；floor 会让恰好少最后一根的盘中残段自证为完整。
-            metadata_spd = max(1, (total_min + bar_min - 1) // bar_min)
-        else:
-            metadata_spd = max(1, (240 + bar_min - 1) // bar_min)
-
-        # Wind 的分钟 bar 可能包含不足一个 bar_size 的尾 bar，例如
-        # 570 分钟 / 60min 理论 floor=9，但实际索引每天会返回 10 根。
-        # 因此优先相信真实 DatetimeIndex 的典型交易日组 bar 数，交易分钟
-        # 元数据只做交叉校验和无法推导时的兜底。
+        metadata_spd = get_trading_bars_per_day(code, bar_min)
         index_spd = _infer_intraday_steps(series.index)
         if index_spd > 1:
-            # 索引只有一个或多个同样的盘中残段时，众数会把残段 bar 数
-            # 自证成“完整日”。自动模式取索引与交易时长元数据中更保守的
-            # 较大值：可保留 10>9 的尾 bar 场景，同时让 3<4 的上午残段
-            # 在期限完整性检查中被拒绝。
-            auto_spd = max(index_spd, metadata_spd)
-            if metadata_spd != index_spd:
-                source = ("交易分钟元数据" if total_min is not None
-                          else "240 分钟备用口径")
+            # 单个或多个同样的盘中残段可能把较小 bar 数自证成众数。
+            # 默认仍取索引与元数据的较大值；只有多日都稳定走到正常日盘
+            # 收盘时，才允许更强的真实索引证据覆盖偏大的粗粒度元数据。
+            repeated_close_evidence = _has_repeated_day_close_evidence(
+                series.index, index_spd)
+            if metadata_spd is None:
+                auto_spd = index_spd
+                print(f"[from_wind] 警告：未命中 {code} 的连续交易时段元数据；"
+                      f"采用实际时间索引 steps_per_day={index_spd}，不套用 "
+                      "240 分钟硬编码下限。")
+            elif metadata_spd > index_spd and repeated_close_evidence:
+                # 元数据表按品种大类维护，可能落后于交易时段调整，或无法
+                # 精确表达被休市段切开的 session。多日真实收盘证据更强时
+                # 不再让偏大的元数据把完整交易日误判为盘中残段。
+                auto_spd = index_spd
+            else:
+                auto_spd = max(index_spd, metadata_spd)
+            if metadata_spd is not None and metadata_spd != index_spd:
                 print(f"[from_wind] 实际时间索引推导 steps_per_day={index_spd}，"
-                      f"与{source}推导值 {metadata_spd} 不同；"
-                      f"自动模式采用保守值 {auto_spd}。")
+                      f"与连续 session 元数据推导值 {metadata_spd} 不同；"
+                      f"自动模式采用{'多日真实收盘证据' if repeated_close_evidence else '保守下限'}"
+                      f" {auto_spd}。")
         else:
-            auto_spd = metadata_spd
-            if total_min is None:
+            auto_spd = metadata_spd if metadata_spd is not None else index_spd
+            if metadata_spd is None:
                 print(f"[from_wind] 警告：实际索引无法推导日内 bar 数，且无法从 "
-                      f"Wind 获取 {code} 的交易分钟数；按 240 分钟备用口径"
-                      f"推导 spd={metadata_spd}。含夜盘品种请显式传入 "
-                      "steps_per_day。")
+                      f"Wind 识别 {code} 的连续交易时段；仅采用索引值 "
+                      f"steps_per_day={auto_spd}。")
 
         if steps_per_day is None:
             spd_final = auto_spd
@@ -1815,6 +2141,12 @@ class HedgeBacktest:
         opt, rescale_info = _rescale_option_to_real_s0(option, real_s0)
         scaled_strategy = _rescale_strategy_to_real_s0(
             strategy, rescale_info['ratio'])
+        # 只有取得明确的品种交易时段时才过滤固定时刻。未知分类继续保留
+        # trading_sessions=None 的严格逐日匹配，不能把元数据缺失误当休市。
+        if isinstance(scaled_strategy, FixedTimeStrategy):
+            session_profile = get_trading_session_clock_ranges(code)
+            if session_profile is not None:
+                scaled_strategy.set_trading_sessions(session_profile)
         try:
             print(_format_rescale_info(rescale_info))
         except Exception:
@@ -1823,9 +2155,24 @@ class HedgeBacktest:
         bt = cls(opt, series, hedge_freq=hedge_freq, tc_rate=tc_rate,
                  position=position, quantity=quantity, multiplier=multiplier,
                  strategy=scaled_strategy, steps_per_day=spd_final,
-                 slippage_bps=slippage_bps)
+                 slippage_bps=slippage_bps,
+                 force_day_close_hedge=force_day_close_hedge)
         used_len = len(bt.prices)
         used_index = series.index[:used_len]
+        if isinstance(bt.strategy, FixedTimeStrategy):
+            fixed_time_wind_meta = {
+                'fixed_time_requested_times': tuple(
+                    value.strftime("%H:%M")
+                    for value in bt.strategy.requested_times),
+                'fixed_time_effective_times': tuple(
+                    value.strftime("%H:%M")
+                    for value in bt.strategy.effective_times),
+                'fixed_time_skipped_times': tuple(
+                    value.strftime("%H:%M")
+                    for value in bt.strategy.skipped_times),
+            }
+        else:
+            fixed_time_wind_meta = {}
         bt._wind_meta = {
             'code': code,
             'start_date': start_date,
@@ -1834,6 +2181,7 @@ class HedgeBacktest:
             # intraday 下 n_trade_days 按 bar 数除以 spd 近似
             'n_trade_days': max(0, (used_len - 1) // max(1, spd_final)),
             'bar_size': bar_size_str,
+            **fixed_time_wind_meta,
         }
         bt._full_price_history = series.copy()
         bt._rescale_info = rescale_info
@@ -1843,7 +2191,8 @@ class HedgeBacktest:
     def from_csv(cls, option, filepath, price_col='close',
                  date_col=None, hedge_freq=1, tc_rate=0.0, position=1,
                  quantity=1.0, multiplier=5,
-                 strategy=None, steps_per_day=None, slippage_bps=0.0):
+                 strategy=None, steps_per_day=None, slippage_bps=0.0,
+                 force_day_close_hedge=False):
         """
         从 CSV 文件加载价格数据创建回测实例（无需 Wind 终端）
 
@@ -1912,7 +2261,8 @@ class HedgeBacktest:
         bt = cls(opt, series, hedge_freq=hedge_freq, tc_rate=tc_rate, position=position,
                  quantity=quantity, multiplier=multiplier,
                  strategy=scaled_strategy, steps_per_day=steps_per_day,
-                 slippage_bps=slippage_bps)
+                 slippage_bps=slippage_bps,
+                 force_day_close_hedge=force_day_close_hedge)
         used_len = len(bt.prices)
         used_index = series.index[:used_len]
         bt._wind_meta = {
