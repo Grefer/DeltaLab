@@ -117,7 +117,7 @@ def test_saved_wind_snapshot_records_resolved_dates_and_actual_bar_size():
         "wind_start": "2025-01-02",
         "wind_end": "2025-02-28",
         "wind_bar_size_requested": gui_app.WIND_AUTO_BAR_SIZE,
-        "wind_bar_size": "15min",
+        "wind_bar_size": "15分钟",
         "wind_date_mode": "custom_range",
     })
 
@@ -125,7 +125,7 @@ def test_saved_wind_snapshot_records_resolved_dates_and_actual_bar_size():
         state=state, result=_result(strategy="hedge_band"))
 
     assert snapshot.source_label == (
-        "Wind · 510050.SH · 2025-01-02 至 2025-02-28 · 15min"
+        "Wind · 510050.SH · 2025-01-02 至 2025-02-28 · 15分钟"
     )
 
 

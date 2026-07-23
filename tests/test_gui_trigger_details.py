@@ -50,7 +50,7 @@ def test_trigger_detail_filters_rows_and_preserves_lifecycle_sources():
     assert detail.index.tolist() == _raw_detail_frame().index[
         [0, 2, 3, 5]].tolist()
     assert detail["触发来源"].tolist() == [
-        "初始建仓", "策略触发", "收盘兜底", "到期平仓"]
+        "初始建仓", "策略触发", "收盘保底", "到期平仓"]
     # “触发”不是“成交”：目标持仓没有变化的触发记录仍会保留。
     assert detail["持仓"].tolist() == [1.0, 1.0, 1.0, 1.0]
 

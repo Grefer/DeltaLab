@@ -174,6 +174,78 @@ class ContractHistoryPool:
     contract_load_errors: Mapping[str, str] = field(default_factory=dict)
 
 
+@dataclass(frozen=True)
+class HistoryReplaySpec:
+    """重放严格区间内单个回测分段所需的全部输入。
+
+    历史择优只保留逐日摘要，原始 bar 级结果会在渲染后释放。本配方改为记录
+    构造 :class:`HedgeBacktest` 的原始参数：同一分段内所有候选共享一份行情
+    切片与按真实 S0 缩放后的期权，只有策略对象逐候选不同。因此重放的内存
+    成本远低于保留结果数组，且不需要在展示层复制分段推导逻辑。
+    """
+
+    lookback: str
+    window_id: str
+    option: object
+    external_path: object
+    evaluation_days: int
+    steps_per_day: int
+    strategies: Mapping[str, HedgeStrategy]
+    backtest_kwargs: Mapping[str, object] = field(default_factory=dict)
+    warmup_kwargs: Mapping[str, Mapping] = field(default_factory=dict)
+    metadata: Mapping[str, object] = field(default_factory=dict)
+
+    def strategy_names(self):
+        return tuple(self.strategies)
+
+    def build(self, strategy_name):
+        """按候选名重建该分段的回测对象；不运行。"""
+        name = str(strategy_name)
+        if name not in self.strategies:
+            raise KeyError(
+                f"回测分段 {self.lookback}/{self.window_id} 没有候选 {name!r}")
+        return HedgeBacktest(
+            self.option,
+            path_source="historical",
+            external_path=self.external_path,
+            evaluation_days=self.evaluation_days,
+            strategy=self.strategies[name],
+            steps_per_day=self.steps_per_day,
+            **dict(self.warmup_kwargs.get(name, {})),
+            **dict(self.backtest_kwargs),
+        )
+
+    def replay(self, strategy_name):
+        """重跑该分段并返回已完成的回测对象，用于逐 bar 明细展示。"""
+        backtest = self.build(strategy_name)
+        backtest.run()
+        return backtest
+
+
+def history_replay_index(window_results):
+    """把逐分段重放配方抽成 ``{lookback: {window_id: HistoryReplaySpec}}``。
+
+    调用方可以只保留该索引并立即释放 ``window_results`` 中的 bar 级数组。
+    没有成功候选的分段不会出现在索引里。
+    """
+    if not isinstance(window_results, Mapping):
+        raise TypeError("window_results 必须是按观察期组织的映射")
+    index = {}
+    for lookback, lookback_results in window_results.items():
+        if not isinstance(lookback_results, Mapping):
+            raise TypeError(f"window_results[{lookback!r}] 必须是窗口映射")
+        specs = {}
+        for window_id, window in lookback_results.items():
+            if not isinstance(window, Mapping):
+                continue
+            spec = window.get("_window_replay")
+            if isinstance(spec, HistoryReplaySpec) and spec.strategies:
+                specs[str(window_id)] = spec
+        if specs:
+            index[str(lookback)] = specs
+    return index
+
+
 def _positive_int(value, name):
     """把整数型配置规范化，并拒绝 bool、小数和非正数。"""
     if isinstance(value, (bool, np.bool_)):
@@ -1457,6 +1529,9 @@ def recommend_by_rolling_history(
                     }
                     continue
 
+            replay_option = None
+            replay_strategies = {}
+            replay_warmup = {}
             for case in cases:
                 case_warmup_days = _realized_sigma_window_days(case.strategy)
                 if case_warmup_days and warmup_error:
@@ -1541,6 +1616,30 @@ def recommend_by_rolling_history(
                 strategy_types[case.name] = result.get(
                     "strategy_name", "unknown")
                 per_case[case.name] = result
+                # 只记录构造参数：同段候选共享行情切片与缩放后的期权，
+                # 展示层据此按需重跑单段，无需长期保留 bar 级结果数组。
+                replay_option = scaled_option
+                replay_strategies[case.name] = scaled_strategy
+                if warmup_kwargs:
+                    replay_warmup[case.name] = warmup_kwargs
+            if replay_strategies:
+                per_case["_window_replay"] = HistoryReplaySpec(
+                    lookback=str(label),
+                    window_id=str(window_id),
+                    option=replay_option,
+                    external_path=external_path,
+                    evaluation_days=segment_days,
+                    steps_per_day=spd,
+                    strategies=dict(replay_strategies),
+                    backtest_kwargs=dict(kwargs),
+                    warmup_kwargs=dict(replay_warmup),
+                    metadata={
+                        "segment_no": plan["segment_no"],
+                        "terminal_mode": plan["terminal_mode"],
+                        "evidence_days": days,
+                        "history_mode": "rolling_history",
+                    },
+                )
             label_results[window_id] = per_case
 
         window_results[label] = label_results
@@ -1844,6 +1943,9 @@ def _recommend_from_explicit_history_plans(
                 }
                 continue
 
+            replay_option = None
+            replay_strategies = {}
+            replay_warmup = {}
             for case in cases:
                 case_warmup_days = _realized_sigma_window_days(case.strategy)
                 warmup_error = str(entry.get("warmup_error", "") or "")
@@ -1929,6 +2031,32 @@ def _recommend_from_explicit_history_plans(
                 strategy_types[case.name] = result.get(
                     "strategy_name", "unknown")
                 per_case[case.name] = result
+                # 具体合约段同样只记录构造参数；固定时刻策略已绑定该合约
+                # 自己的交易时段，重放时不会退回品种代码的默认 session。
+                replay_option = scaled_option
+                replay_strategies[case.name] = scaled_strategy
+                if warmup_kwargs:
+                    replay_warmup[case.name] = warmup_kwargs
+            if replay_strategies:
+                per_case["_window_replay"] = HistoryReplaySpec(
+                    lookback=str(label),
+                    window_id=str(window_id),
+                    option=replay_option,
+                    external_path=external_path,
+                    evaluation_days=evaluation_days,
+                    steps_per_day=entry_spd,
+                    strategies=dict(replay_strategies),
+                    backtest_kwargs=dict(kwargs),
+                    warmup_kwargs=dict(replay_warmup),
+                    metadata={
+                        "segment_no": entry.get("segment_no"),
+                        "terminal_mode": entry.get("terminal_mode"),
+                        "evidence_days": plan.get("evidence_days"),
+                        "history_mode": "product_contract_pool",
+                        "contract_code": contract_code,
+                        "endpoint_date": entry.get("endpoint_date"),
+                    },
+                )
             label_results[window_id] = per_case
         window_results[label] = label_results
 

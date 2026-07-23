@@ -20,7 +20,9 @@ from .hedge_backtest import (
 from .hedge_analysis import (
     StrategyCase,
     ContractHistoryPool,
+    HistoryReplaySpec,
     compare_strategies,
+    history_replay_index,
     history_window_summary,
     result_daily_frame,
     summarize_strategy_result,

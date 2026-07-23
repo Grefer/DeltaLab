@@ -20,6 +20,7 @@ from pricing import (
     SigmaBandStrategy,
     StrategyCase,
     compare_strategies,
+    history_replay_index,
     history_window_summary,
     result_daily_frame,
     summarize_strategy_result,
@@ -3285,3 +3286,100 @@ def test_rolling_history_rebases_absolute_band_for_each_price_window():
         only_window["absolute"]["hedge_triggered"],
         only_window["relative"]["hedge_triggered"],
     )
+
+
+def test_rolling_history_replay_reproduces_each_segment_bar_by_bar():
+    """重放配方必须逐 bar 复现原分段结果，否则展示页会与排名口径脱节。"""
+    prices = _variable_return_history(2 + 5 + 4)
+    cases = [
+        StrategyCase("c2c", CloseToCloseStrategy()),
+        StrategyCase(
+            "rv", HedgeBandStrategy(
+                "sigma", threshold=0.5,
+                sigma_source="realized", window_days=4)),
+    ]
+    kwargs = {"multiplier": 5.0, "quantity": 2.0, "tc_rate": 0.0}
+    _rec, _ranking, windows = recommend_by_rolling_history(
+        _option(days=2), prices, cases, kwargs, lookbacks={"week": 5})
+
+    index = history_replay_index(windows)
+    assert set(index) == {"week"}
+    assert set(index["week"]) == set(windows["week"])
+    for window_id, spec in index["week"].items():
+        assert set(spec.strategy_names()) == {"c2c", "rv"}
+        for name in spec.strategy_names():
+            backtest = spec.replay(name)
+            original = windows["week"][window_id][name]
+            assert np.allclose(
+                backtest._results["cumulative_pnl"],
+                original["cumulative_pnl"])
+            assert np.array_equal(
+                backtest._results["hedge_triggered"],
+                original["hedge_triggered"])
+            # 展示页按逐 bar 明细渲染，长度必须与原结果一致。
+            assert len(backtest.to_dataframe()) == len(original["prices"])
+
+
+def test_history_replay_spec_records_segment_metadata_and_rejects_unknown():
+    prices = _variable_return_history(2 + 5 + 4)
+    cases = [StrategyCase("c2c", CloseToCloseStrategy())]
+    _rec, _ranking, windows = recommend_by_rolling_history(
+        _option(days=2), prices, cases,
+        {"multiplier": 5.0, "quantity": 2.0, "tc_rate": 0.0},
+        lookbacks={"week": 5})
+
+    spec = history_replay_index(windows)["week"]["segment_1"]
+    assert spec.lookback == "week"
+    assert spec.window_id == "segment_1"
+    assert spec.metadata["history_mode"] == "rolling_history"
+    assert spec.metadata["segment_no"] == 1
+    assert spec.metadata["evidence_days"] == 5
+    with pytest.raises(KeyError, match="没有候选"):
+        spec.replay("不存在的候选")
+
+
+def test_contract_pool_replay_binds_each_segment_to_its_own_contract():
+    pool = _two_contract_history_pool()
+    cases = [
+        StrategyCase("c2c", CloseToCloseStrategy()),
+        StrategyCase("band", HedgeBandStrategy("absolute", threshold=1.25)),
+    ]
+    _rec, _ranking, windows = recommend_by_contract_history_pool(
+        _option(days=2), pool, cases,
+        {"position": 1, "quantity": 2.0, "multiplier": 0.0, "tc_rate": 0.0},
+        lookbacks={"sample": 8})
+
+    index = history_replay_index(windows)
+    specs = index["sample"]
+    assert specs
+    codes = {
+        spec.metadata["contract_code"] for spec in specs.values()}
+    assert codes == {"P2601.DCE", "P2605.DCE"}
+    for window_id, spec in specs.items():
+        assert spec.metadata["history_mode"] == "product_contract_pool"
+        for name in spec.strategy_names():
+            backtest = spec.replay(name)
+            original = windows["sample"][window_id][name]
+            assert np.allclose(
+                backtest._results["cumulative_pnl"],
+                original["cumulative_pnl"])
+            # 每段行情只来自该分段自己的具体合约，绝不跨合约拼接。
+            assert np.allclose(
+                backtest._results["prices"][0],
+                original["prices"][0])
+
+
+def test_history_replay_index_skips_windows_without_successful_candidate():
+    prices = pd.Series(
+        [100.0, 101.0, 99.5, 102.0, 101.0, 103.0, 102.0, 104.0],
+        index=pd.bdate_range("2026-01-05", periods=8))
+    _rec, _ranking, windows = recommend_by_rolling_history(
+        _option(days=2), prices,
+        [StrategyCase("c2c", CloseToCloseStrategy())],
+        {"multiplier": 0.0, "tc_rate": 0.0}, lookbacks={"sample": 5})
+    windows["sample"]["broken"] = {"_window_error": "构造失败"}
+
+    index = history_replay_index(windows)
+
+    assert "broken" not in index["sample"]
+    assert set(index["sample"]).issubset(set(windows["sample"]))

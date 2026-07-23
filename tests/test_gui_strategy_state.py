@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import datetime
 from types import SimpleNamespace
 
@@ -8,6 +9,7 @@ import pandas as pd
 import pytest
 
 import gui_app
+import history_selection
 from gui_app import (
     BacktestApp,
     DEFAULT_BAND_CANDIDATE_SIGMAS,
@@ -318,7 +320,6 @@ def test_history_fixed_candidate_defers_missing_target_bars_to_rolling_windows()
         "2026-01-05 15:00",
     ]))
     cases, notes = BacktestApp._strategy_cases_for_history(
-        SimpleNamespace(),
         {
             "source": "csv",
             "history_include_close": False,
@@ -351,11 +352,10 @@ def test_history_wind_fixed_candidate_discloses_closed_session_skip(
     ]))
 
     cases, notes = BacktestApp._strategy_cases_for_history(
-        SimpleNamespace(),
         {
             "source": "wind",
             "wind_code": "NO_NIGHT.TEST",
-            "wind_bar_size": "15min",
+            "wind_bar_size": "15分钟",
             "history_include_fixed_times": True,
             "history_include_band": False,
             "fixed_times": "21:07,11:30,15:00",
@@ -383,9 +383,8 @@ def test_history_fixed_candidate_still_rejects_daily_csv_granularity():
     backtest = SimpleNamespace(timestamps=pd.date_range(
         "2026-01-02", periods=3, freq="B"))
 
-    with pytest.raises(ValueError, match="只有每日收盘 C2C 基准") as exc_info:
+    with pytest.raises(ValueError, match="只有每日收盘基准") as exc_info:
         BacktestApp._strategy_cases_for_history(
-            SimpleNamespace(),
             {
                 "source": "csv",
                 "history_include_close": False,
@@ -498,10 +497,10 @@ def test_single_wind_custom_end_is_preserved_exactly():
     ("strategy_name", "fixed_times", "expected"),
     [
         ("close_to_close", "", "日频"),
-        ("fixed_times", "11:30,15:00", "15min"),
-        ("fixed_times", "10:10", "5min"),
-        ("fixed_times", "10:07", "1min"),
-        ("hedge_band", "", "15min"),
+        ("fixed_times", "11:30,15:00", "15分钟"),
+        ("fixed_times", "10:10", "5分钟"),
+        ("fixed_times", "10:07", "1分钟"),
+        ("hedge_band", "", "15分钟"),
     ],
 )
 def test_wind_auto_bar_size_follows_strategy_observation_needs(
@@ -533,7 +532,7 @@ def test_wind_auto_bar_size_ignores_locally_known_closed_session_targets(
         strategy_name="fixed_times",
         fixed_times="21:07,15:00",
         wind_code="NO_NIGHT.TEST",
-    ) == "15min"
+    ) == "15分钟"
     # 自动频率在 GUI 主线程解析，只读本地已知 session，不能触发 Wind wss。
     assert calls == [("NO_NIGHT.TEST", False)]
 
@@ -570,7 +569,7 @@ def test_history_wind_auto_range_covers_strict_year_plus_day0_anchor():
     assert resolved["wind_end"] == asof.isoformat()
     assert resolved["wind_start"] == (
         asof - datetime.timedelta(days=expected_span)).isoformat()
-    assert resolved["wind_bar_size"] == "15min"
+    assert resolved["wind_bar_size"] == "15分钟"
     assert resolved["wind_date_mode"] == "history_auto_year_strict_interval"
     assert resolved["wind_sigma_warmup_days"] == 0
 
@@ -694,7 +693,6 @@ def test_history_wind_dates_reject_future_or_reversed_ranges(
 def test_history_candidates_have_no_legacy_fixed_frequency_case():
     fake = SimpleNamespace()
     cases, notes = BacktestApp._strategy_cases_for_history(
-        fake,
         {
             "source": "wind",
             "wind_bar_size": "日频",
@@ -727,7 +725,6 @@ def test_history_candidates_have_no_legacy_fixed_frequency_case():
 def test_history_strategy_cases_respect_independent_candidate_switches():
     fake = SimpleNamespace()
     cases, notes = BacktestApp._strategy_cases_for_history(
-        fake,
         {
             "source": "wind", "wind_bar_size": "日频",
             "history_include_close": True,
@@ -782,7 +779,7 @@ def test_band_candidate_parser_caps_search_size():
 )
 def test_current_band_units_normalize_to_same_sigma_candidate(
         band_type, threshold):
-    cases = BacktestApp._band_cases_for_comparison({
+    cases = BacktestApp._band_cases_for_history({
         "interval_type": band_type,
         "price_interval": threshold,
         "params": {"s0": 100.0, "sigma": 0.2},
@@ -798,7 +795,7 @@ def test_current_band_units_normalize_to_same_sigma_candidate(
 
 
 def test_current_band_matching_preset_is_included_once_with_unique_names():
-    cases = BacktestApp._band_cases_for_comparison({
+    cases = BacktestApp._band_cases_for_history({
         "interval_type": "sigma", "price_interval": 1.0,
         "params": {"s0": 100.0, "sigma": 0.2},
         "band_candidate_sigmas": (0.5, 1.0, 1.00000000001, 2.0),
@@ -814,7 +811,7 @@ def test_current_band_matching_preset_is_included_once_with_unique_names():
 
 
 def test_history_band_candidates_do_not_implicitly_add_current_band():
-    cases = BacktestApp._band_cases_for_comparison({
+    cases = BacktestApp._band_cases_for_history({
         "interval_type": "absolute", "price_interval": 3.0,
         "params": {"s0": 100.0, "sigma": 0.2},
         "band_candidate_sigmas": (0.5, 1.0),
@@ -829,7 +826,7 @@ def test_history_band_candidates_do_not_implicitly_add_current_band():
 
 def test_current_band_counts_toward_candidate_limit():
     with pytest.raises(ValueError, match="包含勾选加入的当前带宽"):
-        BacktestApp._band_cases_for_comparison({
+        BacktestApp._band_cases_for_history({
             "interval_type": "sigma", "price_interval": 0.25,
             "params": {"s0": 100.0, "sigma": 0.2},
             "band_candidate_sigmas": tuple(
@@ -1048,9 +1045,9 @@ def test_history_wind_collection_uses_independent_asof_range_and_frequency():
     assert state["wind_sigma_warmup_days"] == state["sigma_window"]
     assert state["history_wind_bar_size_requested"] == WIND_AUTO_BAR_SIZE
     # 默认固定时刻 + 固定间隔候选冻结为同一实际粒度，保持公平比较。
-    assert state["wind_bar_size"] == "15min"
+    assert state["wind_bar_size"] == "15分钟"
     assert BacktestApp._history_recommendation_source_label(state) == (
-        f"Wind · 510050.SH · {expected_start} 至 2025-06-30 · 15min"
+        f"Wind · 510050.SH · {expected_start} 至 2025-06-30 · 15分钟"
     )
 
 
@@ -1129,7 +1126,7 @@ def test_history_cases_record_day_close_fallback_for_recommendation_replay():
     }
 
     cases, notes = BacktestApp._strategy_cases_for_history(
-        SimpleNamespace(), state, SimpleNamespace())
+        state, SimpleNamespace())
 
     assert notes == []
     assert len(cases) == 3
@@ -1302,7 +1299,7 @@ def test_history_rejects_simulate_before_collecting_or_starting(monkeypatch):
 
     assert started is False
     assert calls == []
-    assert errors and errors[0][0] == "历史择优不可用"
+    assert errors and errors[0][0] == "策略优选不可用"
     assert "模拟路径不可用" in errors[0][1]
 
 
@@ -1446,7 +1443,7 @@ def test_contract_pool_source_label_and_single_contract_label_are_explicit():
     pool_label = BacktestApp._history_recommendation_source_label({
         "source": "wind", "wind_code": "P.DCE",
         "wind_start": "2025-06-01", "wind_end": "2026-06-30",
-        "wind_bar_size": "15min",
+        "wind_bar_size": "15分钟",
     }, pool)
     single_label = BacktestApp._history_recommendation_source_label({
         "source": "wind", "wind_code": "P2609.DCE",
@@ -1699,14 +1696,14 @@ def test_history_metric_labels_mark_product_pool_raw_rms_as_diagnostic():
         uses_strict_metric=True, uses_product_pool=True)
 
     assert single == {
-        "score": "区间RMS↓",
-        "baseline": "C2C区间RMS",
-        "improvement": "较C2C改善",
+        "score": "区间得分↓",
+        "baseline": "每日收盘区间得分",
+        "improvement": "较每日收盘改善",
     }
     assert pool == {
-        "score": "汇总RMS(诊断)↓",
-        "baseline": "C2C RMS(诊断)",
-        "improvement": "较C2C改善",
+        "score": "诊断总得分↓",
+        "baseline": "每日收盘诊断分",
+        "improvement": "较每日收盘改善",
     }
 
 
@@ -1782,9 +1779,9 @@ def _history_cross_contract_normalized_summary():
 
 def test_history_chart_exposes_full_interval_and_proxy_diagnostic_modes():
     assert gui_app.HISTORY_CHART_MODE_DISPLAY == {
-        "full": "完整 L 日累计路径",
-        "single": "单代理段路径",
-        "typical": "多代理段中位路径",
+        "full": "完整回放累积路径",
+        "single": "单次分段路径",
+        "typical": "多分段中位路径",
     }
 
 
@@ -1892,7 +1889,7 @@ def test_history_multi_chart_uses_strict_common_windows_and_one_c2c_series():
     assert model["primary_strategy"] == "每日固定时刻"
     assert all("window_" not in item["label"]
                for item in model["window_options"])
-    assert all(item["label"].startswith("代理段 ")
+    assert all(item["label"].startswith("回测分段 ")
                for item in model["window_options"])
 
 
@@ -1994,7 +1991,7 @@ def test_history_cross_contract_full_chart_uses_normalized_daily_curves():
     ])
     assert model["state"] == "ok"
     assert model["uses_normalized_notional"] is True
-    assert "各代理段期初名义金额" in model["metric_label"]
+    assert "各回测分段期初名义金额" in model["metric_label"]
     np.testing.assert_allclose(candidate["y"], np.cumsum(expected_daily))
 
 
@@ -2009,7 +2006,7 @@ def test_history_cross_contract_typical_chart_fails_closed_without_normalization
 
     assert model["state"] == "empty"
     assert "安全归一化" in model["message"]
-    assert "单代理段路径" in model["message"]
+    assert "单回测分段路径" in model["message"]
 
 
 def test_history_cross_contract_single_chart_keeps_raw_amount_curves():
@@ -2191,11 +2188,11 @@ def test_history_multi_chart_renderer_draws_c2c_and_all_candidates(mode):
     BacktestApp._draw_history_chart(app)
 
     _handles, labels = app._history_chart_ax.get_legend_handles_labels()
-    assert labels[0] == "每日收盘（C2C基准）"
+    assert labels[0] == "每日收盘（固定基准）"
     assert labels[1].startswith("固定间隔(1σ)")
     assert labels[2].startswith("每日固定时刻")
     assert len(app._history_chart_ax.lines) >= 3
-    assert "共同代理段 2 个" in app._history_chart_hint_var.get()
+    assert "共同回测分段 2 个" in app._history_chart_hint_var.get()
 
 
 def _history_period_view_model_fixture():
@@ -2205,7 +2202,7 @@ def _history_period_view_model_fixture():
         "strategy_type": "hedge_band", "score": 8.0,
         "baseline_score": 10.0, "improvement_vs_c2c": 0.20,
         "selection_improvement_vs_c2c": 0.20,
-        "selection_metric": gui_app.STRICT_LOOKBACK_SELECTION_METRIC,
+        "selection_metric": history_selection.STRICT_LOOKBACK_SELECTION_METRIC,
         "window_win_rate_vs_c2c": 0.75,
         "paired_windows": 4, "baseline_windows": 4,
         "comparison_eligible": True,
@@ -2231,7 +2228,7 @@ def _history_period_view_model_fixture():
             "baseline_score": baseline_score,
             "improvement_vs_c2c": improvement,
             "selection_improvement_vs_c2c": improvement,
-            "selection_metric": gui_app.STRICT_LOOKBACK_SELECTION_METRIC,
+            "selection_metric": history_selection.STRICT_LOOKBACK_SELECTION_METRIC,
             "window_win_rate_vs_c2c": win_rate,
             "paired_windows": paired, "baseline_windows": paired,
             "comparison_eligible": comparison_eligible,
@@ -2302,9 +2299,9 @@ def test_recommendation_view_model_compares_each_period_with_fixed_c2c():
     assert rows[2]["strategy_label"] == "仅基准（无完整配对候选）"
     assert rows[2]["has_comparable_candidate"] is False
     assert rows[3]["period"] == "近半年"
-    assert rows[3]["status"] == "无可评估代理段"
+    assert rows[3]["status"] == "无可评估回测分段"
     assert rows[4]["period"] == "近年"
-    assert rows[4]["status"] == "无可评估代理段"
+    assert rows[4]["status"] == "无可评估回测分段"
 
 
 def test_recommendation_view_model_only_returns_selected_period_subset():
@@ -2326,7 +2323,7 @@ def test_product_pool_view_uses_strict_metric_and_contract_list():
         "score": 110.0, "baseline_score": 100.0,
         "improvement_vs_c2c": -0.10,
         "selection_improvement_vs_c2c": 0.20,
-        "selection_metric": gui_app.STRICT_LOOKBACK_SELECTION_METRIC,
+        "selection_metric": history_selection.STRICT_LOOKBACK_SELECTION_METRIC,
         "window_win_rate_vs_c2c": 0.75,
         "paired_windows": 4, "baseline_windows": 4,
         "comparison_eligible": True, "recommendation_eligible": True,
@@ -2360,7 +2357,7 @@ def test_product_pool_view_uses_strict_metric_and_contract_list():
     assert rows[0]["strategy"] == "固定间隔(1σ)"
     assert rows[0]["improvement_vs_c2c"] == pytest.approx(0.20)
     assert rows[0]["selection_metric"] == (
-        gui_app.STRICT_LOOKBACK_SELECTION_METRIC)
+        history_selection.STRICT_LOOKBACK_SELECTION_METRIC)
     assert rows[0]["uses_strict_metric"] is True
     assert rows[0]["uses_window_equal_metric"] is False
     assert rows[0]["paired_contract_codes"] == (
@@ -2428,7 +2425,7 @@ def test_history_period_view_model_accepts_legacy_ranking_and_proxy_alias():
         "strategy_type": "hedge_band", "score": 8.0,
         "baseline_score": 10.0, "improvement_vs_c2c": 0.2,
         "selection_improvement_vs_c2c": 0.3,
-        "selection_metric": gui_app.HISTORY_SELECTION_METRIC,
+        "selection_metric": history_selection.HISTORY_SELECTION_METRIC,
         "rolling_windows": 1, "paired_windows": 1,
         "baseline_windows": 1, "eligible_endpoints": 1,
         "skipped_endpoints": 0, "history_days_available": 5,
@@ -2460,11 +2457,11 @@ def test_history_period_view_model_accepts_legacy_ranking_and_proxy_alias():
 
 def test_history_metric_recognition_does_not_label_legacy_as_strict():
     legacy = {
-        "selection_metric": gui_app.HISTORY_SELECTION_METRIC,
+        "selection_metric": history_selection.HISTORY_SELECTION_METRIC,
         "selection_improvement_vs_c2c": 0.12,
     }
     strict = {
-        "selection_metric": gui_app.STRICT_LOOKBACK_SELECTION_METRIC,
+        "selection_metric": history_selection.STRICT_LOOKBACK_SELECTION_METRIC,
         "selection_improvement_vs_c2c": 0.08,
     }
 
@@ -2487,7 +2484,7 @@ def test_zero_window_or_non_finite_history_result_is_not_a_diagnostic_leader():
     week = BacktestApp._comparison_recommendation_rows(None, ranking)[0]
 
     assert week["strategy"] == "—"
-    assert week["status"] == "无可评估代理段"
+    assert week["status"] == "无可评估回测分段"
 
 
 def test_trigger_detail_labels_mark_to_market_evaluation_close():
@@ -2869,6 +2866,264 @@ def test_current_path_validation_launches_with_current_left_position(position):
     assert launched_positions == [position]
 
 
+class _RankTreeStub:
+    def __init__(self, iids):
+        self._iids = tuple(iids)
+
+    def get_children(self):
+        return self._iids
+
+
+_HISTORY_BATCH_ROWS = {
+    "history_rank_0": {
+        "strategy": "每日收盘", "strategy_type": "close_to_close",
+        "meta_strategy_name": "close_to_close", "lookback": "month",
+    },
+    "history_rank_1": {
+        "strategy": "固定间隔(1.5σ)", "strategy_type": "hedge_band",
+        "meta_strategy_name": "hedge_band", "meta_candidate_sigma": 1.5,
+        "lookback": "month",
+    },
+    "history_rank_2": {
+        "strategy": "固定时刻(10:30)", "strategy_type": "fixed_times",
+        "meta_strategy_name": "fixed_times", "meta_fixed_times": "10:30",
+        "lookback": "month",
+    },
+}
+
+
+def _fake_history_batch_gui(*, checked=("固定时刻(10:30)", "固定间隔(1.5σ)"),
+                            saved_backtests=None, position=-1):
+    rows = copy.deepcopy(_HISTORY_BATCH_ROWS)
+    fake = SimpleNamespace(
+        _active_job=None,
+        _pending_history_retain_name=None,
+        _history_batch_queue=[],
+        _history_batch_total=0,
+        _history_batch_done=0,
+        _history_batch_failures=[],
+        _history_batch_position=None,
+        _history_rank_tree=_RankTreeStub(rows),
+        _history_rank_rows=rows,
+        _pos_var=_Var(position),
+        _history_chart_selection=lambda: ("month", None),
+        _history_chart_candidates=lambda lookback: list(checked),
+        _saved_backtests=dict(saved_backtests or {}),
+        _saved_comparison_selection=set(),
+        _saved_comparison_baseline_id=None,
+    )
+    fake._history_batch_targets = lambda: BacktestApp._history_batch_targets(
+        fake)
+    fake._reset_history_batch = lambda: BacktestApp._reset_history_batch(fake)
+    fake._history_batch_step = lambda: BacktestApp._history_batch_step(fake)
+    fake._history_batch_advance = (
+        lambda success: BacktestApp._history_batch_advance(fake, success))
+    fake._finish_history_batch = lambda: BacktestApp._finish_history_batch(
+        fake)
+    fake._history_batch_skip_rest = (
+        lambda: BacktestApp._history_batch_skip_rest(fake))
+    return fake
+
+
+def test_history_batch_targets_keep_rank_order_and_prepend_new_baseline():
+    fake = _fake_history_batch_gui()
+
+    targets = BacktestApp._history_batch_targets(fake)
+
+    assert [item["label"] for item in targets] == [
+        "每日收盘", "固定间隔(1.5σ)", "固定时刻(10:30)"]
+    assert [item["name"] for item in targets] == [
+        "优选近月 · 每日收盘基准",
+        "优选近月 · 固定间隔(1.5σ)",
+        "优选近月 · 固定时刻(10:30)",
+    ]
+
+
+def test_history_batch_targets_skip_baseline_when_pool_already_has_one():
+    saved = {
+        "result-0001": SimpleNamespace(
+            summary_row={"strategy_type": "close_to_close"}, position=-1),
+    }
+    fake = _fake_history_batch_gui(saved_backtests=saved, position=-1)
+
+    targets = BacktestApp._history_batch_targets(fake)
+
+    assert [item["label"] for item in targets] == [
+        "固定间隔(1.5σ)", "固定时刻(10:30)"]
+
+
+def test_history_batch_targets_empty_without_any_checked_candidate():
+    fake = _fake_history_batch_gui(checked=())
+
+    assert BacktestApp._history_batch_targets(fake) == []
+
+
+def _drive_history_batch(fake, outcomes):
+    """按队列顺序模拟每次回测的成功 / 失败回调。"""
+    launched = []
+
+    def run_backtest():
+        index = len(launched)
+        launched.append({
+            "name": fake._pending_history_retain_name,
+            "position": BacktestApp._normalize_position(fake._pos_var.get()),
+        })
+        fake._active_job = "backtest"
+        outcome = outcomes[index] if index < len(outcomes) else True
+        fake.after(0, lambda: _settle(outcome))
+        return True
+
+    def _settle(success):
+        fake._active_job = None
+        fake._pending_history_retain_name = None
+        BacktestApp._history_batch_advance(fake, success)
+
+    pending = []
+    fake.after = lambda _delay, callback: pending.append(callback)
+    fake._run_backtest = run_backtest
+    fake._apply_history_recommendation = lambda row, navigate: None
+    fake._set_status = lambda _text: None
+    fake._show_saved_comparison_page = lambda: fake.opened.append(True)
+    fake.opened = []
+    fake.errors = []
+    started = BacktestApp._run_history_batch_on_current_path(fake)
+    while pending:
+        pending.pop(0)()
+    return started, launched
+
+
+def test_history_batch_runs_every_candidate_then_opens_comparison(monkeypatch):
+    fake = _fake_history_batch_gui()
+    monkeypatch.setattr(
+        gui_app.messagebox, "showerror",
+        lambda title, message: fake.errors.append((title, message)))
+
+    started, launched = _drive_history_batch(fake, [True, True, True])
+
+    assert started is True
+    assert [item["name"] for item in launched] == [
+        "优选近月 · 每日收盘基准",
+        "优选近月 · 固定间隔(1.5σ)",
+        "优选近月 · 固定时刻(10:30)",
+    ]
+    assert {item["position"] for item in launched} == {-1}
+    assert fake.opened == [True]
+    assert fake.errors == []
+    assert fake._history_batch_queue == []
+
+
+def test_history_batch_aborts_remaining_candidates_after_a_failed_run(
+        monkeypatch):
+    fake = _fake_history_batch_gui()
+    monkeypatch.setattr(
+        gui_app.messagebox, "showerror",
+        lambda title, message: fake.errors.append((title, message)))
+
+    _started, launched = _drive_history_batch(fake, [True, False])
+
+    assert [item["name"] for item in launched] == [
+        "优选近月 · 每日收盘基准",
+        "优选近月 · 固定间隔(1.5σ)",
+    ]
+    assert fake.errors and fake.errors[0][0] == "批量验证未全部完成"
+    assert "固定时刻(10:30)" in fake.errors[0][1]
+    # 已成功的快照仍然联动到结果对比页，失败只中止未验证候选。
+    assert fake.opened == [True]
+    assert fake._history_batch_queue == []
+
+
+def test_history_batch_reports_rest_when_a_run_cannot_start(monkeypatch):
+    fake = _fake_history_batch_gui()
+    monkeypatch.setattr(
+        gui_app.messagebox, "showerror",
+        lambda title, message: fake.errors.append((title, message)))
+    fake.errors = []
+    fake.opened = []
+    fake._set_status = lambda _text: None
+    fake._show_saved_comparison_page = lambda: fake.opened.append(True)
+    fake._apply_history_recommendation = lambda row, navigate: None
+    fake.after = lambda _delay, callback: callback()
+    attempts = []
+
+    def run_backtest():
+        attempts.append(fake._pending_history_retain_name)
+        return False
+
+    fake._run_backtest = run_backtest
+
+    assert BacktestApp._run_history_batch_on_current_path(fake) is False
+    assert attempts == ["优选近月 · 每日收盘基准"]
+    assert fake.opened == []
+    assert fake.errors and "回测未能启动" in fake.errors[0][1]
+    assert "固定间隔(1.5σ)" in fake.errors[0][1]
+    assert "固定时刻(10:30)" in fake.errors[0][1]
+    assert fake._pending_history_retain_name is None
+
+
+def test_history_batch_skips_unmappable_row_and_keeps_running_the_rest(
+        monkeypatch):
+    fake = _fake_history_batch_gui()
+    monkeypatch.setattr(
+        gui_app.messagebox, "showerror",
+        lambda title, message: fake.errors.append((title, message)))
+
+    def apply_row(row, navigate):
+        if str(row.get("strategy")) == "固定间隔(1.5σ)":
+            raise ValueError("历史结果缺少有效的固定间隔 σ 参数。")
+
+    fake.errors = []
+    fake.opened = []
+    fake._set_status = lambda _text: None
+    fake._show_saved_comparison_page = lambda: fake.opened.append(True)
+    fake._apply_history_recommendation = apply_row
+    pending = []
+    fake.after = lambda _delay, callback: pending.append(callback)
+    launched = []
+
+    def run_backtest():
+        launched.append(fake._pending_history_retain_name)
+        fake.after(0, lambda: BacktestApp._history_batch_advance(fake, True))
+        return True
+
+    fake._run_backtest = run_backtest
+
+    started = BacktestApp._run_history_batch_on_current_path(fake)
+    while pending:
+        pending.pop(0)()
+
+    assert started is True
+    # 只有元数据残缺的那一条被跳过，其余候选照常验证并联动到对比页。
+    assert launched == [
+        "优选近月 · 每日收盘基准", "优选近月 · 固定时刻(10:30)"]
+    assert fake.errors and "固定间隔(1.5σ)" in fake.errors[0][1]
+    assert fake.opened == [True]
+    assert fake._history_batch_queue == []
+
+
+def test_history_batch_refuses_to_start_while_another_job_runs(monkeypatch):
+    fake = _fake_history_batch_gui()
+    fake._active_job = "backtest"
+    infos = []
+    monkeypatch.setattr(
+        gui_app.messagebox, "showinfo",
+        lambda title, message: infos.append(title))
+
+    assert BacktestApp._run_history_batch_on_current_path(fake) is False
+    assert infos == ["任务运行中"]
+
+
+def test_history_batch_reports_missing_selection_without_running(monkeypatch):
+    fake = _fake_history_batch_gui(checked=())
+    infos = []
+    monkeypatch.setattr(
+        gui_app.messagebox, "showinfo",
+        lambda title, message: infos.append(title))
+    fake._run_backtest = lambda: pytest.fail("不应在无勾选候选时启动回测")
+
+    assert BacktestApp._run_history_batch_on_current_path(fake) is False
+    assert infos == ["请勾选候选"]
+
+
 def test_successfully_started_backtest_reports_true_to_auto_retain_caller(
         monkeypatch):
     started_threads = []
@@ -3215,7 +3470,7 @@ def test_worker_rejects_simulation_before_building_backtest():
         ("csv", "from_csv", {"csv_path": "prices.csv", "csv_col": "close"}),
         ("wind", "from_wind", {
             "wind_code": "510050.SH", "wind_start": "2026-01-01",
-            "wind_end": "2026-02-01", "wind_bar_size": "60min",
+            "wind_end": "2026-02-01", "wind_bar_size": "60分钟",
         }),
     ],
 )
@@ -3276,15 +3531,15 @@ def test_resolved_wind_dates_and_bar_size_flow_to_build_meta_and_label(
     backtest = BacktestApp._build_backtest(app, state)
 
     assert state["wind_bar_size_requested"] == WIND_AUTO_BAR_SIZE
-    assert state["wind_bar_size"] == "15min"
+    assert state["wind_bar_size"] == "15分钟"
     assert captured["args"] == (
         "510050.SH", "2025-01-02", "2025-02-28")
     assert captured["kwargs"]["bar_size"] == "15"
     assert backtest._gui_meta["wind_start"] == "2025-01-02"
     assert backtest._gui_meta["wind_end"] == "2025-02-28"
-    assert backtest._gui_meta["wind_bar_size"] == "15min"
+    assert backtest._gui_meta["wind_bar_size"] == "15分钟"
     assert BacktestApp._snapshot_source_label(state) == (
-        "Wind · 510050.SH · 2025-01-02 至 2025-02-28 · 15min"
+        "Wind · 510050.SH · 2025-01-02 至 2025-02-28 · 15分钟"
     )
 
 
@@ -3386,3 +3641,376 @@ def test_current_comparison_rebases_only_absolute_case_copy():
     assert scaled[1].strategy.threshold == pytest.approx(0.01)
     # 原始 cases 必须保留参考价口径，rolling 才能逐窗独立重定基。
     assert absolute.strategy.threshold == pytest.approx(1.0)
+
+
+class _ReplaySpecStub:
+    def __init__(self, window_id, strategies, *, segment_no=1, index=None,
+                 metadata=None):
+        self.lookback = "month"
+        self.window_id = window_id
+        self.strategies = {name: SimpleNamespace(name=name)
+                           for name in strategies}
+        self.external_path = SimpleNamespace(
+            index=() if index is None else index)
+        self.evaluation_days = 5
+        self.steps_per_day = 1
+        self.metadata = {"segment_no": segment_no, **(metadata or {})}
+        self.replayed = []
+
+    def replay(self, strategy_name):
+        self.replayed.append(strategy_name)
+        return SimpleNamespace(
+            _results={"timestamps": self.external_path.index})
+
+
+def _fake_history_replay_gui(*, selected="固定间隔(1.5σ)", specs=None):
+    dates = pd.bdate_range("2026-03-02", periods=4)
+    if specs is None:
+        specs = {
+            "segment_2": _ReplaySpecStub(
+                "segment_2", ("每日收盘", "固定间隔(1.5σ)"),
+                segment_no=2, index=dates),
+            "segment_1": _ReplaySpecStub(
+                "segment_1", ("每日收盘",), segment_no=1, index=dates),
+        }
+    fake = SimpleNamespace(
+        _active_job=None,
+        _history_replay_index={"month": specs},
+        _history_chart_selection=lambda: ("month", None),
+        _selected_history_rank_row=lambda: (
+            {"strategy": selected} if selected else None),
+        _history_replay_window_var=_Var(""),
+        _history_replay_window_combo=None,
+    )
+    fake._history_replay_options = (
+        lambda strategy_name=None, lookback=None:
+        BacktestApp._history_replay_options(
+            fake, strategy_name, lookback))
+    fake._selected_history_replay_spec = (
+        lambda: BacktestApp._selected_history_replay_spec(fake))
+    return fake
+
+
+def test_history_replay_label_shows_segment_dates_and_contract():
+    spec = _ReplaySpecStub(
+        "segment_3", ("每日收盘",), segment_no=3,
+        index=pd.bdate_range("2026-03-02", periods=4),
+        metadata={"contract_code": "P2605.DCE",
+                  "terminal_mode": "mark_to_market"})
+
+    label = BacktestApp._history_replay_label(spec)
+
+    assert label == "回测分段 3 · 2026-03-02~2026-03-05 · P2605.DCE · 市值估算"
+
+
+def test_history_replay_options_keep_only_segments_running_the_candidate():
+    fake = _fake_history_replay_gui()
+
+    options = BacktestApp._history_replay_options(fake)
+
+    # segment_1 只跑过每日收盘，选中固定间隔时不能出现在可加载分段里。
+    assert [item["window_id"] for item in options] == ["segment_2"]
+
+
+def test_history_replay_options_are_ordered_by_segment_number():
+    fake = _fake_history_replay_gui(selected="每日收盘")
+
+    options = BacktestApp._history_replay_options(fake)
+
+    assert [item["window_id"] for item in options] == [
+        "segment_1", "segment_2"]
+
+
+def test_selected_history_replay_spec_follows_the_window_dropdown():
+    fake = _fake_history_replay_gui(selected="每日收盘")
+    options = BacktestApp._history_replay_options(fake)
+    fake._history_replay_window_var.set(options[1]["label"])
+
+    spec, strategy_name = BacktestApp._selected_history_replay_spec(fake)
+
+    assert strategy_name == "每日收盘"
+    assert spec.window_id == "segment_2"
+
+
+def test_selected_history_replay_spec_falls_back_to_first_segment():
+    fake = _fake_history_replay_gui(selected="每日收盘")
+    fake._history_replay_window_var.set("已失效的旧标签")
+
+    spec, _strategy_name = BacktestApp._selected_history_replay_spec(fake)
+
+    assert spec.window_id == "segment_1"
+
+
+def test_load_history_window_refuses_without_a_replayable_candidate(
+        monkeypatch):
+    fake = _fake_history_replay_gui(selected="没有跑成功的候选")
+    infos = []
+    monkeypatch.setattr(
+        gui_app.messagebox, "showinfo",
+        lambda title, message: infos.append((title, message)))
+    fake._begin_job = lambda *a, **k: pytest.fail("不应在无分段时占用任务槽")
+
+    assert BacktestApp._load_history_window_backtest(fake) is False
+    assert infos and infos[0][0] == "没有可加载的分段"
+
+
+def test_load_history_window_refuses_while_another_job_runs(monkeypatch):
+    fake = _fake_history_replay_gui()
+    fake._active_job = "backtest"
+    infos = []
+    monkeypatch.setattr(
+        gui_app.messagebox, "showinfo",
+        lambda title, message: infos.append(title))
+
+    assert BacktestApp._load_history_window_backtest(fake) is False
+    assert infos == ["任务运行中"]
+
+
+def test_delivered_history_replay_becomes_the_current_retainable_backtest():
+    dates = pd.bdate_range("2026-03-02", periods=4)
+    spec = _ReplaySpecStub(
+        "segment_2", ("固定间隔(1.5σ)",), segment_no=2, index=dates,
+        metadata={"contract_code": "P2605.DCE"})
+    backtest = SimpleNamespace(_results={"timestamps": dates})
+    finished = []
+    fake = SimpleNamespace(
+        _latest_history_state={
+            "cls_name": "香草期权 (Vanilla)", "subtype": "call",
+            "source": "wind", "wind_bar_size": "15分钟",
+            "wind_bar_size_requested": "自动（推荐）",
+            "wind_date_mode": "custom_range", "wind_code": "P.DCE",
+        },
+        _latest_backtest=None,
+        _latest_backtest_state=None,
+        _latest_retained_result_id="result-0001",
+        _show_results=lambda bt, multi: finished.append(bt),
+        _finish_history_replay=lambda success, spec_, name: finished.append(
+            ("finish", success, name)),
+    )
+    fake._history_replay_gui_state = (
+        lambda spec_, name: BacktestApp._history_replay_gui_state(
+            fake, spec_, name))
+
+    BacktestApp._deliver_history_replay(fake, backtest, spec, "固定间隔(1.5σ)")
+
+    assert fake._latest_backtest is backtest
+    assert fake._latest_retained_result_id is None
+    assert backtest._gui_meta["source"] == "wind"
+    assert backtest._gui_meta["wind_start"] == "2026-03-02"
+    assert backtest._gui_meta["wind_end"] == "2026-03-05"
+    assert list(backtest._wind_meta["dates"]) == list(dates)
+    state = fake._latest_backtest_state
+    # 快照方向与展示口径来自历史任务本身，合约代码收敛到该分段实际合约。
+    assert state["wind_code"] == "P2605.DCE"
+    assert state["history_replay_strategy"] == "固定间隔(1.5σ)"
+    assert state["history_replay_window_id"] == "segment_2"
+    assert finished[-1] == ("finish", True, "固定间隔(1.5σ)")
+
+
+# ---------------------------------------------------------------------------
+# 策略优选：统一的当前路径验证入口与配对缓存
+# ---------------------------------------------------------------------------
+
+
+def _fake_history_verify_gui(checked):
+    """只提供“当前路径验证”分派所需的最小状态。"""
+    calls = []
+    fake = SimpleNamespace(
+        _history_chart_candidates=lambda lookback=None: list(checked),
+        _run_history_batch_on_current_path=lambda: (
+            calls.append("batch") or "batch"),
+        _run_history_selection_on_current_path=lambda: (
+            calls.append("single") or "single"),
+    )
+    return fake, calls
+
+
+def test_history_verify_entry_batches_every_checked_candidate():
+    fake, calls = _fake_history_verify_gui(["固定间隔(1.5σ)", "固定时刻(10:30)"])
+
+    result = BacktestApp._verify_history_on_current_path(fake)
+
+    assert calls == ["batch"]
+    assert result == "batch"
+
+
+def test_history_verify_entry_falls_back_to_the_selected_row():
+    # 没有勾选时仍然只验证排名表选中的那一条，语义与旧的两个按钮一致。
+    fake, calls = _fake_history_verify_gui([])
+
+    result = BacktestApp._verify_history_on_current_path(fake)
+
+    assert calls == ["single"]
+    assert result == "single"
+
+
+def test_history_action_hint_states_the_scope_the_button_will_run():
+    fake = SimpleNamespace(
+        _history_action_hint_var=_Var(""),
+        _history_chart_candidates=lambda lookback=None: [
+            "固定间隔(1.5σ)", "固定时刻(10:30)"],
+    )
+
+    BacktestApp._refresh_history_action_hint(fake)
+    batch_hint = fake._history_action_hint_var.get()
+
+    fake._history_chart_candidates = lambda lookback=None: []
+    BacktestApp._refresh_history_action_hint(fake)
+    single_hint = fake._history_action_hint_var.get()
+
+    assert "已勾选的 2 个候选" in batch_hint
+    assert "只回测排名表中选中的那一条候选" in single_hint
+
+
+def test_history_action_hint_is_silent_before_the_result_page_exists():
+    # 结果页尚未渲染时提示控件还不存在；类级默认值保证这里不会抛异常。
+    fake = SimpleNamespace(_history_action_hint_var=None)
+
+    assert BacktestApp._refresh_history_action_hint(fake) is None
+
+
+def test_history_multi_chart_model_reuses_supplied_pairs_cache():
+    summary = _history_multi_chart_summary()
+    cache = {}
+
+    first = BacktestApp._history_multi_chart_model(
+        summary, "week", ["固定间隔(1σ)", "每日固定时刻"],
+        mode="full", metric="net", pairs_cache=cache,
+    )
+    cached_keys = set(cache)
+    second = BacktestApp._history_multi_chart_model(
+        summary, "week", ["固定间隔(1σ)", "每日固定时刻"],
+        mode="full", metric="net", pairs_cache=cache,
+    )
+
+    assert cached_keys == {("week", "固定间隔(1σ)"), ("week", "每日固定时刻")}
+    # 复用缓存不得改变模型；缓存帧本身也不能被下游就地过滤掉行。
+    assert second["state"] == first["state"] == "ok"
+    assert second["common_window_count"] == first["common_window_count"]
+    assert set(cache) == cached_keys
+    assert all(not pairs.empty for pairs in cache.values())
+
+
+def test_history_multi_chart_model_without_cache_matches_cached_result():
+    summary = _history_multi_chart_summary()
+
+    plain = BacktestApp._history_multi_chart_model(
+        summary, "week", ["固定间隔(1σ)"], mode="full", metric="net")
+    cached = BacktestApp._history_multi_chart_model(
+        summary, "week", ["固定间隔(1σ)"], mode="full", metric="net",
+        pairs_cache={},
+    )
+
+    assert plain["state"] == cached["state"]
+    assert [item["label"] for item in plain["series"]] == [
+        item["label"] for item in cached["series"]]
+
+
+def test_history_batch_step_skips_every_unmappable_row_and_finishes(
+        monkeypatch):
+    # 整队都无法回填时旧实现靠递归逐条跳过；改成循环后仍然只汇报一次收尾，
+    # 且两条原因都出现在同一份汇总里。
+    fake = _fake_history_batch_gui(checked=("固定间隔(1.5σ)", "固定时刻(10:30)"))
+    fake.errors = []
+    monkeypatch.setattr(
+        gui_app.messagebox, "showerror",
+        lambda title, message: fake.errors.append((title, message)))
+    fake._set_status = lambda _text: None
+    fake._show_saved_comparison_page = lambda: pytest.fail(
+        "没有成功快照时不应切换到结果对比页")
+    fake._run_backtest = lambda: pytest.fail("不应为无法回填的候选启动回测")
+
+    def refuse(_row, navigate=False):
+        raise ValueError("缺少策略参数")
+
+    fake._apply_history_recommendation = refuse
+    fake._history_batch_queue = [
+        {"row": {}, "label": "固定间隔(1.5σ)", "name": "优选近月 · A"},
+        {"row": {}, "label": "固定时刻(10:30)", "name": "优选近月 · B"},
+    ]
+    fake._history_batch_total = 2
+
+    started = BacktestApp._history_batch_step(fake)
+
+    assert started is False
+    assert fake._history_batch_queue == []
+    assert len(fake.errors) == 1
+    assert "固定间隔(1.5σ)：缺少策略参数" in fake.errors[0][1]
+    assert "固定时刻(10:30)：缺少策略参数" in fake.errors[0][1]
+
+
+def test_history_batch_step_returns_false_on_an_empty_queue():
+    fake = _fake_history_batch_gui()
+    fake._finish_history_batch = lambda: pytest.fail("空队列不应触发收尾汇报")
+    fake._history_batch_queue = []
+
+    assert BacktestApp._history_batch_step(fake) is False
+
+
+# ---------------------------------------------------------------------------
+# 策略优选：排名口径判定与区间说明
+# ---------------------------------------------------------------------------
+
+
+def test_history_ranking_flags_read_strict_metric_and_candidate_names():
+    ranking = pd.DataFrame([
+        {"strategy": "每日收盘", "strategy_type": "close_to_close",
+         "selection_metric": history_selection.STRICT_LOOKBACK_SELECTION_METRIC,
+         "selection_improvement_vs_c2c": 0.0, "history_mode": "single_series"},
+        {"strategy": "固定间隔(1σ)", "strategy_type": "hedge_band",
+         "selection_metric": history_selection.STRICT_LOOKBACK_SELECTION_METRIC,
+         "selection_improvement_vs_c2c": 0.2, "history_mode": "single_series"},
+    ])
+
+    flags = history_selection.ranking_flags(ranking)
+
+    assert flags["uses_strict_metric"] is True
+    assert flags["uses_window_equal_metric"] is False
+    assert flags["uses_product_pool"] is False
+    # 基准不是候选，配色与勾选集合都不应包含它。
+    assert flags["candidate_names"] == ["固定间隔(1σ)"]
+
+
+def test_history_ranking_flags_detect_product_contract_pool():
+    ranking = pd.DataFrame([
+        {"strategy": "固定间隔(1σ)", "strategy_type": "hedge_band",
+         "selection_metric": history_selection.STRICT_LOOKBACK_SELECTION_METRIC,
+         "selection_improvement_vs_c2c": 0.2,
+         "history_mode": "product_contract_pool"},
+    ])
+
+    flags = history_selection.ranking_flags(ranking)
+
+    assert flags["uses_product_pool"] is True
+
+
+def test_history_ranking_flags_stay_neutral_on_empty_ranking():
+    flags = history_selection.ranking_flags(pd.DataFrame())
+
+    assert flags == {
+        "uses_strict_metric": False,
+        "uses_window_equal_metric": False,
+        "uses_product_pool": False,
+        "candidate_names": [],
+    }
+
+
+@pytest.mark.parametrize("uses_product_pool, expected", [
+    (False, "主指标为完整 L 日合并日净损益 RMS 的有界 每日收盘 改善；"),
+    (True, "汇总金额 RMS 只作诊断；"),
+])
+def test_history_scope_explanation_tracks_the_ranking_route(
+        uses_product_pool, expected):
+    text = history_selection.scope_explanation(
+        "近月", uses_strict_metric=True, uses_product_pool=uses_product_pool)
+
+    assert text.startswith("本次所选严格连续区间：近月。")
+    assert text.endswith(expected)
+
+
+def test_history_scope_explanation_flags_pre_upgrade_results():
+    text = history_selection.scope_explanation(
+        "近月 / 近季", uses_strict_metric=False, uses_product_pool=False)
+
+    assert "升级前的历史终点" in text
+    assert "不能解释为严格连续最近 L 日" in text
