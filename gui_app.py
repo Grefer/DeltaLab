@@ -122,8 +122,8 @@ from pricing import (
 from pricing.constants import ANNUAL_DAYS
 from pricing.hedge_analysis import (
     HISTORY_SELECTION_METRIC,
-    HISTORY_TARGET_ENDPOINTS,
     LOOKBACK_DAYS,
+    STRICT_LOOKBACK_SELECTION_METRIC,
     recommend_by_contract_history_pool,
     recommend_by_rolling_history,
 )
@@ -348,8 +348,8 @@ DEFAULT_FIXED_TIMES = "23:00,11:30,15:00"
 MAX_BAND_CANDIDATES = 10
 MAX_HISTORY_CHART_CANDIDATES = 3
 
-# 历史周期的唯一 GUI 顺序与中文标签。交易日长度和终点预算继续由后端
-# 常量维护，避免控件、任务状态和结果表分别硬编码后发生漂移。
+# 历史周期的唯一 GUI 顺序与中文标签。每个周期都表示截至分析日、严格
+# 连续回放的最近 L 个交易日；交易日长度继续由后端常量维护。
 HISTORY_PERIOD_DEFS = (
     ("week", "近周"),
     ("month", "近月"),
@@ -370,8 +370,9 @@ _WIND_BAR_MINUTES = {
 _WIND_DATE_BUFFER_DAYS = 21
 
 HISTORY_CHART_MODE_DISPLAY = {
-    "single": "单样本路径",
-    "typical": "多样本中位路径",
+    "full": "完整 L 日累计路径",
+    "single": "单代理段路径",
+    "typical": "多代理段中位路径",
 }
 HISTORY_CHART_METRIC_DISPLAY = {
     "net": "净 PnL",
@@ -402,6 +403,7 @@ class SavedBacktestResult:
     path_key: tuple
     contract_key: tuple
     economics_key: tuple
+    position: int
 
 SIGMA_SOURCE_DISPLAY = {
     "implied":  "隐含波动率",
@@ -1310,7 +1312,8 @@ class BacktestApp(tk.Tk):
             ("struct",  " 🔬 结构分析 ",
              "结构分析", "点击左侧『绘制结构图』按钮以生成期权结构的 Greeks 曲线"),
             ("table",   " 📃 每日明细 ",
-             "每日明细", "运行回测后此处将展示逐日对冲持仓、盈亏与 Greeks 明细表"),
+             "每日明细",
+             "运行回测后此处将只展示触发对冲的建仓、策略、收盘兜底与终止记录"),
         ]
 
         for suffix, title, ph_title, ph_desc in _tab_defs:
@@ -1495,7 +1498,7 @@ class BacktestApp(tk.Tk):
                 command=self._history_period_selection_changed,
             ).pack(side="left", padx=(0, 10))
         ttk.Label(
-            period_bar, text="可多选；运行与结果仅包含勾选周期",
+            period_bar, text="可多选；每档严格连续回放最近 L 日",
             style="SurfaceMuted.TLabel",
         ).pack(side="left", padx=(2, 0))
 
@@ -1562,7 +1565,7 @@ class BacktestApp(tk.Tk):
         self._history_sigma_win_entry.pack(side="left", padx=(7, 0))
 
         self._history_wind_frame = ttk.LabelFrame(
-            settings, text=" Wind 历史样本（独立于单次回测） ", padding=5)
+            settings, text=" Wind 严格历史区间（独立于单次回测） ", padding=5)
         self._history_wind_frame.grid(
             row=5, column=0, columnspan=4, sticky="ew", pady=(7, 0))
         ttk.Label(
@@ -1695,7 +1698,7 @@ class BacktestApp(tk.Tk):
         ttk.Label(
             placeholder,
             text=("选择 CSV 或 Wind 真实历史行情，设置候选空间后开始。\n"
-                  "结果仅显示本次勾选周期的滚动排名与样本诊断。"),
+                  "结果仅显示本次勾选周期的严格连续排名与区间诊断。"),
             style="SurfaceMuted.TLabel", justify="center",
         ).pack()
 
@@ -1727,33 +1730,6 @@ class BacktestApp(tk.Tk):
             raise ValueError("请至少选择一个历史分析周期。")
         return ordered
 
-    @staticmethod
-    def _history_target_endpoints_for_lookbacks(
-            lookbacks, target_endpoints=None):
-        """冻结已选周期各自的终点预算，并拒绝缺失或非法预算。"""
-        normalized = BacktestApp._normalize_history_lookbacks(lookbacks)
-        source = (
-            HISTORY_TARGET_ENDPOINTS
-            if target_endpoints is None else target_endpoints)
-        if not isinstance(source, Mapping):
-            raise ValueError("历史样本终点预算必须是逐周期映射。")
-        missing = [key for key in normalized if key not in source]
-        if missing:
-            raise ValueError(
-                "历史样本终点预算缺少周期: " + ", ".join(missing))
-        result = {}
-        for key in normalized:
-            raw = source[key]
-            try:
-                value = float(raw)
-            except (TypeError, ValueError) as exc:
-                raise ValueError(f"{key} 的样本终点数必须是正整数。") from exc
-            if (not np.isfinite(value) or value <= 0
-                    or not value.is_integer()):
-                raise ValueError(f"{key} 的样本终点数必须是正整数。")
-            result[key] = int(value)
-        return result
-
     def _history_lookbacks_from_controls(self, *, require_one=True):
         """读取历史页周期复选框；旧测试替身缺少控件时默认全选。"""
         variables = getattr(self, "_history_period_vars", None)
@@ -1782,8 +1758,8 @@ class BacktestApp(tk.Tk):
             if lookbacks:
                 longest = max(lookbacks.values())
                 auto_label.set(
-                    f"起始日自动覆盖所选最长周期 {longest} 日 + "
-                    "当前期权期限 + HV 预热（如需）")
+                    f"起始日自动覆盖所选最长连续区间 {longest} 日 + "
+                    "Day 0 锚点 + HV 预热（如需）")
             else:
                 auto_label.set("请先勾选至少一个分析周期")
         if getattr(self, "_history_wind_hint_var", None) is not None:
@@ -1840,7 +1816,7 @@ class BacktestApp(tk.Tk):
                 lookbacks = BacktestApp._history_lookbacks_from_controls(
                     self, require_one=False)
                 start = (
-                    f"自动覆盖{max(lookbacks.values())}日+期限"
+                    f"自动覆盖最近{max(lookbacks.values())}日连续区间"
                     if lookbacks else "未选择分析周期")
             else:
                 start = start_var.get().strip() if start_var is not None else "—"
@@ -1883,8 +1859,8 @@ class BacktestApp(tk.Tk):
             selected_period_text = "未选择"
         variable.set(
             f"本次运行将冻结：{source_text}  ·  {subtype or '—'}  ·  "
-            f"期限 T={maturity or '—'} 日  ·  "
-            f"周期 {selected_period_text}  ·  "
+            f"代理期限 T={maturity or '—'} 日  ·  "
+            f"严格连续周期 {selected_period_text}  ·  "
             f"收盘兜底 {close_fallback}  ·  "
             f"头寸方向 {position}  ·  数量 {quantity}  ·  乘数 {multiplier}  ·  "
             f"成本率 {tc}%  ·  滑点 {slippage} bps  ·  左侧期权参数")
@@ -2134,7 +2110,8 @@ class BacktestApp(tk.Tk):
                 hint.set("请至少勾选一个历史分析周期")
                 return
             range_text = (
-                f"自动覆盖至少 {max(lookbacks.values())} 日 + 期权期限")
+                f"自动覆盖最近 {max(lookbacks.values())} 日连续区间"
+                " + Day 0 锚点")
         else:
             range_text = "使用自定义历史起始日"
         sigma_source_var = getattr(self, "_history_sigma_src_var", None)
@@ -2433,10 +2410,6 @@ class BacktestApp(tk.Tk):
             selected_lookbacks = BacktestApp._normalize_history_lookbacks(
                 history_state.get("history_lookbacks"))
             history_state["history_lookbacks"] = selected_lookbacks
-            history_state["history_target_endpoints"] = (
-                BacktestApp._history_target_endpoints_for_lookbacks(
-                    selected_lookbacks,
-                    history_state.get("history_target_endpoints")))
             self._refresh_history_base_summary()
             BacktestApp._validate_history_recommendation_source(history_state)
         except Exception as exc:
@@ -2582,7 +2555,7 @@ class BacktestApp(tk.Tk):
 
     def _strategy_cases_for_history(self, gs, base_bt):
         """根据历史页独立开关生成候选策略集。"""
-        # close-to-close 始终作为历史图表和逐样本优势的固定基准，不允许
+        # close-to-close 始终作为历史图表和严格区间改善的固定基准，不允许
         # 通过旧状态或直接 API 调用移除。
         cases = [StrategyCase(
             "每日收盘", CloseToCloseStrategy(),
@@ -2617,8 +2590,8 @@ class BacktestApp(tk.Tk):
                         get_trading_session_clock_ranges(
                             gs.get("wind_code", "")))
                 # 此处只确认候选具备真实日内时间轴。具体目标时刻是否在
-                # 每个交易日出现，必须由完整历史的滚动样本逐一判断；
-                # base_bt 只含历史最前面的一个期权期限，不能据此全局剔除。
+                # 每个交易日出现，必须由严格历史区间中的代理段逐一判断；
+                # base_bt 只提供粒度上下文，不能据此全局剔除。
                 BacktestApp._validate_fixed_time_history_granularity(base_bt)
                 requested_label = ",".join(
                     t.strftime("%H:%M") for t in fixed.requested_times)
@@ -2662,7 +2635,7 @@ class BacktestApp(tk.Tk):
 
     @staticmethod
     def _rescale_strategy_cases(cases, ratio):
-        """为已重定基的当前路径复制策略，保留原 cases 供滚动样本使用。"""
+        """为已重定基的当前路径复制策略，保留原 cases 供历史代理段使用。"""
         return [
             StrategyCase(
                 case.name,
@@ -2676,7 +2649,7 @@ class BacktestApp(tk.Tk):
     def _comparison_backtest_kwargs(bt):
         return {
             "tc_rate": bt.tc_rate,
-            "position": bt.position,
+            "position": BacktestApp._normalize_position(bt.position),
             "quantity": bt.quantity,
             "multiplier": bt.multiplier,
             "steps_per_day": bt.steps_per_day,
@@ -2712,18 +2685,17 @@ class BacktestApp(tk.Tk):
             gs["wind_end"], "历史分析截至日")
         mapping = get_main_contract_history(
             product_code, start_date.isoformat(), end_date.isoformat())
-        # 只有本次所选最长证据区间中的主力合约会成为回测终点；更早的
-        # 数据仅用于给最早终点补足一个完整 T 日期权生命周期。
+        # 严格区间只加载本次所选最长证据区间内真实出现的主力合约。
+        # 区间之前最多只为 Day 0 锚点和 realized-HV 预热留出必要历史，
+        # 不能再因代理期限 T 把行情扩到证据区间之外。
         history_lookbacks = BacktestApp._normalize_history_lookbacks(
             gs.get("history_lookbacks"))
         evidence_days = max(history_lookbacks.values())
         evidence_mapping = mapping.iloc[-min(evidence_days, len(mapping)):]
         contract_codes = list(dict.fromkeys(evidence_mapping.astype(str)))
-        maturity_days = BacktestApp._maturity_days_from_params(
-            gs.get("params", {}))
         warmup_days = BacktestApp._history_realized_warmup_days(gs)
         prehistory_span = BacktestApp._calendar_span_for_trading_days(
-            maturity_days + warmup_days + 1)
+            warmup_days + 1)
         bar_label = gs.get("wind_bar_size", "日频")
         contract_prices = {}
         contract_load_errors = {}
@@ -2797,7 +2769,8 @@ class BacktestApp(tk.Tk):
             timestamps=timestamps,
             steps_per_day=max(1, int(spd)),
             tc_rate=float(gs.get("tc_rate", 0.0)),
-            position=int(gs.get("position", 1)),
+            position=BacktestApp._normalize_position(
+                gs.get("position", 1)),
             quantity=float(gs.get("quantity", 1.0)),
             multiplier=float(gs.get("multiplier", 0.0)),
             slippage_bps=float(gs.get("slippage_bps", 0.0)),
@@ -2886,13 +2859,13 @@ class BacktestApp(tk.Tk):
     @staticmethod
     def _validate_history_recommendation_payload(
             recommendations, ranking, window_results):
-        """确认成功结果确实包含至少一个基于真实历史的可评估样本。"""
+        """确认成功结果确实包含至少一个基于真实历史的可评估代理段。"""
         if recommendations is None:
             raise ValueError("历史择优未返回历史参考结果表。")
         if ranking is None or getattr(ranking, "empty", True):
             raise ValueError("历史择优未返回诊断排名。")
         if not isinstance(window_results, dict) or not window_results:
-            raise ValueError("历史择优未返回滚动样本明细。")
+            raise ValueError("历史择优未返回严格区间代理段明细。")
 
         try:
             import pandas as pd
@@ -2903,8 +2876,8 @@ class BacktestApp(tk.Tk):
         except (KeyError, TypeError, ValueError) as exc:
             raise ValueError("历史择优排名缺少有效样本或评分字段。") from exc
         if not np.any((rolling_windows > 0) & np.isfinite(scores)):
-            # fixed_times 的逐样本失败已由历史分析层保留原始原因。若全部
-            # 样本都因目标时刻缺失而失败，应把真实数据问题直接反馈给
+            # fixed_times 的逐代理段失败已由历史分析层保留原始原因。若全部
+            # 代理段都因目标时刻缺失而失败，应把真实数据问题直接反馈给
             # 用户，而不是误报成历史区间长度不足。
             try:
                 strategy_types = ranking["strategy_type"].astype(str)
@@ -2920,7 +2893,7 @@ class BacktestApp(tk.Tk):
             if len(fixed_failures):
                 first_failure = str(fixed_failures.iloc[0])
                 raise ValueError(
-                    "固定时刻策略没有形成任何可评估滚动样本；"
+                    "固定时刻策略没有形成任何可评估代理段；"
                     f"首个失败原因：{first_failure} "
                     "请确认行情粒度以及各交易日的 Bar 时间戳与设定时刻一致。"
                 )
@@ -2934,11 +2907,11 @@ class BacktestApp(tk.Tk):
             if len(endpoint_failures):
                 first_failure = str(endpoint_failures.iloc[0])
                 raise ValueError(
-                    "历史具体合约池没有形成任何可评估样本；"
+                    "历史具体合约池没有形成任何可评估代理段；"
                     f"首个失败原因：{first_failure}"
                 )
             raise ValueError(
-                "真实历史长度不足，尚未形成任何可评估滚动样本；"
+                "真实历史长度不足，尚未形成任何可评估严格区间；"
                 "请扩大 CSV/Wind 历史区间后重试。")
 
     def _history_recommendation_worker(self, gs):
@@ -2946,10 +2919,6 @@ class BacktestApp(tk.Tk):
             BacktestApp._validate_history_recommendation_source(gs)
             history_lookbacks = BacktestApp._normalize_history_lookbacks(
                 gs.get("history_lookbacks"))
-            history_target_endpoints = (
-                BacktestApp._history_target_endpoints_for_lookbacks(
-                    history_lookbacks,
-                    gs.get("history_target_endpoints")))
             original_option = gs["cfg"]["build"](gs["subtype"], gs["params"])
             is_product_pool = False
             if gs.get("source") == "wind":
@@ -2973,7 +2942,6 @@ class BacktestApp(tk.Tk):
                     recommend_by_contract_history_pool(
                         original_option, history, cases, kwargs,
                         lookbacks=history_lookbacks,
-                        target_endpoints=history_target_endpoints,
                     )
                 )
             else:
@@ -2989,7 +2957,6 @@ class BacktestApp(tk.Tk):
                     recommend_by_rolling_history(
                         original_option, history, cases, kwargs,
                         lookbacks=history_lookbacks,
-                        target_endpoints=history_target_endpoints,
                         steps_per_day=base_bt.steps_per_day,
                     )
                 )
@@ -3240,14 +3207,13 @@ class BacktestApp(tk.Tk):
         if asof > today:
             raise ValueError("历史分析截至日不能晚于当前日期。")
 
-        maturity_days = BacktestApp._maturity_days_from_params(
-            resolved.get("params", {}))
         warmup_days = BacktestApp._history_realized_warmup_days(resolved)
         history_lookbacks = BacktestApp._normalize_history_lookbacks(
             resolved.get("history_lookbacks"))
         max_lookback_days = max(history_lookbacks.values())
-        required_trade_days = (
-            max_lookback_days + maturity_days + warmup_days)
+        # L 与 V 是评分/估计所需交易日；额外 1 日只作为首日建仓的
+        # Day 0 收盘锚点，不计入历史评分区间。
+        required_trade_days = max_lookback_days + warmup_days + 1
         auto_start = bool(resolved.get("history_wind_auto_start", True))
         if auto_start:
             span = BacktestApp._calendar_span_for_trading_days(
@@ -3277,9 +3243,9 @@ class BacktestApp(tk.Tk):
         if not auto_start:
             date_mode = "history_custom_range"
         elif max_lookback_days == int(ANNUAL_DAYS):
-            date_mode = "history_auto_year_plus_maturity"
+            date_mode = "history_auto_year_strict_interval"
         else:
-            date_mode = "history_auto_selected_period_plus_maturity"
+            date_mode = "history_auto_selected_strict_interval"
         resolved.update({
             "wind_start": start.isoformat(),
             "wind_end": asof.isoformat(),
@@ -3306,6 +3272,20 @@ class BacktestApp(tk.Tk):
         if value <= 0:
             raise ValueError("模拟采样 bar/日必须大于 0。")
         return value
+
+    @staticmethod
+    def _normalize_position(value):
+        """把所有 GUI / worker 方向入口收敛为唯一的 ``±1`` 表示。"""
+        if isinstance(value, (bool, np.bool_)):
+            raise ValueError("头寸方向只允许 1（卖出）或 -1（买入）。")
+        try:
+            normalized = float(value)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError(
+                "头寸方向只允许 1（卖出）或 -1（买入）。") from exc
+        if not np.isfinite(normalized) or normalized not in (-1.0, 1.0):
+            raise ValueError("头寸方向只允许 1（卖出）或 -1（买入）。")
+        return int(normalized)
 
     def _collect_gui_state(self):
         """收集单次回测状态；不读取或校验任何历史择优控件。"""
@@ -3385,7 +3365,9 @@ class BacktestApp(tk.Tk):
             "params": params,
             "source": source,
             "tc_rate": float(self._tc_var.get()) / 100.0,
-            "position": int(self._pos_var.get()),
+            # 左侧方向控件是唯一来源；任务启动时冻结并规范成严格 ±1。
+            "position": BacktestApp._normalize_position(
+                self._pos_var.get()),
             "quantity": float(self._qty_var.get()),
             "multiplier": float(self._mult_var.get()),
             "s0": str(params.get("s0", "")),
@@ -3417,9 +3399,6 @@ class BacktestApp(tk.Tk):
     def _collect_history_state(self):
         """收集历史择优的独立候选配置，并冻结当前公共回测环境。"""
         history_lookbacks = BacktestApp._history_lookbacks_from_controls(self)
-        history_target_endpoints = (
-            BacktestApp._history_target_endpoints_for_lookbacks(
-                history_lookbacks))
         # 每日收盘是历史图表的固定 C2C 基准，UI 中只读且状态永远为真。
         include_close = True
         include_fixed_times = bool(
@@ -3476,7 +3455,6 @@ class BacktestApp(tk.Tk):
 
         state.update({
             "history_lookbacks": history_lookbacks,
-            "history_target_endpoints": history_target_endpoints,
             "history_include_close": include_close,
             "history_include_fixed_times": include_fixed_times,
             "history_include_band": include_band,
@@ -3509,7 +3487,7 @@ class BacktestApp(tk.Tk):
                 history_start_var.get().strip()
                 if history_start_var is not None else state.get("wind_start", "")),
             # 旧测试替身 / API 调用没有历史控件时保留显式起始日；真实 GUI
-            # 默认自动覆盖已选最长观察期加当前期权期限。
+            # 默认自动覆盖最长已选严格区间、HV 预热与 Day 0 锚点。
             "history_wind_auto_start": (
                 bool(history_auto_start_var.get())
                 if history_auto_start_var is not None else False),
@@ -3774,18 +3752,46 @@ class BacktestApp(tk.Tk):
         summary_row = getattr(snapshot, "summary_row", {}) or {}
         return str(summary_row.get("strategy_type", "")).strip()
 
-    def _resolve_saved_comparison_baseline_id(self):
-        """返回会话固定的 close-to-close 基准 ID，并在删除后稳定接替。"""
+    @staticmethod
+    def _saved_snapshot_position(snapshot):
+        """读取快照的经济方向；显示名称和其它参数均不能覆盖它。"""
+        return BacktestApp._normalize_position(snapshot.position)
+
+    def _resolve_saved_comparison_baseline_id(self, position=None):
+        """返回当前方向最早的 close-to-close 基准，禁止跨方向复用。"""
         saved = getattr(self, "_saved_backtests", {})
+        target_position = (
+            BacktestApp._normalize_position(position)
+            if position is not None else None)
+        if target_position is None:
+            selected_ids = getattr(
+                self, "_saved_comparison_selection", set())
+            selected_positions = {
+                BacktestApp._saved_snapshot_position(saved[result_id])
+                for result_id in selected_ids if result_id in saved
+            }
+            if len(selected_positions) == 1:
+                target_position = next(iter(selected_positions))
+            elif len(selected_positions) > 1:
+                # 防御旧状态或外部调用制造的混选；调用方随后会给出明确提示。
+                self._saved_comparison_baseline_id = None
+                return None
+
         preferred = getattr(self, "_saved_comparison_baseline_id", None)
         if (preferred in saved and BacktestApp._saved_snapshot_strategy_type(
-                saved[preferred]) == "close_to_close"):
+                saved[preferred]) == "close_to_close"
+                and (target_position is None
+                     or BacktestApp._saved_snapshot_position(
+                         saved[preferred]) == target_position)):
             return preferred
 
         baseline_id = next((
             result_id for result_id, snapshot in saved.items()
             if BacktestApp._saved_snapshot_strategy_type(snapshot)
             == "close_to_close"
+            and (target_position is None
+                 or BacktestApp._saved_snapshot_position(snapshot)
+                 == target_position)
         ), None)
         self._saved_comparison_baseline_id = baseline_id
         return baseline_id
@@ -3793,6 +3799,14 @@ class BacktestApp(tk.Tk):
     @staticmethod
     def _make_saved_backtest_result(
             bt, gui_state, result_id, name, saved_at=None):
+        snapshot_position = BacktestApp._normalize_position(
+            gui_state.get("position"))
+        result_position = (getattr(bt, "_results", {}) or {}).get("position")
+        if result_position is not None:
+            result_position = BacktestApp._normalize_position(result_position)
+            if result_position != snapshot_position:
+                raise ValueError(
+                    "回测结果的头寸方向与本次左侧参数不一致，已拒绝保存。")
         summary_row, daily_frame = BacktestApp._snapshot_comparison_data(
             bt._results)
         strategy_label, parameter_summary = (
@@ -3804,7 +3818,7 @@ class BacktestApp(tk.Tk):
             "params": params,
         })
         economics_key = BacktestApp._freeze_snapshot_value({
-            "position": gui_state.get("position"),
+            "position": snapshot_position,
             "quantity": gui_state.get("quantity"),
             "multiplier": gui_state.get("multiplier"),
             "tc_rate": gui_state.get("tc_rate"),
@@ -3825,6 +3839,7 @@ class BacktestApp(tk.Tk):
             path_key=BacktestApp._backtest_path_key(bt, gui_state),
             contract_key=contract_key,
             economics_key=economics_key,
+            position=snapshot_position,
         )
 
     @staticmethod
@@ -3861,9 +3876,17 @@ class BacktestApp(tk.Tk):
             bt, gui_state, result_id, cleaned_name)
         self._saved_backtest_sequence = next_sequence
         self._saved_backtests[result_id] = snapshot
-        BacktestApp._resolve_saved_comparison_baseline_id(self)
+        position = BacktestApp._saved_snapshot_position(snapshot)
+        # 结果池可同时保存买卖两组，但当前视图始终只激活一个方向。
+        self._saved_comparison_selection.intersection_update({
+            saved_id for saved_id, saved_snapshot
+            in self._saved_backtests.items()
+            if BacktestApp._saved_snapshot_position(saved_snapshot)
+            == position
+        })
         self._saved_comparison_selection.add(result_id)
-        baseline_id = BacktestApp._resolve_saved_comparison_baseline_id(self)
+        baseline_id = BacktestApp._resolve_saved_comparison_baseline_id(
+            self, position)
         if baseline_id is not None:
             self._saved_comparison_selection.add(baseline_id)
         self._latest_retained_result_id = result_id
@@ -3919,6 +3942,14 @@ class BacktestApp(tk.Tk):
         """只读取已完成快照生成排名与曲线数据，绝不重新运行回测。"""
         import pandas as pd
         snapshots = list(snapshots)
+        positions = {
+            BacktestApp._saved_snapshot_position(snapshot)
+            for snapshot in snapshots
+        }
+        if len(positions) > 1:
+            raise ValueError(
+                "买入(long)与卖出(short)结果不能混选；"
+                "请一次只比较同一头寸方向。")
         close_snapshots = [
             snapshot for snapshot in snapshots
             if BacktestApp._saved_snapshot_strategy_type(snapshot)
@@ -3963,6 +3994,14 @@ class BacktestApp(tk.Tk):
         snapshots = list(snapshots)
         if not snapshots:
             return []
+        if len({
+                BacktestApp._saved_snapshot_position(snapshot)
+                for snapshot in snapshots
+        }) > 1:
+            return [
+                "买入(long)与卖出(short)结果不能混选；"
+                "请清空后选择同一头寸方向。"
+            ]
         warnings = []
         close_snapshots = [
             snapshot for snapshot in snapshots
@@ -4034,7 +4073,7 @@ class BacktestApp(tk.Tk):
         params = gs["params"]
         src = gs["source"]
         tc_rate = gs["tc_rate"]
-        position = gs["position"]
+        position = BacktestApp._normalize_position(gs["position"])
         quantity = gs["quantity"]
         multiplier = gs["multiplier"]
         slippage_bps = gs.get("slippage_bps", 0.0)
@@ -4411,7 +4450,7 @@ class BacktestApp(tk.Tk):
         )
         if pairs.empty:
             return pairs
-        # 只保留生命周期日数完全一致的同终点配对样本；图表不得静默截断。
+        # 只保留段内交易日数完全一致的共同代理段；图表不得静默截断。
         def _daily_length(value):
             try:
                 return len(np.asarray(value, dtype=float).reshape(-1))
@@ -4431,13 +4470,17 @@ class BacktestApp(tk.Tk):
         pairs = pairs.loc[same_length].copy()
         if pairs.empty:
             return pairs
+        start_values = pairs.get("start_ts_candidate")
+        if start_values is None:
+            start_values = pairs.get("start_ts_baseline")
         end_values = pairs.get("end_ts_candidate")
         if end_values is None:
             end_values = pairs.get("end_ts_baseline")
         pairs = pairs.assign(
+            _chart_start_ts=pd.to_datetime(start_values, errors="coerce"),
             _chart_end_ts=pd.to_datetime(end_values, errors="coerce"))
         return pairs.sort_values(
-            ["_chart_end_ts", "window_id"], kind="stable",
+            ["_chart_start_ts", "_chart_end_ts", "window_id"], kind="stable",
             na_position="last",
         ).reset_index(drop=True)
 
@@ -4458,10 +4501,10 @@ class BacktestApp(tk.Tk):
 
     @staticmethod
     def _history_chart_band(arrays):
-        """按生命周期日对齐多样本累计曲线并返回中位数与 P25/P75。
+        """按代理段内交易日对齐累计曲线并返回中位数与 P25/P75。
 
-        提前敲出/结算后的累计值保持不变直至最长生命周期，避免后半段只剩
-        未敲出样本而产生幸存者偏差。调用方只向这里传累计曲线。
+        提前敲出/结算后的累计值保持不变直至最长代理段，避免后半段只剩
+        未敲出代理段而产生幸存者偏差。调用方只向这里传累计曲线。
         """
         arrays = [np.asarray(array, dtype=float).reshape(-1)
                   for array in arrays if len(array)]
@@ -4521,7 +4564,7 @@ class BacktestApp(tk.Tk):
         if pairs.empty:
             return {
                 "state": "empty", "mode": mode, "metric": metric,
-                "message": "所选周期没有可与每日收盘基准配对的成功样本。",
+                "message": "所选周期没有可与每日收盘基准配对的成功代理段。",
                 "window_options": [],
             }
         window_options = []
@@ -4536,7 +4579,7 @@ class BacktestApp(tk.Tk):
             window_options.append({
                 "window_id": str(row["window_id"]),
                 "end_ts": end_ts,
-                "label": f"样本 {sample_no} · {date_text}",
+                "label": f"代理段 {sample_no} · {date_text}",
             })
         base = {
             "state": "ok", "mode": mode, "metric": metric,
@@ -4566,7 +4609,7 @@ class BacktestApp(tk.Tk):
                 if not len(values):
                     return {
                         **base, "state": "empty",
-                        "message": f"配对样本缺少{metric_label}曲线。",
+                        "message": f"配对代理段缺少{metric_label}曲线。",
                         "selected_window_id": selected_window,
                     }
                 series.append({
@@ -4577,13 +4620,13 @@ class BacktestApp(tk.Tk):
             if len({len(item["y"]) for item in series}) != 1:
                 return {
                     **base, "state": "empty",
-                    "message": "配对样本生命周期日数不一致，无法绘图。",
+                    "message": "配对代理段内交易日数不一致，无法绘图。",
                     "selected_window_id": selected_window,
                 }
             return {
                 **base, "selected_window_id": selected_window,
                 "series": series, "metric_label": metric_label,
-                "title": f"单样本路径 · {metric_label}",
+                "title": f"单代理段路径 · {metric_label}",
             }
 
         bands = []
@@ -4596,13 +4639,13 @@ class BacktestApp(tk.Tk):
             if band is None:
                 return {
                     **base, "state": "empty",
-                    "message": f"配对样本缺少{metric_label}曲线。",
+                    "message": f"配对代理段缺少{metric_label}曲线。",
                 }
             bands.append({"role": role, "label": label, **band})
         return {
             **base, "bands": bands, "metric_label": metric_label,
             "title": (
-                f"多样本中位路径 · {metric_label}"
+                f"多代理段中位路径 · {metric_label}"
                 "（中位数；P25/P75 为描述区间，非置信区间）"
             ),
         }
@@ -4611,7 +4654,7 @@ class BacktestApp(tk.Tk):
     def _history_multi_chart_model(
             summary, lookback, strategies, mode="single", metric="net",
             window_id=None, primary_strategy=None):
-        """生成固定 C2C 基准加多个候选的严格配对样本图表模型。"""
+        """生成固定 C2C 基准加多个候选的严格配对代理段图表模型。"""
         import pandas as pd
 
         if isinstance(strategies, str):
@@ -4624,7 +4667,7 @@ class BacktestApp(tk.Tk):
             strategies = []
         mode = str(mode or "single")
         metric = str(metric or "net")
-        if mode not in {"single", "typical"}:
+        if mode not in {"full", "single", "typical"}:
             return {
                 "state": "empty", "mode": mode, "metric": metric,
                 "message": "未知历史图表模式。", "window_options": [],
@@ -4643,7 +4686,7 @@ class BacktestApp(tk.Tk):
                 or not required.issubset(summary.columns)):
             return {
                 "state": "empty", "mode": mode, "metric": metric,
-                "message": "所选周期没有可绘制的历史样本。",
+                "message": "所选周期没有可绘制的历史代理段。",
                 "window_options": [], "strategies": strategies,
             }
 
@@ -4652,7 +4695,7 @@ class BacktestApp(tk.Tk):
         if period_rows.empty:
             return {
                 "state": "empty", "mode": mode, "metric": metric,
-                "message": "所选周期没有可绘制的历史样本。",
+                "message": "所选周期没有可绘制的历史代理段。",
                 "window_options": [], "strategies": strategies,
             }
         successful = period_rows[
@@ -4682,7 +4725,8 @@ class BacktestApp(tk.Tk):
                 for value in successful["history_contract_code"].dropna()
                 if str(value).strip() and str(value).strip() != "nan"
             }
-        uses_normalized_notional = mode == "typical" and len(contract_codes) > 1
+        uses_normalized_notional = (
+            mode in {"full", "typical"} and len(contract_codes) > 1)
 
         pairs_by_strategy = {
             strategy: BacktestApp._history_chart_pairs(
@@ -4696,7 +4740,7 @@ class BacktestApp(tk.Tk):
             return {
                 "state": "empty", "mode": mode, "metric": metric,
                 "message": (
-                    "以下策略没有可与 C2C 严格配对的样本："
+                    "以下策略没有可与 C2C 严格配对的代理段："
                     + "、".join(missing)),
                 "window_options": [], "strategies": candidates,
                 "baseline_strategy": baseline_strategy,
@@ -4712,17 +4756,31 @@ class BacktestApp(tk.Tk):
             "gross": "normalized_cumulative_gross_pnl",
             "tc": "normalized_cumulative_tc",
         }
+        raw_daily_metric_columns = {
+            "net": "daily_net_pnl",
+            "gross": "daily_gross_pnl",
+            "tc": "daily_tc",
+        }
+        normalized_daily_metric_columns = {
+            "net": "normalized_daily_net_pnl",
+            "gross": "normalized_daily_gross_pnl",
+            "tc": "normalized_daily_tc",
+        }
         metric_columns = (
-            normalized_metric_columns
-            if uses_normalized_notional else raw_metric_columns)
+            (normalized_daily_metric_columns
+             if uses_normalized_notional else raw_daily_metric_columns)
+            if mode == "full" else
+            (normalized_metric_columns
+             if uses_normalized_notional else raw_metric_columns)
+        )
         required_curve_column = metric_columns[metric]
         if (uses_normalized_notional
                 and required_curve_column not in successful.columns):
             return {
                 "state": "empty", "mode": mode, "metric": metric,
                 "message": (
-                    "跨合约多样本路径缺少安全归一化数据；"
-                    "请改用单样本路径查看原始金额。"),
+                    "跨合约历史路径缺少安全归一化数据；"
+                    "请改用单代理段路径查看原始金额。"),
                 "window_options": [], "strategies": candidates,
                 "baseline_strategy": baseline_strategy,
                 "uses_normalized_notional": True,
@@ -4737,7 +4795,9 @@ class BacktestApp(tk.Tk):
                 baseline_curve = BacktestApp._history_chart_array(
                     row, curve_column, "baseline")
                 if (not len(candidate_curve)
-                        or len(candidate_curve) != len(baseline_curve)):
+                        or len(candidate_curve) != len(baseline_curve)
+                        or not np.all(np.isfinite(candidate_curve))
+                        or not np.all(np.isfinite(baseline_curve))):
                     continue
                 valid_ids.add(str(row["window_id"]))
             return valid_ids
@@ -4760,10 +4820,10 @@ class BacktestApp(tk.Tk):
             return {
                 "state": "empty", "mode": mode, "metric": metric,
                 "message": (
-                    "跨合约多样本路径没有可安全归一化的共同样本；"
-                    "请改用单样本路径查看原始金额。"
+                    "跨合约历史路径没有可安全归一化的共同代理段；"
+                    "请改用单代理段路径查看原始金额。"
                     if uses_normalized_notional else
-                    "所选候选之间没有共同的严格配对样本。"),
+                    "所选候选之间没有共同的严格配对代理段。"),
                 "window_options": [], "strategies": candidates,
                 "baseline_strategy": baseline_strategy,
                 "uses_normalized_notional": uses_normalized_notional,
@@ -4793,7 +4853,7 @@ class BacktestApp(tk.Tk):
             window_options.append({
                 "window_id": common_id,
                 "end_ts": end_ts,
-                "label": f"样本 {sample_no} · {date_text}{contract_text}",
+                "label": f"代理段 {sample_no} · {date_text}{contract_text}",
             })
 
         base = {
@@ -4812,6 +4872,110 @@ class BacktestApp(tk.Tk):
                 len(window_ids) != len(ordered_ids)
                 for window_ids in valid_ids_by_strategy.values()),
         }
+        if mode == "full":
+            curve_column = metric_columns[metric]
+
+            def _ordered_pair_rows(strategy):
+                pairs = pairs_by_strategy[strategy].copy()
+                pairs = pairs[
+                    pairs["window_id"].astype(str).isin(ordered_ids)]
+                rows_by_id = {
+                    str(row["window_id"]): row
+                    for _index, row in pairs.iterrows()
+                }
+                return [rows_by_id[common_id] for common_id in ordered_ids]
+
+            first_rows = _ordered_pair_rows(comparison_strategies[0])
+            baseline_parts = [
+                BacktestApp._history_chart_array(
+                    row, curve_column, "baseline")
+                for row in first_rows
+            ]
+            if (not baseline_parts
+                    or any(not len(part) for part in baseline_parts)):
+                return {
+                    **base, "state": "empty",
+                    "message": "共同代理段缺少每日收盘 C2C 日级曲线。",
+                }
+            segment_lengths = [len(part) for part in baseline_parts]
+
+            def _full_series(parts, role, label, strategy):
+                if (len(parts) != len(segment_lengths)
+                        or any(
+                            not len(part)
+                            or len(part) != expected_length
+                            or not np.all(np.isfinite(part))
+                            for part, expected_length in zip(
+                                parts, segment_lengths))):
+                    return None
+                daily = np.concatenate(parts)
+                return {
+                    "role": role, "label": label, "strategy": strategy,
+                    "x": np.arange(1, len(daily) + 1, dtype=float),
+                    "y": np.cumsum(daily),
+                }
+
+            baseline_item = _full_series(
+                baseline_parts, "baseline", "每日收盘（C2C基准）",
+                baseline_strategy)
+            if baseline_item is None:
+                return {
+                    **base, "state": "empty",
+                    "message": "共同代理段内 C2C 日级曲线不完整；未补零。",
+                }
+            series = [baseline_item]
+            for strategy in candidates:
+                candidate_parts = [
+                    BacktestApp._history_chart_array(
+                        row, curve_column, "candidate")
+                    for row in _ordered_pair_rows(strategy)
+                ]
+                item = _full_series(
+                    candidate_parts, "candidate", strategy, strategy)
+                if item is None:
+                    return {
+                        **base, "state": "empty",
+                        "message": (
+                            f"{strategy} 的共同代理段日级曲线不完整；未补零。"),
+                    }
+                series.append(item)
+
+            common_day_count = int(sum(segment_lengths))
+            expected_day_count = int(
+                LOOKBACK_DAYS.get(str(lookback), common_day_count))
+            complete_evidence = common_day_count == expected_day_count
+            raw_labels = {
+                "net": "累计净 PnL",
+                "gross": "累计成本前 PnL",
+                "tc": "累计成本",
+            }
+            normalized_labels = {
+                "net": "累计净 PnL / 各代理段期初名义金额",
+                "gross": "累计成本前 PnL / 各代理段期初名义金额",
+                "tc": "累计成本 / 各代理段期初名义金额",
+            }
+            metric_label = (
+                normalized_labels if uses_normalized_notional
+                else raw_labels)[metric]
+            title_prefix = (
+                "完整 L 日累计路径"
+                if complete_evidence else
+                f"共同交集累计路径（{common_day_count}/{expected_day_count} 日）"
+            )
+            return {
+                **base,
+                "series": series,
+                "metric_label": metric_label,
+                "title": f"{title_prefix} · {metric_label}",
+                "common_day_count": common_day_count,
+                "expected_day_count": expected_day_count,
+                "complete_evidence": complete_evidence,
+                "segment_lengths": tuple(segment_lengths),
+                "segment_boundaries": tuple(
+                    int(value)
+                    for value in np.cumsum(segment_lengths)[:-1]),
+            }
+
         first_strategy = comparison_strategies[0]
         first_model = BacktestApp._history_chart_model(
             filtered, lookback, first_strategy, mode=mode, metric=metric,
@@ -4825,7 +4989,7 @@ class BacktestApp(tk.Tk):
         if baseline_item is None:
             return {
                 **base, "state": "empty",
-                "message": "共同样本缺少每日收盘 C2C 曲线。",
+                "message": "共同代理段缺少每日收盘 C2C 曲线。",
             }
         collection = [{**baseline_item, "strategy": baseline_strategy}]
         for strategy in candidates:
@@ -4837,7 +5001,7 @@ class BacktestApp(tk.Tk):
                 return {
                     **base, "state": "empty",
                     "message": model.get(
-                        "message", f"{strategy} 缺少共同样本曲线。"),
+                        "message", f"{strategy} 缺少共同代理段曲线。"),
                 }
             candidate_item = next(
                 (item for item in model[collection_key]
@@ -4847,7 +5011,8 @@ class BacktestApp(tk.Tk):
                     **candidate_item, "strategy": strategy,
                     "label": strategy,
                 })
-        title_prefix = "单样本路径" if mode == "single" else "多样本中位路径"
+        title_prefix = (
+            "单代理段路径" if mode == "single" else "多代理段中位路径")
         result = {
             **base, collection_key: collection,
             "metric_label": first_model.get("metric_label", "累计 PnL"),
@@ -4865,12 +5030,9 @@ class BacktestApp(tk.Tk):
         """读取历史择优主指标；旧结果回退到合并 RMS 改善。"""
         if not row:
             return None
-        # 新口径先逐样本计算有界配对 C2C 优势，再取样本等权均值。
-        # 旧的 improvement_vs_c2c 是把所有日损益合并后的金额 RMS 改善，
-        # 继续保留作诊断，但不能支配跨具体合约的推荐名次。
-        if (str(row.get("selection_metric", ""))
-                == HISTORY_SELECTION_METRIC
-                and "selection_improvement_vs_c2c" in row):
+        # 新版严格区间与旧版逐窗等权结果都有各自正式的 selection 指标；
+        # 二者都优先读取该指标，但只有新版常量可以驱动“严格 L 日”文案。
+        if BacktestApp._history_row_uses_recognized_selection_metric(row):
             return BacktestApp._comparison_finite(
                 row.get("selection_improvement_vs_c2c"))
         value = BacktestApp._comparison_finite(
@@ -4892,12 +5054,53 @@ class BacktestApp(tk.Tk):
         return (baseline_score - candidate_score) / abs(baseline_score)
 
     @staticmethod
-    def _history_row_uses_window_equal_metric(row):
+    def _history_row_uses_recognized_selection_metric(row):
+        """是否携带当前 GUI 能解释的新版或旧版选择指标。"""
+        return bool(
+            row
+            and str(row.get("selection_metric", "")) in {
+                HISTORY_SELECTION_METRIC,
+                STRICT_LOOKBACK_SELECTION_METRIC,
+            }
+            and "selection_improvement_vs_c2c" in row)
+
+    @staticmethod
+    def _history_row_uses_strict_metric(row):
+        """只有严格连续 L 日选择指标才允许展示 strict 口径文案。"""
         return bool(
             row
             and str(row.get("selection_metric", ""))
-            == HISTORY_SELECTION_METRIC
+            == STRICT_LOOKBACK_SELECTION_METRIC
             and "selection_improvement_vs_c2c" in row)
+
+    @staticmethod
+    def _history_row_uses_window_equal_metric(row):
+        """识别升级前的逐历史终点等权选择指标。"""
+        return bool(
+            row
+            and str(row.get("selection_metric", "")) == HISTORY_SELECTION_METRIC
+            and "selection_improvement_vs_c2c" in row)
+
+    @staticmethod
+    def _history_metric_labels(*, uses_strict_metric, uses_product_pool):
+        """返回与历史数据路由一致的表头，避免把品种池诊断值写成主指标。"""
+        if uses_strict_metric and uses_product_pool:
+            return {
+                "score": "汇总RMS(诊断)↓",
+                "baseline": "C2C RMS(诊断)",
+                "improvement": "较C2C改善",
+            }
+        if uses_strict_metric:
+            return {
+                "score": "区间RMS↓",
+                "baseline": "C2C区间RMS",
+                "improvement": "较C2C改善",
+            }
+        return {
+            "score": "汇总RMS↓",
+            "baseline": "C2C汇总RMS",
+            "improvement": "旧口径改善",
+        }
 
     @staticmethod
     def _history_contract_codes_text(values, *, limit=6):
@@ -4933,8 +5136,23 @@ class BacktestApp(tk.Tk):
 
         def _sampling_context(item):
             item = item or {}
+            segment_count = item.get(
+                "segment_count", item.get("proxy_segments"))
             return {
                 "maturity_days": item.get("maturity_days"),
+                "evaluation_mode": item.get("evaluation_mode"),
+                "evidence_days": BacktestApp._comparison_safe_int(
+                    item.get("evidence_days"), 0),
+                "days_used": BacktestApp._comparison_safe_int(
+                    item.get("days_used"), 0),
+                "segment_count": (
+                    BacktestApp._comparison_safe_int(segment_count, 0)
+                    if segment_count is not None else None),
+                "expiry_segments": BacktestApp._comparison_safe_int(
+                    item.get("expiry_segments"), 0),
+                "mtm_segments": BacktestApp._comparison_safe_int(
+                    item.get("mtm_segments"), 0),
+                "terminal_mode": item.get("terminal_mode"),
                 "realized_sigma_warmup_days": (
                     BacktestApp._comparison_safe_int(
                         item.get("realized_sigma_warmup_days"), 0)),
@@ -4943,20 +5161,6 @@ class BacktestApp(tk.Tk):
                         item.get("warmup_eligible_endpoints"), 0)),
                 "sampling_mode": item.get("sampling_mode", "fixed_step"),
                 "step_days": item.get("step_days"),
-                "target_endpoints": item.get("target_endpoints"),
-                "planned_endpoints": BacktestApp._comparison_safe_int(
-                    item.get("planned_endpoints"), 0),
-                "selected_endpoints": BacktestApp._comparison_safe_int(
-                    item.get("selected_endpoints"), 0),
-                "endpoint_spacing_min": item.get("endpoint_spacing_min"),
-                "endpoint_spacing_max": item.get("endpoint_spacing_max"),
-                "window_overlap_min_ratio": item.get(
-                    "window_overlap_min_ratio"),
-                "window_overlap_max_ratio": item.get(
-                    "window_overlap_max_ratio"),
-                "maturity_exceeds_lookback": (
-                    BacktestApp._comparison_safe_bool(
-                        item.get("maturity_exceeds_lookback"), False)),
                 "required_history_days": BacktestApp._comparison_safe_int(
                     item.get("required_history_days"), 0),
                 "available_history_days": BacktestApp._comparison_safe_int(
@@ -4977,6 +5181,8 @@ class BacktestApp(tk.Tk):
                     BacktestApp._comparison_safe_int(
                         item.get("mapping_trailing_days_dropped"), 0)),
                 "selection_metric": item.get("selection_metric"),
+                "uses_strict_metric": (
+                    BacktestApp._history_row_uses_strict_metric(item)),
                 "uses_window_equal_metric": (
                     BacktestApp._history_row_uses_window_equal_metric(item)),
                 "relative_comparison_windows": (
@@ -5006,7 +5212,7 @@ class BacktestApp(tk.Tk):
                     if str(item.get("strategy_type", "")) == "close_to_close":
                         continue
                     # 新结果显式携带 comparison_eligible；旧快照仅在完整行
-                    # 上回退为可比，避免把部分样本结果包装成配对诊断冠军。
+                    # 上回退为可比，避免把部分代理段结果包装成诊断冠军。
                     if "comparison_eligible" in item:
                         comparable = BacktestApp._comparison_safe_bool(
                             item.get("comparison_eligible"), False)
@@ -5064,7 +5270,7 @@ class BacktestApp(tk.Tk):
                             "history_days_available", 0), 0),
                     "requested": BacktestApp._comparison_safe_int(
                         (context_row or {}).get("lookback_days", 0), 0),
-                    "status": "无可评估样本", "formal": False,
+                    "status": "无可评估代理段", "formal": False,
                     "best_is_baseline": False,
                     "has_comparable_candidate": False,
                     "trailing_dropped": BacktestApp._comparison_safe_int(
@@ -5085,8 +5291,8 @@ class BacktestApp(tk.Tk):
                     baseline.get("score"))
             improvement = BacktestApp._history_row_improvement(
                 leader, baseline)
-            uses_window_equal = (
-                BacktestApp._history_row_uses_window_equal_metric(leader))
+            uses_strict_metric = (
+                BacktestApp._history_row_uses_strict_metric(leader))
             paired = BacktestApp._comparison_safe_int(
                 leader.get("paired_windows", leader.get("rolling_windows")), 0)
             baseline_windows = BacktestApp._comparison_safe_int(
@@ -5100,10 +5306,16 @@ class BacktestApp(tk.Tk):
                 strategy_label = "每日收盘（基准最优）"
                 if not formal:
                     strategy_label = f"诊断：{strategy_label}"
-                status = "历史样本完整" if formal else "样本不足，仅诊断"
+                if uses_strict_metric:
+                    status = "严格区间完整" if formal else "区间不足，仅诊断"
+                else:
+                    status = "旧口径样本完整" if formal else "旧口径，仅诊断"
             else:
                 strategy_label = strategy if formal else f"诊断领先：{strategy}"
-                status = "历史样本完整" if formal else "样本不足，仅诊断"
+                if uses_strict_metric:
+                    status = "严格区间完整" if formal else "区间不足，仅诊断"
+                else:
+                    status = "旧口径样本完整" if formal else "旧口径，仅诊断"
             rows.append({
                 "lookback": key,
                 "period": display,
@@ -5113,7 +5325,7 @@ class BacktestApp(tk.Tk):
                 "baseline_score": baseline_score,
                 "improvement_vs_c2c": improvement,
                 "selection_improvement_vs_c2c": (
-                    improvement if uses_window_equal else None),
+                    improvement if uses_strict_metric else None),
                 # 旧展示模型字段保留同值软兼容；其语义已固定为较 C2C 改善。
                 "gap_ratio": improvement,
                 "window_win_rate_vs_c2c": win_rate,
@@ -5273,8 +5485,8 @@ class BacktestApp(tk.Tk):
         ).grid(row=0, column=0, sticky="w")
         ttk.Label(
             header,
-            text=("仅保存在当前应用会话；最早保留的 close-to-close 结果固定为"
-                  "基准，勾选结果不会重新回测"),
+            text=("仅保存在当前应用会话；同方向最早保留的 close-to-close "
+                  "结果固定为基准，勾选结果不会重新回测"),
             style="SurfaceMuted.TLabel",
         ).grid(row=1, column=0, sticky="w", pady=(2, 0))
         pool = ttk.LabelFrame(container, text=" 已保留结果 ", padding=5)
@@ -5283,8 +5495,8 @@ class BacktestApp(tk.Tk):
         toolbar.pack(fill="x", pady=(0, 4))
         ttk.Label(
             toolbar,
-            text=("选择其它结果时会自动带入固定基准；点击其它列聚焦后可"
-                  "重命名或删除"),
+            text=("选择其它结果时会自动带入同方向固定基准；买卖方向分组"
+                  "展示，点击其它列聚焦后可重命名或删除"),
             style="SurfaceMuted.TLabel",
         ).pack(side="left", fill="x", expand=True)
         ttk.Button(
@@ -5433,7 +5645,25 @@ class BacktestApp(tk.Tk):
             else:
                 self._saved_comparison_selection.remove(result_id)
         elif result_id in self._saved_backtests:
+            target_position = BacktestApp._saved_snapshot_position(
+                self._saved_backtests[result_id])
+            selected_positions = {
+                BacktestApp._saved_snapshot_position(
+                    self._saved_backtests[selected_id])
+                for selected_id in self._saved_comparison_selection
+                if selected_id in self._saved_backtests
+            }
+            if selected_positions and selected_positions != {target_position}:
+                # 点击另一方向时切换整个视图分组，绝不沿用上一组的 C2C。
+                self._saved_comparison_selection.clear()
+                direction = (
+                    "卖出(short)" if target_position == 1
+                    else "买入(long)")
+                self._set_status(
+                    f"已切换到{direction}结果组；买卖方向不混合比较。")
             self._saved_comparison_selection.add(result_id)
+            baseline_id = BacktestApp._resolve_saved_comparison_baseline_id(
+                self, target_position)
             if baseline_id is not None:
                 self._saved_comparison_selection.add(baseline_id)
         self._refresh_saved_pool_tree()
@@ -5442,7 +5672,42 @@ class BacktestApp(tk.Tk):
     def _select_all_saved_backtests(self):
         if not BacktestApp._saved_pool_actions_allowed(self):
             return
-        self._saved_comparison_selection = set(self._saved_backtests)
+        if not self._saved_backtests:
+            self._saved_comparison_selection.clear()
+            self._refresh_saved_pool_tree()
+            self._refresh_saved_comparison_view()
+            return
+        focused_id = BacktestApp._focused_saved_backtest_id(self)
+        if focused_id in self._saved_backtests:
+            target_position = BacktestApp._saved_snapshot_position(
+                self._saved_backtests[focused_id])
+        else:
+            selected_positions = {
+                BacktestApp._saved_snapshot_position(
+                    self._saved_backtests[result_id])
+                for result_id in self._saved_comparison_selection
+                if result_id in self._saved_backtests
+            }
+            target_position = (
+                next(iter(selected_positions))
+                if len(selected_positions) == 1 else
+                BacktestApp._saved_snapshot_position(
+                    next(iter(self._saved_backtests.values())))
+            )
+        same_direction = {
+            result_id for result_id, snapshot in self._saved_backtests.items()
+            if BacktestApp._saved_snapshot_position(snapshot)
+            == target_position
+        }
+        skipped = len(self._saved_backtests) - len(same_direction)
+        self._saved_comparison_selection = same_direction
+        BacktestApp._resolve_saved_comparison_baseline_id(
+            self, target_position)
+        if skipped:
+            direction = (
+                "卖出(short)" if target_position == 1 else "买入(long)")
+            self._set_status(
+                f"已全选{direction}结果；另 {skipped} 条相反方向结果未混入。")
         self._refresh_saved_pool_tree()
         self._refresh_saved_comparison_view()
 
@@ -5502,7 +5767,20 @@ class BacktestApp(tk.Tk):
             f"已删除『{snapshot.name}』  |  剩余 {len(self._saved_backtests)} 条")
 
     def _selected_saved_backtests(self):
-        baseline_id = BacktestApp._resolve_saved_comparison_baseline_id(self)
+        selected_positions = {
+            BacktestApp._saved_snapshot_position(
+                self._saved_backtests[result_id])
+            for result_id in self._saved_comparison_selection
+            if result_id in self._saved_backtests
+        }
+        if len(selected_positions) > 1:
+            raise ValueError(
+                "买入(long)与卖出(short)结果不能混选；"
+                "请清空后选择同一头寸方向。")
+        selected_position = (
+            next(iter(selected_positions)) if selected_positions else None)
+        baseline_id = BacktestApp._resolve_saved_comparison_baseline_id(
+            self, selected_position)
         if self._saved_comparison_selection and baseline_id is not None:
             self._saved_comparison_selection.add(baseline_id)
         return [
@@ -5531,7 +5809,11 @@ class BacktestApp(tk.Tk):
         label.configure(text=text, bg=bg, fg=fg)
 
     def _refresh_saved_comparison_view(self):
-        snapshots = self._selected_saved_backtests()
+        try:
+            snapshots = self._selected_saved_backtests()
+        except Exception as exc:
+            messagebox.showerror("选择已保存结果失败", str(exc))
+            return
         self._refresh_saved_comparison_notice(snapshots)
         content = self._saved_comparison_content
         if not snapshots:
@@ -5581,7 +5863,7 @@ class BacktestApp(tk.Tk):
     def _show_history_recommendation(
             self, recommendations, ranking, notes=None, source_label=None,
             window_results=None, history_state=None):
-        """只在历史择优页渲染滚动历史结论与排名。"""
+        """只在历史择优页渲染严格区间结论与排名。"""
         container = self._history_results_container
         view_attrs = (
             "_history_ranking", "_history_period_rows",
@@ -5596,7 +5878,8 @@ class BacktestApp(tk.Tk):
             "_history_chart_hint_var",
             "_history_chart_selected_by_period",
             "_history_chart_color_map", "_history_chart_marker_map",
-            "_history_lookbacks",
+            "_history_lookbacks", "_history_uses_strict_metric",
+            "_history_uses_window_equal_metric",
         )
         missing = object()
         old_view_state = {
@@ -5608,7 +5891,7 @@ class BacktestApp(tk.Tk):
         mode_bar.pack(fill="x", padx=4, pady=(3, 0))
         ttk.Label(
             mode_bar,
-            text=("滚动历史结果"
+            text=("严格区间历史结果"
                   + (f"  ·  {source_label}" if source_label else "")),
             style="SurfaceMuted.TLabel",
         ).pack(side="left")
@@ -5960,7 +6243,7 @@ class BacktestApp(tk.Tk):
         self._history_ranking = ranking
         self._history_lookbacks = BacktestApp._normalize_history_lookbacks(
             history_lookbacks)
-        # 原始逐样本结果含完整 bar 级价格、Greeks 与 PnL 数组；历史分钟数据下
+        # 原始逐代理段结果含完整 bar 级价格、Greeks 与 PnL 数组；历史分钟数据下
         # 深拷贝并长期保留会占用大量内存。图表只保存压缩后的独立日级摘要，
         # worker 投递的原始结果在本次渲染结束后即可释放。
         self._history_window_summary = history_window_summary(
@@ -5989,39 +6272,60 @@ class BacktestApp(tk.Tk):
             strategy: chart_markers[index % len(chart_markers)]
             for index, strategy in enumerate(candidate_names)
         }
-        uses_window_equal_metric = bool(
+        uses_strict_metric = bool(
             ranking is not None
             and not getattr(ranking, "empty", True)
             and "selection_metric" in ranking
+            and "selection_improvement_vs_c2c" in ranking
+            and ranking["selection_metric"].fillna("").astype(str).eq(
+                STRICT_LOOKBACK_SELECTION_METRIC).all())
+        uses_product_pool = bool(
+            ranking is not None
+            and not getattr(ranking, "empty", True)
+            and "history_mode" in ranking
+            and ranking["history_mode"].fillna("").astype(str).eq(
+                "product_contract_pool").any())
+        self._history_uses_strict_metric = uses_strict_metric
+        self._history_uses_window_equal_metric = bool(
+            ranking is not None
+            and not getattr(ranking, "empty", True)
+            and "selection_metric" in ranking
+            and "selection_improvement_vs_c2c" in ranking
             and ranking["selection_metric"].fillna("").astype(str).eq(
                 HISTORY_SELECTION_METRIC).all())
-        self._history_uses_window_equal_metric = uses_window_equal_metric
         selected_periods = [
             (key, label) for key, label in HISTORY_PERIOD_DEFS
             if key in self._history_lookbacks
         ]
         period_names = " / ".join(label for _key, label in selected_periods)
-        endpoint_text = "、".join(
-            f"{label} {HISTORY_TARGET_ENDPOINTS[key]}"
-            for key, label in selected_periods)
-        metric_explanation = (
-            "排名按逐样本有界 C2C 优势的均值，每个历史样本等权；"
-            if uses_window_equal_metric else
-            "该结果使用旧版汇总 RMS 择优口径，建议重新运行以获得样本等权排名；"
-        )
+        if uses_strict_metric:
+            scope_explanation = (
+                f"本次所选严格连续区间：{period_names}。每档都从共同分析"
+                "截止日向前回放最近 L 日；期权期限 T 只决定代理合约每段"
+                "最长存续期，L>T 时自动续接代理段，最后不足 T 的尾段按"
+                "剩余期限公允价值 MTM。realized σ 候选另要求区间前完整"
+                " V 日 HV 预热；排名只使用同一严格区间内与 C2C 成功配对"
+                "的证据日；")
+            if uses_product_pool:
+                scope_explanation += (
+                    "品种池主指标为各非重叠代理段的有界 C2C RMS 改善按"
+                    "实际评分日数加权，汇总金额 RMS 只作诊断；")
+            else:
+                scope_explanation += (
+                    "主指标为完整 L 日合并日净 PnL RMS 的有界 C2C 改善；")
+        else:
+            scope_explanation = (
+                f"本次所选周期：{period_names}。该结果来自升级前的历史终点"
+                "抽样口径，不能解释为严格连续最近 L 日；建议重新运行以生成"
+                "新版严格区间排名；")
         parent.columnconfigure(0, weight=1)
         parent.rowconfigure(2, weight=1)
         parent.rowconfigure(3, weight=2)
         ttk.Label(
             parent,
-            text=(f"期权期限 T 固定每个样本的完整生命周期；"
-                  f"本次所选周期：{period_names}。这些周期只限定样本终点的"
-                  "观察区间，不会改写 T。计划样本终点数："
-                  f"{endpoint_text}；"
-                  "realized σ 候选另要求 Day 0 前完整 V 日 HV 预热；"
+            text=(scope_explanation +
                   "短周期更贴近当前，长周期覆盖更多市场阶段、更稳健但反应更慢。"
-                  f"{metric_explanation}"
-                  "重叠样本仅作历史描述参考，不代表独立证据或未来表现。"),
+                  "各周期结论仅作历史参考，不代表未来表现。"),
             style="SurfaceMuted.TLabel",
         ).grid(row=0, column=0, sticky="w", padx=6, pady=(7, 3))
 
@@ -6031,15 +6335,21 @@ class BacktestApp(tk.Tk):
             "period", "strategy", "score", "baseline", "improvement",
             "win_rate", "windows", "status",
         )
+        metric_labels = BacktestApp._history_metric_labels(
+            uses_strict_metric=uses_strict_metric,
+            uses_product_pool=uses_product_pool,
+        )
         headings = {
             "period": "分析周期", "strategy": "历史最优参考",
-            "score": "汇总RMS↓", "baseline": "C2C汇总RMS",
-            "improvement": "择优优势", "win_rate": "样本等权胜率",
-            "windows": "配对样本/C2C", "status": "历史资格",
+            "score": metric_labels["score"],
+            "baseline": metric_labels["baseline"],
+            "improvement": metric_labels["improvement"],
+            "win_rate": "代理段胜率",
+            "windows": "配对代理段/C2C", "status": "历史资格",
         }
         widths = {
-            "period": 58, "strategy": 170, "score": 70,
-            "baseline": 82, "improvement": 92, "win_rate": 84,
+            "period": 58, "strategy": 170, "score": 98,
+            "baseline": 98, "improvement": 88, "win_rate": 84,
             "windows": 100, "status": 105,
         }
         tree = ttk.Treeview(
@@ -6088,7 +6398,7 @@ class BacktestApp(tk.Tk):
 
         chart_box = ttk.LabelFrame(
             parent,
-            text=(" 多策略共同样本 PnL 图表（C2C 固定；"
+            text=(" 多策略共同代理段 PnL 图表（C2C 固定；"
                   f"候选最多 {MAX_HISTORY_CHART_CANDIDATES} 项） "),
             padding=5,
         )
@@ -6099,7 +6409,7 @@ class BacktestApp(tk.Tk):
             controls, text="模式:", style="SurfaceMuted.TLabel",
         ).pack(side="left")
         self._history_chart_mode_var = tk.StringVar(
-            value=HISTORY_CHART_MODE_DISPLAY["typical"])
+            value=HISTORY_CHART_MODE_DISPLAY["full"])
         self._history_chart_mode_combo = ttk.Combobox(
             controls, textvariable=self._history_chart_mode_var,
             values=tuple(HISTORY_CHART_MODE_DISPLAY.values()),
@@ -6124,7 +6434,7 @@ class BacktestApp(tk.Tk):
             "<<ComboboxSelected>>", self._update_history_chart_controls)
 
         ttk.Label(
-            controls, text="样本终点:", style="SurfaceMuted.TLabel",
+            controls, text="代理段:", style="SurfaceMuted.TLabel",
         ).pack(side="left")
         self._history_chart_window_var = tk.StringVar(value="")
         self._history_chart_window_combo = ttk.Combobox(
@@ -6187,15 +6497,16 @@ class BacktestApp(tk.Tk):
         )
         rank_headings = {
             "shown": "图表", "rank": "#", "strategy": "策略 / 参数",
-            "score": "汇总RMS↓",
-            "baseline": "C2C汇总RMS", "improvement": "择优优势",
-            "win_rate": "样本等权胜率", "windows": "配对样本/C2C",
+            "score": metric_labels["score"],
+            "baseline": metric_labels["baseline"],
+            "improvement": metric_labels["improvement"],
+            "win_rate": "代理段胜率", "windows": "配对代理段/C2C",
             "status": "比较资格",
         }
         rank_widths = {
-            "shown": 48, "rank": 34, "strategy": 175, "score": 72,
-            "baseline": 72,
-            "improvement": 92, "win_rate": 84, "windows": 100,
+            "shown": 48, "rank": 34, "strategy": 175, "score": 98,
+            "baseline": 98,
+            "improvement": 88, "win_rate": 84, "windows": 100,
             "status": 92,
         }
         rank_tree = ttk.Treeview(
@@ -6228,8 +6539,8 @@ class BacktestApp(tk.Tk):
             row=3, column=0, columnspan=2, sticky="ew", pady=(5, 0))
         ttk.Label(
             result_actions,
-            text=("历史参考只说明同终点配对样本相对 C2C 的结果；"
-                  "结果适用 T 见上方，若当前期限已修改，路径验证会按当前 T 运行。"),
+            text=("历史参考只说明同一严格区间内代理段相对 C2C 的结果；"
+                  "若当前期限已修改，路径验证会按当前 T 重新运行。"),
             style="SurfaceMuted.TLabel",
         ).pack(side="left", fill="x", expand=True)
         ttk.Button(
@@ -6278,7 +6589,7 @@ class BacktestApp(tk.Tk):
             candidates[0] if candidates else None)
 
     def _history_top_chart_candidates(self, limit=2):
-        """选择排名靠前且能保持共同样本交集的候选。"""
+        """选择排名靠前且能保持共同代理段交集的候选。"""
         lookback, _row = self._history_chart_selection()
         if not lookback:
             return []
@@ -6289,7 +6600,7 @@ class BacktestApp(tk.Tk):
         mode_var = getattr(self, "_history_chart_mode_var", None)
         metric_var = getattr(self, "_history_chart_metric_var", None)
         mode = HISTORY_CHART_MODE_FROM_DISPLAY.get(
-            mode_var.get() if mode_var is not None else "", "typical")
+            mode_var.get() if mode_var is not None else "", "full")
         metric = HISTORY_CHART_METRIC_FROM_DISPLAY.get(
             metric_var.get() if metric_var is not None else "", "net")
         selected = []
@@ -6366,7 +6677,8 @@ class BacktestApp(tk.Tk):
             getattr(self, "_history_window_summary", None),
             lookback, strategy)
         if pairs.empty:
-            self._set_status(f"『{strategy}』没有可与 C2C 严格配对的图表样本。")
+            self._set_status(
+                f"『{strategy}』没有可与 C2C 严格配对的图表代理段。")
             self._update_history_rank_selection()
             return
         states = getattr(self, "_history_chart_selected_by_period", None)
@@ -6385,7 +6697,7 @@ class BacktestApp(tk.Tk):
         else:
             current_candidates = self._history_chart_candidates(lookback)
             mode = HISTORY_CHART_MODE_FROM_DISPLAY.get(
-                self._history_chart_mode_var.get(), "typical")
+                self._history_chart_mode_var.get(), "full")
             metric = HISTORY_CHART_METRIC_FROM_DISPLAY.get(
                 self._history_chart_metric_var.get(), "net")
             preview = BacktestApp._history_multi_chart_model(
@@ -6394,7 +6706,7 @@ class BacktestApp(tk.Tk):
                 mode=mode, metric=metric,
             )
             if preview.get("state") != "ok":
-                reason = preview.get("message", "没有共同的严格配对样本")
+                reason = preview.get("message", "没有共同的严格配对代理段")
                 self._set_status(f"无法加入『{strategy}』：{reason}")
                 self._update_history_rank_selection()
                 return
@@ -6432,11 +6744,11 @@ class BacktestApp(tk.Tk):
         return period.get("lookback"), self._selected_history_rank_row()
 
     def _update_history_chart_controls(self, _event=None):
-        """按当前周期及图表候选刷新共同样本和控件可用性。"""
+        """按当前周期及图表候选刷新共同代理段和控件可用性。"""
         mode_display = self._history_chart_mode_var.get()
         # 旧热更新控件可能仍残留已删除的“逐窗优势”显示值；统一降级到
-        # 多样本中位路径，不再把旧模式暴露给用户。
-        mode = HISTORY_CHART_MODE_FROM_DISPLAY.get(mode_display, "typical")
+        # 与严格区间排名证据一致的完整 L 日累计路径。
+        mode = HISTORY_CHART_MODE_FROM_DISPLAY.get(mode_display, "full")
         metric = HISTORY_CHART_METRIC_FROM_DISPLAY.get(
             self._history_chart_metric_var.get(), "net")
         lookback, _row = self._history_chart_selection()
@@ -6482,13 +6794,6 @@ class BacktestApp(tk.Tk):
                     "基准" if is_baseline else
                     self._format_comparison_value(
                         improvement, 1, signed=True, percent=True))
-                aggregate_improvement = self._comparison_finite(
-                    row.get("improvement_vs_c2c"))
-                aggregate_text = (
-                    "基准" if is_baseline else
-                    self._format_comparison_value(
-                        aggregate_improvement, 1,
-                        signed=True, percent=True))
                 win_rate_text = (
                     "基准" if is_baseline else
                     self._format_comparison_value(
@@ -6498,27 +6803,37 @@ class BacktestApp(tk.Tk):
                     row.get("paired_windows", row.get("rolling_windows")), 0)
                 baseline_windows = self._comparison_safe_int(
                     row.get("baseline_windows", paired), paired)
-                uses_window_equal = (
-                    BacktestApp._history_row_uses_window_equal_metric(row))
+                uses_strict_metric = (
+                    BacktestApp._history_row_uses_strict_metric(row))
+                uses_product_pool = (
+                    row.get("history_mode") == "product_contract_pool")
+                rms_label = (
+                    "汇总RMS(诊断)" if uses_product_pool
+                    else "区间RMS" if uses_strict_metric
+                    else "汇总RMS")
                 selected_detail = (
-                    f"所选={strategy} · 汇总RMS={score_text}/C2C {baseline_text}")
-                if uses_window_equal:
+                    f"所选={strategy} · {rms_label}="
+                    f"{score_text}/C2C {baseline_text}")
+                if uses_strict_metric:
+                    improvement_label = (
+                        "较C2C改善(逐段按实际天数加权)"
+                        if uses_product_pool
+                        else "较C2C改善(完整L日合并RMS)")
                     selected_detail += (
-                        f" · 逐样本平均优势={improvement_text}"
-                        f" · 样本等权胜率={win_rate_text}"
-                        f" · 汇总RMS改善={aggregate_text}")
+                        f" · {improvement_label}={improvement_text}"
+                        f" · 代理段胜率={win_rate_text}")
                 else:
                     selected_detail += (
-                        f" · 旧口径汇总RMS改善={improvement_text}"
-                        " · 建议重新运行获取样本等权排名")
+                        f" · 旧结果RMS改善={improvement_text}"
+                        " · 建议重新运行获取严格区间排名")
                 selected_detail += (
-                    f" · 配对样本={paired}/C2C {baseline_windows}")
+                    f" · 配对代理段={paired}/C2C {baseline_windows}")
                 if row.get("history_mode") == "product_contract_pool":
                     code_text = BacktestApp._history_contract_codes_text(
                         row.get("paired_contract_codes", ()))
                     if code_text:
                         selected_detail += f" · 所选参与合约={code_text}"
-                    elif not uses_window_equal:
+                    elif not uses_strict_metric:
                         selected_detail += " · 所选参与合约=旧结果未记录"
                 failure_reason = str(
                     row.get("failure_reason") or "").strip()
@@ -6531,7 +6846,7 @@ class BacktestApp(tk.Tk):
         self._update_history_chart_controls()
 
     def _draw_history_chart(self, _event=None):
-        """绘制固定 C2C 加多个已勾选候选的严格配对样本图表。"""
+        """绘制固定 C2C 加多个已勾选候选的严格配对代理段图表。"""
         ax = getattr(self, "_history_chart_ax", None)
         canvas = getattr(self, "_history_chart_canvas", None)
         if ax is None or canvas is None:
@@ -6541,7 +6856,7 @@ class BacktestApp(tk.Tk):
         candidates = self._history_chart_candidates(lookback)
         primary_strategy = self._history_chart_primary_candidate(candidates)
         mode = HISTORY_CHART_MODE_FROM_DISPLAY.get(
-            self._history_chart_mode_var.get(), "typical")
+            self._history_chart_mode_var.get(), "full")
         metric = HISTORY_CHART_METRIC_FROM_DISPLAY.get(
             self._history_chart_metric_var.get(), "net")
         window_label = self._history_chart_window_var.get()
@@ -6555,7 +6870,7 @@ class BacktestApp(tk.Tk):
         )
 
         if model.get("state") != "ok":
-            message = model.get("message", "暂无可绘制的配对样本。")
+            message = model.get("message", "暂无可绘制的配对代理段。")
             ax.text(
                 0.5, 0.5, message, ha="center", va="center",
                 transform=ax.transAxes, color=PALETTE["text_muted"],
@@ -6583,9 +6898,9 @@ class BacktestApp(tk.Tk):
         common_count = self._comparison_safe_int(
             model.get("common_window_count"), 0)
         scope_note = (
-            "；共同样本少于个别策略的独立配对样本，与排名表口径不同"
+            "；共同代理段少于个别策略的独立配对代理段，与排名表口径不同"
             if model.get("sample_scope_differs") else "")
-        if mode == "single":
+        if mode in {"full", "single"}:
             candidate_index = 0
             for series in model["series"]:
                 baseline = series["role"] == "baseline"
@@ -6607,12 +6922,39 @@ class BacktestApp(tk.Tk):
                     markevery=(None if baseline else max(1, len(y_values) // 9)),
                     alpha=1.0 if baseline or emphasized else 0.86,
                 )
-            ax.set_xlabel("生命周期日", fontsize=8)
+            ax.set_xlabel(
+                "严格区间交易日" if mode == "full" else "代理段内交易日",
+                fontsize=8)
             ax.set_ylabel(model["metric_label"], fontsize=8)
-            self._history_chart_hint_var.set(
-                f"共同样本 {common_count} 个 · 当前={window_label or '—'} · "
-                f"C2C + {len(candidates)} 个候选；"
-                f"净PnL = 成本前PnL - 成本{scope_note}")
+            if mode == "full":
+                for boundary in model.get("segment_boundaries", ()):
+                    ax.axvline(
+                        float(boundary) + 0.5,
+                        color=PALETTE["text_muted"], linestyle=":",
+                        linewidth=0.7, alpha=0.55)
+                common_days = self._comparison_safe_int(
+                    model.get("common_day_count"), 0)
+                expected_days = self._comparison_safe_int(
+                    model.get("expected_day_count"), common_days)
+                completeness = (
+                    "完整" if model.get("complete_evidence")
+                    else "部分共同交集")
+                self._history_chart_hint_var.set(
+                    f"共同代理段 {common_count} 个 · {completeness} "
+                    f"{common_days}/{expected_days} 日 · "
+                    f"C2C + {len(candidates)} 个候选；"
+                    f"失败段不补零{scope_note}")
+                if model.get("uses_normalized_notional"):
+                    self._history_chart_hint_var.set(
+                        self._history_chart_hint_var.get()
+                        + "；跨合约按各段 "
+                        "PnL/(S0×乘数×|数量|) 安全归一化后拼接")
+            else:
+                self._history_chart_hint_var.set(
+                    f"共同代理段 {common_count} 个 · "
+                    f"当前={window_label or '—'} · "
+                    f"C2C + {len(candidates)} 个候选；"
+                    f"净PnL = 成本前PnL - 成本{scope_note}")
         elif mode == "typical":
             candidate_index = 0
             for band in model["bands"]:
@@ -6642,18 +6984,20 @@ class BacktestApp(tk.Tk):
                         1, len(band["median"]) // 9)),
                     alpha=1.0 if baseline or emphasized else 0.86,
                 )
-            ax.set_xlabel("生命周期日", fontsize=8)
+            ax.set_xlabel("代理段内交易日", fontsize=8)
             ax.set_ylabel(model["metric_label"], fontsize=8)
             interval_text = (
                 "阴影仅显示 C2C 与主候选的 P25/P75（非置信区间）"
-                if common_count >= 2 else "仅1个共同样本，不绘制区间带")
+                if common_count >= 2 else "仅1个共同代理段，不绘制区间带")
             self._history_chart_hint_var.set(
-                f"共同样本 {common_count} 个 · C2C + {len(candidates)} 个候选；"
+                f"共同代理段 {common_count} 个 · "
+                f"C2C + {len(candidates)} 个候选；"
                 f"{interval_text}；提前结算后累计值保持不变{scope_note}")
             if model.get("uses_normalized_notional"):
                 self._history_chart_hint_var.set(
                     self._history_chart_hint_var.get()
-                    + "；品种池多样本路径按 PnL/(S0×乘数×|数量|) 归一化")
+                    + "；品种池多代理段路径按 "
+                    "PnL/(S0×乘数×|数量|) 归一化")
 
         ax.axhline(
             0.0, color=PALETTE["text_muted"],
@@ -6765,67 +7109,52 @@ class BacktestApp(tk.Tk):
             rank_tree.focus(rank_children[0])
 
         maturity = period_item.get("maturity_days")
-        step = period_item.get("step_days")
         extra = []
         maturity_value = self._comparison_finite(maturity)
-        step_value = self._comparison_finite(step)
         if maturity_value is not None:
             extra.append(
-                f"固定T={self._comparison_safe_int(maturity_value)}日")
+                f"代理期限T={self._comparison_safe_int(maturity_value)}日")
         warmup_days = self._comparison_safe_int(
             period_item.get("realized_sigma_warmup_days"), 0)
         if warmup_days:
             extra.append(f"HV预热V={warmup_days}日")
-        if period_item.get("requested", 0):
+        evidence_days = self._comparison_safe_int(
+            period_item.get("evidence_days"), 0)
+        if evidence_days:
+            extra.append(f"目标L={evidence_days}日")
+        elif period_item.get("requested", 0):
+            extra.append(f"目标观察期={period_item.get('requested', 0)}日")
+        days_used = self._comparison_safe_int(
+            period_item.get("days_used"), 0)
+        if evidence_days or period_item.get("requested", 0) or days_used:
+            extra.append(f"实际评分={days_used}日")
+        segment_count = period_item.get("segment_count")
+        if segment_count is not None:
+            segment_count = self._comparison_safe_int(segment_count, 0)
+            expiry_segments = self._comparison_safe_int(
+                period_item.get("expiry_segments"), 0)
+            mtm_segments = self._comparison_safe_int(
+                period_item.get("mtm_segments"), 0)
+            segment_text = f"代理段数={segment_count}"
+            if expiry_segments or mtm_segments:
+                segment_text += (
+                    f"（到期{expiry_segments} / MTM {mtm_segments}）")
+            extra.append(segment_text)
+        terminal_labels = {
+            "expiry": "到期结算",
+            "mark_to_market": "尾段MTM",
+            "mixed": "到期+尾段MTM",
+        }
+        terminal_mode = str(period_item.get("terminal_mode") or "")
+        if terminal_mode:
             extra.append(
-                f"分析周期L={period_item.get('requested', 0)}日")
-
-        sampling_mode = str(period_item.get("sampling_mode", "fixed_step"))
-        if sampling_mode == "target_count":
-            target = self._comparison_safe_int(
-                period_item.get("target_endpoints"), 0)
-            planned = self._comparison_safe_int(
-                period_item.get("planned_endpoints"), 0)
-            selected = self._comparison_safe_int(
-                period_item.get("selected_endpoints"), 0)
-            eligible = self._comparison_safe_int(
-                period_item.get("eligible"), 0)
-            sample_text = f"计划/可回测样本={planned}/{eligible}"
-            if selected and selected != eligible:
-                sample_text += f"（已选{selected}）"
-            if target:
-                sample_text += f"，上限{target}"
-            warmup_eligible = self._comparison_safe_int(
-                period_item.get("warmup_eligible_endpoints"), 0)
-            if warmup_days and warmup_eligible != eligible:
-                sample_text += f"，HV预热可用{warmup_eligible}"
-            extra.append(sample_text)
-        elif step_value is not None:
-            extra.append(
-                f"样本截止日步长={self._comparison_safe_int(step_value)}日")
-
-        spacing_min = self._comparison_finite(
-            period_item.get("endpoint_spacing_min"))
-        spacing_max = self._comparison_finite(
-            period_item.get("endpoint_spacing_max"))
-        if spacing_min is not None and spacing_max is not None:
-            low = self._comparison_safe_int(spacing_min)
-            high = self._comparison_safe_int(spacing_max)
-            extra.append(
-                f"样本截止日间隔={low}日" if low == high
-                else f"样本截止日间隔={low}–{high}日")
-
-        overlap_min = self._comparison_finite(
-            period_item.get("window_overlap_min_ratio"))
-        overlap_max = self._comparison_finite(
-            period_item.get("window_overlap_max_ratio"))
-        if (overlap_min is not None and overlap_max is not None
-                and overlap_max > 0):
-            low = max(0, int(round(overlap_min * 100)))
-            high = max(0, int(round(overlap_max * 100)))
-            extra.append(
-                f"相邻样本重叠≈{low}%" if low == high
-                else f"相邻样本重叠≈{low}%–{high}%")
+                "终止口径=" + terminal_labels.get(
+                    terminal_mode, terminal_mode))
+        sampling_mode = str(period_item.get("sampling_mode", ""))
+        if not period_item.get("uses_strict_metric", False):
+            extra.append("旧版终点采样口径（建议重新运行）")
+        elif sampling_mode and sampling_mode != "strict_contiguous":
+            extra.append("采样元数据与严格区间口径不一致")
 
         required = self._comparison_safe_int(
             period_item.get("required_history_days"), 0)
@@ -6837,8 +7166,6 @@ class BacktestApp(tk.Tk):
             extra.append(
                 f"历史覆盖={period_item.get('available', 0)}/"
                 f"{period_item.get('requested', 0)} 日")
-        if period_item.get("maturity_exceeds_lookback", False):
-            extra.append("T>L（正常：周期仅限定样本截止日范围）")
         if period_item.get("history_mode") == "product_contract_pool":
             effective_date = period_item.get("effective_asof_date")
             effective_date_text = (
@@ -6861,9 +7188,9 @@ class BacktestApp(tk.Tk):
             if mapping_dropped:
                 extra.append(f"回退盘中主力映射={mapping_dropped}日")
         extra.append(
-            f"成功配对样本={period_item.get('effective', 0)} · "
-            f"可回测样本={period_item.get('eligible', 0)} · "
-            f"失败样本={period_item.get('skipped', 0)}")
+            f"成功配对代理段={period_item.get('effective', 0)} · "
+            f"可回放代理段={period_item.get('eligible', 0)} · "
+            f"失败代理段={period_item.get('skipped', 0)}")
         relative_value = period_item.get("relative_comparison_windows")
         relative_windows = (
             self._comparison_safe_int(relative_value, 0)
@@ -6871,7 +7198,7 @@ class BacktestApp(tk.Tk):
         if (relative_windows is not None and period_item.get("effective", 0)
                 and relative_windows != period_item.get("effective", 0)):
             extra.append(
-                f"可评分样本={relative_windows}/"
+                f"可评分代理段={relative_windows}/"
                 f"{period_item.get('effective', 0)}")
         if period_item.get("trailing_dropped", 0):
             extra.append(
@@ -6999,8 +7326,16 @@ class BacktestApp(tk.Tk):
         if not row:
             messagebox.showinfo("请选择策略", "请先在周期排名表中选择一条策略。")
             return False
+        position_var = getattr(self, "_pos_var", None)
+        launch_position = (
+            BacktestApp._normalize_position(position_var.get())
+            if position_var is not None else None)
         try:
             self._apply_history_recommendation(row, navigate=False)
+            # 历史行只携带策略参数；当前路径验证始终沿用点击启动时的
+            # 左侧方向，不能被历史任务快照或未来新增回填字段覆盖。
+            if position_var is not None:
+                position_var.set(launch_position)
         except Exception as exc:
             messagebox.showerror("无法应用历史策略", str(exc))
             return False
@@ -7022,6 +7357,13 @@ class BacktestApp(tk.Tk):
         self._show_dist_chart(multi_stats)
         self._show_table(bt)
         self._nb.select(0)
+
+    @staticmethod
+    def _result_greek_series(result, greek_name):
+        """优先返回已按经济头寸签名的 Greek，兼容旧回测原始字段。"""
+        portfolio_key = f"portfolio_{greek_name}"
+        key = portfolio_key if portfolio_key in result else greek_name
+        return np.asarray(result[key], dtype=float)
 
     def _show_summary(self, bt, multi_stats=None):
         self._hide_placeholder("summary")
@@ -7215,7 +7557,7 @@ class BacktestApp(tk.Tk):
         _section("【Greeks 统计】")
         _ins(f"  {'':15s}  {'初始值':>10s}  {'均值':>10s}  {'最大|值|':>10s}\n", "label")
         for gn in ("delta", "gamma", "vega", "theta", "rho"):
-            gv = r[gn]
+            gv = BacktestApp._result_greek_series(r, gn)
             _ins(f"  {gn.capitalize():15s}  {gv[0]:>10.4f}  {np.mean(gv):>10.4f}  {np.max(np.abs(gv)):>10.4f}\n")
         _sep()
 
@@ -7331,7 +7673,9 @@ class BacktestApp(tk.Tk):
 
         # (3) Gamma
         ax3 = fig.add_subplot(3, 2, 3)
-        ax3.plot(days, r['gamma'], 'm-', linewidth=1.2)
+        ax3.plot(
+            days, BacktestApp._result_greek_series(r, "gamma"),
+            'm-', linewidth=1.2)
         ax3.axhline(y=0, color='gray', linestyle='--', alpha=0.4)
         ax3.set_title('Gamma', fontsize=10)
         ax3.set_xlabel(x_label, fontsize=8)
@@ -7341,7 +7685,9 @@ class BacktestApp(tk.Tk):
 
         # (4) Vega
         ax4 = fig.add_subplot(3, 2, 4)
-        ax4.plot(days, r['vega'], 'c-', linewidth=1.2)
+        ax4.plot(
+            days, BacktestApp._result_greek_series(r, "vega"),
+            'c-', linewidth=1.2)
         ax4.axhline(y=0, color='gray', linestyle='--', alpha=0.4)
         ax4.set_title('Vega', fontsize=10)
         ax4.set_xlabel(x_label, fontsize=8)
@@ -7351,7 +7697,9 @@ class BacktestApp(tk.Tk):
 
         # (5) Theta
         ax5 = fig.add_subplot(3, 2, 5)
-        ax5.plot(days, r['theta'], color='orange', linewidth=1.2)
+        ax5.plot(
+            days, BacktestApp._result_greek_series(r, "theta"),
+            color='orange', linewidth=1.2)
         ax5.axhline(y=0, color='gray', linestyle='--', alpha=0.4)
         ax5.set_title('Theta', fontsize=10)
         ax5.set_xlabel(x_label, fontsize=8)
@@ -7595,6 +7943,73 @@ class BacktestApp(tk.Tk):
         self._dist_figure = fig
         self._dist_canvas = canvas
 
+    @staticmethod
+    def _hedge_trigger_detail_frame(bt):
+        """返回只含对冲触发事件的明细及其原始 Bar 位置。"""
+        df = bt.to_dataframe()
+        result = getattr(bt, "_results", None)
+        if not isinstance(result, Mapping) or "hedge_triggered" not in result:
+            raise ValueError("回测结果缺少 hedge_triggered，无法生成对冲触发明细。")
+
+        triggered = np.asarray(result["hedge_triggered"], dtype=bool)
+        if triggered.ndim != 1 or len(triggered) != len(df):
+            raise ValueError(
+                "回测触发标记与每日明细长度不一致："
+                f"hedge_triggered={triggered.size}, 明细={len(df)}。")
+
+        optional_masks = {}
+        for key in ("strategy_hedge_triggered",
+                    "day_close_fallback_triggered"):
+            values = result.get(key)
+            if values is None:
+                optional_masks[key] = np.zeros(len(df), dtype=bool)
+                continue
+            mask = np.asarray(values, dtype=bool)
+            if mask.ndim != 1 or len(mask) != len(df):
+                raise ValueError(
+                    f"回测触发来源 {key} 与每日明细长度不一致："
+                    f"{mask.size} != {len(df)}。")
+            optional_masks[key] = mask
+
+        source_positions = np.flatnonzero(triggered)
+        detail = df.iloc[source_positions].copy()
+        strategy_mask = optional_masks["strategy_hedge_triggered"]
+        fallback_mask = optional_masks["day_close_fallback_triggered"]
+        last_position = len(df) - 1
+        knocked_out = bool(result.get("knocked_out", False))
+
+        sources = []
+        for position in source_positions:
+            if position == 0:
+                source = "初始建仓"
+            elif position == last_position:
+                if knocked_out:
+                    source = "敲出平仓"
+                elif result.get("terminal_mode") == "mark_to_market":
+                    source = "评价期末平仓"
+                else:
+                    source = "到期平仓"
+            elif strategy_mask[position]:
+                source = "策略触发"
+            elif fallback_mask[position]:
+                source = "收盘兜底"
+            else:
+                source = "引擎触发"
+            sources.append(source)
+        detail.insert(0, "触发来源", sources)
+        return detail, source_positions
+
+    @staticmethod
+    def _format_detail_index(value, *, include_time=False):
+        """格式化表格索引；日内触发必须保留时分。"""
+        if hasattr(value, "strftime"):
+            pattern = "%Y-%m-%d %H:%M" if include_time else "%Y-%m-%d"
+            try:
+                return value.strftime(pattern)
+            except (TypeError, ValueError):
+                pass
+        return str(value)
+
     def _show_table(self, bt):
         self._hide_placeholder("table")
         # table 没有单独 container；占位符是 tab 的直接子控件。保留其
@@ -7602,7 +8017,17 @@ class BacktestApp(tk.Tk):
         self._clear_tab_content_preserving_placeholder(
             "table", self._table_tab)
 
-        df = bt.to_dataframe()
+        df, source_positions = self._hedge_trigger_detail_frame(bt)
+        result = getattr(bt, "_results", {}) or {}
+        total_rows = len(np.asarray(result["hedge_triggered"]))
+        is_intraday = (
+            int(result.get("steps_per_day", 1) or 1) > 1
+            or any(
+                any(getattr(value, field, 0) != 0
+                    for field in ("hour", "minute", "second"))
+                for value in df.index
+            )
+        )
 
         # 顶部工具栏 (导出 + 行数提示 + 统计信息)
         toolbar = ttk.Frame(self._table_tab, style="Surface.TFrame")
@@ -7614,9 +8039,15 @@ class BacktestApp(tk.Tk):
                  font=(_UI_FONT_FAMILY, 14),
                  bg=PALETTE["surface"]).pack(side="left", padx=(0, 6))
         tk.Label(info_frame,
-                 text=f"共 {len(df)} 行 × {len(df.columns)} 列",
+                 text=(f"共 {len(df)} 条对冲触发记录"
+                       f"（原始 {total_rows} {'个 Bar' if is_intraday else '行'}）"),
                  font=(_UI_FONT_FAMILY, 10, "bold"),
                  bg=PALETTE["surface"], fg=PALETTE["text"]).pack(side="left")
+        tk.Label(info_frame,
+                 text="  ·  盈亏字段为触发 Bar 当期值",
+                 font=(_UI_FONT_FAMILY, 9),
+                 bg=PALETTE["surface"],
+                 fg=PALETTE["text_muted"]).pack(side="left")
 
         ttk.Button(toolbar, text="💾 导出 CSV", style="Accent.TButton",
                    command=lambda: self._export_csv(df)).pack(side="right")
@@ -7636,23 +8067,31 @@ class BacktestApp(tk.Tk):
         xscroll.config(command=tree.xview)
         yscroll.config(command=tree.yview)
 
-        tree.heading("day_no", text="交易日")
+        tree.heading("day_no", text="原始 Bar" if is_intraday else "交易日")
         tree.column("day_no", width=60, anchor="center")
         tree.heading("idx", text=df.index.name or "日期")
-        tree.column("idx", width=96, anchor="center")
+        tree.column("idx", width=142 if is_intraday else 96, anchor="center")
         for col in columns:
             tree.heading(col, text=col)
-            tree.column(col, width=92, anchor="e")
+            tree.column(
+                col,
+                width=92,
+                anchor="center" if col == "触发来源" else "e",
+            )
 
         # 斑马行
         tree.tag_configure("odd",  background=PALETTE["surface"])
         tree.tag_configure("even", background=PALETTE["surface_alt"])
 
-        for i, (idx, row) in enumerate(df.iterrows()):
-            idx_str = str(idx)[:10] if hasattr(idx, 'strftime') else str(idx)
-            values = [i, idx_str] + [f"{v:.4f}" if isinstance(v, float) else str(v)
-                                     for v in row.values]
-            tag = "even" if i % 2 == 0 else "odd"
+        for display_i, ((idx, row), source_position) in enumerate(
+                zip(df.iterrows(), source_positions)):
+            idx_str = self._format_detail_index(
+                idx, include_time=is_intraday)
+            values = [int(source_position), idx_str] + [
+                f"{v:.4f}" if isinstance(v, (float, np.floating)) else str(v)
+                for v in row.values
+            ]
+            tag = "even" if display_i % 2 == 0 else "odd"
             tree.insert("", "end", values=values, tags=(tag,))
 
         tree.grid(row=0, column=0, sticky="nsew")

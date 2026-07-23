@@ -156,6 +156,32 @@ def run_rolling_backtest(
             contract_multiplier=contract_multiplier,
         )
     )
+    # 方向只能由 position 表达。滚动驱动器会在循环内捕获单窗异常，
+    # 因此必须在进入循环前校验，避免非法方向被静默吞掉后返回空结果。
+    position = hk_base.get("position", 1)
+    if isinstance(position, (bool, np.bool_)):
+        raise ValueError("hedge_kwargs['position'] 只允许 1（short）或 -1（long）")
+    try:
+        position_value = float(position)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(
+            "hedge_kwargs['position'] 只允许 1（short）或 -1（long）"
+        ) from exc
+    if (not np.isfinite(position_value)
+            or position_value not in (-1.0, 1.0)):
+        raise ValueError(
+            "hedge_kwargs['position'] 只允许 1（short）或 -1（long）")
+    position = int(position_value)
+    hk_base["position"] = position
+
+    quantity = hk_base.get("quantity", 1.0)
+    try:
+        quantity = float(quantity)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError("hedge_kwargs['quantity'] 必须为有限正数") from exc
+    if not np.isfinite(quantity) or quantity <= 0:
+        raise ValueError("hedge_kwargs['quantity'] 必须为有限正数")
+    hk_base["quantity"] = quantity
 
     cfg_s0 = float(option_cfg["s0"])  # S_ref，仅用于按比例缩放期权要素
     dt = 1.0 / ANNUAL_DAYS
@@ -245,6 +271,8 @@ def run_rolling_backtest(
             rows.append(
                 {
                     "start_date": log_ret.index[t0],
+                    "position": position,
+                    "position_label": "short" if position == 1 else "long",
                     "sigma_pre": sigma_pre,
                     "real_s0": real_s0,
                     "rescale_ratio": float(rescale_info["ratio"]),
@@ -270,4 +298,7 @@ def run_rolling_backtest(
     # 注意：每一轮的 ratio 单独存在 'rescale_ratio' 列中。
     df.attrs["first_rescale_info"] = first_rescale_info
     df.attrs["s_ref"] = cfg_s0
+    df.attrs["position"] = position
+    df.attrs["position_label"] = "short" if position == 1 else "long"
+    df.attrs["quantity"] = quantity
     return df

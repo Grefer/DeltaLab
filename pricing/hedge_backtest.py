@@ -913,7 +913,7 @@ def _run_single_path(args):
     """
     (option_init, price_path, hedge_freq, tc_rate, position, quantity, multiplier,
      strategy, steps_per_day, slippage_bps, force_day_close_hedge,
-     path_idx, base_seed) = args
+     evaluation_days, path_idx, base_seed) = args
 
     price_path = np.asarray(price_path, dtype=float)
     if price_path.ndim != 1:
@@ -942,6 +942,7 @@ def _run_single_path(args):
         steps_per_day=steps_per_day,
         slippage_bps=slippage_bps,
         force_day_close_hedge=force_day_close_hedge,
+        evaluation_days=evaluation_days,
     )
     res = bt.run()
     return {
@@ -969,17 +970,22 @@ class HedgeBacktest:
         旧版固定 bar 频率，仅在 ``strategy=None`` 时生效；为后端 API
         兼容保留。新调用应显式传入 ``strategy``。
     tc_rate : float
-        单边交易成本率，默认 0
+        有限非负的单边交易成本率，默认 0
     position : int
         期权头寸方向：1 = 卖出（short）期权，-1 = 买入（long）期权
     quantity : float
-        交易数量（如 10 吨、1000 股等），用于将 Delta 转换为实际持仓。
+        有限正交易数量（如 10 吨、1000 股等），用于将 Delta 转换为实际持仓。
+        头寸方向只能由 ``position`` 表达，不能用负数量再次翻转。
         实际持仓 = position * delta * quantity。默认 1（等价于 1 份标的）
     multiplier : float
         合约乘数（每手对应的标的数量），用于取整到整数手。
         手数 = round(持仓 / multiplier)，实际持仓 = 手数 * multiplier。
         0 表示不取整（连续对冲）。默认 5，与 GUI 默认保持一致。
         例：quantity=10, multiplier=10 → 最多 1 手。
+    evaluation_days : int | None
+        本次回测的评估窗口 H（交易日）。默认 None 表示沿用期权完整剩余
+        期限 T；显式设置时须满足 ``1 <= H <= T``。当 H < T 时，末端按
+        剩余 ``T-H`` 日的期权公允价值做 MTM，并只平掉标的对冲头寸。
 
     Examples
     --------
@@ -1001,7 +1007,7 @@ class HedgeBacktest:
                  strategy=None, steps_per_day=1, slippage_bps=0.0,
                  base_seed=20, force_day_close_hedge=False,
                  sigma_warmup_log_returns=None,
-                 strict_sigma_warmup=False):
+                 strict_sigma_warmup=False, evaluation_days=None):
         """
         Parameters
         ----------
@@ -1020,7 +1026,8 @@ class HedgeBacktest:
         force_day_close_hedge : bool
             公共的每日收盘兜底开关。开启后，非到期交易日的最后一根 bar
             至少执行一次 Delta 对齐；若当前策略已在同一 bar 触发，引擎
-            自动去重。到期或敲出末 bar 始终直接平仓，不先做兜底调仓。
+            自动去重。评估窗口、到期或敲出末 bar 始终直接平仓，不先做
+            兜底调仓。
         sigma_warmup_log_returns : array-like | None
             Day 0 前、与 ``external_path`` 独立的对数收益预热种子。它只进入
             realized-sigma 的滚动估计，不会改变期权期限、价格路径、PnL
@@ -1028,6 +1035,9 @@ class HedgeBacktest:
         strict_sigma_warmup : bool
             要求 realized-sigma 策略在首个可交易 bar 前已具备完整窗口。
             历史择优使用 True；不足或波动率无效时明确失败，不回退 implied。
+        evaluation_days : int | None
+            本次评估窗口 H。None 表示使用期权完整剩余期限 T；H<T 时允许
+            外部价格路径只覆盖 H 个交易日，末端以剩余期限期权价值 MTM。
         base_seed : int | None
             run_multi 多路径 MC 采样的基础种子。每条路径实际使用的 option.mc_seed
             = base_seed + path_idx，实现路径间独立采样的同时保持整体可复现。
@@ -1063,14 +1073,50 @@ class HedgeBacktest:
             raise ValueError(f"未知 path_source: {path_source}，仅支持 'gbm' | 'historical'")
 
         self.hedge_freq = max(1, int(hedge_freq))
-        self.tc_rate = tc_rate
-        self.position = position
-        self.quantity = float(quantity)
+
+        # 头寸方向必须只有一个信息源。过去 position=0 / 2 或负 quantity
+        # 会静默制造“零风险最优策略”或再次翻转 long/short，历史择优仍会
+        # 把它当成合法结果排名，因此在进入任何 Greeks/PnL 计算前 fail fast。
+        if isinstance(position, (bool, np.bool_)):
+            raise ValueError("position 只允许 1（short）或 -1（long）")
+        try:
+            position_value = float(position)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError(
+                "position 只允许 1（short）或 -1（long）") from exc
+        if (not np.isfinite(position_value)
+                or position_value not in (-1.0, 1.0)):
+            raise ValueError("position 只允许 1（short）或 -1（long）")
+
+        try:
+            quantity_value = float(quantity)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError("quantity 必须为有限正数") from exc
+        if not np.isfinite(quantity_value) or quantity_value <= 0:
+            raise ValueError("quantity 必须为有限正数")
+
+        try:
+            tc_rate_value = float(tc_rate)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError("tc_rate 必须为有限非负数") from exc
+        if not np.isfinite(tc_rate_value) or tc_rate_value < 0:
+            raise ValueError("tc_rate 必须为有限非负数")
+
+        try:
+            slippage_bps_value = float(slippage_bps)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError("slippage_bps 必须为有限非负数") from exc
+        if not np.isfinite(slippage_bps_value) or slippage_bps_value < 0:
+            raise ValueError("slippage_bps 必须为有限非负数")
+
+        self.tc_rate = tc_rate_value
+        self.position = int(position_value)
+        self.quantity = quantity_value
         self.multiplier = float(multiplier)
         # 日内 intraday 支持：每个交易日切分成 steps_per_day 个 bar。
         # steps_per_day=1 时行为与旧代码一致。
         self.steps_per_day = max(1, int(steps_per_day))
-        self.slippage_bps = float(slippage_bps)
+        self.slippage_bps = slippage_bps_value
         self.force_day_close_hedge = bool(force_day_close_hedge)
         # strategy=None 时回退到旧的 FixedFreqStrategy(hedge_freq) 以保持兼容。
         self.strategy = strategy if strategy is not None else FixedFreqStrategy(self.hedge_freq)
@@ -1117,42 +1163,71 @@ class HedgeBacktest:
         self.base_seed = base_seed
         self._results = None
 
-        # ---- 价格序列长度校正：严格裁剪到期权剩余期限 ----
+        # ---- 价格序列长度校正：严格裁剪到评估窗口 H ----
         #
-        # 无真实时间戳时，口径仍为 Day 0 建仓、之后 T*spd 根 bar 到期。
+        # 默认 H=T，完全保持历史“跑到到期”的口径。显式 H<T 时，期权
+        # 自身期限仍保留 T，只把行情截到 H 日；run() 末端会按 T-H 日的
+        # 公允价值 MTM，再平掉标的对冲头寸。
+        #
+        # 无真实时间戳时，口径为 Day 0 建仓、之后 H*spd 根 bar 终止。
         # 真实 DatetimeIndex 则不能假设每组恰好 spd 根：从 i>0 的第一个
-        # 可完成交易日组收盘开始计数，严格截到第 T 个组收盘。这样首日从
+        # 可完成交易日组收盘开始计数，严格截到第 H 个组收盘。这样首日从
         # 盘中开始、夜盘或偶发缺 bar 时，都不会把下一组 bar 带到到期后并
         # 制造伪 MtM 盈亏。
         try:
             t_rem = int(option._time_remaining)
         except Exception:
             t_rem = None
+        self.initial_maturity_days = t_rem
+        if evaluation_days is None:
+            evaluation_horizon = t_rem
+        else:
+            if isinstance(evaluation_days, (bool, np.bool_)):
+                raise ValueError("evaluation_days 必须为正整数")
+            try:
+                evaluation_value = float(evaluation_days)
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise ValueError("evaluation_days 必须为正整数") from exc
+            if (not np.isfinite(evaluation_value)
+                    or not evaluation_value.is_integer()
+                    or evaluation_value <= 0):
+                raise ValueError("evaluation_days 必须为正整数")
+            if t_rem is None:
+                raise ValueError(
+                    "显式 evaluation_days 需要期权提供可用的剩余期限")
+            evaluation_horizon = int(evaluation_value)
+            if evaluation_horizon > t_rem:
+                raise ValueError(
+                    "evaluation_days 不能超过期权初始剩余期限："
+                    f"H={evaluation_horizon}, T={t_rem}")
+        self.evaluation_days = evaluation_horizon
+
         fixed_time_validated = False
-        if t_rem is not None and t_rem > 0:
+        if evaluation_horizon is not None and evaluation_horizon > 0:
             if self.timestamps is not None:
-                # fixed_times 先在原始第 T 个组边界内逐组检查目标时刻，
+                # fixed_times 先在原始第 H 个组边界内逐组检查目标时刻，
                 # 这样缺某根目标 bar 时能给出比“组 bar 数不足”更精确的错误。
                 if isinstance(self.strategy, FixedTimeStrategy):
                     raw_closes = _trading_day_close_indices(self.timestamps)
                     raw_actionable = raw_closes[raw_closes > 0]
-                    if len(raw_actionable) >= t_rem:
-                        provisional_end = int(raw_actionable[t_rem - 1])
+                    if len(raw_actionable) >= evaluation_horizon:
+                        provisional_end = int(
+                            raw_actionable[evaluation_horizon - 1])
                         _validate_fixed_time_data(
                             self.strategy,
                             self.timestamps[:provisional_end + 1],
                         )
                         fixed_time_validated = True
                 terminal_index = _expiry_terminal_index(
-                    self.timestamps, t_rem, self.steps_per_day)
+                    self.timestamps, evaluation_horizon, self.steps_per_day)
                 self.prices = self.prices[:terminal_index + 1]
                 self.timestamps = self.timestamps[:terminal_index + 1]
             else:
-                need = t_rem * self.steps_per_day + 1
+                need = evaluation_horizon * self.steps_per_day + 1
                 have = len(self.prices)
                 if have < need:
                     raise ValueError(
-                        f"价格序列长度不足：期权剩余 {t_rem} 日 x "
+                        f"价格序列长度不足：评估窗口 {evaluation_horizon} 日 x "
                         f"steps_per_day={self.steps_per_day} 需要 {need} 个"
                         f"价格点，实际仅 {have} 个。"
                     )
@@ -1361,7 +1436,10 @@ class HedgeBacktest:
             # 交易费率基于成交价收取；滑点部分 |trade|*S*sl_rate 已相当于 sign 化后
             # trade*(S_exec - S)，与交易费率各记一次、不重复。
             if i == n:
-                # 到期：平仓所有标的头寸
+                # 评估窗口末端：无论是到期、期限前 MTM 或敲出，均平掉
+                # 标的对冲头寸。期权腿的 V/Greeks 已在上方按其真实剩余
+                # 期限计算；H<T 时绝不能在这里改成 intrinsic 或将 Greeks
+                # 归零。
                 trade = -H[i]
                 if trade != 0:
                     sign_trade = 1.0 if trade > 0 else -1.0
@@ -1482,6 +1560,27 @@ class HedgeBacktest:
         else:
             completed_days = n // spd if spd > 0 else n
 
+        # 末端状态口径：
+        # - 正常 H<T：期权仍存续，按剩余期限公允价值 MTM；
+        # - H=T：到期结算；
+        # - 敲出：结构已提前终止，不能伪装成普通 MTM。
+        try:
+            model_remaining_days = max(0, int(option._time_remaining))
+        except Exception:
+            model_remaining_days = max(
+                0,
+                int(self.initial_maturity_days or 0) - completed_days,
+            )
+        if ko_settle is not None:
+            remaining_days_at_end = 0
+            terminal_mode = "knockout"
+        else:
+            remaining_days_at_end = model_remaining_days
+            terminal_mode = (
+                "mark_to_market"
+                if remaining_days_at_end > 0 else "expiry"
+            )
+
         normalization_schema = "s0_x_multiplier_x_abs_quantity_v1"
         normalization_s0 = float(S[0])
         normalization_notional = (
@@ -1498,6 +1597,17 @@ class HedgeBacktest:
             normalization_reasons.append("归一化分母必须为有限正数")
         normalization_available = not normalization_reasons
         normalization_reason = "；".join(normalization_reasons)
+
+        # ``delta/gamma/...`` 始终保留模型对“一份多头 claim”的原始 Greeks，
+        # 以维持既有 API。组合经济头寸为 -position * quantity 份 claim：
+        # position=+1 是卖出，故 signed Greeks 取负；position=-1 是买入，
+        # 故取正。标的对冲腿只有 Delta、没有高阶 Greeks，不并入这些数组。
+        portfolio_greek_scale = -self.position * self.quantity
+        portfolio_delta = portfolio_greek_scale * delta
+        portfolio_gamma = portfolio_greek_scale * gamma
+        portfolio_vega = portfolio_greek_scale * vega
+        portfolio_theta = portfolio_greek_scale * theta
+        portfolio_rho = portfolio_greek_scale * rho
 
         if isinstance(strategy, FixedTimeStrategy):
             fixed_time_requested_times = tuple(
@@ -1526,6 +1636,12 @@ class HedgeBacktest:
             'n_bars': n,
             'steps_per_day': spd,
             'n_trade_days': completed_days,
+            # 配置窗口 H 与期权原始期限 T 分开披露。正常非敲出路径满足
+            # remaining_days_at_end = initial_maturity_days - evaluation_days。
+            'evaluation_days': self.evaluation_days,
+            'initial_maturity_days': self.initial_maturity_days,
+            'remaining_days_at_end': remaining_days_at_end,
+            'terminal_mode': terminal_mode,
             # 敲出提前了结标记：knocked_out=True 时回测在 ko_day（交易日）截断，
             # ko_settle 为敲出当日结算票息（普通期权恒为 False/None）。
             'knocked_out': ko_settle is not None,
@@ -1536,6 +1652,9 @@ class HedgeBacktest:
             'day_close_fallback_triggered': day_close_fallback_triggered,
             'force_day_close_hedge': self.force_day_close_hedge,
             'strategy_name': getattr(strategy, 'name', 'unknown'),
+            'position': self.position,
+            'position_label': (
+                'short' if self.position == 1 else 'long'),
             # fixed_times 请求/过滤结果。非固定时刻策略为 None；空 tuple
             # 表示显式 session 已证明没有有效目标，而非元数据缺失。
             'fixed_time_requested_times': fixed_time_requested_times,
@@ -1556,6 +1675,13 @@ class HedgeBacktest:
             'vega': vega,
             'theta': theta,
             'rho': rho,
+            # 按经济期权头寸签名后的 Greeks。原始 Greeks 字段继续表示
+            # 一份多头 claim，避免破坏现有定价/绘图调用。
+            'portfolio_delta': portfolio_delta,
+            'portfolio_gamma': portfolio_gamma,
+            'portfolio_vega': portfolio_vega,
+            'portfolio_theta': portfolio_theta,
+            'portfolio_rho': portfolio_rho,
             'shares': H,
             'hedge_daily': hedge_daily,
             'option_daily': option_daily,
@@ -1641,6 +1767,13 @@ class HedgeBacktest:
         else:
             strategy_text = getattr(strategy, "name", type(strategy).__name__)
 
+        # 摘要从持仓经济视角展示 Greeks；旧结果若没有 portfolio_* 字段，
+        # 仍回退到模型原始 Greeks，保持读取兼容。
+        summary_greeks = {
+            name: np.asarray(r.get(f"portfolio_{name}", r[name]), dtype=float)
+            for name in ("delta", "gamma", "vega", "theta", "rho")
+        }
+
         lines = [
             "=" * 52,
             "          动态对冲回测结果摘要",
@@ -1666,11 +1799,12 @@ class HedgeBacktest:
             "-" * 52,
             "  【Greeks 统计】",
             f"  {'':15s}  {'初始值':>10s}  {'均值':>10s}  {'最大|值|':>10s}",
-            f"  {'Delta':15s}  {r['delta'][0]:>10.4f}  {np.mean(r['delta']):>10.4f}  {np.max(np.abs(r['delta'])):>10.4f}",
-            f"  {'Gamma':15s}  {r['gamma'][0]:>10.4f}  {np.mean(r['gamma']):>10.4f}  {np.max(np.abs(r['gamma'])):>10.4f}",
-            f"  {'Vega':15s}  {r['vega'][0]:>10.4f}  {np.mean(r['vega']):>10.4f}  {np.max(np.abs(r['vega'])):>10.4f}",
-            f"  {'Theta':15s}  {r['theta'][0]:>10.4f}  {np.mean(r['theta']):>10.4f}  {np.max(np.abs(r['theta'])):>10.4f}",
-            f"  {'Rho':15s}  {r['rho'][0]:>10.4f}  {np.mean(r['rho']):>10.4f}  {np.max(np.abs(r['rho'])):>10.4f}",
+            *[
+                f"  {name.capitalize():15s}  "
+                f"{values[0]:>10.4f}  {np.mean(values):>10.4f}  "
+                f"{np.max(np.abs(values)):>10.4f}"
+                for name, values in summary_greeks.items()
+            ],
             "-" * 52,
             f"  调仓次数          :  {int(np.sum(np.abs(np.diff(r['shares'])) > 1e-10)):>10d}",
             "=" * 52,
@@ -1755,9 +1889,23 @@ class HedgeBacktest:
             '每日净盈亏': r['net_daily'],
             '累计盈亏': r['cumulative_pnl'],
         })
-        # 使用 Wind 日期作为索引（如有）
-        if hasattr(self, '_wind_meta') and self._wind_meta is not None:
-            df.index = self._wind_meta['dates']
+        # 优先使用本次 run 实际采用并可能因敲出而截短的时间戳。旧对象没有
+        # 结果级 timestamps 时才回退数据源元信息，并按结果长度裁切。
+        result_timestamps = r.get('timestamps')
+        if result_timestamps is not None:
+            if len(result_timestamps) != len(df):
+                raise ValueError(
+                    "回测结果 timestamps 与明细长度不一致："
+                    f"{len(result_timestamps)} != {len(df)}")
+            df.index = result_timestamps
+            df.index.name = '日期'
+        elif hasattr(self, '_wind_meta') and self._wind_meta is not None:
+            dates = self._wind_meta['dates']
+            if len(dates) < len(df):
+                raise ValueError(
+                    "历史行情日期与明细长度不一致："
+                    f"{len(dates)} < {len(df)}")
+            df.index = dates[:len(df)]
             df.index.name = '日期'
         else:
             df.index.name = '交易日'
@@ -1844,6 +1992,9 @@ class HedgeBacktest:
         -------
         dict with keys:
             n_paths        : int
+            position       : int — 1=short，-1=long
+            position_label : str — "short" 或 "long"
+            quantity       : float — 有限正交易数量
             errors         : ndarray — 每条路径的对冲误差
             total_pnl      : ndarray — 每条路径的累计净盈亏 (cum_pnl[-1])
             total_tc       : ndarray — 每条路径的累计交易成本
@@ -1878,6 +2029,7 @@ class HedgeBacktest:
              self.tc_rate, self.position, self.quantity, self.multiplier,
              self.strategy, self.steps_per_day, self.slippage_bps,
              self.force_day_close_hedge,
+             self.evaluation_days,
              i, effective_seed)
             for i in range(n)
         ]
@@ -1909,6 +2061,10 @@ class HedgeBacktest:
 
         return {
             'n_paths': n,
+            'position': self.position,
+            'position_label': (
+                'short' if self.position == 1 else 'long'),
+            'quantity': self.quantity,
             'force_day_close_hedge': self.force_day_close_hedge,
             'errors': errors,
             'total_pnl': total_pnl,
@@ -1954,7 +2110,8 @@ class HedgeBacktest:
                   hedge_freq=1, tc_rate=0.0, position=1, adjust="F",
                   quantity=1.0, multiplier=5,
                   strategy=None, steps_per_day=None, slippage_bps=0.0,
-                  bar_size=None, force_day_close_hedge=False):
+                  bar_size=None, force_day_close_hedge=False,
+                  evaluation_days=None):
         """
         使用 Wind 历史行情创建回测实例
 
@@ -2042,7 +2199,8 @@ class HedgeBacktest:
                      position=position, quantity=quantity, multiplier=multiplier,
                      strategy=scaled_strategy, steps_per_day=spd_final,
                      slippage_bps=slippage_bps,
-                     force_day_close_hedge=force_day_close_hedge)
+                     force_day_close_hedge=force_day_close_hedge,
+                     evaluation_days=evaluation_days)
             used_len = len(bt.prices)
             bt._wind_meta = {
                 'code': code,
@@ -2156,7 +2314,8 @@ class HedgeBacktest:
                  position=position, quantity=quantity, multiplier=multiplier,
                  strategy=scaled_strategy, steps_per_day=spd_final,
                  slippage_bps=slippage_bps,
-                 force_day_close_hedge=force_day_close_hedge)
+                 force_day_close_hedge=force_day_close_hedge,
+                 evaluation_days=evaluation_days)
         used_len = len(bt.prices)
         used_index = series.index[:used_len]
         if isinstance(bt.strategy, FixedTimeStrategy):
@@ -2192,7 +2351,7 @@ class HedgeBacktest:
                  date_col=None, hedge_freq=1, tc_rate=0.0, position=1,
                  quantity=1.0, multiplier=5,
                  strategy=None, steps_per_day=None, slippage_bps=0.0,
-                 force_day_close_hedge=False):
+                 force_day_close_hedge=False, evaluation_days=None):
         """
         从 CSV 文件加载价格数据创建回测实例（无需 Wind 终端）
 
@@ -2262,7 +2421,8 @@ class HedgeBacktest:
                  quantity=quantity, multiplier=multiplier,
                  strategy=scaled_strategy, steps_per_day=steps_per_day,
                  slippage_bps=slippage_bps,
-                 force_day_close_hedge=force_day_close_hedge)
+                 force_day_close_hedge=force_day_close_hedge,
+                 evaluation_days=evaluation_days)
         used_len = len(bt.prices)
         used_index = series.index[:used_len]
         bt._wind_meta = {

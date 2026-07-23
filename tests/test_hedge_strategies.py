@@ -1114,9 +1114,9 @@ def test_history_window_summary_preserves_strategy_and_endpoint_failures():
 
 def _normalizable_history_result(
         strategy_name, *, s0=100.0, multiplier=5.0, quantity=2.0,
-        normalization_available=True, normalization_reason=""):
-    notional = s0 * multiplier * abs(quantity)
-    return {
+        position=None, normalization_available=True, normalization_reason=""):
+    notional = s0 * multiplier * quantity
+    result = {
         "net_daily": np.array([0.0, -10.0, 20.0]),
         "tc_paid": np.array([0.0, 1.0, 2.0]),
         "steps_per_day": 1,
@@ -1130,6 +1130,9 @@ def _normalizable_history_result(
         "normalization_available": normalization_available,
         "normalization_reason": normalization_reason,
     }
+    if position is not None:
+        result["position"] = position
+    return result
 
 
 def test_history_window_summary_normalizes_signed_curves_by_initial_notional():
@@ -1177,31 +1180,92 @@ def test_history_window_summary_rejects_mismatched_pair_denominators():
         assert candidate_row[column].size == 0
 
 
-@pytest.mark.parametrize(
-    ("multiplier", "quantity"),
-    [(0.0, 2.0), (5.0, 0.0)],
-)
-def test_backtest_normalization_invalid_denominator_fails_closed(
-        multiplier, quantity):
+def test_history_window_summary_carries_position_and_rejects_cross_direction():
+    baseline = _normalizable_history_result(
+        "close_to_close", position=1)
+    same_side = _normalizable_history_result(
+        "hedge_band", position=1)
+    summary = history_window_summary({
+        "month": {
+            "window_1": {
+                "c2c": baseline,
+                "candidate": same_side,
+            },
+        },
+    })
+    assert summary["position"].eq(1).all()
+
+    opposite_side = _normalizable_history_result(
+        "hedge_band", position=-1)
+    with pytest.raises(ValueError, match="禁止跨方向"):
+        history_window_summary({
+            "month": {
+                "window_1": {
+                    "c2c": baseline,
+                    "candidate": opposite_side,
+                },
+            },
+        })
+
+
+def test_history_window_summary_keeps_legacy_missing_position_readable():
+    summary = history_window_summary({
+        "month": {
+            "window_1": {
+                "c2c": _normalizable_history_result("close_to_close"),
+                "candidate": _normalizable_history_result("hedge_band"),
+            },
+        },
+    })
+
+    assert summary["position"].isna().all()
+
+
+def test_lookback_rejects_mixed_known_positions_but_allows_legacy_missing():
+    legacy = {
+        "a": _fake_intraday_result([0.0, 1.0, -1.0], steps_per_day=1),
+        "b": _fake_intraday_result([0.0, 2.0, -2.0], steps_per_day=1),
+    }
+    _recommendations, legacy_ranking = recommend_by_lookback(
+        legacy, lookbacks={"sample": 2})
+    assert legacy_ranking["position"].isna().all()
+
+    mixed = {
+        "short": {**legacy["a"], "position": 1},
+        "long": {**legacy["b"], "position": -1},
+    }
+    with pytest.raises(ValueError, match="禁止跨方向"):
+        recommend_by_lookback(mixed, lookbacks={"sample": 2})
+
+
+def test_backtest_normalization_zero_multiplier_fails_closed():
     result = HedgeBacktest(
         _option(days=2), np.array([100.0, 101.0, 102.0]),
         strategy=CloseToCloseStrategy(),
-        multiplier=multiplier,
-        quantity=quantity,
+        multiplier=0.0,
+        quantity=2.0,
         is_future=True,
         contract_multiplier=1000.0,
     ).run()
 
     assert not result["normalization_available"]
-    assert result["normalization_notional"] == pytest.approx(
-        100.0 * multiplier * abs(quantity))
+    assert result["normalization_notional"] == pytest.approx(0.0)
     assert result["normalization_reason"]
     assert result["normalization_invalid_reason"] == (
         result["normalization_reason"])
     # contract_multiplier 不能被拿来替换无效的 multiplier。
-    if multiplier == 0 and quantity != 0:
-        assert result["normalization_notional"] != (
-            100.0 * 1000.0 * abs(quantity))
+    assert result["normalization_notional"] != 100.0 * 1000.0 * 2.0
+
+
+@pytest.mark.parametrize("quantity", [0.0, -2.0, np.nan, np.inf])
+def test_backtest_rejects_non_positive_or_non_finite_quantity(quantity):
+    with pytest.raises(ValueError, match="quantity 必须为有限正数"):
+        HedgeBacktest(
+            _option(days=2), np.array([100.0, 101.0, 102.0]),
+            strategy=CloseToCloseStrategy(),
+            multiplier=5.0,
+            quantity=quantity,
+        )
 
 
 @pytest.mark.parametrize("s0", [0.0, np.nan, np.inf])
@@ -1218,15 +1282,15 @@ def test_backtest_normalization_invalid_s0_fails_closed(s0):
     assert "S0 必须为有限正数" in result["normalization_reason"]
 
 
-def test_backtest_normalization_snapshot_uses_abs_quantity_formula():
+def test_backtest_normalization_snapshot_uses_positive_quantity_formula():
     result = HedgeBacktest(
         _option(days=2), np.array([100.0, 101.0, 102.0]),
         strategy=CloseToCloseStrategy(),
         multiplier=5.0,
-        quantity=-2.0,
+        quantity=2.0,
     ).run()
 
-    assert result["quantity"] == pytest.approx(-2.0)
+    assert result["quantity"] == pytest.approx(2.0)
     assert result["multiplier"] == pytest.approx(5.0)
     assert result["normalization_s0"] == pytest.approx(100.0)
     assert result["normalization_notional"] == pytest.approx(1000.0)
@@ -1245,6 +1309,7 @@ def test_summarize_strategy_result_returns_comparison_compatible_metrics():
         "shares": np.array([1.0, 1.0, 2.0, 2.0, 0.0]),
         "prices": np.array([100.0, 101.0, 102.0, 103.0, 104.0]),
         "strategy_name": "hedge_band",
+        "position": -1,
         "hedging_error": 3.0,
     }
     metadata = {"description": "绝对间隔=2", "nested": {"items": [1]}}
@@ -1253,6 +1318,7 @@ def test_summarize_strategy_result_returns_comparison_compatible_metrics():
 
     assert row["strategy"] == "固定间隔(绝对=2)"
     assert row["strategy_type"] == "hedge_band"
+    assert row["position"] == -1
     assert row["hedging_error"] == pytest.approx(3.0)
     assert row["n_trade_days"] == 2
     assert row["daily_net_pnl_rms"] == pytest.approx(np.sqrt(8.5))
@@ -1466,9 +1532,15 @@ def test_rolling_history_realized_sigma_uses_max_v_without_future_leakage():
     assert len(recommendations) == 1
     assert ranking["realized_sigma_warmup_days"].eq(max_v).all()
     assert ranking["required_history_days"].eq(
-        maturity + lookback + max_v).all()
+        lookback + max_v).all()
+    assert ranking["required_price_groups"].eq(
+        lookback + max_v + 1).all()
     assert ranking["history_complete"].all()
-    assert ranking["warmup_eligible_endpoints"].eq(lookback).all()
+    assert ranking["segment_count"].eq(3).all()
+    assert ranking["expiry_segments"].eq(2).all()
+    assert ranking["mtm_segments"].eq(1).all()
+    assert ranking["warmup_eligible_endpoints"].eq(3).all()
+    assert ranking["days_used"].eq(lookback).all()
     for window in windows["week"].values():
         for strategy_name in ("rv_short", "rv_long"):
             result = window[strategy_name]
@@ -1485,11 +1557,11 @@ def test_rolling_history_realized_sigma_uses_max_v_without_future_leakage():
             assert result["sigma_warmup_bars"] == max_v
             assert result["timestamps"][0] == day0
             assert result["timestamps"][-1] == prices.index[
-                day0_position + maturity]
-            assert len(result["prices"]) == maturity + 1
+                day0_position + result["evaluation_days"]]
+            assert len(result["prices"]) == result["evaluation_days"] + 1
 
 
-def test_rolling_history_realized_sigma_formal_boundary_is_l_plus_t_plus_v():
+def test_rolling_history_realized_sigma_formal_boundary_is_l_plus_v_plus_anchor():
     maturity, lookback, warmup = 2, 5, 4
     cases = [
         StrategyCase("c2c", CloseToCloseStrategy()),
@@ -1499,8 +1571,9 @@ def test_rolling_history_realized_sigma_formal_boundary_is_l_plus_t_plus_v():
                 k=0.5, sigma_source="realized", window_days=warmup)),
     ]
     outputs = {}
-    required = maturity + lookback + warmup
-    for available in (required - 1, required):
+    required = lookback + warmup
+    required_price_groups = required + 1
+    for available in (required_price_groups - 1, required_price_groups):
         outputs[available] = recommend_by_rolling_history(
             _option(days=maturity), _variable_return_history(available), cases,
             {"multiplier": 5.0, "quantity": 1.0, "tc_rate": 0.0},
@@ -1508,16 +1581,19 @@ def test_rolling_history_realized_sigma_formal_boundary_is_l_plus_t_plus_v():
         )
 
     incomplete_recommendations, incomplete_ranking, incomplete_windows = (
-        outputs[required - 1])
+        outputs[required_price_groups - 1])
     assert incomplete_recommendations.empty
     assert incomplete_ranking["required_history_days"].eq(required).all()
+    assert incomplete_ranking["required_price_groups"].eq(
+        required_price_groups).all()
     assert not incomplete_ranking["history_complete"].any()
     assert not incomplete_ranking["recommendation_eligible"].any()
     assert any(
         "预热" in window.get("rv", {}).get("error", "")
         for window in incomplete_windows["week"].values())
 
-    complete_recommendations, complete_ranking, _ = outputs[required]
+    complete_recommendations, complete_ranking, _ = outputs[
+        required_price_groups]
     assert len(complete_recommendations) == 1
     assert complete_ranking["history_complete"].all()
     assert complete_ranking["recommendation_eligible"].all()
@@ -1546,14 +1622,15 @@ def test_non_realized_band_modes_do_not_add_warmup_requirement():
 
     assert len(recommendations) == 1
     assert ranking["realized_sigma_warmup_days"].eq(0).all()
-    assert ranking["required_history_days"].eq(maturity + lookback).all()
+    assert ranking["required_history_days"].eq(lookback).all()
+    assert ranking["required_price_groups"].eq(lookback + 1).all()
     assert ranking["history_complete"].all()
     for window in windows["week"].values():
         assert window["absolute"]["sigma_warmup_bars"] == 0
         assert window["implied_sigma"]["sigma_warmup_bars"] == 0
 
 
-def test_target_endpoint_sampling_adapts_to_each_lookback():
+def test_strict_lookbacks_cover_each_evidence_day_once():
     maturity = 2
     prices = pd.Series(
         100.0 + np.sin(np.arange(int(ANNUAL_DAYS) + maturity) / 17.0),
@@ -1569,41 +1646,49 @@ def test_target_endpoint_sampling_adapts_to_each_lookback():
     )
 
     assert recommendations.empty
-    expected = {
-        "week": (5, 1, 1),
-        "month": (12, 1, 2),
-        "quarter": (24, 2, 3),
-        "half_year": (36, 3, 4),
-        "year": (48, 5, 6),
+    expected_segments = {
+        "week": (3, 2, 1),
+        "month": (10, 10, 0),
+        "quarter": (31, 30, 1),
+        "half_year": (61, 61, 0),
+        "year": (122, 121, 1),
     }
-    for lookback, (count, spacing_min, spacing_max) in expected.items():
+    for lookback, (
+            segment_count, expiry_segments, mtm_segments,
+    ) in expected_segments.items():
         row = ranking[ranking["lookback"] == lookback].iloc[0]
         lookback_days = LOOKBACK_DAYS[lookback]
-        assert row["sampling_mode"] == "target_count"
+        assert row["evaluation_mode"] == "strict_lookback"
+        assert row["sampling_mode"] == "strict_contiguous"
         assert row["target_endpoints"] == HISTORY_TARGET_ENDPOINTS[lookback]
+        assert row["legacy_target_endpoints_ignored"]
         assert np.isnan(row["step_days"])
-        assert row["planned_endpoints"] == count
-        assert row["selected_endpoints"] == count
-        assert row["eligible_endpoints"] == count
-        assert row["rolling_windows"] == count
-        assert row["endpoint_spacing_min"] == spacing_min
-        assert row["endpoint_spacing_max"] == spacing_max
-        assert row["required_history_days"] == maturity + lookback_days
-        assert row["available_history_days"] == len(prices)
+        assert row["evidence_days"] == lookback_days
+        assert row["segment_count"] == segment_count
+        assert row["expiry_segments"] == expiry_segments
+        assert row["mtm_segments"] == mtm_segments
+        assert row["planned_endpoints"] == segment_count
+        assert row["selected_endpoints"] == segment_count
+        assert row["rolling_windows"] == segment_count
+        assert row["required_history_days"] == lookback_days
+        assert row["required_price_groups"] == lookback_days + 1
+        assert row["days_used"] == lookback_days
         assert row["history_complete"]
+        assert row["selection_metric"] == (
+            "strict_lookback_daily_rms_advantage_vs_c2c")
 
         paths = _history_window_indices(windows, lookback, "daily")
-        endpoints = pd.DatetimeIndex([path[-1] for path in paths])
-        assert len(endpoints) == count
-        assert endpoints.is_unique
-        assert endpoints[0] == prices.index[-lookback_days]
-        assert endpoints[-1] == prices.index[-1]
-        endpoint_positions = prices.index.get_indexer(endpoints)
-        assert np.diff(endpoint_positions).min() == spacing_min
-        assert np.diff(endpoint_positions).max() == spacing_max
+        assert len(paths) == segment_count
+        assert paths[0][0] == prices.index[-lookback_days - 1]
+        assert paths[-1][-1] == prices.index[-1]
+        assert sum(len(path) - 1 for path in paths) == lookback_days
+        assert all(
+            left[-1] == right[0]
+            for left, right in zip(paths, paths[1:])
+        )
 
 
-def test_target_endpoint_sampling_keeps_scalar_api_and_validates_mapping():
+def test_legacy_target_endpoint_api_is_accepted_but_does_not_change_segments():
     prices = pd.Series(
         np.linspace(100.0, 105.0, 32),
         index=pd.bdate_range("2026-01-05", periods=32),
@@ -1617,9 +1702,10 @@ def test_target_endpoint_sampling_keeps_scalar_api_and_validates_mapping():
     )
     assert scalar_ranking["target_endpoints"].tolist() == [4, 4]
     assert {key: len(value) for key, value in scalar_windows.items()} == {
-        "short": 4,
-        "long": 4,
+        "short": 3,
+        "long": 10,
     }
+    assert scalar_ranking["legacy_target_endpoints_ignored"].all()
 
     _, mapped_ranking, mapped_windows = recommend_by_rolling_history(
         _option(days=2), prices, cases,
@@ -1630,19 +1716,28 @@ def test_target_endpoint_sampling_keeps_scalar_api_and_validates_mapping():
     assert mapped_ranking["target_endpoints"].tolist() == [3, 7]
     assert {key: len(value) for key, value in mapped_windows.items()} == {
         "short": 3,
-        "long": 7,
+        "long": 10,
     }
 
-    with pytest.raises(ValueError, match="缺少观察期预算: 'long'"):
-        recommend_by_rolling_history(
-            _option(days=2), prices, cases,
-            {"multiplier": 0, "tc_rate": 0.0},
-            lookbacks={"short": 5, "long": 20},
-            target_endpoints={"short": 3},
-        )
+    _, missing_ranking, missing_windows = recommend_by_rolling_history(
+        _option(days=2), prices, cases,
+        {"multiplier": 0, "tc_rate": 0.0},
+        lookbacks={"short": 5, "long": 20},
+        target_endpoints={"short": 3},
+    )
+    assert missing_ranking.loc[
+        missing_ranking["lookback"].eq("short"), "target_endpoints"
+    ].iloc[0] == 3
+    assert np.isnan(missing_ranking.loc[
+        missing_ranking["lookback"].eq("long"), "target_endpoints"
+    ].iloc[0])
+    assert {key: len(value) for key, value in missing_windows.items()} == {
+        "short": 3,
+        "long": 10,
+    }
 
 
-def test_target_sampling_endpoints_do_not_depend_on_option_maturity():
+def test_strict_evidence_bounds_do_not_depend_on_option_maturity():
     prices = pd.Series(
         100.0 + np.sin(np.arange(80) / 11.0),
         index=pd.date_range("2025-08-01", periods=80, freq="B"),
@@ -1663,24 +1758,29 @@ def test_target_sampling_endpoints_do_not_depend_on_option_maturity():
             "lengths": [len(path) for path in paths],
         }
 
-    assert outputs[2]["ends"].equals(outputs[22]["ends"])
-    assert outputs[2]["ends"][0] == prices.index[-20]
+    assert outputs[2]["starts"][0] == outputs[22]["starts"][0]
+    assert outputs[2]["ends"][-1] == outputs[22]["ends"][-1]
+    assert outputs[2]["starts"][0] == prices.index[-21]
     assert outputs[2]["ends"][-1] == prices.index[-1]
     assert set(outputs[2]["lengths"]) == {3}
-    assert set(outputs[22]["lengths"]) == {23}
-    assert not outputs[2]["starts"].equals(outputs[22]["starts"])
+    assert outputs[22]["lengths"] == [21]
+    assert len(outputs[2]["lengths"]) == 10
+    assert sum(length - 1 for length in outputs[2]["lengths"]) == 20
+    assert sum(length - 1 for length in outputs[22]["lengths"]) == 20
 
     short_row = outputs[2]["row"]
     long_row = outputs[22]["row"]
     assert not short_row["maturity_exceeds_lookback"]
     assert long_row["maturity_exceeds_lookback"]
-    assert short_row["window_overlap_min_ratio"] == pytest.approx(0.0)
-    assert short_row["window_overlap_max_ratio"] == pytest.approx(0.5)
-    assert long_row["window_overlap_min_ratio"] == pytest.approx(20 / 22)
-    assert long_row["window_overlap_max_ratio"] == pytest.approx(21 / 22)
+    assert short_row["segment_count"] == 10
+    assert short_row["terminal_mode"] == "expiry"
+    assert long_row["segment_count"] == 1
+    assert long_row["terminal_mode"] == "mark_to_market"
+    assert short_row["window_overlap_max_ratio"] == pytest.approx(0.0)
+    assert long_row["window_overlap_max_ratio"] == pytest.approx(0.0)
 
 
-def test_target_sampling_history_completeness_boundary():
+def test_strict_history_completeness_boundary_requires_l_plus_day0_anchor():
     maturity = 5
     lookback_days = 20
     cases = [
@@ -1689,9 +1789,7 @@ def test_target_sampling_history_completeness_boundary():
     ]
 
     outputs = {}
-    for available_days in (
-            maturity + lookback_days - 1,
-            maturity + lookback_days):
+    for available_days in (lookback_days, lookback_days + 1):
         prices = pd.Series(
             np.linspace(100.0, 104.0, available_days),
             index=pd.date_range(
@@ -1704,29 +1802,30 @@ def test_target_sampling_history_completeness_boundary():
         )
 
     incomplete_recommendations, incomplete_ranking, incomplete_windows = (
-        outputs[maturity + lookback_days - 1])
+        outputs[lookback_days])
     assert incomplete_recommendations.empty
-    assert incomplete_ranking["planned_endpoints"].eq(12).all()
-    assert incomplete_ranking["selected_endpoints"].eq(12).all()
-    assert incomplete_ranking["eligible_endpoints"].eq(11).all()
-    assert incomplete_ranking["rolling_windows"].eq(11).all()
+    assert incomplete_ranking["planned_endpoints"].eq(4).all()
+    assert incomplete_ranking["selected_endpoints"].eq(0).all()
+    assert incomplete_ranking["eligible_endpoints"].eq(0).all()
+    assert incomplete_ranking["rolling_windows"].eq(0).all()
     assert not incomplete_ranking["history_complete"].any()
     assert not incomplete_ranking["baseline_complete"].any()
     assert not incomplete_ranking["recommendation_eligible"].any()
-    assert incomplete_ranking["comparison_status"].eq("diagnostic").all()
-    assert len(incomplete_windows["month"]) == 11
+    assert incomplete_ranking["comparison_status"].eq("no_pair").all()
+    assert "_window_error" in incomplete_windows["month"]["segment_1"]
 
     complete_recommendations, complete_ranking, complete_windows = (
-        outputs[maturity + lookback_days])
+        outputs[lookback_days + 1])
     assert len(complete_recommendations) == 1
-    assert complete_ranking["planned_endpoints"].eq(12).all()
-    assert complete_ranking["eligible_endpoints"].eq(12).all()
-    assert complete_ranking["rolling_windows"].eq(12).all()
+    assert complete_ranking["planned_endpoints"].eq(4).all()
+    assert complete_ranking["eligible_endpoints"].eq(4).all()
+    assert complete_ranking["rolling_windows"].eq(4).all()
+    assert complete_ranking["days_used"].eq(lookback_days).all()
     assert complete_ranking["history_complete"].all()
     assert complete_ranking["baseline_complete"].all()
     assert complete_ranking["recommendation_eligible"].all()
     assert complete_ranking["comparison_status"].eq("formal").all()
-    assert len(complete_windows["month"]) == 12
+    assert len(complete_windows["month"]) == 4
 
 
 def test_target_sampling_all_strategies_share_each_period_path():
@@ -1747,7 +1846,7 @@ def test_target_sampling_all_strategies_share_each_period_path():
         lookbacks={"month": 20}, target_endpoints=12,
     )
 
-    assert len(windows["month"]) == 12
+    assert len(windows["month"]) == 10
     for window in windows["month"].values():
         indices = [
             pd.DatetimeIndex(window[name]["timestamps"])
@@ -1755,13 +1854,14 @@ def test_target_sampling_all_strategies_share_each_period_path():
         ]
         assert indices[0].equals(indices[1])
         assert indices[0].equals(indices[2])
-    assert ranking["planned_endpoints"].eq(12).all()
-    assert ranking["baseline_windows"].eq(12).all()
-    assert ranking["paired_windows"].eq(12).all()
+    assert ranking["planned_endpoints"].eq(10).all()
+    assert ranking["baseline_windows"].eq(10).all()
+    assert ranking["paired_windows"].eq(10).all()
+    assert ranking["days_used"].eq(20).all()
     assert ranking["comparison_coverage"].eq(1.0).all()
 
 
-def test_fixed_step_sampling_remains_backward_compatible_without_target():
+def test_legacy_fixed_step_is_ignored_by_strict_contiguous_mode():
     prices = pd.Series(
         np.linspace(100.0, 104.0, 30),
         index=pd.date_range("2026-04-01", periods=30, freq="B"),
@@ -1788,23 +1888,24 @@ def test_fixed_step_sampling_remains_backward_compatible_without_target():
     default_endpoints = pd.DatetimeIndex([path[-1] for path in default_paths])
     explicit_endpoints = pd.DatetimeIndex(
         [path[-1] for path in explicit_paths])
-    expected_positions = np.asarray([10, 14, 19, 24, 29])
+    expected_positions = np.asarray([11, 13, 15, 17, 19, 21, 23, 25, 27, 29])
 
     assert default_endpoints.equals(explicit_endpoints)
     np.testing.assert_array_equal(
         prices.index.get_indexer(default_endpoints), expected_positions)
     for ranking in (default_ranking, explicit_ranking):
         row = ranking.iloc[0]
-        assert row["sampling_mode"] == "fixed_step"
-        assert row["step_days"] == 5
+        assert row["sampling_mode"] == "strict_contiguous"
+        assert row["legacy_step_days_ignored"]
+        assert np.isnan(row["step_days"])
         assert np.isnan(row["target_endpoints"])
-        assert row["planned_endpoints"] == 5
-        assert row["selected_endpoints"] == 5
-        assert row["endpoint_spacing_min"] == 4
-        assert row["endpoint_spacing_max"] == 5
+        assert row["planned_endpoints"] == 10
+        assert row["selected_endpoints"] == 10
+        assert row["days_used"] == 20
+        assert np.isnan(row["endpoint_spacing_min"])
 
 
-def test_target_sampling_with_no_complete_maturity_window_is_diagnostic():
+def test_strict_lookback_without_day0_anchor_is_diagnostic():
     maturity = 5
     prices = pd.Series(
         np.linspace(100.0, 101.0, maturity),
@@ -1820,16 +1921,74 @@ def test_target_sampling_with_no_complete_maturity_window_is_diagnostic():
 
     assert recommendations.empty
     row = ranking.iloc[0]
-    assert row["planned_endpoints"] == 5
-    assert row["selected_endpoints"] == 5
+    assert row["planned_endpoints"] == 1
+    assert row["selected_endpoints"] == 0
     assert row["eligible_endpoints"] == 0
     assert row["rolling_windows"] == 0
-    assert row["required_history_days"] == 10
-    assert row["available_history_days"] == 5
+    assert row["required_history_days"] == 5
+    assert row["required_price_groups"] == 6
+    assert row["available_history_days"] == 4
     assert not row["history_complete"]
     assert not row["recommendation_eligible"]
     assert row["comparison_status"] == "no_pair"
-    assert windows["week"] == {}
+    assert "_window_error" in windows["week"]["segment_1"]
+
+
+def test_strict_lookback_early_termination_stays_incomplete_without_zero_fill(
+        monkeypatch):
+    import pricing.hedge_analysis as hedge_analysis
+
+    class EarlyTerminationBacktest:
+        def __init__(
+                self, option, path_source=None, external_path=None,
+                strategy=None, steps_per_day=1, evaluation_days=None,
+                **kwargs):
+            self.external_path = external_path
+            self.strategy = strategy
+            self.steps_per_day = steps_per_day
+            self.evaluation_days = evaluation_days
+
+        def run(self):
+            # 模拟所有策略共享的 Day 2 提前敲出；剩余三日不得补零后冒充 L=5。
+            used = min(2, self.evaluation_days)
+            path = self.external_path.iloc[:used + 1]
+            net = np.zeros(len(path), dtype=float)
+            net[1:] = 1.0
+            return {
+                "net_daily": net,
+                "tc_paid": np.zeros_like(net),
+                "steps_per_day": self.steps_per_day,
+                "evaluation_days": self.evaluation_days,
+                "strategy_name": self.strategy.name,
+                "prices": path.to_numpy(dtype=float),
+                "timestamps": path.index,
+                "knocked_out": True,
+                "ko_day": used,
+            }
+
+    monkeypatch.setattr(
+        hedge_analysis, "HedgeBacktest", EarlyTerminationBacktest)
+    prices = pd.Series(
+        np.linspace(100.0, 106.0, 7),
+        index=pd.bdate_range("2026-01-05", periods=7),
+    )
+    recommendations, ranking, _ = recommend_by_rolling_history(
+        _option(days=5), prices,
+        [
+            StrategyCase("c2c", CloseToCloseStrategy()),
+            StrategyCase("candidate", FixedFreqStrategy(1)),
+        ],
+        {"multiplier": 0, "tc_rate": 0.0},
+        lookbacks={"week": 5},
+    )
+
+    assert recommendations.empty
+    assert ranking["comparison_eligible"].all()
+    assert not ranking["baseline_complete"].any()
+    assert not ranking["recommendation_eligible"].any()
+    assert ranking["comparison_status"].eq("diagnostic").all()
+    assert ranking["days_used"].eq(2).all()
+    assert ranking["observed_days"].eq(2).all()
 
 
 def _install_deterministic_history_backtest(monkeypatch, pnl_by_strategy):
@@ -1888,6 +2047,161 @@ def _two_contract_history_pool(*, include_first=True):
         contract_prices=contract_prices,
         main_contract_asof="P2605.DCE",
     )
+
+
+def _direction_history_run(mode, position, tc_rate):
+    cases = [
+        StrategyCase("c2c", CloseToCloseStrategy()),
+        StrategyCase(
+            "band", HedgeBandStrategy("absolute", threshold=1.25)),
+    ]
+    kwargs = {
+        "position": position,
+        "quantity": 2.0,
+        "multiplier": 0.0,
+        "tc_rate": tc_rate,
+    }
+    if mode == "rolling":
+        prices = pd.Series(
+            [100.0, 101.0, 99.5, 102.0, 101.0, 103.0, 102.0, 104.0],
+            index=pd.bdate_range("2026-01-05", periods=8),
+        )
+        return recommend_by_rolling_history(
+            _option(days=2),
+            prices,
+            cases,
+            kwargs,
+            lookbacks={"sample": 5},
+            target_endpoints=3,
+        )
+    if mode == "contract_pool":
+        return recommend_by_contract_history_pool(
+            _option(days=2),
+            _two_contract_history_pool(),
+            cases,
+            kwargs,
+            lookbacks={"sample": 8},
+            target_endpoints=4,
+        )
+    raise AssertionError(f"未知 history mode: {mode}")
+
+
+def _successful_direction_windows(window_results):
+    return {
+        (lookback, window_id, strategy): result
+        for lookback, windows in window_results.items()
+        for window_id, window in windows.items()
+        for strategy, result in window.items()
+        if (not str(strategy).startswith("_window_")
+            and isinstance(result, dict)
+            and "error" not in result)
+    }
+
+
+@pytest.mark.parametrize("mode", ["rolling", "contract_pool"])
+def test_history_batch_rejects_backtest_result_with_opposite_position(
+        monkeypatch, mode):
+    import pricing.hedge_analysis as hedge_analysis
+
+    class MismatchedPositionBacktest:
+        def __init__(
+                self, option, path_source=None, external_path=None,
+                strategy=None, steps_per_day=1, position=1, **kwargs):
+            self.external_path = external_path
+            self.strategy = strategy
+            self.steps_per_day = steps_per_day
+            self.position = position
+
+        def run(self):
+            values = np.asarray(self.external_path, dtype=float)
+            net = np.zeros(len(values), dtype=float)
+            return {
+                "net_daily": net,
+                "tc_paid": np.zeros_like(net),
+                "steps_per_day": self.steps_per_day,
+                "strategy_name": self.strategy.name,
+                "prices": values,
+                "timestamps": getattr(self.external_path, "index", None),
+                "position": (
+                    -self.position
+                    if self.strategy.name == "hedge_band"
+                    else self.position
+                ),
+            }
+
+    monkeypatch.setattr(
+        hedge_analysis, "HedgeBacktest", MismatchedPositionBacktest)
+    with pytest.raises(ValueError, match="禁止跨方向比较"):
+        _direction_history_run(mode, position=1, tc_rate=0.0)
+
+
+@pytest.mark.parametrize("mode", ["rolling", "contract_pool"])
+def test_history_zero_cost_long_short_are_mirrors_with_same_rms_ranking(mode):
+    short_rec, short_rank, short_windows = _direction_history_run(
+        mode, position=1, tc_rate=0.0)
+    long_rec, long_rank, long_windows = _direction_history_run(
+        mode, position=-1, tc_rate=0.0)
+
+    assert short_rank["position"].eq(1).all()
+    assert long_rank["position"].eq(-1).all()
+    assert short_rank["strategy"].tolist() == long_rank["strategy"].tolist()
+    np.testing.assert_allclose(
+        short_rank["score"], long_rank["score"], rtol=1e-12, atol=1e-12)
+    np.testing.assert_allclose(
+        short_rank["baseline_score"],
+        long_rank["baseline_score"],
+        rtol=1e-12,
+        atol=1e-12,
+    )
+    assert short_rec["strategy"].tolist() == long_rec["strategy"].tolist()
+
+    short_results = _successful_direction_windows(short_windows)
+    long_results = _successful_direction_windows(long_windows)
+    assert short_results.keys() == long_results.keys()
+    for key in short_results:
+        short = short_results[key]
+        long = long_results[key]
+        assert short["position"] == 1
+        assert short["position_label"] == "short"
+        assert long["position"] == -1
+        assert long["position_label"] == "long"
+        np.testing.assert_allclose(long["shares"], -short["shares"])
+        np.testing.assert_allclose(
+            long["hedge_daily"], -short["hedge_daily"])
+        np.testing.assert_allclose(
+            long["option_daily"], -short["option_daily"])
+        np.testing.assert_allclose(long["net_daily"], -short["net_daily"])
+        np.testing.assert_allclose(
+            long["portfolio_gamma"], -short["portfolio_gamma"])
+        assert not np.any(short["tc_paid"])
+        assert not np.any(long["tc_paid"])
+
+
+@pytest.mark.parametrize("mode", ["rolling", "contract_pool"])
+def test_history_costs_keep_gross_mirrored_and_charge_both_directions(mode):
+    _short_rec, short_rank, short_windows = _direction_history_run(
+        mode, position=1, tc_rate=0.001)
+    _long_rec, long_rank, long_windows = _direction_history_run(
+        mode, position=-1, tc_rate=0.001)
+
+    assert short_rank["position"].eq(1).all()
+    assert long_rank["position"].eq(-1).all()
+    short_results = _successful_direction_windows(short_windows)
+    long_results = _successful_direction_windows(long_windows)
+    assert short_results.keys() == long_results.keys()
+    for key in short_results:
+        short = short_results[key]
+        long = long_results[key]
+        short_tc = np.asarray(short["tc_paid"], dtype=float)
+        long_tc = np.asarray(long["tc_paid"], dtype=float)
+        short_net = np.asarray(short["net_daily"], dtype=float)
+        long_net = np.asarray(long["net_daily"], dtype=float)
+        short_gross = short_net + short_tc
+        long_gross = long_net + long_tc
+        np.testing.assert_allclose(long_tc, short_tc)
+        np.testing.assert_allclose(long_gross, -short_gross)
+        np.testing.assert_allclose(long_net + short_net, -2.0 * short_tc)
+        assert np.sum(short_tc) > 0.0
 
 
 def test_contract_pool_fixed_time_uses_each_concrete_contract_session(
@@ -1958,7 +2272,7 @@ def test_contract_pool_fixed_time_uses_each_concrete_contract_session(
     assert set(observed["night"]) == {(('21:00', '15:00'), ())}
 
 
-def test_contract_pool_realized_sigma_requires_t_plus_v_in_same_contract():
+def test_contract_pool_realized_sigma_requires_each_segment_warmup_in_contract():
     pool = _two_contract_history_pool()
     maturity, warmup = 2, 3
     cases = [
@@ -1976,7 +2290,9 @@ def test_contract_pool_realized_sigma_requires_t_plus_v_in_same_contract():
 
     assert recommendations.empty
     assert ranking["realized_sigma_warmup_days"].eq(warmup).all()
-    assert ranking["required_history_days"].eq(8 + maturity + warmup).all()
+    assert ranking["required_history_days"].eq(8 + warmup).all()
+    assert ranking["required_price_groups"].eq(8 + warmup + 1).all()
+    assert ranking["segment_count"].eq(4).all()
     assert ranking["eligible_endpoints"].eq(4).all()
     assert ranking["warmup_eligible_endpoints"].eq(2).all()
     assert not ranking["history_complete"].any()
@@ -2047,6 +2363,73 @@ def test_contract_pool_windows_follow_endpoint_main_without_crossing_roll(
     assert summary["history_endpoint_date"].notna().all()
 
 
+def test_contract_pool_rolls_split_strict_evidence_and_short_runs_end_mtm():
+    mapping_dates = pd.bdate_range("2026-01-05", periods=8)
+    mapping = pd.Series(
+        ["P2601.DCE"] * 3 + ["P2605.DCE"] * 5,
+        index=mapping_dates,
+    )
+    first_dates = pd.bdate_range(end=mapping_dates[2], periods=6)
+    second_dates = pd.bdate_range(end=mapping_dates[-1], periods=8)
+    pool = ContractHistoryPool(
+        product_code="P.DCE",
+        main_contract_by_date=mapping,
+        contract_prices={
+            "P2601.DCE": pd.Series(
+                np.linspace(100.0, 105.0, len(first_dates)),
+                index=first_dates,
+            ),
+            "P2605.DCE": pd.Series(
+                np.linspace(200.0, 207.0, len(second_dates)),
+                index=second_dates,
+            ),
+        },
+        main_contract_asof="P2605.DCE",
+    )
+
+    recommendations, ranking, windows = recommend_by_contract_history_pool(
+        _option(days=2), pool,
+        [
+            StrategyCase("c2c", CloseToCloseStrategy()),
+            StrategyCase("candidate", FixedFreqStrategy(1)),
+        ],
+        {"multiplier": 0, "tc_rate": 0.0},
+        lookbacks={"sample": 8}, target_endpoints=99,
+    )
+
+    assert len(recommendations) == 1
+    assert ranking["recommendation_eligible"].all()
+    assert ranking["days_used"].eq(8).all()
+    assert ranking["segment_count"].eq(5).all()
+    assert ranking["expiry_segments"].eq(3).all()
+    assert ranking["mtm_segments"].eq(2).all()
+    assert ranking["terminal_mode"].eq("mixed").all()
+    assert ranking["contract_run_count"].eq(2).all()
+    assert ranking["segment_lengths"].apply(
+        lambda value: value == (2, 1, 2, 2, 1)).all()
+
+    observed_evidence_dates = []
+    observed_segments = []
+    for window in windows["sample"].values():
+        result = window["c2c"]
+        timestamps = pd.DatetimeIndex(result["timestamps"])
+        observed_evidence_dates.extend(timestamps[1:].normalize())
+        observed_segments.append((
+            result["history_contract_code"],
+            result["evaluation_days"],
+            result["terminal_mode"],
+        ))
+        assert len(result["prices"]) == result["evaluation_days"] + 1
+    assert pd.DatetimeIndex(observed_evidence_dates).equals(mapping_dates)
+    assert observed_segments == [
+        ("P2601.DCE", 2, "expiry"),
+        ("P2601.DCE", 1, "mark_to_market"),
+        ("P2605.DCE", 2, "expiry"),
+        ("P2605.DCE", 2, "expiry"),
+        ("P2605.DCE", 1, "mark_to_market"),
+    ]
+
+
 def test_contract_pool_accepts_independent_endpoint_budget_mapping(monkeypatch):
     _install_deterministic_history_backtest(monkeypatch, {
         "close_to_close": 4.0,
@@ -2076,6 +2459,9 @@ def test_contract_pool_accepts_independent_endpoint_budget_mapping(monkeypatch):
         "near": 2,
         "far": 4,
     }
+    assert ranking["sampling_mode"].eq("strict_contiguous").all()
+    assert ranking["legacy_target_endpoints_ignored"].all()
+    assert ranking["days_used"].tolist() == [4, 4, 8, 8]
 
 
 @pytest.mark.parametrize("contract_scales", [(1.0, 100.0), (100.0, 1.0)])
@@ -2157,8 +2543,8 @@ def test_contract_pool_ranking_equal_weights_windows_across_price_scales(
         "selection_improvement_vs_c2c"] == pytest.approx(
             (-1.0 / 11.0 + 0.05) / 2.0)
     assert by_name["selection_metric"].eq(
-        "mean_bounded_window_advantage_vs_c2c").all()
-    assert by_name["relative_comparison_windows"].eq(4).all()
+        "strict_lookback_daily_rms_advantage_vs_c2c").all()
+    assert by_name["relative_comparison_windows"].eq(8).all()
     assert by_name["paired_contract_codes"].apply(
         lambda value: value == contract_codes).all()
 
@@ -2399,7 +2785,8 @@ def test_rolling_history_ranks_candidates_by_same_window_c2c_improvement(
     assert worse["median_window_improvement_vs_c2c"] == pytest.approx(-1.0)
 
 
-def test_zero_c2c_window_is_counted_and_tie_keeps_baseline(monkeypatch):
+def test_strict_ranking_uses_combined_l_day_rms_not_equal_segment_votes(
+        monkeypatch):
     import pricing.hedge_analysis as hedge_analysis
 
     prices = pd.Series(
@@ -2447,8 +2834,15 @@ def test_zero_c2c_window_is_counted_and_tie_keeps_baseline(monkeypatch):
     )
 
     candidate = ranking[ranking["strategy"] == "candidate"].iloc[0]
-    assert candidate["selection_improvement_vs_c2c"] == pytest.approx(0.0)
-    assert candidate["relative_comparison_windows"] == 3
+    baseline_rms = np.sqrt((0.0 ** 2 + 10.0 ** 2 + 10.0 ** 2) / 3.0)
+    candidate_rms = np.sqrt((100.0 ** 2 + 5.0 ** 2 + 5.0 ** 2) / 3.0)
+    expected_advantage = (
+        (baseline_rms - candidate_rms) / candidate_rms)
+    assert candidate["selection_improvement_vs_c2c"] == pytest.approx(
+        expected_advantage)
+    assert candidate["selection_metric"] == (
+        "strict_lookback_daily_rms_advantage_vs_c2c")
+    assert candidate["relative_comparison_windows"] == 1
     assert candidate["median_window_improvement_vs_c2c"] == pytest.approx(0.5)
     assert candidate["window_win_rate_vs_c2c"] == pytest.approx(2.0 / 3.0)
     assert ranking.iloc[0]["strategy"] == "c2c_reference"
@@ -2521,7 +2915,7 @@ def test_rolling_history_zero_c2c_score_never_produces_infinite_improvement(
         assert not np.isinf(values).any()
 
 
-def test_incomplete_history_keeps_same_window_leader_as_diagnostic_only(
+def test_incomplete_strict_history_has_no_pair_or_synthetic_leader(
         monkeypatch):
     _install_deterministic_history_backtest(monkeypatch, {
         "close_to_close": 4.0,
@@ -2543,11 +2937,11 @@ def test_incomplete_history_keeps_same_window_leader_as_diagnostic_only(
     )
 
     assert recommendations.empty
-    assert ranking["strategy"].tolist()[0] == "candidate"
-    assert ranking["comparison_eligible"].all()
+    assert ranking["strategy"].tolist()[0] == "c2c_reference"
+    assert not ranking["comparison_eligible"].any()
     assert not ranking["recommendation_eligible"].any()
-    assert ranking["comparison_status"].eq("diagnostic").all()
-    assert ranking.iloc[0]["improvement_vs_c2c"] == pytest.approx(0.75)
+    assert ranking["comparison_status"].eq("no_pair").all()
+    assert ranking["days_used"].eq(0).all()
 
 
 def test_rolling_history_recommendation_uses_multiple_windows():
@@ -2602,11 +2996,11 @@ def test_rolling_history_uses_real_day_groups_with_irregular_intraday_bars():
     assert ranking["strategy"].tolist() == ["daily"]
     assert ranking.iloc[0]["complete_window"]
     assert ranking.iloc[0]["comparison_status"] == "formal"
-    assert ranking.iloc[0]["rolling_windows"] == 4
-    assert ranking.iloc[0]["days_used"] == 8
-    assert len(windows["recent"]) == 4
+    assert ranking.iloc[0]["rolling_windows"] == 2
+    assert ranking.iloc[0]["days_used"] == 4
+    assert len(windows["recent"]) == 2
 
-    expected_end_dates = dates[-4:]
+    expected_end_dates = (dates[-3], dates[-1])
     path_lengths = []
     for result, expected_end in zip(
             (item["daily"] for item in windows["recent"].values()),
@@ -2643,10 +3037,11 @@ def test_rolling_history_drops_latest_partial_group_and_keeps_complete_windows()
     assert recommendations.empty
     assert ranking["strategy"].tolist() == ["daily"]
     assert ranking.iloc[0]["complete_window"]
-    assert ranking.iloc[0]["rolling_windows"] == 5
+    assert ranking.iloc[0]["rolling_windows"] == 3
+    assert ranking.iloc[0]["days_used"] == 5
     assert ranking.iloc[0]["trailing_partial_groups_dropped"] == 1
     assert ranking.iloc[0]["skipped_endpoints"] == 0
-    assert len(windows["week"]) == 5
+    assert len(windows["week"]) == 3
     assert all(
         item["daily"]["timestamps"][-1].strftime("%H:%M") == "15:00"
         for item in windows["week"].values()
@@ -2732,7 +3127,8 @@ def test_rolling_fixed_time_preserves_preconfigured_closed_session_skip():
     )
 
     row = ranking[ranking["strategy"] == "fixed"].iloc[0]
-    assert row["rolling_windows"] == 5
+    assert row["rolling_windows"] == 3
+    assert row["days_used"] == 5
     assert row["paired_windows"] == row["baseline_windows"]
     assert row["comparison_eligible"]
     for window in windows["week"].values():
@@ -2768,9 +3164,9 @@ def test_rolling_fixed_time_all_windows_keep_real_failure_reason():
 
     row = ranking[ranking["strategy"] == "fixed"].iloc[0]
     assert recommendations.empty
-    assert row["eligible_endpoints"] == 5
+    assert row["eligible_endpoints"] == 3
     assert row["rolling_windows"] == 0
-    assert row["skipped_endpoints"] == 5
+    assert row["skipped_endpoints"] == 3
     assert row["failure_scope"] == "strategy"
     assert "缺失 [11:30]" in row["failure_reason"]
     assert all(
@@ -2780,7 +3176,7 @@ def test_rolling_fixed_time_all_windows_keep_real_failure_reason():
     )
 
 
-def test_short_lookbacks_use_endpoints_even_when_maturity_is_longer():
+def test_short_lookbacks_use_only_strict_l_day_mtm_paths():
     prices = pd.Series(
         100 + np.sin(np.arange(50) / 3),
         index=pd.date_range("2026-01-05", periods=50, freq="B"),
@@ -2796,11 +3192,22 @@ def test_short_lookbacks_use_endpoints_even_when_maturity_is_longer():
     assert set(ranking["lookback"]) == {"week", "month"}
     assert set(ranking["strategy"]) == {"daily"}
     assert ranking["complete_window"].all()
-    assert len(windows["week"]) == 2
-    assert len(windows["month"]) == 5
-    # 最早的周回测起点早于“最近一周”观察期起点。
+    assert len(windows["week"]) == 1
+    assert len(windows["month"]) == 1
     first_week = next(iter(windows["week"].values()))["daily"]
-    assert first_week["timestamps"][0] < prices.index[-5]
+    first_month = next(iter(windows["month"].values()))["daily"]
+    assert first_week["timestamps"][0] == prices.index[-6]
+    assert first_week["timestamps"][-1] == prices.index[-1]
+    assert first_week["evaluation_days"] == 5
+    assert first_week["remaining_days_at_end"] == 17
+    assert first_week["terminal_mode"] == "mark_to_market"
+    assert first_month["timestamps"][0] == prices.index[-21]
+    assert first_month["evaluation_days"] == 20
+    assert first_month["remaining_days_at_end"] == 2
+    assert ranking.set_index("lookback")["days_used"].to_dict() == {
+        "week": 5,
+        "month": 20,
+    }
 
 
 def test_default_rolling_history_covers_all_five_horizons_when_complete():
@@ -2822,7 +3229,7 @@ def test_default_rolling_history_covers_all_five_horizons_when_complete():
     assert ranking["complete_window"].all()
 
 
-def test_long_maturity_short_lookback_keeps_partial_diagnostics():
+def test_long_maturity_short_lookback_is_formal_mtm_when_l_is_covered():
     prices = pd.Series(
         np.linspace(100, 103, 24),
         index=pd.date_range("2026-01-05", periods=24, freq="B"),
@@ -2835,10 +3242,15 @@ def test_long_maturity_short_lookback_keeps_partial_diagnostics():
     )
 
     assert recommendations.empty
-    assert not ranking.iloc[0]["complete_window"]
+    assert ranking.iloc[0]["complete_window"]
     assert ranking.iloc[0]["rolling_windows"] == 1
     assert ranking.iloc[0]["eligible_endpoints"] == 1
+    assert ranking.iloc[0]["days_used"] == 5
+    assert ranking.iloc[0]["terminal_mode"] == "mark_to_market"
     assert len(windows["week"]) == 1
+    result = windows["week"]["segment_1"]["daily"]
+    assert len(result["prices"]) == 6
+    assert result["remaining_days_at_end"] == 17
 
 
 def test_rolling_history_rebases_absolute_band_for_each_price_window():
@@ -2860,7 +3272,7 @@ def test_rolling_history_rebases_absolute_band_for_each_price_window():
     recommendations, ranking, windows = recommend_by_rolling_history(
         _option(days=2), prices, cases,
         {"multiplier": 0, "tc_rate": 0.0},
-        lookbacks={"latest": 1}, step_days=1,
+        lookbacks={"latest": 2}, step_days=1,
     )
 
     assert len(recommendations) == 1

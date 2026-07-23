@@ -29,7 +29,7 @@ def _result(*, strategy="close_to_close", price_shift=0.0):
 
 
 def _state(*, strategy="close_to_close", threshold=1.0,
-           force_day_close_hedge=False):
+           force_day_close_hedge=False, position=-1):
     return {
         "cls_name": "香草期权 (Vanilla)",
         "subtype": "Eu",
@@ -40,7 +40,7 @@ def _state(*, strategy="close_to_close", threshold=1.0,
         "fixed_times": "11:30,15:00",
         "interval_type": "absolute",
         "price_interval": threshold,
-        "position": -1,
+        "position": position,
         "quantity": 2.0,
         "multiplier": 100.0,
         "tc_rate": 0.001,
@@ -80,9 +80,19 @@ def test_saved_backtest_is_compact_deep_copy_with_run_time_parameters():
         not isinstance(value, np.ndarray)
         for value in snapshot.summary_row.values())
     assert snapshot.strategy_label == "固定间隔"
+    assert snapshot.position == -1
     assert "绝对 2" in snapshot.parameter_summary
     assert "相对 2.0000%" in snapshot.parameter_summary
     assert snapshot.source_label == "模拟 · seed 42"
+
+
+def test_saved_snapshot_rejects_result_direction_mismatching_left_state():
+    state = _state(position=-1)
+    result = _result()
+    result["position"] = 1
+
+    with pytest.raises(ValueError, match="头寸方向.*不一致"):
+        _snapshot(state=state, result=result)
 
 
 @pytest.mark.parametrize(
@@ -341,6 +351,72 @@ def test_selected_candidates_automatically_keep_fixed_baseline_in_view():
         baseline.result_id, candidate.result_id,
     }
     assert statuses and "固定基准" in statuses[-1]
+
+
+def test_saved_payload_rejects_cross_position_baseline_and_candidate():
+    short_baseline = _snapshot(
+        "result-0001", "卖方每日收盘",
+        state=_state(position=1),
+    )
+    long_candidate = _snapshot(
+        "result-0002", "买方固定间隔",
+        state=_state(
+            strategy="hedge_band", threshold=2.0, position=-1),
+        result=_result(strategy="hedge_band"),
+    )
+
+    with pytest.raises(ValueError, match="不能混选"):
+        BacktestApp._saved_comparison_payload(
+            [short_baseline, long_candidate],
+            baseline_result_id=short_baseline.result_id,
+        )
+    assert any(
+        "不能混选" in warning
+        for warning in BacktestApp._saved_comparison_warnings(
+            [short_baseline, long_candidate],
+            baseline_result_id=short_baseline.result_id,
+        )
+    )
+
+
+def test_saved_selection_switches_position_group_and_uses_matching_baseline():
+    short_baseline = _snapshot(
+        "result-0001", "卖方每日收盘",
+        state=_state(position=1),
+    )
+    long_baseline = _snapshot(
+        "result-0002", "买方每日收盘",
+        state=_state(position=-1),
+    )
+    long_candidate = _snapshot(
+        "result-0003", "买方固定间隔",
+        state=_state(strategy="hedge_band", position=-1),
+        result=_result(strategy="hedge_band"),
+    )
+    statuses = []
+    fake = SimpleNamespace(
+        _saved_backtests={
+            short_baseline.result_id: short_baseline,
+            long_baseline.result_id: long_baseline,
+            long_candidate.result_id: long_candidate,
+        },
+        _saved_comparison_selection={short_baseline.result_id},
+        _saved_comparison_baseline_id=short_baseline.result_id,
+        _set_status=statuses.append,
+        _refresh_saved_pool_tree=lambda: None,
+        _refresh_saved_comparison_view=lambda: None,
+    )
+
+    BacktestApp._toggle_saved_backtest_selection(
+        fake, long_candidate.result_id)
+    selected = BacktestApp._selected_saved_backtests(fake)
+
+    assert {
+        snapshot.result_id for snapshot in selected
+    } == {long_baseline.result_id, long_candidate.result_id}
+    assert short_baseline.result_id not in fake._saved_comparison_selection
+    assert fake._saved_comparison_baseline_id == long_baseline.result_id
+    assert statuses and "不混合比较" in statuses[-1]
 
 
 def test_busy_result_pool_actions_do_not_touch_selection_or_open_dialogs(

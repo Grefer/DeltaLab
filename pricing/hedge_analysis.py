@@ -35,10 +35,8 @@ LOOKBACK_DAYS = {
     "year": int(ANNUAL_DAYS),
 }
 
-# 历史择优按“终点样本预算”均匀覆盖各观察期。预算随证据周期增长，既让
-# 短周期保留全部近期交易日，也让长周期拥有更充分但仍受控的历史样本。
-# 这是推荐给 GUI/调用方显式传入 ``target_endpoints`` 的默认映射；函数层
-# 仍保留 ``None``=fixed-step、整数=全部周期统一预算的 Python API 兼容。
+# 升级前的“终点样本预算”。严格连续 L 日模式不再用它抽样；常量与 API
+# 入参仅为已保存 GUI 状态、第三方调用和旧诊断结果保留兼容。
 HISTORY_TARGET_ENDPOINTS = {
     "week": 5,
     "month": 12,
@@ -47,6 +45,113 @@ HISTORY_TARGET_ENDPOINTS = {
     "year": 48,
 }
 HISTORY_SELECTION_METRIC = "mean_bounded_window_advantage_vs_c2c"
+STRICT_LOOKBACK_SELECTION_METRIC = (
+    "strict_lookback_daily_rms_advantage_vs_c2c"
+)
+
+
+def _normalize_option_position(value, *, context, allow_missing=False):
+    """把期权头寸方向规范为 ``+1``(short) / ``-1``(long)。
+
+    升级前保存或手工构造的结果可能没有 ``position``；只在明确允许时以
+    ``None`` 返回，不能把未知方向静默解释为默认 short。
+    """
+    if value is None:
+        if allow_missing:
+            return None
+        raise ValueError(f"{context} 缺少 position")
+    try:
+        missing = pd.isna(value)
+    except (TypeError, ValueError):
+        missing = False
+    if isinstance(missing, (bool, np.bool_)) and missing:
+        if allow_missing:
+            return None
+        raise ValueError(f"{context} 缺少 position")
+    if isinstance(value, (bool, np.bool_)):
+        raise ValueError(f"{context} position 必须是 1(short) 或 -1(long)")
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(
+            f"{context} position 必须是 1(short) 或 -1(long)"
+        ) from exc
+    if not np.isfinite(numeric) or numeric not in (-1.0, 1.0):
+        raise ValueError(f"{context} position 必须是 1(short) 或 -1(long)")
+    return int(numeric)
+
+
+def _result_option_position(result, *, context, allow_missing=True):
+    """读取回测结果方向；旧结果缺字段时可兼容返回 ``None``。"""
+    if not isinstance(result, Mapping):
+        raise TypeError(f"{context} 必须是回测结果映射")
+    return _normalize_option_position(
+        result.get("position"),
+        context=context,
+        allow_missing=allow_missing,
+    )
+
+
+def _backtest_batch_position(backtest_kwargs, *, context):
+    """返回一个历史/比较批次应统一使用的方向。"""
+    kwargs = dict(backtest_kwargs or {})
+    return _normalize_option_position(
+        kwargs.get("position", 1),
+        context=f"{context} backtest_kwargs",
+    )
+
+
+def _validate_result_matches_batch_position(
+        result, expected_position, *, context):
+    """若结果携带方向，则必须与本批次请求方向一致。
+
+    缺字段只为升级前结果及测试替身保留兼容；正式 ``HedgeBacktest.run``
+    新结果会携带 ``position``，因而能够严格验证。
+    """
+    actual = _result_option_position(
+        result, context=context, allow_missing=True)
+    if actual is not None and actual != expected_position:
+        raise ValueError(
+            f"{context} position={actual} 与历史批次 "
+            f"position={expected_position} 不一致，禁止跨方向比较")
+    return actual
+
+
+def _validate_result_position_pair(result, baseline_result, *, context):
+    """验证同窗候选与 C2C 的已知方向一致。"""
+    candidate = _result_option_position(
+        result, context=f"{context} 候选", allow_missing=True)
+    if baseline_result is None:
+        return candidate
+    baseline = _result_option_position(
+        baseline_result, context=f"{context} close-to-close",
+        allow_missing=True,
+    )
+    if (candidate is not None and baseline is not None
+            and candidate != baseline):
+        raise ValueError(
+            f"{context} 候选 position={candidate} 与 close-to-close "
+            f"position={baseline} 不一致，禁止跨方向配对")
+    return candidate
+
+
+def _known_result_positions(results, *, context):
+    """返回结果映射中所有已知方向，并拒绝一个批次混入多种方向。"""
+    known = {}
+    for name, result in results.items():
+        if not isinstance(result, Mapping):
+            continue
+        position = _result_option_position(
+            result, context=f"{context}/{name}", allow_missing=True)
+        if position is not None:
+            known[name] = position
+    unique = set(known.values())
+    if len(unique) > 1:
+        detail = ", ".join(
+            f"{name}={position}" for name, position in known.items())
+        raise ValueError(
+            f"{context} 含不一致的期权头寸方向（{detail}），禁止跨方向比较")
+    return next(iter(unique), None)
 
 
 @dataclass(frozen=True)
@@ -260,6 +365,7 @@ _HISTORY_WINDOW_SUMMARY_COLUMNS = (
     "strategy",
     "success",
     "strategy_type",
+    "position",
     "start_ts",
     "end_ts",
     "days_used",
@@ -302,7 +408,7 @@ def _history_result_time_bounds(result):
 def _history_failure_summary_row(
         lookback, window_id, strategy, strategy_type, scope, reason,
         start_ts=pd.NaT, end_ts=pd.NaT, history_contract_code="",
-        history_endpoint_date=pd.NaT):
+        history_endpoint_date=pd.NaT, position=None):
     """构造保留统一曲线列的失败行，每个空数组也都独立持有。"""
     return {
         "lookback": lookback,
@@ -312,6 +418,12 @@ def _history_failure_summary_row(
         "strategy": strategy,
         "success": False,
         "strategy_type": strategy_type,
+        "position": (
+            np.nan if position is None else _normalize_option_position(
+                position,
+                context=f"{lookback}/{window_id}/{strategy or 'endpoint'}",
+            )
+        ),
         "start_ts": start_ts,
         "end_ts": end_ts,
         "days_used": 0,
@@ -378,15 +490,15 @@ def _history_normalization_metadata(result):
         validation_errors.append("S0 必须为有限正数")
     if not np.isfinite(multiplier) or multiplier <= 0:
         validation_errors.append("multiplier 必须为有限正数且不能为 0")
-    if not np.isfinite(quantity) or quantity == 0:
-        validation_errors.append("quantity 必须为有限非零数")
-    expected = s0 * multiplier * abs(quantity)
+    if not np.isfinite(quantity) or quantity <= 0:
+        validation_errors.append("quantity 必须为有限正数")
+    expected = s0 * multiplier * quantity
     if not np.isfinite(notional) or notional <= 0:
         validation_errors.append("归一化分母必须为有限正数")
     elif (not np.isfinite(expected)
           or not np.isclose(notional, expected, rtol=1e-12, atol=0.0)):
         validation_errors.append(
-            "归一化分母不等于 S0 * multiplier * abs(quantity)")
+            "归一化分母不等于 S0 * multiplier * quantity")
     if not available and not reason:
         validation_errors.append("回测结果标记归一化不可用")
     if validation_errors:
@@ -406,6 +518,11 @@ def _history_normalization_metadata(result):
 
 def _history_pair_normalization_metadata(result, baseline_result):
     """要求候选与同一样本 C2C 使用完全相同的归一化分母。"""
+    _validate_result_position_pair(
+        result,
+        baseline_result,
+        context="历史窗口归一化",
+    )
     metadata = _history_normalization_metadata(result)
     if baseline_result is None:
         metadata["normalization_available"] = False
@@ -464,6 +581,16 @@ def history_window_summary(window_results):
                 raise TypeError(
                     f"window_results[{lookback!r}][{window_id!r}] "
                     "必须是策略结果映射")
+            comparable_results = {
+                key: candidate
+                for key, candidate in window.items()
+                if (not str(key).startswith("_window_")
+                    and isinstance(candidate, Mapping))
+            }
+            window_position = _known_result_positions(
+                comparable_results,
+                context=f"{lookback}/{window_id}",
+            )
 
             # 固定时刻等单策略失败时，仍可从同窗其它成功策略取得时间边界，
             # 便于 GUI 使用 (lookback, window_id) 做基准配对与诊断定位。
@@ -503,6 +630,7 @@ def history_window_summary(window_results):
                     window_end,
                     error_meta.get("history_contract_code", ""),
                     error_meta.get("history_endpoint_date", pd.NaT),
+                    error_meta.get("position", window_position),
                 ))
 
             for strategy, result in window.items():
@@ -524,9 +652,15 @@ def history_window_summary(window_results):
                         window_end,
                         result.get("history_contract_code", ""),
                         result.get("history_endpoint_date", pd.NaT),
+                        result.get("position", window_position),
                     ))
                     continue
 
+                result_position = _result_option_position(
+                    result,
+                    context=f"{lookback}/{window_id}/{strategy}",
+                    allow_missing=True,
+                )
                 daily = result_daily_frame(result)
                 metrics = _daily_metrics(daily)
                 daily_net = daily["net_pnl"].to_numpy(
@@ -556,6 +690,8 @@ def history_window_summary(window_results):
                     "strategy": strategy,
                     "success": True,
                     "strategy_type": result.get("strategy_name", "unknown"),
+                    "position": (
+                        np.nan if result_position is None else result_position),
                     "start_ts": start_ts,
                     "end_ts": end_ts,
                     "days_used": metrics["n_trade_days"],
@@ -642,7 +778,7 @@ def _history_improvement_vs_c2c(score, baseline_score):
 
 
 def _history_selection_advantage_vs_c2c(score, baseline_score):
-    """返回有界逐窗 C2C 优势，供历史终点等权排名。
+    """返回有界的同段/同证据区间 C2C 优势。
 
     RMS 均为非负数，使用 ``(baseline - candidate) / max(baseline,
     candidate)`` 可把结果限定在 ``[-1, 1]``，并对候选/基准对称。双方都为
@@ -664,18 +800,15 @@ def _history_selection_advantage_vs_c2c(score, baseline_score):
 
 
 def _rank_history_rows(rows):
-    """按窗口等权的同窗 C2C 改善为滚动历史结果排序。"""
+    """按当前历史模式声明的同窗 C2C 改善排序。"""
     ranking = pd.DataFrame(rows)
     if ranking.empty:
         return ranking
 
-    # 正式可比 > 同窗诊断 > 部分配对 > 无配对。正式/诊断组内，每个历史
-    # 终点先独立换算为有界的相对 C2C RMS 优势，再以逐窗均值为主排序。这样
-    # 不同价格量级的具体合约、以及因提前结算而长度不同的窗口都各占一票，
-    # 不会由名义金额较大的窗口支配结论。覆盖率和窗口胜率只使用窗口级
-    # 相对证据；完全持平时固定优先 C2C，避免为了没有改善的候选增加复杂度。
-    # 合并金额 RMS 继续保留作诊断，但不参与名次。旧结果缺少新字段时仍
-    # 回退到合并 RMS 改善，以便读取本次升级前的内存结果。
+    # 正式可比 > 同窗诊断 > 部分配对 > 无配对。严格单序列行使用完整 L 日
+    # 合并 RMS 的有界优势；跨合约行使用按非重叠段天数加权的有界优势；
+    # 旧终点模式行仍使用逐窗均值。完全持平时固定优先 C2C，避免为了没有
+    # 改善的候选增加复杂度。旧结果缺少选择字段时回退合并 RMS 改善。
     recommendation = ranking["recommendation_eligible"].fillna(False).astype(bool)
     comparable = ranking["comparison_eligible"].fillna(False).astype(bool)
     paired = pd.to_numeric(
@@ -694,8 +827,10 @@ def _rank_history_rows(rows):
         "selection_metric",
         pd.Series("", index=ranking.index, dtype=object),
     ).fillna("").astype(str)
-    selection_values = selection_values.where(
-        selection_metrics.eq(HISTORY_SELECTION_METRIC))
+    selection_values = selection_values.where(selection_metrics.isin({
+        HISTORY_SELECTION_METRIC,
+        STRICT_LOOKBACK_SELECTION_METRIC,
+    }))
     # 混合新旧内存行时逐行回退；不能因某一行带新列，就把其它旧行的
     # 有效改善统一变成 -inf。
     selection_values = selection_values.where(
@@ -818,9 +953,15 @@ def summarize_strategy_result(
     metadata_copy = (
         {} if metadata is None else copy.deepcopy(dict(metadata))
     )
+    position = _result_option_position(
+        result,
+        context=f"策略汇总/{display_name}",
+        allow_missing=True,
+    )
     return {
         "strategy": display_name,
         "strategy_type": result["strategy_name"],
+        "position": np.nan if position is None else position,
         "hedging_error": float(result["hedging_error"]),
         **_strategy_activity_metrics(result),
         **_daily_metrics(daily),
@@ -840,6 +981,8 @@ def compare_strategies(option, prices, cases, backtest_kwargs=None):
     低，表示对冲后的逐日偏离越小。
     """
     kwargs = dict(backtest_kwargs or {})
+    batch_position = _backtest_batch_position(
+        kwargs, context="多策略比较")
     rows, results = [], {}
     cases = list(cases)
     seen = set()
@@ -852,6 +995,13 @@ def compare_strategies(option, prices, cases, backtest_kwargs=None):
             strategy=copy.deepcopy(case.strategy), **kwargs,
         )
         results[case.name] = bt.run()
+        _validate_result_matches_batch_position(
+            results[case.name],
+            batch_position,
+            context=f"多策略比较/{case.name}",
+        )
+
+    _known_result_positions(results, context="多策略比较")
 
     spd = _result_steps_per_day(results, kwargs.get("steps_per_day"))
     for case in cases:
@@ -881,6 +1031,15 @@ def recommend_by_lookback(results, steps_per_day=None, lookbacks=None):
     :func:`recommend_by_rolling_history`。
     """
     windows = dict(LOOKBACK_DAYS if lookbacks is None else lookbacks)
+    _known_result_positions(results, context="历史尾部诊断")
+    result_positions = {
+        name: _result_option_position(
+            result,
+            context=f"历史尾部诊断/{name}",
+            allow_missing=True,
+        )
+        for name, result in results.items()
+    }
     spd = _result_steps_per_day(results, steps_per_day)
     daily_results = {
         name: _aggregate_result_by_day(result, spd)
@@ -898,6 +1057,10 @@ def recommend_by_lookback(results, steps_per_day=None, lookbacks=None):
                 "lookback": label,
                 "lookback_days": days,
                 "strategy": name,
+                "position": (
+                    np.nan if result_positions[name] is None
+                    else result_positions[name]
+                ),
                 "days_used": used,
                 # 兼容旧展示字段；它表示该日窗口在固定 spd 口径下对应的
                 # 最大 bar 数，正式样本量请读取 days_used。
@@ -982,7 +1145,7 @@ def _trim_incomplete_trailing_groups(history, steps_per_day):
 
     Wind/CSV 查询的结束时刻可能落在当天盘中。若完整前缀能通过引擎的
     收盘证据校验、而加入最后一组后失败，就把该尾组视为尚未完成的当前
-    交易日，不让它挤占“最近一周/月”的一个历史终点。
+    交易日，不让它挤占“最近一周/月”的严格证据区间。
     """
     if not isinstance(history.index, pd.DatetimeIndex):
         return history, []
@@ -1006,81 +1169,6 @@ def _trim_incomplete_trailing_groups(history, steps_per_day):
             errors.append(str(full_error))
             trimmed = prefix
     return trimmed, errors
-
-
-def _rolling_endpoint_groups(n_groups, lookback_days, step_days):
-    """列出最近观察期内的回测终点（始终包含区间首尾）。"""
-    if n_groups <= 0:
-        return []
-    first = max(0, n_groups - lookback_days)
-    latest = n_groups - 1
-    endpoints = list(range(latest, first - 1, -step_days))
-    if endpoints[-1] != first:
-        endpoints.append(first)
-    return sorted(endpoints)
-
-
-def _target_count_endpoint_groups(
-        n_groups, lookback_days, target_endpoints):
-    """在最近观察期内均匀选择至多 ``target_endpoints`` 个终点。
-
-    只要区间至少有两个交易日，首尾都会纳入。整数终点使用四舍五入后的
-    等距位置；目标数不超过可用交易日数，因此不会产生重复终点。
-    """
-    if n_groups <= 0:
-        return []
-    available = min(n_groups, lookback_days)
-    first = n_groups - available
-    latest = n_groups - 1
-    count = min(target_endpoints, available)
-    if count <= 1:
-        return [latest]
-    span = latest - first
-    offsets = [
-        int(np.floor(index * span / (count - 1) + 0.5))
-        for index in range(count)
-    ]
-    return [first + offset for offset in offsets]
-
-
-def _target_endpoint_budgets(windows, target_endpoints):
-    """把统一或逐观察期的终点预算规范化为 ``label -> 正整数``。
-
-    ``None`` 由调用方保留给 fixed-step 模式，不会进入本函数。整数沿用旧
-    Python API，统一应用到全部观察期；Mapping 则必须覆盖本次实际请求的
-    每个观察期。允许 Mapping 包含未被本次 ``lookbacks`` 使用的额外键，
-    这样默认五周期预算也能直接用于只分析其中部分周期的调用。
-    """
-    labels = list(windows)
-    if isinstance(target_endpoints, Mapping):
-        missing = [label for label in labels if label not in target_endpoints]
-        if missing:
-            formatted = ", ".join(repr(label) for label in missing)
-            raise ValueError(
-                "target_endpoints 映射缺少观察期预算: " + formatted)
-        return {
-            label: _positive_int(
-                target_endpoints[label],
-                f"target_endpoints[{label!r}]",
-            )
-            for label in labels
-        }
-
-    target = _positive_int(target_endpoints, "target_endpoints")
-    return {label: target for label in labels}
-
-
-def _endpoint_spacing_metadata(endpoints, maturity_days):
-    """返回实际可回测终点的间距及相邻 T 窗口重叠比例。"""
-    if len(endpoints) < 2:
-        return None, None, None, None
-    spacing = np.diff(np.asarray(endpoints, dtype=int))
-    spacing_min = int(np.min(spacing))
-    spacing_max = int(np.max(spacing))
-    # 每窗含 T 个损益交易日；相邻终点相隔 s 日时重叠 max(T-s, 0) 日。
-    overlap_min = max(0.0, (maturity_days - spacing_max) / maturity_days)
-    overlap_max = max(0.0, (maturity_days - spacing_min) / maturity_days)
-    return spacing_min, spacing_max, float(overlap_min), float(overlap_max)
 
 
 def _max_realized_sigma_warmup_days(cases):
@@ -1135,6 +1223,39 @@ def _history_warmup_log_returns(
     return warmup_returns
 
 
+def _strict_lookback_segment_lengths(evidence_days, maturity_days):
+    """把连续证据区间拆成不重叠的完整到期段与末尾 MTM 段。"""
+    days = _positive_int(evidence_days, "evidence_days")
+    maturity = _positive_int(maturity_days, "maturity_days")
+    full_segments, remainder = divmod(days, maturity)
+    lengths = [maturity] * full_segments
+    if remainder:
+        lengths.append(remainder)
+    return tuple(lengths)
+
+
+def _legacy_target_endpoint_value(target_endpoints, label):
+    """保留旧参数的可观察值；严格区间模式不会据此抽样。"""
+    if target_endpoints is None:
+        return np.nan
+    if isinstance(target_endpoints, Mapping):
+        return target_endpoints.get(label, np.nan)
+    return target_endpoints
+
+
+def _strict_scored_daily_frame(result, steps_per_day, evaluation_days):
+    """返回本段实际日 PnL；提前终止不伪造零收益日。"""
+    expected = _positive_int(evaluation_days, "evaluation_days")
+    daily = _aggregate_result_by_day(result, steps_per_day).reset_index(drop=True)
+    observed = len(daily)
+    if observed > expected:
+        raise ValueError(
+            "严格区间回测返回的交易日超过 evaluation_days: "
+            f"{observed} > {expected}"
+        )
+    return daily, observed
+
+
 def recommend_by_rolling_history(
     option,
     prices,
@@ -1146,40 +1267,21 @@ def recommend_by_rolling_history(
     target_endpoints=None,
     steps_per_day=None,
 ):
-    """
-    在真实历史价格的多个可比窗口上重跑并推荐对冲策略。
+    """在截至最新完整交易日的严格连续 ``L`` 日区间比较策略。
 
-    与 :func:`recommend_by_lookback` 只截取一次回测结果不同，本函数直接接收
-    ``pd.Series``（保留 DatetimeIndex）或一维价格数组。它使用 ``option`` 的
-    剩余期限作为每个可比回测窗口的固定存续期，在最近周/月/季/半年/年的观察期
-    内选择多个回测终点；每个终点向前取完整期权期限，所以策略起点可以早于
-    观察期起点。``target_endpoints`` 可传一个统一正整数，或传
-    ``{lookback: budget}`` 映射为各观察期指定独立预算；非空时会按对应目标
-    数量均匀覆盖观察期并纳入首尾，``None`` 则沿用 ``step_days`` 固定步长。
-    全部 ``StrategyCase`` 运行相同的真实价格窗口，每轮会按真实起始价等比例
-    伸缩期权的价格量纲要素。``cases``
-    必须且只能包含一个 ``close_to_close`` 策略作为固定基准；所有候选分数
-    都在其与该基准双方成功的严格同窗交集上重算。主排名先计算各窗口相对
-    C2C 的有界 RMS 优势，再取逐窗均值，使每个历史终点等权；合并金额 RMS
-    只保留作诊断。
+    ``lookbacks`` 中的每个 ``L`` 都是实际参与评分、累计 PnL 与图表的证据
+    天数，不再只是旧实现中的“到期终点范围”。当 ``L <= T`` 时，运行一个
+    ``evaluation_days=L`` 的期权段：``L == T`` 正常到期，``L < T`` 在区间
+    末按剩余期限市值结算。当 ``L > T`` 时，从证据区间起点依次运行互不重叠
+    的 ``T`` 日到期段，最后不足 ``T`` 日的尾段按 MTM 结束。C2C 与所有候选
+    共享完全相同的分段边界；正常完成时拼接后恰好有 ``L`` 个日 PnL，每个
+    行情日只计一次。若期权提前敲出导致某段不足，则保留实际天数并把该周期
+    标为 diagnostic/incomplete，不用补零把它伪装成完整区间。
 
-    对带 ``DatetimeIndex`` 的日内行情，窗口边界按真实交易日组定位，而非
-    ``位置 / steps_per_day``。起点使用前一交易日最后一根作为 Day 0 锚点，
-    终点使用到期交易日最后一根，因此偶发缺/多 bar 不会错位，也不会把到期
-    后 bar 混入窗口。
-
-    参数 ``lookbacks`` 描述“最近多少交易日内的可用回测终点用于评估策略”，
-    而不是临时改写期权期限。只有整个观察期内的抽样终点都具备足够的前置
-    到期历史时才视为完整；否则仍给出已有窗口的同窗诊断，但不形成正式历史参考。
-
-    Returns
-    -------
-    (recommendations, ranking, window_results)
-        ``recommendations`` 仅含存在至少一个正式可比候选时的同窗冠军（可能
-        是 C2C 本身）；``ranking`` 含正式、同窗诊断、部分配对与失败结果，并
-        披露 ``baseline_score`` / ``improvement_vs_c2c`` /
-        ``selection_improvement_vs_c2c`` / ``paired_windows``；
-        ``window_results[lookback][window_id][strategy]`` 保存逐窗回测明细。
+    ``target_endpoints`` 与 ``step_days`` 仅作为旧 API 入参继续接受，结果中
+    会披露其已被忽略；它们不参与分段、评分或排名。realized-sigma 的 ``V``
+    日预热只用于段首波动率状态，不进入 PnL，因此正式结果需要 ``L + V`` 个
+    历史交易日，另加证据区间之前的一个 Day 0 收盘锚点。
     """
     history = _history_series(prices)
     cases = list(cases)
@@ -1192,10 +1294,13 @@ def recommend_by_rolling_history(
     warmup_days = _max_realized_sigma_warmup_days(cases)
 
     kwargs = dict(backtest_kwargs or {})
+    batch_position = _backtest_batch_position(
+        kwargs, context="严格区间历史择优")
     kw_spd = kwargs.pop("steps_per_day", None)
     if steps_per_day is not None and kw_spd is not None:
         explicit_spd = _positive_int(steps_per_day, "steps_per_day")
-        kwargs_spd = _positive_int(kw_spd, "backtest_kwargs['steps_per_day']")
+        kwargs_spd = _positive_int(
+            kw_spd, "backtest_kwargs['steps_per_day']")
         if explicit_spd != kwargs_spd:
             raise ValueError(
                 "steps_per_day 与 backtest_kwargs['steps_per_day'] 不一致: "
@@ -1210,23 +1315,16 @@ def recommend_by_rolling_history(
     else:
         spd_value = 1
     spd = _positive_int(spd_value, "steps_per_day")
-    if target_endpoints is None:
-        step = _positive_int(step_days, "step_days")
-        sampling_mode = "fixed_step"
-    else:
-        # target_count 模式与固定步长互斥；目标数量显式给出时直接取得
-        # 优先权，并在结果中把 step_days 记为 NaN。
-        step = None
-        sampling_mode = "target_count"
 
     reserved = {
         "strategy", "path_source", "external_path", "prices",
-        "sigma_warmup_log_returns", "strict_sigma_warmup",
+        "evaluation_days", "sigma_warmup_log_returns",
+        "strict_sigma_warmup",
     }
     conflict = sorted(reserved.intersection(kwargs))
     if conflict:
         raise ValueError(
-            "backtest_kwargs 不应覆盖滚动历史接口管理的参数: "
+            "backtest_kwargs 不应覆盖严格区间历史接口管理的参数: "
             + ", ".join(conflict)
         )
 
@@ -1234,112 +1332,131 @@ def recommend_by_rolling_history(
         maturity_value = float(option._time_remaining)
     except (AttributeError, TypeError, ValueError) as exc:
         raise ValueError("option 必须提供正整数交易日 _time_remaining") from exc
-    maturity_days = _positive_int(maturity_value, "option._time_remaining")
+    maturity_days = _positive_int(
+        maturity_value, "option._time_remaining")
     windows = dict(LOOKBACK_DAYS if lookbacks is None else lookbacks)
-    target_budgets = (
-        _target_endpoint_budgets(windows, target_endpoints)
-        if sampling_mode == "target_count" else None
-    )
+
+    # 旧参数只披露，不再驱动严格连续区间。这里仍触发基本正整数校验，使
+    # 明显错误的 step_days 不因迁移而悄悄通过；target_endpoints 则允许旧
+    # Mapping 缺少当前周期，因为它已不再具有控制语义。
+    _positive_int(step_days, "step_days")
+    legacy_target_ignored = target_endpoints is not None
+
     history, trailing_group_errors = _trim_incomplete_trailing_groups(
         history, spd)
     history_groups = _history_trading_day_groups(history, spd)
     group_ids, group_first_positions = np.unique(
-        history_groups, return_index=True
-    )
-    # _trading_day_groups 与兼容数组分组都保证组号连续且排序；仍显式取每组
-    # 最后一根，避免窗口切片依赖“典型每交易日 bar 数”。
+        history_groups, return_index=True)
     group_last_positions = np.r_[
         group_first_positions[1:] - 1,
         len(history) - 1,
     ].astype(int)
     n_history_groups = len(group_ids)
+    available_scored_days = max(0, n_history_groups - 1)
 
     rows = []
     window_results = {}
     for label, days_value in windows.items():
         days = _positive_int(days_value, f"lookbacks[{label!r}]")
-        if sampling_mode == "target_count":
-            target = target_budgets[label]
-            endpoints = _target_count_endpoint_groups(
-                n_history_groups, days, target)
-            planned_endpoints = min(days, target)
+        segment_lengths = _strict_lookback_segment_lengths(
+            days, maturity_days)
+        segment_count = len(segment_lengths)
+        expiry_segments = sum(
+            length == maturity_days for length in segment_lengths)
+        mtm_segments = segment_count - expiry_segments
+        if expiry_segments and mtm_segments:
+            terminal_mode = "mixed"
+        elif expiry_segments:
+            terminal_mode = "expiry"
         else:
-            target = None
-            endpoints = _rolling_endpoint_groups(
-                n_history_groups, days, step)
-            planned_endpoints = len(
-                _rolling_endpoint_groups(days, days, step))
-        valid_endpoints = [end for end in endpoints if end >= maturity_days]
-        warmup_valid_endpoints = [
-            end for end in valid_endpoints
-            if end >= maturity_days + warmup_days
-        ]
-        (spacing_min, spacing_max,
-         overlap_min, overlap_max) = _endpoint_spacing_metadata(
-            valid_endpoints, maturity_days)
-        # 完整观察期既需要足够的近期终点，也需要最早抽样终点之前仍有一段
-        # 完整期权期限。后者正是旧实现令 T > lookback 时先天 0 窗口的问题：
-        # 起点应允许落在 lookback 之前，而不是强迫整个生命周期塞进 tail。
-        history_complete = (
-            n_history_groups >= days + maturity_days + warmup_days
-            and len(endpoints) == planned_endpoints
-            and len(valid_endpoints) == planned_endpoints
-            and len(warmup_valid_endpoints) == planned_endpoints
-        )
+            terminal_mode = "mark_to_market"
+
+        first_anchor_group = n_history_groups - days - 1
+        evidence_available = first_anchor_group >= 0
+        history_complete = bool(
+            evidence_available and first_anchor_group >= warmup_days)
+        segment_plans = []
+        if evidence_available:
+            start_group = first_anchor_group
+            for segment_no, segment_days in enumerate(
+                    segment_lengths, start=1):
+                end_group = start_group + segment_days
+                start_pos = int(group_last_positions[start_group])
+                stop_pos = int(group_last_positions[end_group]) + 1
+                segment_plans.append({
+                    "window_id": f"segment_{segment_no}",
+                    "segment_no": segment_no,
+                    "evaluation_days": segment_days,
+                    "start_group": start_group,
+                    "end_group": end_group,
+                    "path": history.iloc[start_pos:stop_pos],
+                    "terminal_mode": (
+                        "expiry" if segment_days == maturity_days
+                        else "mark_to_market"),
+                })
+                start_group = end_group
 
         label_results = {}
-        # 按 window_id 保存日级结果，后续所有指标都在候选与 C2C 的严格
-        # 同窗交集上重算，不能再把各策略各自成功的窗口直接拼接比较。
         collected = {case.name: {} for case in cases}
+        observed_days = {case.name: {} for case in cases}
         case_failures = {case.name: 0 for case in cases}
         case_failure_reasons = {case.name: [] for case in cases}
         strategy_types = {}
         endpoint_failures = 0
         endpoint_failure_reasons = []
-        warmup_eligible_endpoint_count = 0
-        for window_no, end_group in enumerate(valid_endpoints, start=1):
-            start_group = end_group - maturity_days
-            # Day 0 只取起始组最后一根作为建仓锚点；随后包含恰好 T 个完整
-            # 交易日，直至目标终点组最后一根。这样不会带入到期后的 bar。
-            start_pos = int(group_last_positions[start_group])
-            stop_pos = int(group_last_positions[end_group]) + 1
-            path = history.iloc[start_pos:stop_pos]
+        warmup_eligible_segment_count = 0
+
+        if not evidence_available:
+            reason = (
+                f"{label} 严格区间需要 {days} 个交易日及此前一个 Day 0 "
+                f"锚点，实际仅有 {n_history_groups} 个价格交易日组"
+            )
+            endpoint_failures = 1
+            endpoint_failure_reasons.append(reason)
+            label_results["segment_1"] = {
+                "_window_error": reason,
+                "_window_error_meta": {"position": batch_position},
+            }
+
+        for plan in segment_plans:
+            window_id = plan["window_id"]
+            segment_days = plan["evaluation_days"]
+            path = plan["path"]
+            per_case = {}
             try:
                 warmup_log_returns = _history_warmup_log_returns(
                     history,
                     group_last_positions,
-                    start_group,
+                    plan["start_group"],
                     warmup_days,
                     spd,
-                    f"{label}/window_{window_no}",
+                    f"{label}/{window_id}",
                 )
                 warmup_error = ""
-                warmup_eligible_endpoint_count += 1
+                warmup_eligible_segment_count += 1
             except ValueError as exc:
                 warmup_log_returns = np.array([], dtype=float)
                 warmup_error = str(exc)
-            # 只有真实 DatetimeIndex 才交给 HedgeBacktest 保留时间戳。RangeIndex
-            # 若直接传入会被 pandas 解释成 1970 年的纳秒时间戳，进而把整段
-            # 数据错误聚合到同一个自然日。
+
             external_path = (
                 path if isinstance(history.index, pd.DatetimeIndex)
                 else path.to_numpy(dtype=float)
             )
-            window_id = f"window_{window_no}"
-            per_case = {}
             if isinstance(path.index, pd.DatetimeIndex):
                 try:
                     _expiry_terminal_index(
-                        path.index, maturity_days, spd)
+                        path.index, segment_days, spd)
                 except ValueError as exc:
-                    # 一个盘中残段不应让其它完整历史窗全部丢失。保留错误
-                    # 诊断并跳过该公共端点；它不会计入任何策略的完整性。
                     endpoint_failures += 1
                     endpoint_failure_reasons.append(str(exc))
                     label_results[window_id] = {
                         "_window_error": str(exc),
+                        "_window_error_meta": {
+                            "position": batch_position,
+                        },
                     }
                     continue
+
             for case in cases:
                 case_warmup_days = _realized_sigma_window_days(case.strategy)
                 if case_warmup_days and warmup_error:
@@ -1350,14 +1467,16 @@ def recommend_by_rolling_history(
                     per_case[case.name] = {
                         "error": warmup_error,
                         "strategy_name": strategy_types[case.name],
+                        "position": batch_position,
+                        "history_segment_no": plan["segment_no"],
+                        "history_segment_days": segment_days,
                     }
                     continue
+
                 scaled_option, rescale_info = _rescale_option_to_real_s0(
-                    option, float(path.iloc[0])
-                )
+                    option, float(path.iloc[0]))
                 scaled_strategy = _rescale_strategy_to_real_s0(
-                    case.strategy, rescale_info["ratio"]
-                )
+                    case.strategy, rescale_info["ratio"])
                 try:
                     warmup_kwargs = ({
                         "sigma_warmup_log_returns": warmup_log_returns,
@@ -1367,14 +1486,13 @@ def recommend_by_rolling_history(
                         scaled_option,
                         path_source="historical",
                         external_path=external_path,
+                        evaluation_days=segment_days,
                         strategy=scaled_strategy,
                         steps_per_day=spd,
                         **warmup_kwargs,
                         **kwargs,
                     ).run()
                 except ValueError as exc:
-                    # 固定时刻可能只在个别窗口缺少目标 bar；该策略保留
-                    # incomplete 诊断，但不能阻断其它策略的历史推荐。
                     if (not isinstance(case.strategy, FixedTimeStrategy)
                             and not case_warmup_days):
                         raise
@@ -1385,31 +1503,66 @@ def recommend_by_rolling_history(
                     per_case[case.name] = {
                         "error": str(exc),
                         "strategy_name": strategy_types[case.name],
+                        "position": batch_position,
+                        "history_segment_no": plan["segment_no"],
+                        "history_segment_days": segment_days,
                     }
                     continue
+
+                _validate_result_matches_batch_position(
+                    result,
+                    batch_position,
+                    context=f"{label}/{window_id}/{case.name}",
+                )
                 if _positive_int(
                     result.get("steps_per_day"),
                     f"{label}/{window_id}/{case.name} steps_per_day",
                 ) != spd:
-                    raise ValueError("滚动回测返回了不一致的 steps_per_day")
-                daily = _aggregate_result_by_day(result, spd)
+                    raise ValueError(
+                        "严格区间回测返回了不一致的 steps_per_day")
+                returned_evaluation_days = _positive_int(
+                    result.get("evaluation_days", segment_days),
+                    f"{label}/{window_id}/{case.name} evaluation_days",
+                )
+                if returned_evaluation_days != segment_days:
+                    raise ValueError(
+                        "严格区间回测返回了不一致的 evaluation_days: "
+                        f"{returned_evaluation_days} != {segment_days}"
+                    )
+
+                result["history_segment_no"] = plan["segment_no"]
+                result["history_segment_days"] = segment_days
+                result["history_evidence_days"] = days
+                result["history_segment_terminal_mode"] = plan["terminal_mode"]
+                daily, actually_observed = _strict_scored_daily_frame(
+                    result, spd, segment_days)
                 collected[case.name][window_id] = daily
-                strategy_types[case.name] = result.get("strategy_name", "unknown")
+                observed_days[case.name][window_id] = actually_observed
+                strategy_types[case.name] = result.get(
+                    "strategy_name", "unknown")
                 per_case[case.name] = result
             label_results[window_id] = per_case
+
         window_results[label] = label_results
         history_complete = bool(
             history_complete
-            and warmup_eligible_endpoint_count == planned_endpoints)
+            and len(segment_plans) == segment_count
+            and warmup_eligible_segment_count == segment_count)
 
         baseline_by_window = collected[baseline_case.name]
-        baseline_window_ids = list(baseline_by_window)
+        baseline_window_ids = [
+            plan["window_id"] for plan in segment_plans
+            if plan["window_id"] in baseline_by_window
+        ]
         baseline_windows = len(baseline_window_ids)
+        baseline_days = sum(
+            len(baseline_by_window[window_id])
+            for window_id in baseline_window_ids)
         baseline_complete = bool(
             history_complete
             and endpoint_failures == 0
-            and baseline_windows == planned_endpoints
-            and baseline_windows > 0
+            and baseline_windows == segment_count
+            and baseline_days == days
         )
 
         for case in cases:
@@ -1429,11 +1582,11 @@ def recommend_by_rolling_history(
             if daily_windows:
                 combined = pd.concat(daily_windows, ignore_index=True)
                 metrics = _daily_metrics(combined)
-                worst_drawdown = max(_max_drawdown(x["net_pnl"]) for x in daily_windows)
+                evidence_drawdown = _max_drawdown(combined["net_pnl"])
             else:
                 combined = pd.DataFrame(columns=["net_pnl", "tc_paid"])
                 metrics = _daily_metrics(combined)
-                worst_drawdown = 0.0
+                evidence_drawdown = 0.0
             if paired_baseline_windows:
                 baseline_combined = pd.concat(
                     paired_baseline_windows, ignore_index=True)
@@ -1451,49 +1604,48 @@ def recommend_by_rolling_history(
                 score_delta = np.nan
             if case.name == baseline_case.name and np.isfinite(score):
                 improvement = 0.0
+                selection_advantage = 0.0
             else:
                 improvement = _history_improvement_vs_c2c(
                     score, baseline_score)
+                selection_advantage = (
+                    _history_selection_advantage_vs_c2c(
+                        score, baseline_score)
+                )
 
-            window_improvements = []
-            window_selection_advantages = []
-            window_wins = 0
+            segment_improvements = []
+            segment_wins = 0
             for candidate_daily, baseline_daily in zip(
                     daily_windows, paired_baseline_windows):
-                candidate_window_score = _daily_metrics(
+                candidate_segment_score = _daily_metrics(
                     candidate_daily)["score"]
-                baseline_window_score = _daily_metrics(
+                baseline_segment_score = _daily_metrics(
                     baseline_daily)["score"]
-                if (np.isfinite(candidate_window_score)
-                        and np.isfinite(baseline_window_score)
-                        and candidate_window_score < baseline_window_score
+                if (np.isfinite(candidate_segment_score)
+                        and np.isfinite(baseline_segment_score)
+                        and candidate_segment_score < baseline_segment_score
                         and not np.isclose(
-                            candidate_window_score, baseline_window_score,
-                            rtol=1e-12, atol=1e-12)):
-                    window_wins += 1
-                window_improvement = _history_improvement_vs_c2c(
-                    candidate_window_score, baseline_window_score)
-                if np.isfinite(window_improvement):
-                    window_improvements.append(window_improvement)
-                selection_advantage = _history_selection_advantage_vs_c2c(
-                    candidate_window_score, baseline_window_score)
-                if np.isfinite(selection_advantage):
-                    window_selection_advantages.append(selection_advantage)
+                            candidate_segment_score,
+                            baseline_segment_score,
+                            rtol=1e-12,
+                            atol=1e-12)):
+                    segment_wins += 1
+                segment_improvement = _history_improvement_vs_c2c(
+                    candidate_segment_score, baseline_segment_score)
+                if np.isfinite(segment_improvement):
+                    segment_improvements.append(segment_improvement)
+
             paired_windows = len(paired_window_ids)
             if case.name == baseline_case.name and paired_windows:
-                window_win_rate = 0.0
-                median_window_improvement = 0.0
-                selection_advantage = 0.0
+                segment_win_rate = 0.0
+                median_segment_improvement = 0.0
             else:
-                window_win_rate = (
-                    float(window_wins / paired_windows)
+                segment_win_rate = (
+                    float(segment_wins / paired_windows)
                     if paired_windows else np.nan)
-                median_window_improvement = (
-                    float(np.median(window_improvements))
-                    if window_improvements else np.nan)
-                selection_advantage = (
-                    float(np.mean(window_selection_advantages))
-                    if window_selection_advantages else np.nan)
+                median_segment_improvement = (
+                    float(np.median(segment_improvements))
+                    if segment_improvements else np.nan)
 
             skipped = endpoint_failures + case_failures[case.name]
             if case_failure_reasons[case.name]:
@@ -1507,11 +1659,13 @@ def recommend_by_rolling_history(
                 failure_reason = ""
             comparison_eligible = bool(
                 baseline_windows > 0
-                and paired_windows == baseline_windows
-            )
+                and paired_windows == baseline_windows)
             recommendation_eligible = bool(
-                baseline_complete and comparison_eligible)
-            complete = recommendation_eligible
+                baseline_complete
+                and comparison_eligible
+                and paired_windows == segment_count
+                and metrics["n_trade_days"] == days
+                and baseline_metrics["n_trade_days"] == days)
             if recommendation_eligible:
                 comparison_status = "formal"
             elif comparison_eligible:
@@ -1520,39 +1674,59 @@ def recommend_by_rolling_history(
                 comparison_status = "partial_pair"
             else:
                 comparison_status = "no_pair"
+
+            legacy_target = _legacy_target_endpoint_value(
+                target_endpoints, label)
             rows.append({
                 "lookback": label,
                 "lookback_days": days,
+                "evidence_days": days,
                 "strategy": case.name,
                 "strategy_type": strategy_types.get(case.name, "unknown"),
-                "evaluation_mode": "rolling_history",
+                "position": batch_position,
+                "evaluation_mode": "strict_lookback",
                 "maturity_days": maturity_days,
-                "sampling_mode": sampling_mode,
-                "step_days": step if step is not None else np.nan,
-                "target_endpoints": target if target is not None else np.nan,
-                "planned_endpoints": planned_endpoints,
-                "selected_endpoints": len(endpoints),
-                "endpoint_spacing_min": spacing_min,
-                "endpoint_spacing_max": spacing_max,
-                "window_overlap_min_ratio": overlap_min,
-                "window_overlap_max_ratio": overlap_max,
+                "segment_count": segment_count,
+                "expiry_segments": expiry_segments,
+                "mtm_segments": mtm_segments,
+                "terminal_mode": terminal_mode,
+                "segment_lengths": segment_lengths,
+                "sampling_mode": "strict_contiguous",
+                "step_days": np.nan,
+                "target_endpoints": legacy_target,
+                "legacy_target_endpoints_ignored": legacy_target_ignored,
+                "legacy_step_days_ignored": True,
+                # 旧列继续存在，数值已明确改为“分段”口径。
+                "planned_endpoints": segment_count,
+                "selected_endpoints": len(segment_plans),
+                "endpoint_spacing_min": np.nan,
+                "endpoint_spacing_max": np.nan,
+                "window_overlap_min_ratio": 0.0,
+                "window_overlap_max_ratio": 0.0,
                 "maturity_exceeds_lookback": maturity_days > days,
                 "realized_sigma_warmup_days": warmup_days,
-                "required_history_days": maturity_days + days + warmup_days,
-                "available_history_days": n_history_groups,
-                "history_days_available": min(days, n_history_groups),
-                "eligible_endpoints": len(valid_endpoints),
-                "warmup_eligible_endpoints": warmup_eligible_endpoint_count,
+                "required_history_days": days + warmup_days,
+                "required_price_groups": days + warmup_days + 1,
+                "requires_day0_anchor": True,
+                "available_history_days": available_scored_days,
+                "history_price_groups": n_history_groups,
+                "history_days_available": min(
+                    days, available_scored_days),
+                "eligible_endpoints": len(segment_plans),
+                "warmup_eligible_endpoints": (
+                    warmup_eligible_segment_count),
                 "rolling_windows": paired_windows,
                 "skipped_endpoints": skipped,
-                # 保留首个真实失败原因供 GUI 在零有效窗口时准确诊断；
-                # 完整逐窗错误仍位于 window_results 中。
                 "failure_scope": failure_scope,
                 "failure_reason": failure_reason,
-                "trailing_partial_groups_dropped": len(trailing_group_errors),
+                "trailing_partial_groups_dropped": len(
+                    trailing_group_errors),
                 "days_used": metrics["n_trade_days"],
-                "complete_window": complete,
-                "history_complete": bool(history_complete),
+                "observed_days": sum(
+                    observed_days[case.name].get(window_id, 0)
+                    for window_id in paired_window_ids),
+                "complete_window": recommendation_eligible,
+                "history_complete": history_complete,
                 "baseline_complete": baseline_complete,
                 "comparison_eligible": comparison_eligible,
                 "recommendation_eligible": recommendation_eligible,
@@ -1560,36 +1734,33 @@ def recommend_by_rolling_history(
                 "baseline_strategy": baseline_case.name,
                 "baseline_windows": baseline_windows,
                 "paired_windows": paired_windows,
-                "unpaired_windows": max(0, baseline_windows - paired_windows),
+                "unpaired_windows": max(
+                    0, segment_count - paired_windows),
                 "comparison_coverage": (
-                    float(paired_windows / baseline_windows)
-                    if baseline_windows else 0.0),
+                    float(paired_windows / segment_count)
+                    if segment_count else 0.0),
                 "window_pnl": metrics["total_net_pnl"],
                 "window_tc": metrics["total_tc"],
                 "daily_net_pnl_rms": metrics["daily_net_pnl_rms"],
                 "avg_daily_tc": metrics["avg_daily_tc"],
                 "mean_daily_pnl": metrics["mean_daily_pnl"],
                 "pnl_volatility": metrics["pnl_volatility"],
-                # 各窗口分别运行且不把边界首尾相连；它们在统计上可能高度
-                # 重叠，并非独立样本。这里仅披露其中最坏的单窗口回撤。
-                "max_drawdown": worst_drawdown,
+                "max_drawdown": evidence_drawdown,
                 "score": score,
                 "baseline_score": baseline_score,
                 "baseline_days_used": baseline_metrics["n_trade_days"],
                 "score_delta_vs_c2c": score_delta,
                 "improvement_vs_c2c": improvement,
-                "window_win_rate_vs_c2c": window_win_rate,
+                # 分段胜率只作诊断；主排名只使用下方完整 L 日有界优势。
+                "window_win_rate_vs_c2c": segment_win_rate,
                 "median_window_improvement_vs_c2c": (
-                    median_window_improvement),
-                # 历史最优按终点窗口等权：每窗先计算有界同窗 C2C
-                # 优势，再取均值；合并金额 RMS 不参与名次。
-                "selection_metric": (
-                    HISTORY_SELECTION_METRIC),
-                "selection_improvement_vs_c2c": (
-                    selection_advantage),
-                "relative_comparison_windows": len(
-                    window_selection_advantages),
-                **{f"meta_{k}": v for k, v in case.metadata.items()},
+                    median_segment_improvement),
+                "selection_metric": STRICT_LOOKBACK_SELECTION_METRIC,
+                "selection_improvement_vs_c2c": selection_advantage,
+                "relative_comparison_windows": (
+                    1 if np.isfinite(selection_advantage) else 0),
+                **{f"meta_{key}": value
+                   for key, value in case.metadata.items()},
             })
 
     ranking = _rank_history_rows(rows)
@@ -1600,23 +1771,21 @@ def recommend_by_rolling_history(
         eligible = group[group["recommendation_eligible"].astype(bool)]
         non_baseline = eligible[
             eligible["strategy_type"].astype(str) != "close_to_close"]
-        # 只有至少一个候选与 C2C 完成正式同窗比较时，才产生该周期的
-        # “历史最优参考”；若候选全失败，保留排名诊断但不把仅有基准包装
-        # 成已经完成的策略择优。
         if eligible.empty or non_baseline.empty:
             continue
         recommendation_rows.append(
             eligible.sort_values("rank", kind="stable").iloc[0])
     recommendations = (
         pd.DataFrame(recommendation_rows).reset_index(drop=True)
-        if recommendation_rows else ranking.iloc[:0].copy()
-    )
+        if recommendation_rows else ranking.iloc[:0].copy())
     return recommendations, ranking, window_results
 
 
 def _recommend_from_explicit_history_plans(
         option, cases, kwargs, spd, baseline_case, plans):
-    """运行已经按具体合约边界切好的历史窗口计划。"""
+    """运行已经按具体合约边界切好的严格连续历史分段计划。"""
+    batch_position = _backtest_batch_position(
+        kwargs, context="跨合约历史择优")
     rows = []
     window_results = {}
     for plan in plans:
@@ -1643,12 +1812,17 @@ def _recommend_from_explicit_history_plans(
                     "_window_error_meta": {
                         "history_contract_code": contract_code,
                         "history_endpoint_date": entry.get("endpoint_date"),
+                        "position": batch_position,
                     },
                 }
                 continue
 
             path = entry["path"]
             external_path = path
+            evaluation_days = _positive_int(
+                entry.get("evaluation_days", plan["maturity_days"]),
+                f"{label}/{window_id} evaluation_days",
+            )
             entry_spd = _positive_int(
                 entry.get("steps_per_day", spd),
                 f"{label}/{window_id} steps_per_day",
@@ -1656,7 +1830,7 @@ def _recommend_from_explicit_history_plans(
             per_case = {}
             try:
                 _expiry_terminal_index(
-                    path.index, plan["maturity_days"], entry_spd)
+                    path.index, evaluation_days, entry_spd)
             except ValueError as exc:
                 endpoint_failures += 1
                 endpoint_failure_reasons.append(str(exc))
@@ -1665,6 +1839,7 @@ def _recommend_from_explicit_history_plans(
                     "_window_error_meta": {
                         "history_contract_code": contract_code,
                         "history_endpoint_date": entry.get("endpoint_date"),
+                        "position": batch_position,
                     },
                 }
                 continue
@@ -1682,6 +1857,7 @@ def _recommend_from_explicit_history_plans(
                         "strategy_name": strategy_types[case.name],
                         "history_contract_code": contract_code,
                         "history_endpoint_date": entry.get("endpoint_date"),
+                        "position": batch_position,
                     }
                     continue
                 scaled_option, rescale_info = _rescale_option_to_real_s0(
@@ -1705,6 +1881,7 @@ def _recommend_from_explicit_history_plans(
                         scaled_option,
                         path_source="historical",
                         external_path=external_path,
+                        evaluation_days=evaluation_days,
                         strategy=scaled_strategy,
                         steps_per_day=entry_spd,
                         **warmup_kwargs,
@@ -1723,8 +1900,14 @@ def _recommend_from_explicit_history_plans(
                         "strategy_name": strategy_types[case.name],
                         "history_contract_code": contract_code,
                         "history_endpoint_date": entry.get("endpoint_date"),
+                        "position": batch_position,
                     }
                     continue
+                _validate_result_matches_batch_position(
+                    result,
+                    batch_position,
+                    context=f"{label}/{window_id}/{case.name}",
+                )
                 if _positive_int(
                     result.get("steps_per_day"),
                     f"{label}/{window_id}/{case.name} steps_per_day",
@@ -1732,7 +1915,16 @@ def _recommend_from_explicit_history_plans(
                     raise ValueError("滚动回测返回了不一致的 steps_per_day")
                 result["history_contract_code"] = contract_code
                 result["history_endpoint_date"] = entry.get("endpoint_date")
-                daily = _aggregate_result_by_day(result, entry_spd)
+                result["history_segment_no"] = entry.get("segment_no")
+                result["history_segment_days"] = evaluation_days
+                result["history_evidence_days"] = plan.get("evidence_days")
+                result["history_segment_terminal_mode"] = entry.get(
+                    "terminal_mode",
+                    "expiry" if evaluation_days == plan["maturity_days"]
+                    else "mark_to_market",
+                )
+                daily, _observed = _strict_scored_daily_frame(
+                    result, entry_spd, evaluation_days)
                 collected[case.name][window_id] = daily
                 strategy_types[case.name] = result.get(
                     "strategy_name", "unknown")
@@ -1743,10 +1935,15 @@ def _recommend_from_explicit_history_plans(
         baseline_by_window = collected[baseline_case.name]
         baseline_window_ids = list(baseline_by_window)
         baseline_windows = len(baseline_window_ids)
+        baseline_days = sum(
+            len(baseline_by_window[window_id])
+            for window_id in baseline_window_ids)
         baseline_complete = bool(
             plan["history_complete"]
             and endpoint_failures == 0
             and baseline_windows == plan["planned_endpoints"]
+            and baseline_days == plan.get(
+                "evidence_days", baseline_days)
             and baseline_windows > 0
         )
 
@@ -1767,9 +1964,7 @@ def _recommend_from_explicit_history_plans(
             if daily_windows:
                 combined = pd.concat(daily_windows, ignore_index=True)
                 metrics = _daily_metrics(combined)
-                worst_drawdown = max(
-                    _max_drawdown(frame["net_pnl"])
-                    for frame in daily_windows)
+                worst_drawdown = _max_drawdown(combined["net_pnl"])
             else:
                 combined = pd.DataFrame(columns=["net_pnl", "tc_paid"])
                 metrics = _daily_metrics(combined)
@@ -1797,6 +1992,7 @@ def _recommend_from_explicit_history_plans(
 
             window_improvements = []
             window_selection_advantages = []
+            window_selection_weights = []
             window_wins = 0
             for candidate_daily, baseline_daily in zip(
                     daily_windows, paired_baseline_windows):
@@ -1819,6 +2015,8 @@ def _recommend_from_explicit_history_plans(
                     candidate_window_score, baseline_window_score)
                 if np.isfinite(selection_advantage):
                     window_selection_advantages.append(selection_advantage)
+                    window_selection_weights.append(
+                        min(len(candidate_daily), len(baseline_daily)))
             paired_windows = len(paired_window_ids)
             if case.name == baseline_case.name and paired_windows:
                 window_win_rate = 0.0
@@ -1832,7 +2030,10 @@ def _recommend_from_explicit_history_plans(
                     float(np.median(window_improvements))
                     if window_improvements else np.nan)
                 selection_advantage = (
-                    float(np.mean(window_selection_advantages))
+                    float(np.average(
+                        window_selection_advantages,
+                        weights=window_selection_weights,
+                    ))
                     if window_selection_advantages else np.nan)
 
             skipped = endpoint_failures + case_failures[case.name]
@@ -1849,7 +2050,13 @@ def _recommend_from_explicit_history_plans(
                 baseline_windows > 0
                 and paired_windows == baseline_windows)
             recommendation_eligible = bool(
-                baseline_complete and comparison_eligible)
+                baseline_complete
+                and comparison_eligible
+                and paired_windows == plan["planned_endpoints"]
+                and metrics["n_trade_days"] == plan.get(
+                    "evidence_days", metrics["n_trade_days"])
+                and baseline_metrics["n_trade_days"] == plan.get(
+                    "evidence_days", baseline_metrics["n_trade_days"]))
             if recommendation_eligible:
                 comparison_status = "formal"
             elif comparison_eligible:
@@ -1868,6 +2075,7 @@ def _recommend_from_explicit_history_plans(
                 "lookback": label,
                 "strategy": case.name,
                 "strategy_type": strategy_types.get(case.name, "unknown"),
+                "position": batch_position,
                 "rolling_windows": paired_windows,
                 "skipped_endpoints": skipped,
                 "failure_scope": failure_scope,
@@ -1882,10 +2090,10 @@ def _recommend_from_explicit_history_plans(
                 "baseline_windows": baseline_windows,
                 "paired_windows": paired_windows,
                 "unpaired_windows": max(
-                    0, baseline_windows - paired_windows),
+                    0, plan["planned_endpoints"] - paired_windows),
                 "comparison_coverage": (
-                    float(paired_windows / baseline_windows)
-                    if baseline_windows else 0.0),
+                    float(paired_windows / plan["planned_endpoints"])
+                    if plan["planned_endpoints"] else 0.0),
                 "contract_count": len(paired_contracts),
                 "window_pnl": metrics["total_net_pnl"],
                 "window_tc": metrics["total_tc"],
@@ -1902,10 +2110,9 @@ def _recommend_from_explicit_history_plans(
                 "window_win_rate_vs_c2c": window_win_rate,
                 "median_window_improvement_vs_c2c": (
                     median_window_improvement),
-                # 品种池尤其不能直接比较不同具体合约的金额 RMS；每个
-                # 历史终点在主排名中拥有相同权重。
-                "selection_metric": (
-                    HISTORY_SELECTION_METRIC),
+                # 跨合约不能直接合并金额 RMS 排名；先在每个不重叠段内
+                # 计算有界 C2C 优势，再按该段实际证据天数加权。
+                "selection_metric": STRICT_LOOKBACK_SELECTION_METRIC,
                 "selection_improvement_vs_c2c": (
                     selection_advantage),
                 "relative_comparison_windows": len(
@@ -1936,14 +2143,17 @@ def _recommend_from_explicit_history_plans(
 def recommend_by_contract_history_pool(
         option, pool, cases, backtest_kwargs=None, *, lookbacks=None,
         step_days=5, target_endpoints=None, steps_per_day=None):
-    """在历史主力映射中按具体合约边界回测同品种期货样本池。
+    """在最近连续 ``L`` 个主力映射日上按具体合约边界比较策略。
 
-    每个终点使用当日的历史主力合约，并只向前切取该具体合约自身的完整
-    ``T`` 日路径；窗口绝不会跨换月边界。周期仍表示从最近完整交易日向前
-    选择终点的证据范围。``target_endpoints`` 与单序列接口一致，支持统一
-    正整数或逐观察期 Mapping；``None`` 保留 fixed-step 兼容。策略按逐窗
-    有界 C2C 优势的均值排名，每个终点等权，因此不同价格量级的具体合约
-    不会以金额大小形成隐含权重。
+    证据区间中的主力换月会强制切段；同一具体合约的连续区间再按不重叠
+    ``T`` 日段拆分。每段只使用该具体合约自身的 Day 0、行情和 HV 预热，
+    绝不跨合约拼价格；长度小于 ``T`` 的换月段或尾段以 MTM 结束。各段
+    PnL 日期互不重叠，正常完成时合计恰好 ``L`` 日。主排名先计算每段相对
+    C2C 的有界 RMS 优势，再按段内证据天数加权，避免不同合约价格量级
+    支配结果。
+
+    ``target_endpoints`` 和 ``step_days`` 仅为旧 API 兼容入参，不再影响
+    分段或排名。
     """
     if not isinstance(pool, ContractHistoryPool):
         raise TypeError("pool 必须是 ContractHistoryPool")
@@ -1990,15 +2200,12 @@ def recommend_by_contract_history_pool(
         explicit_spd if explicit_spd is not None else 1,
         "steps_per_day",
     )
-    if target_endpoints is None:
-        step = _positive_int(step_days, "step_days")
-        sampling_mode = "fixed_step"
-    else:
-        step = None
-        sampling_mode = "target_count"
+    _positive_int(step_days, "step_days")
+    sampling_mode = "strict_contiguous"
     reserved = {
         "strategy", "path_source", "external_path", "prices",
-        "sigma_warmup_log_returns", "strict_sigma_warmup",
+        "evaluation_days", "sigma_warmup_log_returns",
+        "strict_sigma_warmup",
     }
     conflict = sorted(reserved.intersection(kwargs))
     if conflict:
@@ -2119,135 +2326,231 @@ def recommend_by_contract_history_pool(
         raise ValueError("跨合约历史样本池在截止日前没有完整交易日")
 
     windows = dict(LOOKBACK_DAYS if lookbacks is None else lookbacks)
-    target_budgets = (
-        _target_endpoint_budgets(windows, target_endpoints)
-        if sampling_mode == "target_count" else None
-    )
     plans = []
     n_mapping_days = len(mapping)
     for label, days_value in windows.items():
         days = _positive_int(days_value, f"lookbacks[{label!r}]")
-        if sampling_mode == "target_count":
-            target = target_budgets[label]
-            endpoint_positions = _target_count_endpoint_groups(
-                n_mapping_days, days, target)
-            planned_endpoints = min(days, target)
-        else:
-            target = None
-            endpoint_positions = _rolling_endpoint_groups(
-                n_mapping_days, days, step)
-            planned_endpoints = len(
-                _rolling_endpoint_groups(days, days, step))
-
         entries = []
-        valid_positions = []
-        warmup_valid_positions = []
         valid_contracts = set()
-        for window_no, mapping_position in enumerate(
-                endpoint_positions, start=1):
-            endpoint_date = mapping.index[mapping_position]
-            contract_code = mapping.iloc[mapping_position]
-            details = contract_details.get(contract_code)
-            entry = {
-                "window_id": f"window_{window_no}",
-                "endpoint_date": endpoint_date,
-                "endpoint_position": mapping_position,
-                "contract_code": contract_code,
-                "steps_per_day": (
-                    details["steps_per_day"] if details is not None
-                    else default_spd),
-                "trading_sessions": (
-                    details["trading_sessions"]
-                    if details is not None else None),
-            }
-            if details is None:
-                detail = invalid_contracts.get(contract_code)
-                entry["error"] = (
-                    f"具体合约 {contract_code} 的历史行情不可用：{detail}"
-                    if detail else f"缺少具体合约 {contract_code} 的历史行情"
-                )
-                entries.append(entry)
-                continue
-            end_group = details["date_to_group"].get(endpoint_date)
-            if end_group is None:
-                entry["error"] = (
-                    f"具体合约 {contract_code} 缺少主力日 "
-                    f"{endpoint_date.date()} 的完整行情")
-                entries.append(entry)
-                continue
-            if end_group < maturity_days:
-                entry["error"] = (
-                    f"具体合约 {contract_code} 在 {endpoint_date.date()} 前"
-                    f"不足完整 {maturity_days} 个交易日")
-                entries.append(entry)
-                continue
-            start_group = end_group - maturity_days
-            start_pos = int(details["last_positions"][start_group])
-            stop_pos = int(details["last_positions"][end_group]) + 1
-            entry["path"] = details["history"].iloc[start_pos:stop_pos]
-            try:
-                entry["warmup_log_returns"] = _history_warmup_log_returns(
-                    details["history"],
-                    details["last_positions"],
-                    start_group,
-                    warmup_days,
-                    details["steps_per_day"],
-                    (f"具体合约 {contract_code} 在 "
-                     f"{endpoint_date.date()}"),
-                )
-                entry["warmup_error"] = ""
-            except ValueError as exc:
-                entry["warmup_log_returns"] = np.array([], dtype=float)
-                entry["warmup_error"] = (
-                    f"{exc}；预热与 {maturity_days} 日回测路径必须全部来自"
-                    f"同一具体合约 {contract_code}，严禁跨合约补齐")
-            entries.append(entry)
-            valid_positions.append(mapping_position)
-            if not entry["warmup_error"]:
-                warmup_valid_positions.append(mapping_position)
-            valid_contracts.add(contract_code)
+        valid_segments = 0
+        warmup_valid_segments = 0
+        segment_lengths = []
+        contract_run_count = 0
 
-        (spacing_min, spacing_max,
-         overlap_min, overlap_max) = _endpoint_spacing_metadata(
-            valid_positions, maturity_days)
+        if n_mapping_days >= days:
+            evidence_mapping = mapping.iloc[-days:]
+            run_start = 0
+            segment_no = 0
+            while run_start < len(evidence_mapping):
+                contract_code = evidence_mapping.iloc[run_start]
+                run_stop = run_start + 1
+                while (
+                        run_stop < len(evidence_mapping)
+                        and evidence_mapping.iloc[run_stop] == contract_code):
+                    run_stop += 1
+                contract_run_count += 1
+                run_length = run_stop - run_start
+                local_start = run_start
+                for segment_days in _strict_lookback_segment_lengths(
+                        run_length, maturity_days):
+                    segment_no += 1
+                    local_stop = local_start + segment_days
+                    segment_mapping = evidence_mapping.iloc[
+                        local_start:local_stop]
+                    first_evidence_date = segment_mapping.index[0]
+                    endpoint_date = segment_mapping.index[-1]
+                    details = contract_details.get(contract_code)
+                    entry = {
+                        "window_id": f"segment_{segment_no}",
+                        "segment_no": segment_no,
+                        "evaluation_days": segment_days,
+                        "evidence_start_date": first_evidence_date,
+                        "endpoint_date": endpoint_date,
+                        "contract_code": contract_code,
+                        "terminal_mode": (
+                            "expiry" if segment_days == maturity_days
+                            else "mark_to_market"),
+                        "steps_per_day": (
+                            details["steps_per_day"]
+                            if details is not None else default_spd),
+                        "trading_sessions": (
+                            details["trading_sessions"]
+                            if details is not None else None),
+                    }
+                    segment_lengths.append(segment_days)
+                    if details is None:
+                        detail = invalid_contracts.get(contract_code)
+                        entry["error"] = (
+                            f"具体合约 {contract_code} 的历史行情不可用："
+                            f"{detail}" if detail
+                            else f"缺少具体合约 {contract_code} 的历史行情"
+                        )
+                        entries.append(entry)
+                        local_start = local_stop
+                        continue
+
+                    evidence_groups = [
+                        details["date_to_group"].get(date)
+                        for date in segment_mapping.index
+                    ]
+                    missing_dates = [
+                        date for date, group_no in zip(
+                            segment_mapping.index, evidence_groups)
+                        if group_no is None
+                    ]
+                    if missing_dates:
+                        formatted = "、".join(
+                            str(date.date()) for date in missing_dates[:3])
+                        entry["error"] = (
+                            f"具体合约 {contract_code} 缺少主力证据日完整行情："
+                            f"{formatted}")
+                        entries.append(entry)
+                        local_start = local_stop
+                        continue
+
+                    evidence_groups = np.asarray(
+                        evidence_groups, dtype=int)
+                    if (len(evidence_groups) > 1
+                            and not np.all(np.diff(evidence_groups) == 1)):
+                        entry["error"] = (
+                            f"具体合约 {contract_code} 在 "
+                            f"{first_evidence_date.date()} 至 "
+                            f"{endpoint_date.date()} 的证据交易日不连续")
+                        entries.append(entry)
+                        local_start = local_stop
+                        continue
+                    first_group = int(evidence_groups[0])
+                    end_group = int(evidence_groups[-1])
+                    anchor_group = first_group - 1
+                    if anchor_group < 0:
+                        entry["error"] = (
+                            f"具体合约 {contract_code} 在 "
+                            f"{first_evidence_date.date()} 前缺少 Day 0 收盘锚点")
+                        entries.append(entry)
+                        local_start = local_stop
+                        continue
+                    if end_group - anchor_group != segment_days:
+                        entry["error"] = (
+                            f"具体合约 {contract_code} 的严格证据段长度不一致："
+                            f"要求 {segment_days} 日，实际 "
+                            f"{end_group - anchor_group} 日")
+                        entries.append(entry)
+                        local_start = local_stop
+                        continue
+
+                    start_pos = int(
+                        details["last_positions"][anchor_group])
+                    stop_pos = int(
+                        details["last_positions"][end_group]) + 1
+                    entry["path"] = details["history"].iloc[
+                        start_pos:stop_pos]
+                    try:
+                        entry["warmup_log_returns"] = (
+                            _history_warmup_log_returns(
+                                details["history"],
+                                details["last_positions"],
+                                anchor_group,
+                                warmup_days,
+                                details["steps_per_day"],
+                                (f"具体合约 {contract_code} 在 "
+                                 f"{first_evidence_date.date()} 至 "
+                                 f"{endpoint_date.date()}"),
+                            )
+                        )
+                        entry["warmup_error"] = ""
+                        warmup_valid_segments += 1
+                    except ValueError as exc:
+                        entry["warmup_log_returns"] = np.array(
+                            [], dtype=float)
+                        entry["warmup_error"] = (
+                            f"{exc}；预热与 {segment_days} 日严格证据段必须"
+                            f"全部来自同一具体合约 {contract_code}，"
+                            "严禁跨合约补齐")
+                    entries.append(entry)
+                    valid_segments += 1
+                    valid_contracts.add(contract_code)
+                    local_start = local_stop
+                run_start = run_stop
+        else:
+            # 严格模式不把不足 L 日的尾部历史静默降级成更短区间。
+            segment_lengths = list(
+                _strict_lookback_segment_lengths(days, maturity_days))
+            entries.append({
+                "window_id": "segment_1",
+                "segment_no": 1,
+                "evaluation_days": segment_lengths[0],
+                "contract_code": str(mapping.iloc[0]),
+                "endpoint_date": mapping.index[-1],
+                "steps_per_day": default_spd,
+                "error": (
+                    f"{label} 严格区间需要 {days} 个主力映射交易日，"
+                    f"实际仅有 {n_mapping_days} 日"),
+            })
+
+        planned_segments = len(segment_lengths)
+        expiry_segments = sum(
+            length == maturity_days for length in segment_lengths)
+        mtm_segments = planned_segments - expiry_segments
+        if expiry_segments and mtm_segments:
+            terminal_mode = "mixed"
+        elif expiry_segments:
+            terminal_mode = "expiry"
+        else:
+            terminal_mode = "mark_to_market"
         history_complete = bool(
             n_mapping_days >= days
-            and len(endpoint_positions) == planned_endpoints
-            and len(valid_positions) == planned_endpoints
-            and len(warmup_valid_positions) == planned_endpoints)
+            and len(entries) == planned_segments
+            and valid_segments == planned_segments
+            and warmup_valid_segments == planned_segments)
+        legacy_target = _legacy_target_endpoint_value(
+            target_endpoints, label)
+
         plans.append({
             "label": label,
+            "evidence_days": days,
             "maturity_days": maturity_days,
-            "planned_endpoints": planned_endpoints,
+            "planned_endpoints": planned_segments,
             "history_complete": history_complete,
             "entries": entries,
             "row_metadata": {
                 "lookback_days": days,
-                "evaluation_mode": "contract_pool_history",
+                "evidence_days": days,
+                "evaluation_mode": "strict_lookback",
                 "history_mode": "product_contract_pool",
                 "product_code": str(pool.product_code).upper(),
                 "main_contract_asof": str(pool.main_contract_asof).upper(),
                 "effective_asof_date": mapping.index[-1],
                 "effective_main_contract": str(mapping.iloc[-1]).upper(),
                 "sampling_mode": sampling_mode,
-                "step_days": step if step is not None else np.nan,
-                "target_endpoints": (
-                    target if target is not None else np.nan),
-                "planned_endpoints": planned_endpoints,
-                "selected_endpoints": len(endpoint_positions),
-                "endpoint_spacing_min": spacing_min,
-                "endpoint_spacing_max": spacing_max,
-                "window_overlap_min_ratio": overlap_min,
-                "window_overlap_max_ratio": overlap_max,
+                "step_days": np.nan,
+                "target_endpoints": legacy_target,
+                "legacy_target_endpoints_ignored": (
+                    target_endpoints is not None),
+                "legacy_step_days_ignored": True,
+                "planned_endpoints": planned_segments,
+                "selected_endpoints": (
+                    planned_segments if n_mapping_days >= days else 0),
+                "endpoint_spacing_min": np.nan,
+                "endpoint_spacing_max": np.nan,
+                "window_overlap_min_ratio": 0.0,
+                "window_overlap_max_ratio": 0.0,
                 "maturity_days": maturity_days,
+                "segment_count": planned_segments,
+                "expiry_segments": expiry_segments,
+                "mtm_segments": mtm_segments,
+                "terminal_mode": terminal_mode,
+                "segment_lengths": tuple(segment_lengths),
+                "contract_run_count": contract_run_count,
                 "maturity_exceeds_lookback": maturity_days > days,
                 "realized_sigma_warmup_days": warmup_days,
-                "required_history_days": maturity_days + days + warmup_days,
+                "required_history_days": days + warmup_days,
+                "required_price_groups": days + warmup_days + 1,
+                "requires_day0_anchor": True,
                 "available_history_days": n_mapping_days,
                 "raw_mapping_days": raw_mapping_days,
                 "history_days_available": min(days, n_mapping_days),
-                "eligible_endpoints": len(valid_positions),
-                "warmup_eligible_endpoints": len(warmup_valid_positions),
+                "eligible_endpoints": valid_segments,
+                "warmup_eligible_endpoints": warmup_valid_segments,
                 "history_complete": history_complete,
                 "pool_contracts_available": len(contract_details),
                 "pool_contracts_invalid": len(invalid_contracts),

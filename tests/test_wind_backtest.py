@@ -91,8 +91,15 @@ def test_rolling_backtest_smoke():
     assert len(df) >= 10, f"rolling rows 太少: {len(df)}"
 
     # 关键列必须存在
-    for col in ("hedge_pnl_real", "hedge_pnl_mc", "sigma_pre"):
+    for col in (
+            "position", "position_label",
+            "hedge_pnl_real", "hedge_pnl_mc", "sigma_pre"):
         assert col in df.columns, f"缺列 {col}"
+    assert df["position"].eq(1).all()
+    assert df["position_label"].eq("short").all()
+    assert df.attrs["position"] == 1
+    assert df.attrs["position_label"] == "short"
+    assert df.attrs["quantity"] == pytest.approx(1.0)
 
     # 合成数据两边都是 GBM，真实与 MC 的均值差应在 2σ 内（允许放宽到 2.5σ）
     gap = abs(df["hedge_pnl_real"].mean() - df["hedge_pnl_mc"].mean())
@@ -104,6 +111,73 @@ def test_rolling_backtest_smoke():
 
     # sigma_pre 应集中在真值附近（20 天窗口估计误差可观，放宽到 ±0.08）
     assert abs(df["sigma_pre"].mean() - sigma_true) < 0.08
+
+
+def _small_rolling_direction_fixture(position=-1, quantity=2.0):
+    fake_ret = pd.Series(
+        [0.010, -0.004, 0.007, -0.006, 0.003, 0.008, -0.005, 0.004],
+        index=pd.bdate_range("2025-01-02", periods=8),
+    )
+    option_cfg = {
+        "optiontype": "Vanilla",
+        "s0": 100.0,
+        "sr": [],
+        "K": 100.0,
+        "T": 2,
+        "sigma": 0.2,
+        "cp": 1,
+        "r": 0.0,
+        "q": 0.0,
+        "exe_mode": "Eu",
+    }
+    with (
+        patch("pricing.rolling_backtest.get_log_returns", return_value=fake_ret),
+        patch(
+            "pricing.wind_data.load_history_cached",
+            side_effect=RuntimeError("offline unit test"),
+        ),
+    ):
+        return run_rolling_backtest(
+            option_cfg=option_cfg,
+            option_class=Option_Vanilla,
+            code="FAKE.SH",
+            start="2025-01-02",
+            end="2025-01-31",
+            step=2,
+            hv_window=2,
+            hedge_kwargs={
+                "position": position,
+                "quantity": quantity,
+                "tc_rate": 0.0,
+            },
+        )
+
+
+def test_rolling_backtest_preserves_long_direction_in_rows_and_attrs():
+    result = _small_rolling_direction_fixture(position=-1, quantity=2.0)
+
+    assert not result.empty
+    assert result["position"].eq(-1).all()
+    assert result["position_label"].eq("long").all()
+    assert result.attrs["position"] == -1
+    assert result.attrs["position_label"] == "long"
+    assert result.attrs["quantity"] == pytest.approx(2.0)
+
+
+@pytest.mark.parametrize(
+    ("position", "quantity", "message"),
+    [
+        (0, 1.0, "position"),
+        (2, 1.0, "position"),
+        (-1, 0.0, "quantity"),
+        (-1, -2.0, "quantity"),
+    ],
+)
+def test_rolling_backtest_rejects_implicit_or_invalid_direction(
+        position, quantity, message):
+    with pytest.raises(ValueError, match=message):
+        _small_rolling_direction_fixture(
+            position=position, quantity=quantity)
 
 
 # ---------------------------------------------------------------------------

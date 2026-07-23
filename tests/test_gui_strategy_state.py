@@ -549,7 +549,7 @@ def test_manual_daily_wind_rejects_fixed_time_but_keeps_band_choice():
         "日频", strategy_name="hedge_band") == "日频"
 
 
-def test_history_wind_auto_range_covers_year_plus_option_maturity():
+def test_history_wind_auto_range_covers_strict_year_plus_day0_anchor():
     asof = datetime.date(2026, 2, 27)
     maturity_days = 22
     resolved = BacktestApp._resolve_history_wind_state({
@@ -563,7 +563,7 @@ def test_history_wind_auto_range_covers_year_plus_option_maturity():
         "history_include_band": True,
         "fixed_times": "11:30,15:00",
     }, today=datetime.date(2026, 3, 1))
-    required = ANNUAL_DAYS + maturity_days
+    required = ANNUAL_DAYS + 1
     expected_span = BacktestApp._calendar_span_for_trading_days(required)
 
     assert resolved["wind_required_trade_days"] == required
@@ -571,8 +571,34 @@ def test_history_wind_auto_range_covers_year_plus_option_maturity():
     assert resolved["wind_start"] == (
         asof - datetime.timedelta(days=expected_span)).isoformat()
     assert resolved["wind_bar_size"] == "15min"
-    assert resolved["wind_date_mode"] == "history_auto_year_plus_maturity"
+    assert resolved["wind_date_mode"] == "history_auto_year_strict_interval"
     assert resolved["wind_sigma_warmup_days"] == 0
+
+
+def test_history_wind_auto_range_is_independent_of_proxy_maturity():
+    base = {
+        "source": "wind",
+        "wind_code": "510050.SH",
+        "history_lookbacks": {"week": gui_app.LOOKBACK_DAYS["week"]},
+        "history_wind_asof": "2026-02-27",
+        "history_wind_auto_start": True,
+        "history_wind_bar_size_requested": "日频",
+        "history_include_fixed_times": False,
+        "history_include_band": False,
+    }
+    resolved = [
+        BacktestApp._resolve_history_wind_state(
+            {**base, "params": {"T_days": maturity_days}},
+            today=datetime.date(2026, 3, 1),
+        )
+        for maturity_days in (2, 243)
+    ]
+
+    assert resolved[0]["wind_start"] == resolved[1]["wind_start"]
+    assert resolved[0]["wind_required_trade_days"] == (
+        gui_app.LOOKBACK_DAYS["week"] + 1)
+    assert resolved[0]["wind_required_trade_days"] == resolved[1][
+        "wind_required_trade_days"]
 
 
 def test_history_wind_auto_range_uses_longest_selected_period():
@@ -593,7 +619,7 @@ def test_history_wind_auto_range_uses_longest_selected_period():
         "history_include_fixed_times": False,
         "history_include_band": False,
     }, today=datetime.date(2026, 3, 1))
-    required = gui_app.LOOKBACK_DAYS["quarter"] + maturity_days
+    required = gui_app.LOOKBACK_DAYS["quarter"] + 1
 
     assert resolved["history_lookbacks"] == selected
     assert resolved["history_max_lookback_days"] == gui_app.LOOKBACK_DAYS[
@@ -604,7 +630,7 @@ def test_history_wind_auto_range_uses_longest_selected_period():
             days=BacktestApp._calendar_span_for_trading_days(required))
     ).isoformat()
     assert resolved["wind_date_mode"] == (
-        "history_auto_selected_period_plus_maturity")
+        "history_auto_selected_strict_interval")
 
 
 def test_history_wind_auto_range_adds_realized_sigma_warmup():
@@ -621,7 +647,7 @@ def test_history_wind_auto_range_adds_realized_sigma_warmup():
         "sigma_source": "realized",
         "sigma_window": 30,
     }, today=datetime.date(2026, 3, 1))
-    required = ANNUAL_DAYS + 22 + 30
+    required = ANNUAL_DAYS + 30 + 1
 
     assert resolved["wind_required_trade_days"] == required
     assert resolved["wind_sigma_warmup_days"] == 30
@@ -879,6 +905,33 @@ def _fake_history_period_vars(selected=None):
     }
 
 
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [(1, 1), (-1, -1), ("1", 1), ("-1", -1), (1.0, 1), (-1.0, -1)],
+)
+def test_position_normalization_accepts_only_the_two_gui_directions(
+        raw, expected):
+    assert BacktestApp._normalize_position(raw) == expected
+
+
+@pytest.mark.parametrize("raw", [0, 2, -2, "", "long", True, np.nan])
+def test_position_normalization_rejects_ambiguous_or_invalid_values(raw):
+    with pytest.raises(ValueError, match="头寸方向"):
+        BacktestApp._normalize_position(raw)
+
+
+@pytest.mark.parametrize("position", [1, -1])
+def test_single_and_history_state_freeze_left_position_as_unique_source(
+        position):
+    single = _fake_collect_state()
+    single._pos_var.set(position)
+    history = _fake_history_collect_state()
+    history._pos_var.set(position)
+
+    assert BacktestApp._collect_gui_state(single)["position"] == position
+    assert BacktestApp._collect_history_state(history)["position"] == position
+
+
 def test_history_collects_its_own_candidates_times_and_sigma_configuration():
     fake = _fake_history_collect_state()
     # 候选时刻与 σ 配置独立于普通回测区；收盘兜底是唯一共享例外。
@@ -898,27 +951,21 @@ def test_history_collects_its_own_candidates_times_and_sigma_configuration():
     assert state["history_include_current_band"] is True
 
 
-def test_history_default_period_controls_freeze_all_lookbacks_and_budgets():
+def test_history_default_period_controls_freeze_all_strict_lookbacks():
     fake = _fake_history_collect_state()
     fake._history_period_vars = _fake_history_period_vars()
     expected_lookbacks = {
         key: gui_app.LOOKBACK_DAYS[key]
         for key, _label in gui_app.HISTORY_PERIOD_DEFS
     }
-    expected_targets = {
-        key: gui_app.HISTORY_TARGET_ENDPOINTS[key]
-        for key in expected_lookbacks
-    }
-
     state = BacktestApp._collect_history_state(fake)
 
     assert state["history_lookbacks"] == expected_lookbacks
-    assert state["history_target_endpoints"] == expected_targets
+    assert "history_target_endpoints" not in state
     # 任务快照必须是普通字典；启动后再改复选框不能篡改本次实验。
     for variable in fake._history_period_vars.values():
         variable.set(False)
     assert state["history_lookbacks"] == expected_lookbacks
-    assert state["history_target_endpoints"] == expected_targets
 
 
 def test_history_collects_only_checked_periods_in_canonical_order():
@@ -932,10 +979,7 @@ def test_history_collects_only_checked_periods_in_canonical_order():
         "month": gui_app.LOOKBACK_DAYS["month"],
         "half_year": gui_app.LOOKBACK_DAYS["half_year"],
     }
-    assert state["history_target_endpoints"] == {
-        "month": gui_app.HISTORY_TARGET_ENDPOINTS["month"],
-        "half_year": gui_app.HISTORY_TARGET_ENDPOINTS["half_year"],
-    }
+    assert "history_target_endpoints" not in state
 
 
 def test_history_collect_rejects_when_all_period_controls_are_cleared():
@@ -990,8 +1034,7 @@ def test_history_wind_collection_uses_independent_asof_range_and_frequency():
     fake._history_wind_bar_size_var = _Var(WIND_AUTO_BAR_SIZE)
 
     state = BacktestApp._collect_history_state(fake)
-    required = (
-        ANNUAL_DAYS + state["params"]["T_days"] + state["sigma_window"])
+    required = ANNUAL_DAYS + state["sigma_window"] + 1
     expected_start = (
         datetime.date(2025, 6, 30) - datetime.timedelta(
             days=BacktestApp._calendar_span_for_trading_days(required))
@@ -1042,10 +1085,7 @@ def test_new_wind_controls_are_optional_for_legacy_test_doubles():
         key: gui_app.LOOKBACK_DAYS[key]
         for key, _label in gui_app.HISTORY_PERIOD_DEFS
     }
-    assert collected_history["history_target_endpoints"] == {
-        key: gui_app.HISTORY_TARGET_ENDPOINTS[key]
-        for key, _label in gui_app.HISTORY_PERIOD_DEFS
-    }
+    assert "history_target_endpoints" not in collected_history
 
 
 @pytest.mark.parametrize("enabled", [False, True])
@@ -1496,6 +1536,40 @@ def test_contract_pool_loads_contracts_only_from_longest_selected_period(
     assert pool.main_contract_asof == "P2601.DCE"
 
 
+def test_contract_pool_prehistory_does_not_expand_with_proxy_maturity(
+        monkeypatch):
+    mapping = pd.Series(
+        ["P2609.DCE"] * 5,
+        index=pd.bdate_range("2026-06-01", periods=5),
+    )
+    requested_starts = []
+    monkeypatch.setattr(
+        "pricing.wind_data.get_main_contract_history",
+        lambda *_args: mapping,
+    )
+
+    def get_close(_code, start, end, _adjust):
+        requested_starts.append(start)
+        return pd.Series(
+            np.linspace(100.0, 103.0, 4),
+            index=pd.bdate_range(end=pd.Timestamp(end), periods=4),
+        )
+
+    monkeypatch.setattr("pricing.wind_data.get_close_prices", get_close)
+    for maturity_days in (2, 243):
+        BacktestApp._load_wind_contract_history_pool({
+            "wind_code": "P.DCE",
+            "wind_start": "2026-01-01",
+            "wind_end": "2026-06-30",
+            "wind_bar_size": "日频",
+            "params": {"T_days": maturity_days},
+            "history_lookbacks": {"week": gui_app.LOOKBACK_DAYS["week"]},
+        })
+
+    assert len(requested_starts) == 2
+    assert requested_starts[0] == requested_starts[1]
+
+
 def test_comparison_headline_is_order_independent_and_uses_runner_denominator():
     summary = pd.DataFrame([
         {"strategy": "C", "score": 12.0, "total_tc": 120.0},
@@ -1618,6 +1692,24 @@ def test_history_row_improvement_prefers_window_equal_selection_metric():
     assert improvement == pytest.approx(0.20)
 
 
+def test_history_metric_labels_mark_product_pool_raw_rms_as_diagnostic():
+    single = BacktestApp._history_metric_labels(
+        uses_strict_metric=True, uses_product_pool=False)
+    pool = BacktestApp._history_metric_labels(
+        uses_strict_metric=True, uses_product_pool=True)
+
+    assert single == {
+        "score": "区间RMS↓",
+        "baseline": "C2C区间RMS",
+        "improvement": "较C2C改善",
+    }
+    assert pool == {
+        "score": "汇总RMS(诊断)↓",
+        "baseline": "C2C RMS(诊断)",
+        "improvement": "较C2C改善",
+    }
+
+
 def _history_chart_summary():
     rows = []
 
@@ -1677,6 +1769,9 @@ def _history_cross_contract_normalized_summary():
         ("cumulative_net_pnl", "normalized_cumulative_net_pnl"),
         ("cumulative_gross_pnl", "normalized_cumulative_gross_pnl"),
         ("cumulative_tc", "normalized_cumulative_tc"),
+        ("daily_net_pnl", "normalized_daily_net_pnl"),
+        ("daily_gross_pnl", "normalized_daily_gross_pnl"),
+        ("daily_tc", "normalized_daily_tc"),
     ):
         summary[normalized] = pd.Series([
             np.asarray(values, dtype=float) / denominator
@@ -1685,10 +1780,11 @@ def _history_cross_contract_normalized_summary():
     return summary
 
 
-def test_history_chart_exposes_only_single_sample_and_multi_sample_modes():
+def test_history_chart_exposes_full_interval_and_proxy_diagnostic_modes():
     assert gui_app.HISTORY_CHART_MODE_DISPLAY == {
-        "single": "单样本路径",
-        "typical": "多样本中位路径",
+        "full": "完整 L 日累计路径",
+        "single": "单代理段路径",
+        "typical": "多代理段中位路径",
     }
 
 
@@ -1796,8 +1892,57 @@ def test_history_multi_chart_uses_strict_common_windows_and_one_c2c_series():
     assert model["primary_strategy"] == "每日固定时刻"
     assert all("window_" not in item["label"]
                for item in model["window_options"])
-    assert all(item["label"].startswith("样本 ")
+    assert all(item["label"].startswith("代理段 ")
                for item in model["window_options"])
+
+
+def test_history_full_chart_concatenates_common_segments_in_strict_order():
+    model = BacktestApp._history_multi_chart_model(
+        _history_multi_chart_summary(), "week",
+        ["固定间隔(1σ)", "每日固定时刻"],
+        mode="full", metric="net",
+        primary_strategy="每日固定时刻",
+    )
+
+    baseline = next(
+        item for item in model["series"] if item["role"] == "baseline")
+    band = next(
+        item for item in model["series"]
+        if item.get("strategy") == "固定间隔(1σ)")
+
+    assert model["state"] == "ok"
+    assert model["common_window_count"] == 2
+    assert model["segment_lengths"] == (2, 2)
+    assert model["segment_boundaries"] == (2,)
+    assert model["common_day_count"] == 4
+    assert model["expected_day_count"] == gui_app.LOOKBACK_DAYS["week"]
+    assert model["complete_evidence"] is False
+    np.testing.assert_allclose(baseline["y"], [3.0, 8.0, 13.0, 20.0])
+    np.testing.assert_allclose(band["y"], [4.0, 10.0, 16.0, 24.0])
+    assert "共同交集" in model["title"]
+
+
+def test_history_full_chart_drops_failed_segment_from_common_intersection():
+    summary = _history_multi_chart_summary()
+    failed = (
+        summary["strategy"].eq("每日固定时刻")
+        & summary["window_id"].eq("window_2")
+    )
+    summary.loc[failed, "success"] = False
+
+    model = BacktestApp._history_multi_chart_model(
+        summary, "week", ["固定间隔(1σ)", "每日固定时刻"],
+        mode="full", metric="net",
+    )
+
+    assert model["state"] == "ok"
+    assert [item["window_id"] for item in model["window_options"]] == [
+        "window_3",
+    ]
+    assert model["common_day_count"] == 2
+    for item in model["series"]:
+        assert len(item["y"]) == 2
+    assert model["sample_scope_differs"] is True
 
 
 def test_history_multi_typical_chart_uses_same_window_count_for_all_series():
@@ -1832,6 +1977,27 @@ def test_history_cross_contract_typical_chart_uses_normalized_curves():
     np.testing.assert_allclose(candidate["median"], expected)
 
 
+def test_history_cross_contract_full_chart_uses_normalized_daily_curves():
+    summary = _history_cross_contract_normalized_summary()
+    model = BacktestApp._history_multi_chart_model(
+        summary, "week", ["固定间隔(1σ)"],
+        mode="full", metric="net",
+    )
+
+    candidate = next(
+        item for item in model["series"] if item["role"] == "candidate")
+    expected_daily = np.concatenate([
+        row["normalized_daily_net_pnl"]
+        for _index, row in summary[
+            summary["strategy"].eq("固定间隔(1σ)")
+        ].sort_values("end_ts").iterrows()
+    ])
+    assert model["state"] == "ok"
+    assert model["uses_normalized_notional"] is True
+    assert "各代理段期初名义金额" in model["metric_label"]
+    np.testing.assert_allclose(candidate["y"], np.cumsum(expected_daily))
+
+
 def test_history_cross_contract_typical_chart_fails_closed_without_normalization():
     summary = _history_cross_contract_normalized_summary().drop(
         columns=["normalized_cumulative_net_pnl"])
@@ -1843,7 +2009,7 @@ def test_history_cross_contract_typical_chart_fails_closed_without_normalization
 
     assert model["state"] == "empty"
     assert "安全归一化" in model["message"]
-    assert "单样本路径" in model["message"]
+    assert "单代理段路径" in model["message"]
 
 
 def test_history_cross_contract_single_chart_keeps_raw_amount_curves():
@@ -1996,7 +2162,7 @@ def test_history_chart_rejects_candidate_that_removes_all_common_windows():
     assert "共同" in statuses[-1]
 
 
-@pytest.mark.parametrize("mode", ["single", "typical"])
+@pytest.mark.parametrize("mode", ["full", "single", "typical"])
 def test_history_multi_chart_renderer_draws_c2c_and_all_candidates(mode):
     from matplotlib.backends.backend_agg import FigureCanvasAgg
     from matplotlib.figure import Figure
@@ -2029,31 +2195,43 @@ def test_history_multi_chart_renderer_draws_c2c_and_all_candidates(mode):
     assert labels[1].startswith("固定间隔(1σ)")
     assert labels[2].startswith("每日固定时刻")
     assert len(app._history_chart_ax.lines) >= 3
-    assert "共同样本 2 个" in app._history_chart_hint_var.get()
+    assert "共同代理段 2 个" in app._history_chart_hint_var.get()
 
 
 def _history_period_view_model_fixture():
-    """五周期展示样本显式携带 C2C 基准及配对比较口径。"""
+    """五周期展示显式携带严格区间、代理段及 C2C 配对口径。"""
     recommendations = pd.DataFrame([{
         "lookback": "week", "strategy": "固定间隔(1σ)",
         "strategy_type": "hedge_band", "score": 8.0,
         "baseline_score": 10.0, "improvement_vs_c2c": 0.20,
+        "selection_improvement_vs_c2c": 0.20,
+        "selection_metric": gui_app.STRICT_LOOKBACK_SELECTION_METRIC,
         "window_win_rate_vs_c2c": 0.75,
         "paired_windows": 4, "baseline_windows": 4,
         "comparison_eligible": True,
         "rolling_windows": 4, "eligible_endpoints": 4,
         "skipped_endpoints": 0, "history_days_available": 5,
-        "lookback_days": 5, "maturity_days": 22, "step_days": 5,
+        "lookback_days": 5, "evidence_days": 5, "days_used": 5,
+        "maturity_days": 22,
+        "evaluation_mode": "strict_lookback",
+        "sampling_mode": "strict_contiguous",
+        "segment_count": 1, "expiry_segments": 0, "mtm_segments": 1,
+        "terminal_mode": "mark_to_market",
     }])
 
     def row(lookback, rank, strategy, strategy_type, score, baseline_score,
             improvement, paired, eligible, skipped, available, requested,
             complete, *, win_rate=0.0, comparison_eligible=True):
+        evidence = min(available, requested)
+        expiry_segments, tail = divmod(evidence, 22)
+        segment_count = expiry_segments + int(tail > 0)
         return {
             "lookback": lookback, "rank": rank, "strategy": strategy,
             "strategy_type": strategy_type, "score": score,
             "baseline_score": baseline_score,
             "improvement_vs_c2c": improvement,
+            "selection_improvement_vs_c2c": improvement,
+            "selection_metric": gui_app.STRICT_LOOKBACK_SELECTION_METRIC,
             "window_win_rate_vs_c2c": win_rate,
             "paired_windows": paired, "baseline_windows": paired,
             "comparison_eligible": comparison_eligible,
@@ -2061,6 +2239,16 @@ def _history_period_view_model_fixture():
             "skipped_endpoints": skipped,
             "history_days_available": available,
             "lookback_days": requested, "complete_window": complete,
+            "maturity_days": 22, "evidence_days": requested,
+            "days_used": evidence,
+            "evaluation_mode": "strict_lookback",
+            "sampling_mode": "strict_contiguous",
+            "segment_count": segment_count,
+            "expiry_segments": expiry_segments,
+            "mtm_segments": int(tail > 0),
+            "terminal_mode": (
+                "mixed" if expiry_segments and tail else
+                "mark_to_market" if tail else "expiry"),
         }
 
     ranking = pd.DataFrame([
@@ -2090,17 +2278,18 @@ def test_recommendation_view_model_compares_each_period_with_fixed_c2c():
     assert [row["lookback"] for row in rows] == [
         "week", "month", "quarter", "half_year", "year",
     ]
-    assert rows[0]["status"] == "历史样本完整"
+    assert rows[0]["status"] == "严格区间完整"
     assert rows[0]["strategy_label"] == "固定间隔(1σ)"
     assert rows[0]["improvement_vs_c2c"] == pytest.approx(0.20)
     assert rows[0]["gap_ratio"] == pytest.approx(0.20)
-    assert rows[0]["selection_improvement_vs_c2c"] is None
+    assert rows[0]["selection_improvement_vs_c2c"] == pytest.approx(0.20)
+    assert rows[0]["uses_strict_metric"] is True
     assert rows[0]["uses_window_equal_metric"] is False
     assert rows[0]["window_win_rate_vs_c2c"] == pytest.approx(0.75)
     assert (rows[0]["paired"], rows[0]["baseline_windows"]) == (4, 4)
     assert rows[0]["best_is_baseline"] is False
 
-    assert rows[1]["status"] == "样本不足，仅诊断"
+    assert rows[1]["status"] == "区间不足，仅诊断"
     assert rows[1]["strategy_label"] == "诊断：每日收盘（基准最优）"
     assert rows[1]["improvement_vs_c2c"] == pytest.approx(0.0)
     assert rows[1]["best_is_baseline"] is True
@@ -2113,9 +2302,9 @@ def test_recommendation_view_model_compares_each_period_with_fixed_c2c():
     assert rows[2]["strategy_label"] == "仅基准（无完整配对候选）"
     assert rows[2]["has_comparable_candidate"] is False
     assert rows[3]["period"] == "近半年"
-    assert rows[3]["status"] == "无可评估样本"
+    assert rows[3]["status"] == "无可评估代理段"
     assert rows[4]["period"] == "近年"
-    assert rows[4]["status"] == "无可评估样本"
+    assert rows[4]["status"] == "无可评估代理段"
 
 
 def test_recommendation_view_model_only_returns_selected_period_subset():
@@ -2126,26 +2315,31 @@ def test_recommendation_view_model_only_returns_selected_period_subset():
 
     assert [row["lookback"] for row in rows] == ["week", "quarter"]
     assert [row["period"] for row in rows] == ["近周", "近季"]
-    assert rows[0]["status"] == "历史样本完整"
+    assert rows[0]["status"] == "严格区间完整"
     assert rows[1]["status"] == "无完整配对候选"
 
 
-def test_product_pool_view_uses_window_equal_metric_and_contract_list():
+def test_product_pool_view_uses_strict_metric_and_contract_list():
     candidate = {
         "lookback": "week", "rank": 1,
         "strategy": "固定间隔(1σ)", "strategy_type": "hedge_band",
         "score": 110.0, "baseline_score": 100.0,
         "improvement_vs_c2c": -0.10,
         "selection_improvement_vs_c2c": 0.20,
-        "selection_metric": "mean_bounded_window_advantage_vs_c2c",
+        "selection_metric": gui_app.STRICT_LOOKBACK_SELECTION_METRIC,
         "window_win_rate_vs_c2c": 0.75,
         "paired_windows": 4, "baseline_windows": 4,
         "comparison_eligible": True, "recommendation_eligible": True,
         "complete_window": True, "rolling_windows": 4,
         "eligible_endpoints": 4, "selected_endpoints": 4,
         "planned_endpoints": 4, "skipped_endpoints": 0,
-        "history_days_available": 5, "available_history_days": 27,
-        "required_history_days": 27, "lookback_days": 5,
+        "history_days_available": 5, "available_history_days": 5,
+        "required_history_days": 5, "lookback_days": 5,
+        "evidence_days": 5, "days_used": 5,
+        "evaluation_mode": "strict_lookback",
+        "sampling_mode": "strict_contiguous",
+        "segment_count": 1, "expiry_segments": 0, "mtm_segments": 1,
+        "terminal_mode": "mark_to_market",
         "maturity_days": 22, "history_complete": True,
         "history_mode": "product_contract_pool", "product_code": "P.DCE",
         "paired_contract_codes": ("P2601.DCE", "P2605.DCE"),
@@ -2166,26 +2360,25 @@ def test_product_pool_view_uses_window_equal_metric_and_contract_list():
     assert rows[0]["strategy"] == "固定间隔(1σ)"
     assert rows[0]["improvement_vs_c2c"] == pytest.approx(0.20)
     assert rows[0]["selection_metric"] == (
-        "mean_bounded_window_advantage_vs_c2c")
-    assert rows[0]["uses_window_equal_metric"] is True
+        gui_app.STRICT_LOOKBACK_SELECTION_METRIC)
+    assert rows[0]["uses_strict_metric"] is True
+    assert rows[0]["uses_window_equal_metric"] is False
     assert rows[0]["paired_contract_codes"] == (
         "P2601.DCE", "P2605.DCE")
 
 
-def test_history_period_view_model_preserves_target_sampling_and_t_context():
+def test_history_period_view_model_preserves_strict_interval_and_proxy_context():
     sampling = {
         "maturity_days": 243,
-        "sampling_mode": "target_count",
-        "step_days": np.nan,
-        "target_endpoints": 12,
-        "planned_endpoints": 5,
-        "selected_endpoints": 5,
-        "endpoint_spacing_min": 1,
-        "endpoint_spacing_max": 1,
-        "window_overlap_min_ratio": 242 / 243,
-        "window_overlap_max_ratio": 242 / 243,
-        "maturity_exceeds_lookback": True,
-        "required_history_days": 248,
+        "evaluation_mode": "strict_lookback",
+        "sampling_mode": "strict_contiguous",
+        "evidence_days": 5,
+        "days_used": 5,
+        "segment_count": 1,
+        "expiry_segments": 0,
+        "mtm_segments": 1,
+        "terminal_mode": "mark_to_market",
+        "required_history_days": 5,
         "available_history_days": 300,
         "history_complete": True,
     }
@@ -2216,19 +2409,71 @@ def test_history_period_view_model_preserves_target_sampling_and_t_context():
     )[0]
 
     assert week["maturity_days"] == 243
-    assert week["sampling_mode"] == "target_count"
-    assert np.isnan(week["step_days"])
-    assert week["target_endpoints"] == 12
-    assert week["planned_endpoints"] == 5
-    assert week["selected_endpoints"] == 5
-    assert week["endpoint_spacing_min"] == 1
-    assert week["endpoint_spacing_max"] == 1
-    assert week["window_overlap_min_ratio"] == pytest.approx(242 / 243)
-    assert week["window_overlap_max_ratio"] == pytest.approx(242 / 243)
-    assert week["maturity_exceeds_lookback"] is True
-    assert week["required_history_days"] == 248
+    assert week["evaluation_mode"] == "strict_lookback"
+    assert week["sampling_mode"] == "strict_contiguous"
+    assert week["evidence_days"] == 5
+    assert week["days_used"] == 5
+    assert week["segment_count"] == 1
+    assert week["expiry_segments"] == 0
+    assert week["mtm_segments"] == 1
+    assert week["terminal_mode"] == "mark_to_market"
+    assert week["required_history_days"] == 5
     assert week["available_history_days"] == 300
     assert week["history_complete"] is True
+
+
+def test_history_period_view_model_accepts_legacy_ranking_and_proxy_alias():
+    candidate = {
+        "lookback": "week", "rank": 1, "strategy": "旧候选",
+        "strategy_type": "hedge_band", "score": 8.0,
+        "baseline_score": 10.0, "improvement_vs_c2c": 0.2,
+        "selection_improvement_vs_c2c": 0.3,
+        "selection_metric": gui_app.HISTORY_SELECTION_METRIC,
+        "rolling_windows": 1, "paired_windows": 1,
+        "baseline_windows": 1, "eligible_endpoints": 1,
+        "skipped_endpoints": 0, "history_days_available": 5,
+        "lookback_days": 5, "days_used": 22, "comparison_eligible": True,
+        "complete_window": True, "proxy_segments": 2,
+    }
+    baseline = {
+        **candidate, "rank": 2, "strategy": "每日收盘",
+        "strategy_type": "close_to_close", "score": 10.0,
+        "improvement_vs_c2c": 0.0,
+    }
+
+    week = BacktestApp._comparison_recommendation_rows(
+        pd.DataFrame([candidate]),
+        pd.DataFrame([candidate, baseline]),
+    )[0]
+
+    assert week["strategy"] == "旧候选"
+    assert week["improvement_vs_c2c"] == pytest.approx(0.3)
+    assert week["uses_strict_metric"] is False
+    assert week["uses_window_equal_metric"] is True
+    assert week["status"] == "旧口径样本完整"
+    assert week["evaluation_mode"] is None
+    assert week["evidence_days"] == 0
+    assert week["days_used"] == 22
+    assert week["segment_count"] == 2
+    assert week["terminal_mode"] is None
+
+
+def test_history_metric_recognition_does_not_label_legacy_as_strict():
+    legacy = {
+        "selection_metric": gui_app.HISTORY_SELECTION_METRIC,
+        "selection_improvement_vs_c2c": 0.12,
+    }
+    strict = {
+        "selection_metric": gui_app.STRICT_LOOKBACK_SELECTION_METRIC,
+        "selection_improvement_vs_c2c": 0.08,
+    }
+
+    assert BacktestApp._history_row_uses_recognized_selection_metric(legacy)
+    assert BacktestApp._history_row_uses_window_equal_metric(legacy)
+    assert not BacktestApp._history_row_uses_strict_metric(legacy)
+    assert BacktestApp._history_row_uses_recognized_selection_metric(strict)
+    assert not BacktestApp._history_row_uses_window_equal_metric(strict)
+    assert BacktestApp._history_row_uses_strict_metric(strict)
 
 
 def test_zero_window_or_non_finite_history_result_is_not_a_diagnostic_leader():
@@ -2242,7 +2487,26 @@ def test_zero_window_or_non_finite_history_result_is_not_a_diagnostic_leader():
     week = BacktestApp._comparison_recommendation_rows(None, ranking)[0]
 
     assert week["strategy"] == "—"
-    assert week["status"] == "无可评估样本"
+    assert week["status"] == "无可评估代理段"
+
+
+def test_trigger_detail_labels_mark_to_market_evaluation_close():
+    frame = pd.DataFrame(
+        {"标的价格": [100.0, 101.0, 102.0]},
+        index=pd.bdate_range("2026-07-20", periods=3),
+    )
+    bt = SimpleNamespace(
+        _results={
+            "hedge_triggered": np.array([True, False, True]),
+            "terminal_mode": "mark_to_market",
+        },
+        to_dataframe=lambda: frame.copy(),
+    )
+
+    detail, positions = BacktestApp._hedge_trigger_detail_frame(bt)
+
+    assert positions.tolist() == [0, 2]
+    assert detail["触发来源"].tolist() == ["初始建仓", "评价期末平仓"]
 
 
 def test_history_reports_failure_when_main_thread_render_raises(monkeypatch):
@@ -2338,7 +2602,7 @@ def test_zero_window_fixed_time_payload_reports_real_target_error():
         )
 
     message = str(exc_info.value)
-    assert "固定时刻策略没有形成任何可评估滚动样本" in message
+    assert "固定时刻策略没有形成任何可评估代理段" in message
     assert "缺失 [11:30]" in message
     assert "历史长度不足" not in message
 
@@ -2358,7 +2622,7 @@ def test_zero_window_contract_pool_payload_reports_exact_contract_error():
         )
 
     message = str(exc_info.value)
-    assert "历史具体合约池没有形成任何可评估样本" in message
+    assert "历史具体合约池没有形成任何可评估代理段" in message
     assert "P2509.DCE" in message
     assert "历史长度不足" not in message
 
@@ -2486,6 +2750,20 @@ def test_apply_history_recommendation_maps_daily_and_fixed_time_to_backtest(
     assert statuses and "已应用历史候选" in statuses[-1]
 
 
+def test_apply_history_recommendation_never_restores_snapshot_position():
+    fake, _navigated, _statuses = _fake_history_apply_target()
+    fake._pos_var = _Var("-1")
+    fake._latest_history_state = {"position": 1}
+
+    BacktestApp._apply_history_recommendation(
+        fake, {
+            "strategy": "每日收盘",
+            "meta_strategy_name": "close_to_close",
+        }, navigate=False)
+
+    assert BacktestApp._normalize_position(fake._pos_var.get()) == -1
+
+
 @pytest.mark.parametrize("enabled", [False, True])
 def test_apply_history_recommendation_restores_public_close_fallback(enabled):
     fake, _navigated, _statuses = _fake_history_apply_target()
@@ -2564,6 +2842,33 @@ def test_current_path_validation_applies_selection_and_schedules_auto_retain():
         "历史验证 · 固定时刻(10:30,14:30)")
 
 
+@pytest.mark.parametrize("position", [1, -1])
+def test_current_path_validation_launches_with_current_left_position(position):
+    row = {
+        "strategy": "固定时刻(10:30,14:30)",
+        "meta_strategy_name": "fixed_times",
+        "meta_fixed_times": "10:30,14:30",
+    }
+    fake, _navigated, _statuses = _fake_history_apply_target()
+    fake._pos_var = _Var(position)
+    fake._latest_history_state = {"position": -position}
+    fake._active_job = None
+    fake._pending_history_retain_name = None
+    fake._selected_history_rank_row = lambda: row
+    fake._apply_history_recommendation = (
+        lambda selected, navigate:
+        BacktestApp._apply_history_recommendation(
+            fake, selected, navigate=navigate))
+    launched_positions = []
+    fake._run_backtest = lambda: (
+        launched_positions.append(
+            BacktestApp._normalize_position(fake._pos_var.get()))
+        or True)
+
+    assert BacktestApp._run_history_selection_on_current_path(fake) is True
+    assert launched_positions == [position]
+
+
 def test_successfully_started_backtest_reports_true_to_auto_retain_caller(
         monkeypatch):
     started_threads = []
@@ -2634,7 +2939,7 @@ def _history_worker_fixture(source, load_history):
     return fake, state, delivered, failed
 
 
-def test_history_worker_uses_period_target_budgets_for_every_maturity(
+def test_history_worker_uses_strict_periods_without_endpoint_budgets(
         monkeypatch):
     history = pd.Series(
         [100.0, 101.0, 102.0],
@@ -2668,20 +2973,17 @@ def test_history_worker_uses_period_target_budgets_for_every_maturity(
         assert len(delivered) == 1
 
     assert [maturity for maturity, _kwargs in captured] == [2, 22, 243]
-    assert [kwargs["target_endpoints"] for _maturity, kwargs in captured] == [
-        gui_app.HISTORY_TARGET_ENDPOINTS,
-        gui_app.HISTORY_TARGET_ENDPOINTS,
-        gui_app.HISTORY_TARGET_ENDPOINTS,
-    ]
     assert [kwargs["lookbacks"] for _maturity, kwargs in captured] == [
         gui_app.LOOKBACK_DAYS,
         gui_app.LOOKBACK_DAYS,
         gui_app.LOOKBACK_DAYS,
     ]
+    assert all(
+        "target_endpoints" not in kwargs for _maturity, kwargs in captured)
     assert all("step_days" not in kwargs for _maturity, kwargs in captured)
 
 
-def test_csv_history_worker_passes_only_selected_periods_and_budgets(
+def test_csv_history_worker_passes_only_selected_strict_periods(
         monkeypatch):
     history = pd.Series(
         [100.0, 101.0, 102.0],
@@ -2698,10 +3000,6 @@ def test_csv_history_worker_passes_only_selected_periods_and_budgets(
         "week": gui_app.LOOKBACK_DAYS["week"],
         "quarter": gui_app.LOOKBACK_DAYS["quarter"],
     }
-    selected_targets = {
-        "week": gui_app.HISTORY_TARGET_ENDPOINTS["week"],
-        "quarter": gui_app.HISTORY_TARGET_ENDPOINTS["quarter"],
-    }
 
     def recommend(option, loaded, cases, kwargs, **call_kwargs):
         captured.append((option, loaded, cases, kwargs, call_kwargs))
@@ -2710,10 +3008,7 @@ def test_csv_history_worker_passes_only_selected_periods_and_budgets(
     monkeypatch.setattr(gui_app, "recommend_by_rolling_history", recommend)
     fake, state, delivered, failed = _history_worker_fixture(
         "csv", lambda _state, _bt: history)
-    state.update({
-        "history_lookbacks": selected_lookbacks,
-        "history_target_endpoints": selected_targets,
-    })
+    state["history_lookbacks"] = selected_lookbacks
 
     BacktestApp._history_recommendation_worker(fake, state)
 
@@ -2721,11 +3016,54 @@ def test_csv_history_worker_passes_only_selected_periods_and_budgets(
     assert len(delivered) == 1
     assert len(captured) == 1
     assert captured[0][4]["lookbacks"] == selected_lookbacks
-    assert captured[0][4]["target_endpoints"] == selected_targets
+    assert "target_endpoints" not in captured[0][4]
 
 
+@pytest.mark.parametrize("position", [1, -1])
+def test_single_series_history_worker_forwards_position_to_recommender(
+        monkeypatch, position):
+    history = pd.Series(
+        [100.0, 101.0, 102.0],
+        index=pd.date_range("2026-01-01", periods=3, freq="B"),
+    )
+    fake, state, delivered, failed = _history_worker_fixture(
+        "csv", lambda _state, _bt: history)
+    state["position"] = position
+    original_build = fake._build_backtest
+
+    def build(base_state):
+        bt = original_build(base_state)
+        bt.position = BacktestApp._normalize_position(
+            base_state["position"])
+        return bt
+
+    fake._build_backtest = build
+    fake._comparison_backtest_kwargs = (
+        lambda bt: BacktestApp._comparison_backtest_kwargs(bt))
+    captured = []
+    recommendations = pd.DataFrame()
+    ranking = pd.DataFrame([{
+        "lookback": "week", "strategy": "daily",
+        "complete_window": False, "rolling_windows": 1, "score": 2.0,
+    }])
+    windows = {"week": {"window_1": {"daily": {}}}}
+
+    def recommend(_option, _history, _cases, kwargs, **_call_kwargs):
+        captured.append(kwargs)
+        return recommendations, ranking, windows
+
+    monkeypatch.setattr(gui_app, "recommend_by_rolling_history", recommend)
+
+    BacktestApp._history_recommendation_worker(fake, state)
+
+    assert failed == []
+    assert len(delivered) == 1
+    assert captured[0]["position"] == position
+
+
+@pytest.mark.parametrize("position", [1, -1])
 def test_history_worker_routes_product_code_without_building_continuous_backtest(
-        monkeypatch):
+        monkeypatch, position):
     mapping = pd.Series(
         ["P2605.DCE", "P2609.DCE"],
         index=pd.bdate_range("2026-06-29", periods=2),
@@ -2743,20 +3081,16 @@ def test_history_worker_routes_product_code_without_building_continuous_backtest
             pool if base_bt is None else pytest.fail(
                 "品种池加载不应依赖连续合约回测对象")))
     state["wind_code"] = "P.DCE"
+    state["position"] = position
     selected_lookbacks = {
         "week": gui_app.LOOKBACK_DAYS["week"],
         "quarter": gui_app.LOOKBACK_DAYS["quarter"],
     }
-    selected_targets = {
-        "week": gui_app.HISTORY_TARGET_ENDPOINTS["week"],
-        "quarter": gui_app.HISTORY_TARGET_ENDPOINTS["quarter"],
-    }
-    state.update({
-        "history_lookbacks": selected_lookbacks,
-        "history_target_endpoints": selected_targets,
-    })
+    state["history_lookbacks"] = selected_lookbacks
     fake._build_backtest = lambda _state: pytest.fail(
         "P.DCE 历史择优不应先下载连续合约行情")
+    fake._comparison_backtest_kwargs = (
+        lambda bt: BacktestApp._comparison_backtest_kwargs(bt))
     recommendations = pd.DataFrame()
     ranking = pd.DataFrame([{
         "lookback": "week", "strategy": "daily",
@@ -2784,7 +3118,8 @@ def test_history_worker_routes_product_code_without_building_continuous_backtest
     assert len(captured) == 1
     assert captured[0][1] is pool
     assert captured[0][4]["lookbacks"] == selected_lookbacks
-    assert captured[0][4]["target_endpoints"] == selected_targets
+    assert "target_endpoints" not in captured[0][4]
+    assert captured[0][3]["position"] == position
     assert "steps_per_day" not in captured[0][3]
     assert "steps_per_day" not in captured[0][4]
 
@@ -2884,8 +3219,9 @@ def test_worker_rejects_simulation_before_building_backtest():
         }),
     ],
 )
+@pytest.mark.parametrize("position", [1, -1])
 def test_real_sources_always_delegate_bar_count_to_backend(
-        monkeypatch, source, factory_name, source_fields):
+        monkeypatch, source, factory_name, source_fields, position):
     captured = {}
 
     def fake_factory(option, *args, **kwargs):
@@ -2897,7 +3233,7 @@ def test_real_sources_always_delegate_bar_count_to_backend(
     state = {
         "cfg": {"build": lambda subtype, params: SimpleNamespace()},
         "cls_name": "test", "subtype": "test", "params": {},
-        "source": source, "tc_rate": 0.0, "position": 1,
+        "source": source, "tc_rate": 0.0, "position": position,
         "quantity": 1.0, "multiplier": 0.0, "slippage_bps": 0.0,
         "force_day_close_hedge": True,
         "steps_per_day": 240, "strategy_name": "close_to_close",
@@ -2909,6 +3245,7 @@ def test_real_sources_always_delegate_bar_count_to_backend(
 
     BacktestApp._build_backtest(fake_app, state)
     assert captured["steps_per_day"] is None
+    assert captured["position"] == position
     assert isinstance(captured["strategy"], CloseToCloseStrategy)
     assert captured["force_day_close_hedge"] is True
 
@@ -2959,6 +3296,30 @@ def test_comparison_kwargs_do_not_carry_legacy_hedge_frequency():
     ))
     assert "hedge_freq" not in kwargs
     assert kwargs["force_day_close_hedge"] is True
+
+
+@pytest.mark.parametrize(
+    "greek_name", ["delta", "gamma", "vega", "theta", "rho"])
+def test_gui_greek_series_prefers_signed_portfolio_values_with_raw_fallback(
+        greek_name):
+    raw = np.array([1.0, 2.0])
+    signed = np.array([-3.0, -6.0])
+
+    np.testing.assert_array_equal(
+        BacktestApp._result_greek_series(
+            {
+                greek_name: raw,
+                f"portfolio_{greek_name}": signed,
+            },
+            greek_name,
+        ),
+        signed,
+    )
+    np.testing.assert_array_equal(
+        BacktestApp._result_greek_series(
+            {greek_name: raw}, greek_name),
+        raw,
+    )
 
 
 def test_unknown_gui_strategy_never_falls_back_to_fixed_frequency():

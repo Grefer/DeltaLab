@@ -256,6 +256,221 @@ def test_hedge_backtest_pnl_identity():
     )
 
 
+def test_hedge_backtest_partial_horizon_uses_terminal_mtm():
+    """H<T 时只需 H 日行情，末端应按 T-H 日公允价值而非 intrinsic 结算。"""
+    option = Option_Vanilla(
+        "Vanilla", s0=100.0, sr=[], K=100.0,
+        T=5, sigma=0.20, cp=1, r=0.0, q=0.0,
+    )
+    external_path = np.array([100.0, 100.0, 100.0])
+    result = HedgeBacktest(
+        option,
+        path_source="historical",
+        external_path=external_path,
+        evaluation_days=2,
+        position=1,
+        quantity=1.0,
+        multiplier=0,
+    ).run()
+
+    expected_mtm = blsprice(
+        100.0, 100.0, 0.0, 0.0,
+        3 / ANNUAL_DAYS, 0.20, cp=1,
+    )
+    assert len(result["prices"]) == 3
+    assert result["evaluation_days"] == 2
+    assert result["initial_maturity_days"] == 5
+    assert result["remaining_days_at_end"] == 3
+    assert result["terminal_mode"] == "mark_to_market"
+    assert result["opt_value"][-1] == pytest.approx(expected_mtm)
+    assert result["opt_value"][-1] > 0.0  # ATM intrinsic 为 0
+    assert result["delta"][-1] > 0.0
+    assert result["gamma"][-1] > 0.0
+    assert result["shares"][-1] == 0.0
+    assert option.T == 5  # 回测不得修改调用方传入的期权
+
+
+def test_hedge_backtest_default_horizon_remains_full_expiry():
+    """默认 None 与显式 H=T 完全一致，并在末端使用到期 payoff/零 Greeks。"""
+    option = Option_Vanilla(
+        "Vanilla", s0=100.0, sr=[], K=100.0,
+        T=2, sigma=0.20, cp=1, r=0.0, q=0.0,
+    )
+    prices = np.array([100.0, 102.0, 104.0])
+    default_result = HedgeBacktest(
+        option, prices, multiplier=0,
+    ).run()
+    explicit_result = HedgeBacktest(
+        option, prices, multiplier=0, evaluation_days=2,
+    ).run()
+
+    for key in (
+            "prices", "opt_value", "delta", "gamma", "shares",
+            "hedge_daily", "option_daily", "tc_paid", "net_daily"):
+        np.testing.assert_allclose(default_result[key], explicit_result[key])
+    assert default_result["evaluation_days"] == 2
+    assert default_result["initial_maturity_days"] == 2
+    assert default_result["remaining_days_at_end"] == 0
+    assert default_result["terminal_mode"] == "expiry"
+    assert default_result["opt_value"][-1] == pytest.approx(4.0)
+    np.testing.assert_allclose(
+        [default_result[key][-1]
+         for key in ("delta", "gamma", "vega", "theta", "rho")],
+        0.0,
+    )
+
+
+@pytest.mark.parametrize(
+    "evaluation_days", [0, -1, 1.5, True, np.nan, np.inf, "bad"],
+)
+def test_hedge_backtest_rejects_invalid_evaluation_days(evaluation_days):
+    option = Option_Vanilla(
+        "Vanilla", 100.0, [], 100.0, 5, 0.20, 1, r=0.0, q=0.0)
+    with pytest.raises(ValueError, match="evaluation_days.*正整数"):
+        HedgeBacktest(
+            option, np.array([100.0, 101.0]),
+            evaluation_days=evaluation_days,
+        )
+
+
+def test_hedge_backtest_rejects_evaluation_horizon_beyond_maturity():
+    option = Option_Vanilla(
+        "Vanilla", 100.0, [], 100.0, 5, 0.20, 1, r=0.0, q=0.0)
+    with pytest.raises(ValueError, match="evaluation_days.*超过.*剩余期限"):
+        HedgeBacktest(
+            option, np.array([100.0, 101.0]),
+            evaluation_days=6,
+        )
+
+
+def _vanilla_direction_pair(*, tc_rate=0.0):
+    """返回同一期权/路径的 short 与 long 回测结果。"""
+    option = Option_Vanilla(
+        "Vanilla", s0=100.0, sr=[], K=100.0,
+        T=4, sigma=0.20, cp=1, r=0.03, q=0.01,
+    )
+    prices = np.array([100.0, 102.0, 98.0, 105.0, 101.0])
+    kwargs = {
+        "hedge_freq": 1,
+        "tc_rate": tc_rate,
+        "quantity": 3.0,
+        "multiplier": 0,
+        "slippage_bps": 0.0,
+    }
+    short = HedgeBacktest(
+        option, prices, position=1, **kwargs).run()
+    long = HedgeBacktest(
+        option, prices, position=-1, **kwargs).run()
+    return short, long
+
+
+def test_hedge_backtest_long_short_zero_cost_are_exact_mirrors():
+    """零成本下，多空所有经济持仓与 PnL 必须严格互为相反数。"""
+    short, long = _vanilla_direction_pair(tc_rate=0.0)
+
+    assert short["position"] == 1
+    assert short["position_label"] == "short"
+    assert long["position"] == -1
+    assert long["position_label"] == "long"
+    for raw_key in ("opt_value", "delta", "gamma", "vega", "theta", "rho"):
+        np.testing.assert_allclose(short[raw_key], long[raw_key])
+    for signed_key in (
+            "shares", "hedge_daily", "option_daily", "net_daily",
+            "cumulative_pnl", "portfolio_delta", "portfolio_gamma",
+            "portfolio_vega", "portfolio_theta", "portfolio_rho"):
+        np.testing.assert_allclose(short[signed_key], -long[signed_key])
+    assert short["hedging_error"] == pytest.approx(-long["hedging_error"])
+    np.testing.assert_allclose(short["tc_paid"], 0.0)
+    np.testing.assert_allclose(long["tc_paid"], 0.0)
+
+    scale = short["quantity"]
+    np.testing.assert_allclose(
+        short["portfolio_gamma"], -scale * short["gamma"])
+    np.testing.assert_allclose(
+        long["portfolio_gamma"], scale * long["gamma"])
+
+
+def test_hedge_backtest_long_short_nonzero_cost_keep_gross_mirror():
+    """成本不改变毛 PnL 镜像；同一绝对交易应让两边成本同为扣减项。"""
+    short, long = _vanilla_direction_pair(tc_rate=0.001)
+    short_gross = short["hedge_daily"] + short["option_daily"]
+    long_gross = long["hedge_daily"] + long["option_daily"]
+
+    np.testing.assert_allclose(short_gross, -long_gross)
+    np.testing.assert_allclose(short["tc_paid"], long["tc_paid"])
+    assert np.sum(short["tc_paid"]) > 0
+    assert np.all(short["tc_paid"] >= 0)
+    assert np.all(long["tc_paid"] >= 0)
+    np.testing.assert_allclose(
+        short["net_daily"] + long["net_daily"],
+        -2.0 * short["tc_paid"],
+    )
+
+
+def test_hedge_backtest_summary_uses_signed_portfolio_greeks(capsys):
+    option = Option_Vanilla(
+        "Vanilla", 100.0, [], 100.0, 2, 0.20, 1, r=0.0, q=0.0)
+    bt = HedgeBacktest(
+        option, np.array([100.0, 101.0, 102.0]),
+        position=1, quantity=3.0, multiplier=0,
+    )
+    result = bt.run()
+
+    assert result["gamma"][0] > 0
+    assert result["portfolio_gamma"][0] < 0
+    bt.summary()
+    gamma_line = next(
+        line for line in capsys.readouterr().out.splitlines()
+        if line.strip().startswith("Gamma"))
+    assert f"{result['portfolio_gamma'][0]:>10.4f}" in gamma_line
+
+
+@pytest.mark.parametrize("position", [0, 2, -2, np.nan, np.inf, True, "bad"])
+def test_hedge_backtest_rejects_invalid_position(position):
+    option = Option_Vanilla(
+        "Vanilla", 100.0, [], 100.0, 2, 0.20, 1, r=0.0, q=0.0)
+    with pytest.raises(ValueError, match="position.*1.*-1"):
+        HedgeBacktest(
+            option, np.array([100.0, 101.0, 102.0]),
+            position=position, quantity=1.0, multiplier=0,
+        )
+
+
+@pytest.mark.parametrize("quantity", [0, -1, np.nan, np.inf, -np.inf, "bad"])
+def test_hedge_backtest_rejects_nonpositive_or_nonfinite_quantity(quantity):
+    option = Option_Vanilla(
+        "Vanilla", 100.0, [], 100.0, 2, 0.20, 1, r=0.0, q=0.0)
+    with pytest.raises(ValueError, match="quantity.*有限正数"):
+        HedgeBacktest(
+            option, np.array([100.0, 101.0, 102.0]),
+            position=1, quantity=quantity, multiplier=0,
+        )
+
+
+@pytest.mark.parametrize(
+    ("parameter", "value"),
+    [
+        ("tc_rate", -0.001),
+        ("tc_rate", np.nan),
+        ("tc_rate", np.inf),
+        ("tc_rate", "bad"),
+        ("slippage_bps", -1.0),
+        ("slippage_bps", np.nan),
+        ("slippage_bps", np.inf),
+        ("slippage_bps", "bad"),
+    ],
+)
+def test_hedge_backtest_rejects_invalid_cost_inputs(parameter, value):
+    option = Option_Vanilla(
+        "Vanilla", 100.0, [], 100.0, 2, 0.20, 1, r=0.0, q=0.0)
+    kwargs = {parameter: value}
+    with pytest.raises(ValueError, match=rf"{parameter}.*有限非负数"):
+        HedgeBacktest(
+            option, np.array([100.0, 101.0, 102.0]),
+            position=1, quantity=1.0, multiplier=0, **kwargs,
+        )
+
+
 # ---------------------------------------------------------------------------
 # 6) _rescale_option_to_real_s0 字段白名单完整性
 # ---------------------------------------------------------------------------
@@ -415,10 +630,24 @@ def test_run_multi_snowball_final_price_uses_knockout_endpoint():
     opt.greeks_nPath = 100
     paths = np.array([[100.0, 100.0, 105.0, 80.0]])
 
+    single = HedgeBacktest(
+        opt, paths[0], hedge_freq=1, tc_rate=0.0,
+        position=1, quantity=1.0, multiplier=0,
+        evaluation_days=2,
+    ).run()
+    assert single["knocked_out"]
+    assert single["evaluation_days"] == 2
+    assert single["initial_maturity_days"] == 3
+    assert single["remaining_days_at_end"] == 0
+    assert single["terminal_mode"] == "knockout"
+
     bt = HedgeBacktest(opt, paths[0], hedge_freq=1, tc_rate=0.0,
                        position=1, quantity=1.0, multiplier=0)
     res = bt.run_multi(paths, max_workers=1)
 
+    assert res["position"] == 1
+    assert res["position_label"] == "short"
+    assert res["quantity"] == pytest.approx(1.0)
     assert res["knocked_out"][0]
     assert res["ko_days"][0] == 2
     assert abs(res["final_prices"][0] - 105.0) < 1e-12
