@@ -14,7 +14,7 @@ import platform
 import threading
 import datetime
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from types import SimpleNamespace
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, simpledialog
@@ -379,6 +379,30 @@ HISTORY_CHART_METRIC_FROM_DISPLAY = {
     value: key for key, value in HISTORY_CHART_METRIC_DISPLAY.items()
 }
 
+# 结果对比页与策略优选页此前各有一套曲线配色，同一个策略在两页会拿到不同
+# 颜色，用户无法把两页的曲线对应起来。两页现在共用这一份色表和标记表，由
+# BacktestApp._strategy_style 按会话内首次出现顺序登记。
+STRATEGY_CHART_COLORS = (
+    "#2563EB", "#D97706", "#7C3AED", "#0F766E",
+    "#DB2777", "#DC2626", "#0891B2", "#65A30D",
+    "#9333EA", "#C2410C", "#4F46E5", "#047857",
+)
+STRATEGY_CHART_MARKERS = ("o", "s", "^", "D", "v", "P", "X", "<", ">", "h")
+# 每日收盘在两页都是固定基准，必须始终占用同一个颜色位，不能因为登记顺序
+# 不同而换色。
+BASELINE_STRATEGY_STYLE_KEY = "close_to_close"
+
+# 快照来源：只有 origin 是结构化字段，可供结果池分组与回跳使用；此前来源
+# 只体现在用户可改的结果名前缀里，改名即丢失。
+SNAPSHOT_ORIGIN_MANUAL = "manual"
+SNAPSHOT_ORIGIN_HISTORY_VERIFY = "history_verify"
+SNAPSHOT_ORIGIN_HISTORY_REPLAY = "history_replay"
+SNAPSHOT_ORIGIN_DISPLAY = {
+    SNAPSHOT_ORIGIN_MANUAL: "手工回测",
+    SNAPSHOT_ORIGIN_HISTORY_VERIFY: "优选验证",
+    SNAPSHOT_ORIGIN_HISTORY_REPLAY: "分段重放",
+}
+
 
 @dataclass
 class SavedBacktestResult:
@@ -397,6 +421,11 @@ class SavedBacktestResult:
     contract_key: tuple
     economics_key: tuple
     position: int
+    # 跨页配色键：曲线名是用户可改的结果名，不能用来对齐策略优选页的颜色。
+    style_key: str = BASELINE_STRATEGY_STYLE_KEY
+    # 结构化来源，不随重命名丢失；origin_meta 记录优选周期、批次与当时排名。
+    origin: str = SNAPSHOT_ORIGIN_MANUAL
+    origin_meta: dict = field(default_factory=dict)
 
 SIGMA_SOURCE_DISPLAY = {
     "implied":  "隐含波动率",
@@ -584,6 +613,9 @@ class BacktestApp(tk.Tk):
         self._latest_history_state = None
         self._latest_history_source_label = None
         self._pending_history_retain_name = None
+        self._pending_history_retain_origin = None
+        # 策略配色登记表：结果对比与策略优选共用，使同一策略跨页同色。
+        self._strategy_style_registry = None
         # 策略优选批量联动：把勾选候选逐条在当前单次回测路径上验证，
         # 完成后送入结果池，使优选结论可直接在其它展示页面对照。
         self._history_batch_queue = []
@@ -591,6 +623,11 @@ class BacktestApp(tk.Tk):
         self._history_batch_done = 0
         self._history_batch_failures = []
         self._history_batch_position = None
+        self._history_batch_result_ids = []
+        self._history_batch_id = None
+        # 上一批验证的收尾结论，供优选页结果条按需展开与回跳。
+        self._history_batch_failure_details = []
+        self._history_batch_last_result_ids = []
         self._apply_window_icon()
         self._setup_styles()
         self._build_ui()
@@ -3313,6 +3350,8 @@ class BacktestApp(tk.Tk):
         success = False
         pending_history_name = getattr(
             self, "_pending_history_retain_name", None)
+        pending_history_origin = copy.deepcopy(dict(getattr(
+            self, "_pending_history_retain_origin", None) or {}))
         try:
             state_copy = BacktestApp._copy_snapshot_gui_state(gui_state)
             self._show_results(bt, multi_stats)
@@ -3328,6 +3367,7 @@ class BacktestApp(tk.Tk):
         finally:
             self._finish_run(success)
         self._pending_history_retain_name = None
+        self._pending_history_retain_origin = None
         if success and pending_history_name:
             next_sequence = self._saved_backtest_sequence + 1
             auto_name = f"{pending_history_name} #{next_sequence:02d}"
@@ -3338,7 +3378,10 @@ class BacktestApp(tk.Tk):
                 auto_name = f"{pending_history_name} ({suffix})"
                 suffix += 1
             try:
-                self._store_current_backtest(auto_name)
+                self._store_current_backtest(
+                    auto_name,
+                    origin=SNAPSHOT_ORIGIN_HISTORY_VERIFY,
+                    origin_meta=pending_history_origin)
             except Exception as exc:
                 success = False
                 messagebox.showerror("历史验证结果保留失败", str(exc))
@@ -3347,6 +3390,7 @@ class BacktestApp(tk.Tk):
 
     def _fail_backtest(self, message):
         self._pending_history_retain_name = None
+        self._pending_history_retain_origin = None
         messagebox.showerror("回测失败", message)
         self._finish_run(False)
         if getattr(self, "_history_batch_queue", None):
@@ -3426,6 +3470,115 @@ class BacktestApp(tk.Tk):
                 digest.update(
                     repr(tuple(timestamps)[:len(prices)]).encode("utf-8"))
         return source, int(len(prices)), digest.hexdigest()
+
+    @staticmethod
+    def _strategy_style_key(strategy_name, *, fixed_times=None, sigma=None):
+        """把策略身份压成跨页稳定的配色键。
+
+        结果对比页的曲线名是用户可改的结果名，策略优选页的是候选名，两者都
+        不能直接当配色键。这里只取策略类型及其决定性参数，使同一策略在两页
+        取到同一颜色和标记。
+        """
+        name = str(strategy_name or "").strip()
+        if name == "close_to_close":
+            return BASELINE_STRATEGY_STYLE_KEY
+        if name == "fixed_times":
+            times = ",".join(
+                part.strip()
+                for part in str(fixed_times or "").split(",")
+                if part.strip()
+            )
+            return f"fixed_times:{times or '—'}"
+        if name == "hedge_band":
+            value = BacktestApp._comparison_finite(sigma)
+            # σ 是三种带宽输入的共同换算口径；用它当键，绝对/相对输入换算到
+            # 同一带宽时也能共享颜色。
+            return (
+                f"hedge_band:{value:.6g}σ" if value is not None
+                else "hedge_band:—")
+        return f"other:{name or '—'}"
+
+    @staticmethod
+    def _snapshot_origin_from_state(gui_state):
+        """从单次回测状态判断快照来源。
+
+        历史分段重放会在状态里留下 history_replay_* 字段；手工点『保留当前
+        结果』时据此把它标成分段重放，而不是笼统的手工回测。
+        """
+        gui_state = dict(gui_state or {})
+        strategy = str(
+            gui_state.get("history_replay_strategy", "") or "").strip()
+        if not strategy:
+            return SNAPSHOT_ORIGIN_MANUAL, {}
+        lookback = str(gui_state.get("history_replay_lookback", "") or "")
+        return SNAPSHOT_ORIGIN_HISTORY_REPLAY, {
+            "lookback": lookback,
+            "period_label": dict(HISTORY_PERIOD_DEFS).get(lookback, lookback),
+            "history_strategy": strategy,
+            "window_id": str(
+                gui_state.get("history_replay_window_id", "") or ""),
+        }
+
+    @staticmethod
+    def _snapshot_style_key(gui_state):
+        """从单次回测状态取配色键；σ 一律换算成日波动倍数。"""
+        strategy = str(gui_state.get("strategy_name", "")).strip()
+        if strategy != "hedge_band":
+            return BacktestApp._strategy_style_key(
+                strategy, fixed_times=gui_state.get("fixed_times"))
+        band_type = gui_state.get("interval_type", "absolute")
+        threshold = BacktestApp._comparison_finite(
+            gui_state.get("price_interval"))
+        sigma = None
+        if threshold is not None:
+            try:
+                params = gui_state.get("params", {})
+                sigma = HedgeBandStrategy.convert_threshold(
+                    threshold, band_type, float(params["s0"]),
+                    float(params["sigma"]),
+                )["sigma"]
+            except (KeyError, TypeError, ValueError, ZeroDivisionError):
+                # 换算不出 σ 时退回按输入口径区分，绝不让不同带宽共享颜色。
+                return BacktestApp._strategy_style_key(
+                    f"hedge_band_{band_type}_{threshold:.6g}")
+        return BacktestApp._strategy_style_key("hedge_band", sigma=sigma)
+
+    @staticmethod
+    def _history_row_style_key(row):
+        """从策略优选排名行取配色键，与快照侧使用同一套命名。"""
+        row = dict(row or {})
+        strategy_name = str(
+            row.get("meta_strategy_name")
+            or row.get("strategy_type")
+            or "").strip()
+        return BacktestApp._strategy_style_key(
+            strategy_name,
+            fixed_times=row.get("meta_fixed_times"),
+            sigma=row.get("meta_candidate_sigma"),
+        )
+
+    def _strategy_style(self, style_key):
+        """按会话内首次出现顺序固定策略配色；两页共用同一登记表。
+
+        登记表随会话保留，因此先在策略优选页看到的候选，之后作为快照进入
+        结果对比页时颜色不变。
+        """
+        registry = getattr(self, "_strategy_style_registry", None)
+        if registry is None:
+            # 基准先占位，保证 每日收盘 在两页永远是同一个颜色。
+            registry = {
+                BASELINE_STRATEGY_STYLE_KEY: (
+                    STRATEGY_CHART_COLORS[0], STRATEGY_CHART_MARKERS[0]),
+            }
+            self._strategy_style_registry = registry
+        key = str(style_key or BASELINE_STRATEGY_STYLE_KEY)
+        if key not in registry:
+            index = len(registry)
+            registry[key] = (
+                STRATEGY_CHART_COLORS[index % len(STRATEGY_CHART_COLORS)],
+                STRATEGY_CHART_MARKERS[index % len(STRATEGY_CHART_MARKERS)],
+            )
+        return registry[key]
 
     @staticmethod
     def _strategy_snapshot_labels(gui_state):
@@ -3508,6 +3661,21 @@ class BacktestApp(tk.Tk):
         """读取快照的经济方向；显示名称和其它参数均不能覆盖它。"""
         return BacktestApp._normalize_position(snapshot.position)
 
+    @staticmethod
+    def _saved_snapshot_origin_label(snapshot):
+        """产生方式列文案；优选验证额外标出来自哪一档周期。
+
+        来源读结构化的 origin 字段，用户重命名结果不会让它丢失。
+        """
+        origin = str(getattr(snapshot, "origin", "") or
+                     SNAPSHOT_ORIGIN_MANUAL)
+        label = SNAPSHOT_ORIGIN_DISPLAY.get(origin, origin)
+        meta = getattr(snapshot, "origin_meta", None) or {}
+        period = str(meta.get("period_label", "") or "").strip()
+        if origin == SNAPSHOT_ORIGIN_HISTORY_VERIFY and period:
+            return f"{label}·{period}"
+        return label
+
     def _resolve_saved_comparison_baseline_id(self, position=None):
         """返回当前方向最早的 close-to-close 基准，禁止跨方向复用。"""
         saved = getattr(self, "_saved_backtests", {})
@@ -3549,7 +3717,8 @@ class BacktestApp(tk.Tk):
 
     @staticmethod
     def _make_saved_backtest_result(
-            bt, gui_state, result_id, name, saved_at=None):
+            bt, gui_state, result_id, name, saved_at=None, *,
+            origin=SNAPSHOT_ORIGIN_MANUAL, origin_meta=None):
         snapshot_position = BacktestApp._normalize_position(
             gui_state.get("position"))
         result_position = (getattr(bt, "_results", {}) or {}).get("position")
@@ -3591,6 +3760,9 @@ class BacktestApp(tk.Tk):
             contract_key=contract_key,
             economics_key=economics_key,
             position=snapshot_position,
+            style_key=BacktestApp._snapshot_style_key(gui_state),
+            origin=str(origin or SNAPSHOT_ORIGIN_MANUAL),
+            origin_meta=copy.deepcopy(dict(origin_meta or {})),
         )
 
     @staticmethod
@@ -3610,7 +3782,9 @@ class BacktestApp(tk.Tk):
             button.configure(
                 text=f"⚖  结果对比 ({len(self._saved_backtests)})")
 
-    def _store_current_backtest(self, name):
+    def _store_current_backtest(self, name, *,
+                                origin=SNAPSHOT_ORIGIN_MANUAL,
+                                origin_meta=None):
         """用已完成的普通回测结果创建快照，绝不重跑回测。"""
         bt = getattr(self, "_latest_backtest", None)
         gui_state = getattr(self, "_latest_backtest_state", None)
@@ -3624,7 +3798,8 @@ class BacktestApp(tk.Tk):
         next_sequence = self._saved_backtest_sequence + 1
         result_id = f"result-{next_sequence:04d}"
         snapshot = self._make_saved_backtest_result(
-            bt, gui_state, result_id, cleaned_name)
+            bt, gui_state, result_id, cleaned_name,
+            origin=origin, origin_meta=origin_meta)
         self._saved_backtest_sequence = next_sequence
         self._saved_backtests[result_id] = snapshot
         position = BacktestApp._saved_snapshot_position(snapshot)
@@ -3682,8 +3857,11 @@ class BacktestApp(tk.Tk):
             except ValueError as exc:
                 messagebox.showerror("名称无效", str(exc))
 
+        origin, origin_meta = BacktestApp._snapshot_origin_from_state(
+            gui_state)
         try:
-            self._store_current_backtest(name)
+            self._store_current_backtest(
+                name, origin=origin, origin_meta=origin_meta)
         except Exception as exc:
             messagebox.showerror("保留结果失败", str(exc))
             return
@@ -3729,6 +3907,11 @@ class BacktestApp(tk.Tk):
                 "meta_result_id": snapshot.result_id,
                 "meta_is_comparison_baseline": (
                     snapshot.result_id == baseline_result_id),
+                # 曲线名可被用户改写，配色必须走稳定的策略身份键。
+                "meta_style_key": getattr(
+                    snapshot, "style_key", BASELINE_STRATEGY_STYLE_KEY),
+                "meta_origin": getattr(
+                    snapshot, "origin", SNAPSHOT_ORIGIN_MANUAL),
             })
             rows.append(row)
             daily_curves[snapshot.name] = snapshot.daily_frame
@@ -4099,6 +4282,21 @@ class BacktestApp(tk.Tk):
         }
 
     @staticmethod
+    def _comparison_improvement_vs_baseline(score, baseline_score):
+        """结果对比页“较每日收盘改善”的唯一定义：正值表示 RMS 低于基准。
+
+        方向与策略优选页的同名指标以及本页顶部统计卡一致。此前排名列用的是
+        (本行-基准)/|基准|，负值才代表更好，与相邻页面读法相反，容易被反着
+        解读。分母仍是 |基准 RMS|，因此它与优选页那个以 max(基准, 候选) 为
+        分母的有界改善不是同一个统计量，只是方向相同。
+        """
+        score = BacktestApp._comparison_finite(score)
+        baseline_score = BacktestApp._comparison_finite(baseline_score)
+        if score is None or baseline_score is None or baseline_score == 0:
+            return None
+        return (baseline_score - score) / abs(baseline_score)
+
+    @staticmethod
     def _comparison_relative_delta(selected, baseline, key):
         selected_value = BacktestApp._comparison_finite(selected.get(key))
         baseline_value = BacktestApp._comparison_finite(baseline.get(key))
@@ -4184,12 +4382,8 @@ class BacktestApp(tk.Tk):
             stat_strip, 1, "基准日净损益 RMS（已含成本）",
             self._format_comparison_value(baseline.get("score"), 2),
             "金额口径 · 越低越好")
-        baseline_score = self._comparison_finite(baseline.get("score"))
-        best_score = self._comparison_finite(best.get("score"))
-        improvement = None
-        if (baseline_score is not None and best_score is not None
-                and baseline_score != 0):
-            improvement = (baseline_score - best_score) / abs(baseline_score)
+        improvement = BacktestApp._comparison_improvement_vs_baseline(
+            best.get("score"), baseline.get("score"))
         best_name = str(best.get("strategy", "无可比较结果"))
         if not baseline:
             improvement_note = "缺少基准，无法计算改善"
@@ -4274,14 +4468,16 @@ class BacktestApp(tk.Tk):
             command=self._prompt_delete_saved_backtest,
         ).pack(side="left", padx=(4, 0))
 
-        columns = ("shown", "name", "strategy", "parameters", "source", "saved_at")
+        columns = ("shown", "name", "origin", "strategy", "parameters",
+                   "source", "saved_at")
         headings = {
-            "shown": "显示", "name": "结果名称", "strategy": "策略",
-            "parameters": "策略参数", "source": "行情来源", "saved_at": "保留时间",
+            "shown": "显示", "name": "结果名称", "origin": "产生方式",
+            "strategy": "策略", "parameters": "策略参数",
+            "source": "行情来源", "saved_at": "保留时间",
         }
         widths = {
-            "shown": 50, "name": 150, "strategy": 112,
-            "parameters": 238, "source": 145, "saved_at": 115,
+            "shown": 46, "name": 138, "origin": 74, "strategy": 104,
+            "parameters": 212, "source": 132, "saved_at": 104,
         }
         tree_frame = ttk.Frame(pool, style="Surface.TFrame")
         tree_frame.pack(fill="x")
@@ -4292,8 +4488,9 @@ class BacktestApp(tk.Tk):
         for column in columns:
             tree.heading(column, text=headings[column])
             tree.column(
-                column, width=widths[column], minwidth=45,
-                anchor="center" if column in ("shown", "strategy", "saved_at") else "w",
+                column, width=widths[column], minwidth=44,
+                anchor="center" if column in (
+                    "shown", "origin", "strategy", "saved_at") else "w",
                 stretch=column in ("name", "parameters"),
             )
         scrollbar = ttk.Scrollbar(tree_frame, orient="vertical", command=tree.yview)
@@ -4348,6 +4545,7 @@ class BacktestApp(tk.Tk):
                 values=(
                     "✅" if snapshot.result_id in self._saved_comparison_selection else "☐",
                     snapshot.name,
+                    BacktestApp._saved_snapshot_origin_label(snapshot),
                     (f"{snapshot.strategy_label} · 基准"
                      if snapshot.result_id == baseline_id
                      else snapshot.strategy_label),
@@ -4640,6 +4838,12 @@ class BacktestApp(tk.Tk):
             "_history_chart_selected_by_period", "_history_pairs_cache",
             "_history_chart_color_map", "_history_chart_marker_map",
             "_history_action_hint_var",
+            "_history_batch_outcome_bar", "_history_batch_outcome_var",
+            "_history_batch_outcome_label",
+            "_history_batch_outcome_detail_btn",
+            "_history_batch_outcome_open_btn",
+            "_history_batch_failure_details",
+            "_history_batch_last_result_ids",
             "_history_lookbacks", "_history_uses_strict_metric",
             "_history_uses_window_equal_metric",
         )
@@ -4743,14 +4947,20 @@ class BacktestApp(tk.Tk):
             }
         else:
             self._comparison_daily_curves = dict(daily_curves)
-        color_cycle = [
-            PALETTE["primary"], PALETTE["accent"], PALETTE["warning"],
-            PALETTE["success"], PALETTE["danger"],
-            "#7C3AED", "#0F766E", "#DB2777", "#475569", "#65A30D",
-        ]
+        # 曲线配色走与策略优选页共用的登记表，使同一策略跨页同色；summary 未
+        # 携带策略身份键时退回按曲线名登记，只保证本页内部不撞色。
+        style_keys = {}
+        if summary is not None and not getattr(summary, "empty", True):
+            for _index, row in summary.iterrows():
+                item = row.to_dict()
+                name = str(item.get("strategy", ""))
+                if name and name not in style_keys:
+                    style_keys[name] = str(
+                        item.get("meta_style_key") or f"result_name:{name}")
         self._comparison_color_map = {
-            name: color_cycle[index % len(color_cycle)]
-            for index, name in enumerate(self._comparison_daily_curves)
+            name: self._strategy_style(
+                style_keys.get(name, f"result_name:{name}"))[0]
+            for name in self._comparison_daily_curves
         }
         self._comparison_curve_vars = {}
         for index, name in enumerate(self._comparison_daily_curves):
@@ -4796,7 +5006,7 @@ class BacktestApp(tk.Tk):
         )
         headings = {
             "rank": "#", "strategy": "策略 / 参数",
-            "score": "日净损益 RMS↓", "gap": "相对每日收盘基准",
+            "score": "日净损益 RMS↓", "gap": "较每日收盘改善↑",
             "total_net_pnl": "期末净损益", "total_tc": "总成本↓",
             "rehedge_count": "再触发/成交", "max_drawdown": "最大回撤↓",
         }
@@ -4830,9 +5040,8 @@ class BacktestApp(tk.Tk):
             item = row.to_dict()
             iid = f"strategy_{row_no}"
             score = self._comparison_finite(item.get("score"))
-            gap = None
-            if score is not None and baseline_score not in (None, 0):
-                gap = (score - baseline_score) / abs(baseline_score)
+            gap = BacktestApp._comparison_improvement_vs_baseline(
+                score, baseline_score)
             is_baseline = self._comparison_rows_match(item, baseline)
             is_best = self._comparison_rows_match(
                 item, self._comparison_best_row)
@@ -5049,7 +5258,7 @@ class BacktestApp(tk.Tk):
         self._history_uses_strict_metric = flags["uses_strict_metric"]
         self._history_uses_window_equal_metric = flags[
             "uses_window_equal_metric"]
-        self._assign_history_chart_styles(flags["candidate_names"])
+        self._assign_history_chart_styles(flags["candidate_names"], ranking)
         labels = BacktestApp._history_metric_labels(
             uses_strict_metric=flags["uses_strict_metric"],
             uses_product_pool=flags["uses_product_pool"],
@@ -5086,22 +5295,30 @@ class BacktestApp(tk.Tk):
             period_tree.focus(children[0])
             self._update_history_selection()
 
-    def _assign_history_chart_styles(self, candidate_names):
-        """为本次候选固定颜色与标记，使排名表与图表配色始终一致。"""
-        chart_colors = (
-            "#2563EB", "#D97706", "#7C3AED", "#0F766E",
-            "#DB2777", "#DC2626", "#0891B2", "#65A30D",
-            "#9333EA", "#C2410C", "#4F46E5", "#047857",
-        )
-        chart_markers = ("o", "s", "^", "D", "v", "P", "X", "<", ">", "h")
-        self._history_chart_color_map = {
-            strategy: chart_colors[index % len(chart_colors)]
-            for index, strategy in enumerate(candidate_names)
-        }
-        self._history_chart_marker_map = {
-            strategy: chart_markers[index % len(chart_markers)]
-            for index, strategy in enumerate(candidate_names)
-        }
+    def _assign_history_chart_styles(self, candidate_names, ranking=None):
+        """为本次候选固定颜色与标记，使排名表与图表配色始终一致。
+
+        配色来自 _strategy_style 这一份会话级登记表，因此同一策略在结果对比
+        页拿到的颜色与这里相同。ranking 提供策略身份元数据；缺失时退回按候选
+        名登记，只保证本页内部一致。
+        """
+        identities = {}
+        if ranking is not None and not getattr(ranking, "empty", True):
+            for _index, row in ranking.iterrows():
+                item = row.to_dict()
+                name = str(item.get("strategy", "")).strip()
+                if name and name not in identities:
+                    identities[name] = BacktestApp._history_row_style_key(item)
+        color_map = {}
+        marker_map = {}
+        for strategy in candidate_names:
+            style_key = identities.get(
+                strategy, f"history_name:{strategy}")
+            color, marker = self._strategy_style(style_key)
+            color_map[strategy] = color
+            marker_map[strategy] = marker
+        self._history_chart_color_map = color_map
+        self._history_chart_marker_map = marker_map
 
     def _build_history_period_box(
             self, parent, recommendations, ranking, labels, period_count):
@@ -5244,7 +5461,98 @@ class BacktestApp(tk.Tk):
             detail_box, textvariable=self._history_action_hint_var,
             style="SurfaceMuted.TLabel", justify="left", wraplength=1100,
         ).grid(row=4, column=0, columnspan=2, sticky="ew", pady=(3, 0))
+
+        # 批量验证收尾结果条：默认隐藏，只在一次批量验证结束后出现，让用户
+        # 自己决定是否跳到结果对比页或展开失败详情。
+        self._history_batch_outcome_bar = tk.Frame(
+            detail_box, bg=PALETTE["surface_alt"],
+            highlightbackground=PALETTE["border_soft"], highlightthickness=1,
+            padx=10, pady=5)
+        self._history_batch_outcome_var = tk.StringVar(value="")
+        self._history_batch_outcome_label = tk.Label(
+            self._history_batch_outcome_bar,
+            textvariable=self._history_batch_outcome_var,
+            bg=PALETTE["surface_alt"], fg=PALETTE["text"], anchor="w",
+            justify="left", font=(_UI_FONT_FAMILY, 9), wraplength=760,
+        )
+        self._history_batch_outcome_label.pack(
+            side="left", fill="x", expand=True)
+        self._history_batch_outcome_detail_btn = ttk.Button(
+            self._history_batch_outcome_bar, text="失败详情", width=9,
+            command=self._show_history_batch_failures,
+        )
+        self._history_batch_outcome_open_btn = ttk.Button(
+            self._history_batch_outcome_bar, text="查看结果对比", width=12,
+            command=self._open_history_batch_results,
+        )
+        self._history_batch_outcome_open_btn.pack(side="right", padx=(6, 0))
+        self._history_batch_failure_details = []
+        self._history_batch_last_result_ids = []
         self._refresh_history_action_hint()
+
+    def _publish_history_batch_outcome(self, done, total, failures,
+                                       result_ids):
+        """把批量验证结论写进优选页结果条，替代跳页与模态弹窗。"""
+        self._history_batch_failure_details = list(failures)
+        self._history_batch_last_result_ids = list(result_ids)
+        bar = getattr(self, "_history_batch_outcome_bar", None)
+        var = getattr(self, "_history_batch_outcome_var", None)
+        if bar is None or var is None:
+            # 结果页尚未构建（例如批量在渲染前中止）时退回状态栏即可。
+            return
+        if failures:
+            text = f"⚠ 批量验证已完成 {done}/{total} 条，{len(failures)} 条未完成。"
+            bg, fg = PALETTE["warning_light"], PALETTE["warning"]
+        elif done:
+            text = f"✓ 批量验证完成：{done}/{total} 条已送入结果对比。"
+            bg, fg = PALETTE["success_light"], PALETTE["success"]
+        else:
+            text = "批量验证未产生任何可保留结果。"
+            bg, fg = PALETTE["surface_alt"], PALETTE["text"]
+        var.set(text)
+        try:
+            bar.configure(bg=bg)
+            self._history_batch_outcome_label.configure(bg=bg, fg=fg)
+            detail_btn = self._history_batch_outcome_detail_btn
+            if failures:
+                detail_btn.pack(side="right", padx=(6, 0))
+            else:
+                detail_btn.pack_forget()
+            self._history_batch_outcome_open_btn.configure(
+                state="normal" if done else "disabled")
+            bar.grid(row=5, column=0, columnspan=2, sticky="ew", pady=(5, 0))
+        except tk.TclError:
+            pass
+
+    def _show_history_batch_failures(self):
+        """按需展开上一次批量验证的失败原因，默认不打断操作。"""
+        failures = list(
+            getattr(self, "_history_batch_failure_details", ()) or ())
+        if not failures:
+            return
+        messagebox.showinfo(
+            "批量验证未完成的候选", "\n".join(failures))
+
+    def _open_history_batch_results(self):
+        """跳到结果对比页，并只勾选上一次批量验证产生的快照。"""
+        result_ids = [
+            result_id
+            for result_id in getattr(
+                self, "_history_batch_last_result_ids", ()) or ()
+            if result_id in self._saved_backtests
+        ]
+        if not result_ids:
+            messagebox.showinfo(
+                "没有可查看的结果", "上一次批量验证没有留下仍在结果池中的快照。")
+            return
+        position = BacktestApp._saved_snapshot_position(
+            self._saved_backtests[result_ids[0]])
+        self._saved_comparison_selection = set(result_ids)
+        baseline_id = BacktestApp._resolve_saved_comparison_baseline_id(
+            self, position)
+        if baseline_id is not None:
+            self._saved_comparison_selection.add(baseline_id)
+        self._show_saved_comparison_page()
 
     def _refresh_history_action_hint(self):
         """让动作说明始终反映“当前路径验证”这一刻的真实执行范围。"""
@@ -6302,6 +6610,30 @@ class BacktestApp(tk.Tk):
             self._nb.select(self._summary_tab)
         return applied
 
+    @staticmethod
+    def _history_verify_origin_meta(row, *, batch, batch_id=None):
+        """记录该快照来自哪一次优选的哪个周期、当时排第几、改善多少。
+
+        这些字段只作来源溯源，不参与结果对比页的任何排名计算；结果对比页
+        的指标始终由快照自身的单路径结果算出。
+        """
+        row = dict(row or {})
+        lookback = str(row.get("lookback", "") or "")
+        meta = {
+            "lookback": lookback,
+            "period_label": dict(HISTORY_PERIOD_DEFS).get(lookback, lookback),
+            "history_strategy": str(row.get("strategy", "") or ""),
+            "history_rank": BacktestApp._comparison_safe_int(
+                row.get("rank"), 0),
+            "history_improvement": BacktestApp._comparison_finite(
+                row.get("selection_improvement_vs_c2c",
+                        row.get("improvement_vs_c2c"))),
+            "batch": bool(batch),
+        }
+        if batch_id:
+            meta["batch_id"] = str(batch_id)
+        return meta
+
     def _verify_history_on_current_path(self):
         """“当前路径验证”的唯一入口：有勾选走批量，没有则验证选中的一条。
 
@@ -6339,9 +6671,12 @@ class BacktestApp(tk.Tk):
             return False
         self._pending_history_retain_name = (
             f"历史验证 · {str(row.get('strategy', '策略')).strip()}")
+        self._pending_history_retain_origin = (
+            BacktestApp._history_verify_origin_meta(row, batch=False))
         started = bool(self._run_backtest())
         if not started:
             self._pending_history_retain_name = None
+            self._pending_history_retain_origin = None
         return started
 
     def _history_batch_targets(self):
@@ -6370,6 +6705,8 @@ class BacktestApp(tk.Tk):
                     "row": copy.deepcopy(row),
                     "label": strategy,
                     "name": f"优选{period_label} · {strategy}",
+                    "origin_meta": BacktestApp._history_verify_origin_meta(
+                        row, batch=True),
                 })
         if not targets:
             return []
@@ -6386,6 +6723,8 @@ class BacktestApp(tk.Tk):
                 "row": baseline_row,
                 "label": str(baseline_row.get("strategy", "每日收盘")),
                 "name": f"优选{period_label} · 每日收盘基准",
+                "origin_meta": BacktestApp._history_verify_origin_meta(
+                    baseline_row, batch=True),
             })
         return targets
 
@@ -6411,6 +6750,9 @@ class BacktestApp(tk.Tk):
         self._history_batch_total = len(targets)
         self._history_batch_done = 0
         self._history_batch_failures = []
+        self._history_batch_result_ids = []
+        self._history_batch_id = datetime.datetime.now().strftime(
+            "batch-%Y%m%d-%H%M%S")
         started = self._history_batch_step()
         if not started:
             self._reset_history_batch()
@@ -6422,6 +6764,8 @@ class BacktestApp(tk.Tk):
         self._history_batch_done = 0
         self._history_batch_failures = []
         self._history_batch_position = None
+        self._history_batch_result_ids = []
+        self._history_batch_id = None
 
     def _history_batch_skip_rest(self):
         """中止剩余候选并记录，避免静默丢弃用户勾选的验证项。"""
@@ -6457,12 +6801,19 @@ class BacktestApp(tk.Tk):
                 queue.pop(0)
                 continue
             self._pending_history_retain_name = item["name"]
+            batch_origin = dict(item.get("origin_meta") or {})
+            batch_origin["batch_id"] = str(
+                getattr(self, "_history_batch_id", "") or "")
+            batch_origin["batch_index"] = index
+            batch_origin["batch_total"] = self._history_batch_total
+            self._pending_history_retain_origin = batch_origin
             self._set_status(
                 f"批量验证 {index}/{self._history_batch_total}："
                 f"正在按当前路径回测『{item['label']}』…")
             started = bool(self._run_backtest())
             if not started:
                 self._pending_history_retain_name = None
+                self._pending_history_retain_origin = None
                 self._history_batch_failures.append(
                     f"{item['label']}：回测未能启动")
                 queue.pop(0)
@@ -6480,6 +6831,10 @@ class BacktestApp(tk.Tk):
         item = queue.pop(0)
         if success:
             self._history_batch_done += 1
+            # 记录本批次实际入池的快照，收尾结果条据此直接定位这批结果。
+            retained_id = getattr(self, "_latest_retained_result_id", None)
+            if retained_id:
+                self._history_batch_result_ids.append(retained_id)
         else:
             self._history_batch_failures.append(f"{item['label']}：回测失败")
         if success and queue:
@@ -6489,17 +6844,20 @@ class BacktestApp(tk.Tk):
         self._finish_history_batch()
 
     def _finish_history_batch(self):
-        """收尾批量验证：把成功快照带到结果对比页并汇报失败原因。"""
+        """收尾批量验证：就地汇报结果，不再抢走用户当前的优选上下文。
+
+        此前成功即跳到结果对比页、失败弹模态框，用户刚才选定的周期和勾选被
+        留在身后。现在结论写在优选页动作区，跳转与失败详情都由用户主动点。
+        """
         total = getattr(self, "_history_batch_total", 0)
         done = getattr(self, "_history_batch_done", 0)
         failures = list(getattr(self, "_history_batch_failures", ()) or ())
+        result_ids = list(
+            getattr(self, "_history_batch_result_ids", ()) or ())
         self._reset_history_batch()
-        if done:
-            self._show_saved_comparison_page()
-        if failures:
-            messagebox.showerror(
-                "批量验证未全部完成",
-                f"已完成 {done}/{total} 条。\n" + "\n".join(failures))
+        self._publish_history_batch_outcome(done, total, failures, result_ids)
+        # 结果池已经变化，可见时同步刷新；不可见时不抢占当前页面。
+        self._refresh_saved_comparison_if_visible()
         self._set_status(
             f"策略优选批量验证完成：{done}/{total} 条已送入结果对比")
         return done

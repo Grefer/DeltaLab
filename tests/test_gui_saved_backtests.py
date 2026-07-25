@@ -9,7 +9,9 @@ import pandas as pd
 import pytest
 
 import gui_app
+import history_selection
 from gui_app import BacktestApp
+from pricing import HedgeBandStrategy
 
 
 def _result(*, strategy="close_to_close", price_shift=0.0):
@@ -508,11 +510,15 @@ def test_history_validation_delivery_auto_retain_uses_completed_result_only(
     monkeypatch.setattr(gui_app.HedgeBacktest, "run", unexpected)
     monkeypatch.setattr(gui_app, "compare_strategies", unexpected)
     monkeypatch.setattr(gui_app, "recommend_by_rolling_history", unexpected)
+    stored_kwargs = []
     fake = SimpleNamespace(
         _pending_history_retain_name="历史验证 · 每日收盘",
+        _pending_history_retain_origin={
+            "lookback": "month", "period_label": "近月", "batch": False},
         _show_results=lambda *_args: None,
         _finish_run=finished.append,
-        _store_current_backtest=lambda name: stored_names.append(name),
+        _store_current_backtest=lambda name, **kwargs: (
+            stored_names.append(name), stored_kwargs.append(kwargs)),
         _latest_backtest=None,
         _latest_backtest_state=None,
         _latest_retained_result_id=None,
@@ -526,7 +532,14 @@ def test_history_validation_delivery_auto_retain_uses_completed_result_only(
     assert fake._latest_backtest is bt
     assert fake._latest_backtest_state == state
     assert fake._pending_history_retain_name is None
+    assert fake._pending_history_retain_origin is None
     assert stored_names == ["历史验证 · 每日收盘 #04"]
+    # 自动入池的快照必须带上结构化来源，重命名后仍能追溯到优选周期。
+    assert stored_kwargs == [{
+        "origin": gui_app.SNAPSHOT_ORIGIN_HISTORY_VERIFY,
+        "origin_meta": {
+            "lookback": "month", "period_label": "近月", "batch": False},
+    }]
 
 
 def test_failed_history_validation_render_does_not_retain(monkeypatch):
@@ -534,10 +547,11 @@ def test_failed_history_validation_render_does_not_retain(monkeypatch):
     errors = []
     fake = SimpleNamespace(
         _pending_history_retain_name="历史验证 · 每日收盘",
+        _pending_history_retain_origin={"period_label": "近月"},
         _show_results=lambda *_args: (_ for _ in ()).throw(
             RuntimeError("render failed")),
         _finish_run=finished.append,
-        _store_current_backtest=lambda _name: pytest.fail(
+        _store_current_backtest=lambda _name, **_kwargs: pytest.fail(
             "展示失败的结果不得进入对比池"),
         _latest_backtest="previous",
         _latest_backtest_state={"previous": True},
@@ -560,4 +574,198 @@ def test_failed_history_validation_render_does_not_retain(monkeypatch):
     assert fake._latest_backtest_state == {"previous": True}
     assert fake._latest_retained_result_id == "previous-result"
     assert fake._pending_history_retain_name is None
+    assert fake._pending_history_retain_origin is None
     assert errors and errors[0][0] == "回测结果展示失败"
+
+
+# ---------------------------------------------------------------------------
+#  结果对比 与 策略优选 的衔接：改善方向、跨页配色、结构化来源
+# ---------------------------------------------------------------------------
+
+
+def test_comparison_improvement_is_positive_when_beating_the_baseline():
+    """对比页排名列与策略优选页同名指标必须同向：正值表示优于基准。"""
+    improvement = BacktestApp._comparison_improvement_vs_baseline(8.0, 10.0)
+
+    assert improvement == pytest.approx(0.2)
+    # 比基准差时为负；与基准持平为 0。
+    assert BacktestApp._comparison_improvement_vs_baseline(
+        12.0, 10.0) == pytest.approx(-0.2)
+    assert BacktestApp._comparison_improvement_vs_baseline(
+        10.0, 10.0) == pytest.approx(0.0)
+
+
+@pytest.mark.parametrize("score,baseline", [
+    (None, 10.0), (8.0, None), (8.0, 0.0),
+    (float("nan"), 10.0), (8.0, float("inf")),
+])
+def test_comparison_improvement_is_undefined_without_a_usable_baseline(
+        score, baseline):
+    assert BacktestApp._comparison_improvement_vs_baseline(
+        score, baseline) is None
+
+
+def test_comparison_improvement_matches_history_page_direction():
+    """同一对 RMS 在两页得到同符号结论，避免用户反着读。"""
+    candidate_rms, baseline_rms = 8.0, 10.0
+    comparison = BacktestApp._comparison_improvement_vs_baseline(
+        candidate_rms, baseline_rms)
+    history = history_selection.row_improvement({
+        "score": candidate_rms, "baseline_score": baseline_rms,
+        "strategy_type": "hedge_band",
+    })
+
+    assert comparison > 0 and history > 0
+
+
+def test_snapshot_and_history_row_share_one_style_key_per_strategy():
+    """同一策略在两页必须取到同一配色键，否则曲线无法跨页对应。"""
+    band_state = _state(strategy="hedge_band", threshold=1.0)
+    band_state["interval_type"] = "sigma"
+    snapshot_key = BacktestApp._snapshot_style_key(band_state)
+    history_key = BacktestApp._history_row_style_key({
+        "meta_strategy_name": "hedge_band", "meta_candidate_sigma": 1.0,
+    })
+
+    assert snapshot_key == history_key == "hedge_band:1σ"
+
+    fixed_state = _state(strategy="fixed_times")
+    fixed_state["fixed_times"] = "11:30,15:00"
+    assert BacktestApp._snapshot_style_key(fixed_state) == (
+        BacktestApp._history_row_style_key({
+            "meta_strategy_name": "fixed_times",
+            "meta_fixed_times": " 11:30 , 15:00 ",
+        }))
+
+    assert BacktestApp._snapshot_style_key(
+        _state(strategy="close_to_close")) == (
+        BacktestApp._history_row_style_key({
+            "meta_strategy_name": "close_to_close"}))
+
+
+def test_absolute_band_input_shares_color_with_equivalent_sigma_candidate():
+    """绝对 / 相对带宽换算到同一 σ 时共享配色，不同带宽仍然分色。"""
+    state = _state(strategy="hedge_band", threshold=1.0)
+    state["interval_type"] = "sigma"
+    sigma_key = BacktestApp._snapshot_style_key(state)
+
+    params = state["params"]
+    absolute = HedgeBandStrategy.convert_threshold(
+        1.0, "sigma", float(params["s0"]), float(params["sigma"]),
+    )["absolute"]
+    absolute_state = _state(strategy="hedge_band", threshold=absolute)
+    absolute_state["interval_type"] = "absolute"
+
+    assert BacktestApp._snapshot_style_key(absolute_state) == sigma_key
+
+    other = _state(strategy="hedge_band", threshold=2.0)
+    other["interval_type"] = "sigma"
+    assert BacktestApp._snapshot_style_key(other) != sigma_key
+
+
+def test_strategy_style_registry_is_stable_and_pins_the_baseline_color():
+    """基准配色不随登记顺序漂移，同一键重复取值不变。"""
+    first = object.__new__(BacktestApp)
+    first._strategy_style_registry = None
+    baseline_style = first._strategy_style("close_to_close")
+    band_style = first._strategy_style("hedge_band:1σ")
+
+    assert baseline_style != band_style
+    assert first._strategy_style("close_to_close") == baseline_style
+
+    # 另一个会话先登记候选，基准仍然拿到同一个颜色。
+    second = object.__new__(BacktestApp)
+    second._strategy_style_registry = None
+    second._strategy_style("hedge_band:1σ")
+
+    assert second._strategy_style("close_to_close") == baseline_style
+    assert second._strategy_style("hedge_band:1σ") == band_style
+
+
+def test_saved_snapshot_defaults_to_manual_origin_with_stable_style_key():
+    snapshot = _snapshot(state=_state(strategy="hedge_band", threshold=1.0))
+
+    assert snapshot.origin == gui_app.SNAPSHOT_ORIGIN_MANUAL
+    assert snapshot.origin_meta == {}
+    assert snapshot.style_key.startswith("hedge_band:")
+    assert BacktestApp._saved_snapshot_origin_label(snapshot) == "手工回测"
+
+
+def test_saved_snapshot_origin_survives_rename_and_names_its_period():
+    """来源是结构化字段，改名不会像旧的名称前缀那样丢失。"""
+    bt = SimpleNamespace(
+        _results=_result(), prices=_result()["prices"],
+        timestamps=pd.DatetimeIndex(
+            ["2026-01-02", "2026-01-05", "2026-01-06"]),
+    )
+    snapshot = BacktestApp._make_saved_backtest_result(
+        bt, _state(), "result-0007", "优选近月 · 每日收盘基准",
+        origin=gui_app.SNAPSHOT_ORIGIN_HISTORY_VERIFY,
+        origin_meta={
+            "period_label": "近月", "lookback": "month",
+            "history_rank": 1, "batch": True,
+        },
+    )
+
+    assert BacktestApp._saved_snapshot_origin_label(snapshot) == "优选验证·近月"
+
+    snapshot.name = "随便改个名字"
+    assert snapshot.origin == gui_app.SNAPSHOT_ORIGIN_HISTORY_VERIFY
+    assert snapshot.origin_meta["history_rank"] == 1
+    assert BacktestApp._saved_snapshot_origin_label(snapshot) == "优选验证·近月"
+
+
+def test_snapshot_origin_meta_is_decoupled_from_the_caller_dict():
+    meta = {"period_label": "近月"}
+    bt = SimpleNamespace(
+        _results=_result(), prices=_result()["prices"],
+        timestamps=pd.DatetimeIndex(
+            ["2026-01-02", "2026-01-05", "2026-01-06"]),
+    )
+    snapshot = BacktestApp._make_saved_backtest_result(
+        bt, _state(), "result-0008", "结果",
+        origin=gui_app.SNAPSHOT_ORIGIN_HISTORY_VERIFY, origin_meta=meta)
+
+    meta["period_label"] = "近年"
+
+    assert snapshot.origin_meta == {"period_label": "近月"}
+
+
+def test_replay_state_marks_snapshot_as_segment_replay():
+    """手工保留重放结果时来源应是分段重放，而不是笼统的手工回测。"""
+    state = _state()
+    state.update({
+        "history_replay_strategy": "固定间隔(1.5σ)",
+        "history_replay_lookback": "quarter",
+        "history_replay_window_id": "w-3",
+    })
+
+    origin, meta = BacktestApp._snapshot_origin_from_state(state)
+
+    assert origin == gui_app.SNAPSHOT_ORIGIN_HISTORY_REPLAY
+    assert meta["period_label"] == "近季"
+    assert meta["history_strategy"] == "固定间隔(1.5σ)"
+    assert meta["window_id"] == "w-3"
+
+    plain_origin, plain_meta = BacktestApp._snapshot_origin_from_state(
+        _state())
+    assert plain_origin == gui_app.SNAPSHOT_ORIGIN_MANUAL
+    assert plain_meta == {}
+
+
+def test_saved_payload_exposes_style_key_and_origin_for_the_chart():
+    """曲线配色必须走稳定的策略身份键，而不是用户可改的结果名。"""
+    baseline = _snapshot("result-0001", "每日收盘 · 基准")
+    candidate = _snapshot(
+        "result-0002", "固定间隔 · 更优",
+        state=_state(strategy="hedge_band", threshold=2.0),
+        result=_result(strategy="hedge_band"),
+    )
+
+    summary, _curves = BacktestApp._saved_comparison_payload(
+        [baseline, candidate])
+    keys = dict(zip(summary["strategy"], summary["meta_style_key"]))
+
+    assert keys["每日收盘 · 基准"] == "close_to_close"
+    assert keys["固定间隔 · 更优"].startswith("hedge_band:")
+    assert set(summary["meta_origin"]) == {gui_app.SNAPSHOT_ORIGIN_MANUAL}

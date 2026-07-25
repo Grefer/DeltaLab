@@ -2898,11 +2898,17 @@ def _fake_history_batch_gui(*, checked=("固定时刻(10:30)", "固定间隔(1.5
     fake = SimpleNamespace(
         _active_job=None,
         _pending_history_retain_name=None,
+        _pending_history_retain_origin=None,
         _history_batch_queue=[],
         _history_batch_total=0,
         _history_batch_done=0,
         _history_batch_failures=[],
         _history_batch_position=None,
+        _history_batch_result_ids=[],
+        _history_batch_id=None,
+        _history_batch_failure_details=[],
+        _history_batch_last_result_ids=[],
+        _latest_retained_result_id=None,
         _history_rank_tree=_RankTreeStub(rows),
         _history_rank_rows=rows,
         _pos_var=_Var(position),
@@ -2922,6 +2928,12 @@ def _fake_history_batch_gui(*, checked=("固定时刻(10:30)", "固定间隔(1.5
         fake)
     fake._history_batch_skip_rest = (
         lambda: BacktestApp._history_batch_skip_rest(fake))
+    # 收尾不再跳页；结论写进优选页结果条，这里让真实实现落数据后直接返回。
+    fake._publish_history_batch_outcome = (
+        lambda done, total, failures, result_ids:
+        BacktestApp._publish_history_batch_outcome(
+            fake, done, total, failures, result_ids))
+    fake._refresh_saved_comparison_if_visible = lambda: None
     return fake
 
 
@@ -2967,15 +2979,20 @@ def _drive_history_batch(fake, outcomes):
         launched.append({
             "name": fake._pending_history_retain_name,
             "position": BacktestApp._normalize_position(fake._pos_var.get()),
+            "origin": copy.deepcopy(fake._pending_history_retain_origin),
         })
         fake._active_job = "backtest"
         outcome = outcomes[index] if index < len(outcomes) else True
-        fake.after(0, lambda: _settle(outcome))
+        fake.after(0, lambda: _settle(outcome, index))
         return True
 
-    def _settle(success):
+    def _settle(success, index):
         fake._active_job = None
         fake._pending_history_retain_name = None
+        fake._pending_history_retain_origin = None
+        # 模拟 _deliver_backtest_result 成功入池后登记的快照 id。
+        fake._latest_retained_result_id = (
+            f"result-{index + 1:04d}" if success else None)
         BacktestApp._history_batch_advance(fake, success)
 
     pending = []
@@ -2992,7 +3009,7 @@ def _drive_history_batch(fake, outcomes):
     return started, launched
 
 
-def test_history_batch_runs_every_candidate_then_opens_comparison(monkeypatch):
+def test_history_batch_runs_every_candidate_and_reports_in_place(monkeypatch):
     fake = _fake_history_batch_gui()
     monkeypatch.setattr(
         gui_app.messagebox, "showerror",
@@ -3007,9 +3024,30 @@ def test_history_batch_runs_every_candidate_then_opens_comparison(monkeypatch):
         "优选近月 · 固定时刻(10:30)",
     ]
     assert {item["position"] for item in launched} == {-1}
-    assert fake.opened == [True]
+    # 收尾不再抢走优选页上下文：既不自动跳页，也不弹模态框。
+    assert fake.opened == []
     assert fake.errors == []
     assert fake._history_batch_queue == []
+    # 全部成功时结果条没有失败详情，但记住这一批入池的快照供“查看结果对比”。
+    assert fake._history_batch_failure_details == []
+    assert fake._history_batch_last_result_ids == [
+        "result-0001", "result-0002", "result-0003"]
+
+
+def test_history_batch_origin_meta_records_period_rank_and_batch_id():
+    fake = _fake_history_batch_gui()
+
+    _started, launched = _drive_history_batch(fake, [True, True, True])
+
+    origins = [item["origin"] for item in launched]
+    assert all(item["batch"] is True for item in origins)
+    assert {item["period_label"] for item in origins} == {"近月"}
+    assert [item["history_strategy"] for item in origins] == [
+        "每日收盘", "固定间隔(1.5σ)", "固定时刻(10:30)"]
+    # 同一批次共享 batch_id，并记录批内顺序，便于结果池按批次成组。
+    assert len({item["batch_id"] for item in origins}) == 1
+    assert [item["batch_index"] for item in origins] == [1, 2, 3]
+    assert {item["batch_total"] for item in origins} == {3}
 
 
 def test_history_batch_aborts_remaining_candidates_after_a_failed_run(
@@ -3025,10 +3063,14 @@ def test_history_batch_aborts_remaining_candidates_after_a_failed_run(
         "优选近月 · 每日收盘基准",
         "优选近月 · 固定间隔(1.5σ)",
     ]
-    assert fake.errors and fake.errors[0][0] == "批量验证未全部完成"
-    assert "固定时刻(10:30)" in fake.errors[0][1]
-    # 已成功的快照仍然联动到结果对比页，失败只中止未验证候选。
-    assert fake.opened == [True]
+    # 失败原因留在结果条里按需展开，不再用模态框打断，也不跳页。
+    assert fake.errors == []
+    assert fake.opened == []
+    details = "\n".join(fake._history_batch_failure_details)
+    assert "固定间隔(1.5σ)：回测失败" in details
+    assert "固定时刻(10:30)" in details
+    # 失败前已成功入池的快照仍然可以从结果条直接查看。
+    assert fake._history_batch_last_result_ids == ["result-0001"]
     assert fake._history_batch_queue == []
 
 
@@ -3054,10 +3096,14 @@ def test_history_batch_reports_rest_when_a_run_cannot_start(monkeypatch):
     assert BacktestApp._run_history_batch_on_current_path(fake) is False
     assert attempts == ["优选近月 · 每日收盘基准"]
     assert fake.opened == []
-    assert fake.errors and "回测未能启动" in fake.errors[0][1]
-    assert "固定间隔(1.5σ)" in fake.errors[0][1]
-    assert "固定时刻(10:30)" in fake.errors[0][1]
+    assert fake.errors == []
+    details = "\n".join(fake._history_batch_failure_details)
+    assert "回测未能启动" in details
+    assert "固定间隔(1.5σ)" in details
+    assert "固定时刻(10:30)" in details
+    assert fake._history_batch_last_result_ids == []
     assert fake._pending_history_retain_name is None
+    assert fake._pending_history_retain_origin is None
 
 
 def test_history_batch_skips_unmappable_row_and_keeps_running_the_rest(
@@ -3092,11 +3138,12 @@ def test_history_batch_skips_unmappable_row_and_keeps_running_the_rest(
         pending.pop(0)()
 
     assert started is True
-    # 只有元数据残缺的那一条被跳过，其余候选照常验证并联动到对比页。
+    # 只有元数据残缺的那一条被跳过，其余候选照常验证并送入结果池。
     assert launched == [
         "优选近月 · 每日收盘基准", "优选近月 · 固定时刻(10:30)"]
-    assert fake.errors and "固定间隔(1.5σ)" in fake.errors[0][1]
-    assert fake.opened == [True]
+    assert fake.errors == []
+    assert fake.opened == []
+    assert "固定间隔(1.5σ)" in "\n".join(fake._history_batch_failure_details)
     assert fake._history_batch_queue == []
 
 
@@ -3934,9 +3981,12 @@ def test_history_batch_step_skips_every_unmappable_row_and_finishes(
 
     assert started is False
     assert fake._history_batch_queue == []
-    assert len(fake.errors) == 1
-    assert "固定间隔(1.5σ)：缺少策略参数" in fake.errors[0][1]
-    assert "固定时刻(10:30)：缺少策略参数" in fake.errors[0][1]
+    # 收尾只汇报一次，两条原因进同一份结果条详情，不再弹模态框。
+    assert fake.errors == []
+    details = fake._history_batch_failure_details
+    assert "固定间隔(1.5σ)：缺少策略参数" in "\n".join(details)
+    assert "固定时刻(10:30)：缺少策略参数" in "\n".join(details)
+    assert fake._history_batch_last_result_ids == []
 
 
 def test_history_batch_step_returns_false_on_an_empty_queue():
