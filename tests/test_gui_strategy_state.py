@@ -39,6 +39,19 @@ class _Var:
         self.value = str(value)
 
 
+class _RemovedControlVar:
+    """已下线控件的替身：任何再次读取它的代码路径都会立即失败。"""
+
+    def __init__(self, label):
+        self.label = label
+
+    def get(self):
+        raise AssertionError(f"{self.label} 已不再是可选参数，不应被读取")
+
+    def set(self, value):
+        raise AssertionError(f"{self.label} 已不再是可选参数，不应被写入")
+
+
 def test_default_fixed_times_include_day_and_night_closes():
     assert DEFAULT_FIXED_TIMES == "23:00,11:30,15:00"
     assert tuple(
@@ -279,7 +292,7 @@ def test_band_sync_strict_rejects_invalid_visible_value():
     ],
 )
 def test_fixed_time_gui_rejects_known_non_intraday_sources(state):
-    with pytest.raises(ValueError, match="日内|分钟"):
+    with pytest.raises(ValueError, match="日内|分钟|日频"):
         BacktestApp._validate_fixed_time_source_state(state)
 
 
@@ -500,7 +513,11 @@ def test_single_wind_custom_end_is_preserved_exactly():
         ("fixed_times", "11:30,15:00", "15分钟"),
         ("fixed_times", "10:10", "5分钟"),
         ("fixed_times", "10:07", "1分钟"),
-        ("hedge_band", "", "15分钟"),
+        # 任何不落在 5/15 分钟网格上的时刻都必须退到 1 分钟。
+        ("fixed_times", "14:22", "1分钟"),
+        ("fixed_times", "14:22,15:00", "1分钟"),
+        ("fixed_times", "09:31", "1分钟"),
+        ("hedge_band", "", "1分钟"),
     ],
 )
 def test_wind_auto_bar_size_follows_strategy_observation_needs(
@@ -510,6 +527,38 @@ def test_wind_auto_bar_size_follows_strategy_observation_needs(
         strategy_name=strategy_name,
         fixed_times=fixed_times,
     ) == expected
+
+
+@pytest.mark.parametrize(
+    "band_sigma_multiple", [0.2, 0.75, 1.0, 2.0, 3.0, 5.0, None, 0.0])
+def test_band_auto_bar_size_is_always_finest_regardless_of_width(
+        band_sigma_multiple):
+    """带宽宽窄不改变漏采机制，自动粒度一律 1 分钟，不按带宽分档。"""
+    assert BacktestApp._resolve_wind_bar_size(
+        WIND_AUTO_BAR_SIZE, strategy_name="hedge_band") == "1分钟"
+    # 带宽只用于量化手动选粗的代价，不参与自动粒度判定。
+    assert BacktestApp._recommended_band_bar_size() == "1分钟"
+
+
+def test_auto_bar_size_is_the_only_source_of_truth():
+    """粒度不再有用户入口：解析函数是唯一决定者，且对同一策略是确定的。"""
+    for _ in range(3):
+        assert BacktestApp._resolve_wind_bar_size(
+            WIND_AUTO_BAR_SIZE, strategy_name="close_to_close") == "日频"
+        assert BacktestApp._resolve_wind_bar_size(
+            WIND_AUTO_BAR_SIZE, strategy_name="hedge_band") == "1分钟"
+
+
+def test_history_band_bar_size_does_not_depend_on_candidate_mix():
+    """粒度不得依赖“本批次里最窄的候选是谁”，否则单个候选的评分会随
+    它和谁一起被评估而改变。"""
+    for sigmas in ((0.5, 1.0), (3.0, 5.0), (2.0,)):
+        assert BacktestApp._resolve_wind_bar_size(
+            WIND_AUTO_BAR_SIZE, include_band=True) == "1分钟"
+    # 同时含固定时刻候选时仍取更细的一档。
+    assert BacktestApp._resolve_wind_bar_size(
+        WIND_AUTO_BAR_SIZE, include_band=True, include_fixed_times=True,
+        fixed_times="11:30,15:00") == "1分钟"
 
 
 def test_wind_auto_bar_size_ignores_locally_known_closed_session_targets(
@@ -535,6 +584,72 @@ def test_wind_auto_bar_size_ignores_locally_known_closed_session_targets(
     ) == "15分钟"
     # 自动频率在 GUI 主线程解析，只读本地已知 session，不能触发 Wind wss。
     assert calls == [("NO_NIGHT.TEST", False)]
+
+
+_A_SHARE_SESSIONS = ((datetime.time(9, 30), datetime.time(11, 30)),
+                     (datetime.time(13, 0), datetime.time(15, 0)))
+_COMMODITY_SESSIONS = ((datetime.time(21, 0), datetime.time(23, 0)),
+                       (datetime.time(9, 0), datetime.time(10, 15)),
+                       (datetime.time(10, 30), datetime.time(11, 30)),
+                       (datetime.time(13, 30), datetime.time(15, 0)))
+
+
+def _patch_trading_sessions(monkeypatch, sessions):
+    import pricing.wind_data as wind_data
+    monkeypatch.setattr(
+        wind_data, "get_trading_session_clock_ranges",
+        lambda code, *, allow_wind=True: sessions)
+
+
+@pytest.mark.parametrize(
+    ("sessions", "fixed_times"),
+    [
+        (_A_SHARE_SESSIONS, "09:30"),
+        (_A_SHARE_SESSIONS, "13:00"),
+        (_A_SHARE_SESSIONS, "09:30,15:00"),
+        (_COMMODITY_SESSIONS, "21:00"),
+        (_COMMODITY_SESSIONS, "09:00"),
+        (_COMMODITY_SESSIONS, "10:30"),
+        (_COMMODITY_SESSIONS, "13:30"),
+    ],
+)
+def test_session_open_times_require_the_finest_granularity(
+        monkeypatch, sessions, fixed_times):
+    """开盘时刻只有 1 分钟粒度取得到。
+
+    实测 Wind 的标签约定随粒度而变：1 分钟是左标签（首根 09:30），
+    5/15/60 分钟是右标签（首根 09:35/09:45/10:30）。整除判据只看墙钟，
+    会把 09:30 误判成 15 分钟可覆盖，因此要显式降到最细一档。
+    """
+    _patch_trading_sessions(monkeypatch, sessions)
+    assert BacktestApp._resolve_wind_bar_size(
+        WIND_AUTO_BAR_SIZE, strategy_name="fixed_times",
+        fixed_times=fixed_times, wind_code="TEST.CODE") == "1分钟"
+
+
+def test_session_close_times_remain_valid_fixed_hedge_targets(monkeypatch):
+    """收盘时刻是真实存在的末根 bar，不能被开盘拦截误伤。"""
+    _patch_trading_sessions(monkeypatch, _A_SHARE_SESSIONS)
+    assert BacktestApp._resolve_wind_bar_size(
+        WIND_AUTO_BAR_SIZE, strategy_name="fixed_times",
+        fixed_times="11:30,15:00", wind_code="510050.SH") == "15分钟"
+    _patch_trading_sessions(monkeypatch, _COMMODITY_SESSIONS)
+    assert BacktestApp._resolve_wind_bar_size(
+        WIND_AUTO_BAR_SIZE, strategy_name="fixed_times",
+        fixed_times="23:00,10:15,15:00", wind_code="rb2412.SHF") == "15分钟"
+
+
+def test_unknown_session_metadata_defers_to_backtest_time_validation(
+        monkeypatch):
+    """元数据未知时不能凭空拦截，仍由逐交易日组完整性校验兜底。"""
+    _patch_trading_sessions(monkeypatch, None)
+    assert BacktestApp._resolve_wind_bar_size(
+        WIND_AUTO_BAR_SIZE, strategy_name="fixed_times",
+        fixed_times="09:30", wind_code="UNKNOWN.TEST") == "15分钟"
+    # 没有代码时同样无从判断该时刻属于哪个 session。
+    assert BacktestApp._resolve_wind_bar_size(
+        WIND_AUTO_BAR_SIZE, strategy_name="fixed_times",
+        fixed_times="09:30") == "15分钟"
 
 
 def test_manual_daily_wind_rejects_fixed_time_but_keeps_band_choice():
@@ -569,7 +684,7 @@ def test_history_wind_auto_range_covers_strict_year_plus_day0_anchor():
     assert resolved["wind_end"] == asof.isoformat()
     assert resolved["wind_start"] == (
         asof - datetime.timedelta(days=expected_span)).isoformat()
-    assert resolved["wind_bar_size"] == "15分钟"
+    assert resolved["wind_bar_size"] == "1分钟"
     assert resolved["wind_date_mode"] == "history_auto_year_strict_interval"
     assert resolved["wind_sigma_warmup_days"] == 0
 
@@ -862,7 +977,9 @@ def _fake_collect_state():
         _npaths_var=_Var("10"), _csv_path_var=_Var("real.csv"),
         _csv_col_var=_Var("close"), _wind_code_var=_Var("510050.SH"),
         _wind_start_var=_Var("2025-01-01"),
-        _wind_end_var=_Var("2026-01-01"), _wind_bar_size_var=_Var("日频"),
+        _wind_end_var=_Var("2026-01-01"),
+        # 粒度已不再是可选项；留一个会爆炸的替身，确保没有代码路径再读它。
+        _wind_bar_size_var=_RemovedControlVar("行情采样粒度"),
         _slip_var=_Var("0"), _force_day_close_hedge_var=_BoolVar(False),
         _gui_steps_per_day=lambda source, value: BacktestApp._gui_steps_per_day(
             source, value),
@@ -997,7 +1114,6 @@ def test_single_wind_collection_uses_maturity_auto_end_and_ignores_history_ui():
     fake._wind_start_var.set("2025-01-02")
     fake._wind_end_var.set("invalid-but-disabled")
     fake._wind_auto_end_var = _BoolVar(True)
-    fake._wind_bar_size_var.set(WIND_AUTO_BAR_SIZE)
     fake._strategy_var.set(STRATEGY_DISPLAY["close_to_close"])
     fake._history_wind_asof_var = _ForbiddenVar()
     fake._history_wind_start_var = _ForbiddenVar()
@@ -1024,11 +1140,9 @@ def test_history_wind_collection_uses_independent_asof_range_and_frequency():
     # 单次回测 Wind 控件故意不可用；历史页必须用自己的日期和粒度。
     fake._wind_start_var.set("not-a-single-start")
     fake._wind_end_var.set("not-a-single-end")
-    fake._wind_bar_size_var.set("日频")
     fake._history_wind_asof_var = _Var("2025-06-30")
     fake._history_wind_start_var = _Var("not-used-while-auto")
     fake._history_wind_auto_start_var = _BoolVar(True)
-    fake._history_wind_bar_size_var = _Var(WIND_AUTO_BAR_SIZE)
 
     state = BacktestApp._collect_history_state(fake)
     required = ANNUAL_DAYS + state["sigma_window"] + 1
@@ -1044,14 +1158,17 @@ def test_history_wind_collection_uses_independent_asof_range_and_frequency():
     assert state["wind_required_trade_days"] == required
     assert state["wind_sigma_warmup_days"] == state["sigma_window"]
     assert state["history_wind_bar_size_requested"] == WIND_AUTO_BAR_SIZE
-    # 默认固定时刻 + 固定间隔候选冻结为同一实际粒度，保持公平比较。
-    assert state["wind_bar_size"] == "15分钟"
+    # 默认固定时刻 + 固定间隔候选冻结为同一实际粒度，保持公平比较；
+    # 该粒度由最窄的 σ 候选（默认 0.5σ）决定，否则窄带候选会被系统性
+    # 少记触发次数而在排名里虚高。
+    assert state["wind_bar_size"] == "1分钟"
     assert BacktestApp._history_recommendation_source_label(state) == (
-        f"Wind · 510050.SH · {expected_start} 至 2025-06-30 · 15分钟"
+        f"Wind · 510050.SH · {expected_start} 至 2025-06-30 · 1分钟"
     )
 
 
-def test_history_manual_daily_with_fixed_time_fails_during_state_collection():
+def test_history_state_always_requests_auto_bar_size():
+    """择优页不再提供粒度选择：旧版本残留的手动值不得泄漏进新任务。"""
     fake = _fake_history_collect_state()
     fake._source_var.set("wind")
     fake._history_wind_asof_var = _Var("2025-06-30")
@@ -1059,8 +1176,12 @@ def test_history_manual_daily_with_fixed_time_fails_during_state_collection():
     fake._history_wind_auto_start_var = _BoolVar(False)
     fake._history_wind_bar_size_var = _Var("日频")
 
-    with pytest.raises(ValueError, match="固定时刻策略需要分钟行情"):
-        BacktestApp._collect_history_state(fake)
+    state = BacktestApp._collect_history_state(fake)
+
+    assert state["history_wind_bar_size_requested"] == WIND_AUTO_BAR_SIZE
+    assert state["wind_bar_size_requested"] == WIND_AUTO_BAR_SIZE
+    # 默认候选含固定时刻 + 固定间隔，实际粒度取两者所需里最细的一档。
+    assert state["wind_bar_size"] == "1分钟"
 
 
 def test_new_wind_controls_are_optional_for_legacy_test_doubles():
@@ -1698,12 +1819,14 @@ def test_history_metric_labels_mark_product_pool_raw_rms_as_diagnostic():
     assert single == {
         "score": "区间得分↓",
         "baseline": "每日收盘区间得分",
-        "improvement": "较每日收盘改善",
+        "improvement": "较收盘改善",
     }
+    # 品种池的原始 RMS 只是诊断值，三个字段都必须带上“诊断”字样，
+    # 不能与严格区间主指标共用同一套措辞。
     assert pool == {
         "score": "诊断总得分↓",
         "baseline": "每日收盘诊断分",
-        "improvement": "较每日收盘改善",
+        "improvement": "较收盘诊断改善",
     }
 
 
@@ -2579,8 +2702,8 @@ def test_diagnostic_only_history_payload_is_valid():
 
 def test_zero_window_fixed_time_payload_reports_real_target_error():
     reason = (
-        "fixed_times 目标时刻 [11:30,15:00] 未逐交易日组完整匹配；"
-        "第1个交易日组缺失 [11:30]。"
+        "fixed_times 目标时刻 [11:30,15:00] 未能逐交易日组匹配："
+        "11:30 在全部 2 个交易日组中都不存在。"
     )
     ranking = pd.DataFrame([{
         "strategy": "fixed", "strategy_type": "fixed_times",
@@ -2600,7 +2723,7 @@ def test_zero_window_fixed_time_payload_reports_real_target_error():
 
     message = str(exc_info.value)
     assert "固定时刻策略没有形成任何可评估代理段" in message
-    assert "缺失 [11:30]" in message
+    assert "11:30 在全部 2 个交易日组中都不存在" in message
     assert "历史长度不足" not in message
 
 
@@ -3570,7 +3693,6 @@ def test_resolved_wind_dates_and_bar_size_flow_to_build_meta_and_label(
     form._wind_start_var.set("2025-01-02")
     form._wind_end_var.set("2025-02-28")
     form._wind_auto_end_var = _BoolVar(False)
-    form._wind_bar_size_var.set(WIND_AUTO_BAR_SIZE)
 
     state = BacktestApp._collect_gui_state(form)
     app = SimpleNamespace(
@@ -3578,15 +3700,16 @@ def test_resolved_wind_dates_and_bar_size_flow_to_build_meta_and_label(
     backtest = BacktestApp._build_backtest(app, state)
 
     assert state["wind_bar_size_requested"] == WIND_AUTO_BAR_SIZE
-    assert state["wind_bar_size"] == "15分钟"
+    # 表单带宽是 1 元绝对值 = 0.78σ_daily，属于窄带，必须落到 1 分钟。
+    assert state["wind_bar_size"] == "1分钟"
     assert captured["args"] == (
         "510050.SH", "2025-01-02", "2025-02-28")
-    assert captured["kwargs"]["bar_size"] == "15"
+    assert captured["kwargs"]["bar_size"] == "1"
     assert backtest._gui_meta["wind_start"] == "2025-01-02"
     assert backtest._gui_meta["wind_end"] == "2025-02-28"
-    assert backtest._gui_meta["wind_bar_size"] == "15分钟"
+    assert backtest._gui_meta["wind_bar_size"] == "1分钟"
     assert BacktestApp._snapshot_source_label(state) == (
-        "Wind · 510050.SH · 2025-01-02 至 2025-02-28 · 15分钟"
+        "Wind · 510050.SH · 2025-01-02 至 2025-02-28 · 1分钟"
     )
 
 

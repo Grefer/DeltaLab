@@ -92,6 +92,11 @@ class FixedTimeStrategy(HedgeStrategy):
 
     name = "fixed_times"
 
+    # 目标时刻没有对应 bar 时，允许回退到之前最近一根 bar 的最大间隔。
+    # 取 60 分钟：足以覆盖 60 分钟粒度缺一根尾 bar 的情形，又不会让日盘的
+    # 末根 bar 去顶替夜盘时刻（14:59 与 23:00 相距 8 小时）。
+    max_backfill_minutes = 60
+
     def __init__(self, times, trading_sessions=None):
         if isinstance(times, str):
             times = [x.strip() for x in times.split(",") if x.strip()]
@@ -174,6 +179,29 @@ class FixedTimeStrategy(HedgeStrategy):
         self._triggered.clear()
         return self
 
+    def can_serve(self, bar_time, target):
+        """``bar_time`` 这根 bar 是否可以承接 ``target`` 的调仓。
+
+        Wind 分钟行情按成交返回 bar：收盘时刻（11:30 / 15:00）在 1 分钟
+        左标签下只有约七成的交易日存在，那一秒没成交就没有 bar。要求精确
+        命中会让“每日收盘调仓”在细粒度行情上大面积失败，而实务含义本就
+        是“在收盘时调仓”——那一刻没成交，成交价就是之前最后一笔。
+        """
+        if bar_time == target:
+            return True
+        gap = (target.hour * 60 + target.minute) - (
+            bar_time.hour * 60 + bar_time.minute)
+        if not 0 < gap <= self.max_backfill_minutes:
+            return False
+        if self.trading_sessions is None:
+            return True
+        # 必须同属一段连续交易，否则日盘末根会去顶替夜盘时刻。
+        return any(
+            self._time_in_session(bar_time, start, end)
+            and self._time_in_session(target, start, end)
+            for start, end in self.trading_sessions
+        )
+
     def should_hedge(self, ctx):
         # 已由显式 session 证明所有请求都处于非交易时段时，策略是合法
         # no-op；此时甚至不需要用时间戳来判定触发。
@@ -188,13 +216,38 @@ class FixedTimeStrategy(HedgeStrategy):
             raise ValueError("fixed_times 策略需要真实 datetime 时间戳")
         current_time = timestamp.time().replace(
             second=0, microsecond=0, tzinfo=None)
-        if current_time not in self.effective_times:
-            return False
-        key = (timestamp.date(), current_time)
-        if key in self._triggered:
-            return False
-        self._triggered.add(key)
-        return True
+        current_date = timestamp.date()
+
+        # 只有同自然日的下一根 bar 参与“是否已越过目标”的判定；跨日则说明
+        # 当前就是当天最后一根，不必再等。
+        next_timestamp = ctx.get("next_timestamp")
+        next_time = None
+        if next_timestamp is not None:
+            if hasattr(next_timestamp, "to_pydatetime"):
+                next_timestamp = next_timestamp.to_pydatetime()
+            if next_timestamp.date() == current_date:
+                next_time = next_timestamp.time().replace(
+                    second=0, microsecond=0, tzinfo=None)
+
+        # 不在第一个命中就返回：同一根 bar 可能同时承接多个目标（例如
+        # 14:59 这根既是 14:59 本身、又要顶替缺失的 15:00）。调仓到同一个
+        # Δ 只需一次，但这些目标都应记为已消费，否则先匹配的那个会把
+        # bar “抢走”，让另一个目标当天凭空丢失。
+        hit = False
+        for target in self.effective_times:
+            key = (current_date, target)
+            if key in self._triggered:
+                continue
+            if not self.can_serve(current_time, target):
+                continue
+            # 目标时刻本身有 bar 时就在那一根触发；否则要等到“下一根已经
+            # 越过目标”，确保用的是目标之前最近的一根，而不是提前调仓。
+            if (current_time != target
+                    and next_time is not None and next_time <= target):
+                continue
+            self._triggered.add(key)
+            hit = True
+        return hit
 
 
 _EVENING_SESSION_START = _datetime.time(18, 0)
@@ -282,12 +335,40 @@ def _trading_day_close_indices(timestamps):
     ).astype(int, copy=False)
 
 
+# 交易日组末 bar 允许早于典型收盘的分钟数。分钟级行情偶尔会缺尾部一两根
+# bar（Wind 数据瑕疵），此时用 14:59 代替 15:00 对 close-to-close 的影响可
+# 以忽略；而丢掉整个尾盘竞价区间（A 股 14:57-15:00）必须继续拒绝。取 5
+# 分钟同时保证 15/60 分钟这类粗粒度缺一整根尾 bar 时仍然报错——那种缺失
+# 意味着最后一个小时的行情整段没有，性质完全不同。
+_TERMINAL_CLOSE_TOLERANCE_MINUTES = 5
+
+
+def _close_gap_minutes(actual_close, expected_close):
+    """末时刻早于典型收盘的分钟数；晚于或跨午夜时返回一个大值。"""
+    actual = actual_close.hour * 60 + actual_close.minute
+    expected = expected_close.hour * 60 + expected_close.minute
+    gap = expected - actual
+    if gap < 0:
+        # 夜盘收盘（如 02:30）与日盘末 bar 相减会得到负数；补一整天还原
+        # 真实间隔。末时刻晚于典型收盘同样会落进这里，得到极大的 gap 而
+        # 被拒绝——那本身就是异常数据。
+        gap += 24 * 60
+    return gap
+
+
 def _expiry_terminal_index(timestamps, term_days, steps_per_day):
     """验证真实日内组完整性并返回第 ``term_days`` 个收盘下标。
 
     连续分组本身只能说明“这是样本里最后一根”，不能证明最后一组真的
     已收盘。这里用声明/推导的典型 bar 数和完整组的常见收盘时刻共同
     判定；期限内出现盘中残段时明确拒绝，避免强制到期。
+
+    “盘中残段”按定义只可能是样本末尾那一组（例如下午两点拉当天数据）。
+    中间的交易日组必然早已收盘，其 bar 数与末时刻的波动只反映 Wind 分钟
+    行情“有成交才有 bar”的稀疏性——510050 这类高流动性 ETF 也有约四分之
+    一的交易日尾盘无成交、末根停在 14:59 而非 15:00。对历史组套用“末时刻
+    必须等于众数收盘”会把大量正常交易日误判为残段，因此只对末尾组严格
+    判定。中间组的数据稀疏程度属于数据质量问题，不该阻断回测。
     """
     close_indices = _trading_day_close_indices(timestamps)
     bounds = []
@@ -307,12 +388,15 @@ def _expiry_terminal_index(timestamps, term_days, steps_per_day):
     inferred_steps = _infer_intraday_steps(timestamps)
     expected_steps = max(1, int(steps_per_day), int(inferred_steps))
 
-    # 只用 bar 数达到典型水平的组估计正常收盘时刻；盘中残段不会
-    # 反过来污染预期。平票时取更晚时刻，对日盘/含夜盘数据更稳健。
+    # 用末组之外的所有组估计正常收盘时刻：残段只可能出现在样本末尾，
+    # 前面的组都是已收盘的交易日，它们的末时刻就是该品种的正常收盘。
+    # 不能再拿“bar 数达到典型水平”当门槛——Wind 分钟行情按成交返回 bar，
+    # 每日根数本就在 240~242 之间浮动，短窗口（如最近 5 个交易日）很可能
+    # 没有任何一天达到全样本的典型值，那样 expected_close 会退化成 None，
+    # 进而落到过严的 bar 数判定上，把正常的一周直接判死。
+    # 平票时取更晚时刻，对日盘/含夜盘数据更稳健。
     close_time_counts = {}
-    for group_start, group_end in bounds:
-        if group_end - group_start + 1 < expected_steps:
-            continue
+    for group_start, group_end in bounds[:-1]:
         close_time = timestamps[group_end].time().replace(
             second=0, microsecond=0, tzinfo=None)
         close_time_counts[close_time] = close_time_counts.get(close_time, 0) + 1
@@ -332,12 +416,18 @@ def _expiry_terminal_index(timestamps, term_days, steps_per_day):
 
         # 缺少中间 bar 不代表没有收盘：只要能由典型组确认末时刻就是
         # 正常收盘，仍可用于 close-to-close。若无法判断正常收盘时刻，
-        # 才退回到典型 bar 数作为完整性证据。
+        # 才退回到典型 bar 数作为完整性证据。末时刻允许早于典型收盘几
+        # 分钟：分钟级行情缺尾部一两根 bar 时，它仍是一个已收盘的交易日。
         count_complete = count >= expected_steps
         time_complete = (
-            expected_close is not None and actual_close == expected_close
+            expected_close is not None
+            and _close_gap_minutes(actual_close, expected_close)
+            <= _TERMINAL_CLOSE_TOLERANCE_MINUTES
         )
-        if expected_close is not None:
+        if group_end < len(timestamps) - 1:
+            # 后面还有别的交易日组，说明这一组早已收盘，不可能是残段。
+            complete = True
+        elif expected_close is not None:
             complete = time_complete
         else:
             complete = count_complete
@@ -439,10 +529,14 @@ def _validate_fixed_time_data(strategy, timestamps):
         )
 
     close_indices = _trading_day_close_indices(timestamps)
-    problems = []
     checked_group = 0
     start = 0
     requested_times = set(strategy.effective_times)
+    # 按“缺失时刻”而不是按交易日组聚合：粒度对不上时每一组报的都是同一
+    # 件事，逐组罗列会生成几十段重复文本，在 GUI 弹窗里完全没法读。
+    missing_groups = {}
+    example_dates = {}
+    available_sample = ()
     for end in close_indices:
         end = int(end)
         # 只有下标 0 的单点组只是 Day 0 建仓观测，不会进入策略循环，
@@ -454,31 +548,41 @@ def _validate_fixed_time_data(strategy, timestamps):
                 ts.time().replace(second=0, microsecond=0, tzinfo=None)
                 for ts in group_timestamps
             }
-            missing = requested_times.difference(available)
-            if missing:
-                first_ts = group_timestamps[0]
-                last_ts = group_timestamps[-1]
-                missing_text = ",".join(
-                    t.strftime("%H:%M") for t in sorted(missing)
-                )
-                sample = ",".join(
-                    t.strftime("%H:%M") for t in sorted(available)[:12]
-                )
-                problems.append(
-                    f"第{checked_group}个交易日组 "
-                    f"[{first_ts.strftime('%Y-%m-%d %H:%M')} ~ "
-                    f"{last_ts.strftime('%Y-%m-%d %H:%M')}] "
-                    f"缺失 [{missing_text}]（可用: [{sample}]）"
-                )
+            # 判据与 should_hedge 共用 can_serve：目标时刻没有 bar 时可以
+            # 由之前最近一根承接，只有连承接的 bar 都没有才是真的匹配不上。
+            for value in requested_times:
+                if any(strategy.can_serve(bar_time, value)
+                       for bar_time in available):
+                    continue
+                missing_groups[value] = missing_groups.get(value, 0) + 1
+                example_dates.setdefault(
+                    value, group_timestamps[-1].strftime("%Y-%m-%d"))
+            if not available_sample:
+                available_sample = tuple(sorted(available))
         start = end + 1
 
-    if problems:
+    if missing_groups:
         requested = ",".join(
             t.strftime("%H:%M") for t in strategy.effective_times)
+        details = []
+        for value in sorted(missing_groups):
+            count = missing_groups[value]
+            clock = value.strftime("%H:%M")
+            if count == checked_group:
+                # 全组缺失 = 该时刻根本不落在这份行情的 bar 网格上。
+                details.append(f"{clock} 在全部 {checked_group} 个交易日组中都不存在")
+            else:
+                details.append(
+                    f"{clock} 在 {count}/{checked_group} 个交易日组中缺失"
+                    f"（如 {example_dates[value]}）")
+        sample = ",".join(t.strftime("%H:%M") for t in available_sample[:8])
+        more = "…" if len(available_sample) > 8 else ""
         raise ValueError(
-            f"fixed_times 目标时刻 [{requested}] 未逐交易日组完整匹配；"
-            + "；".join(problems)
-            + "。"
+            f"fixed_times 目标时刻 [{requested}] 未能逐交易日组匹配："
+            + "；".join(details)
+            + f"。该行情每日 {len(available_sample)} 根 bar，"
+            f"可用时刻为 [{sample}{more}]。"
+            "请改用行情中实际存在的时刻，或改用更细的行情粒度。"
         )
 
 
@@ -1406,18 +1510,67 @@ class HedgeBacktest:
 
             time_left = eval_opt._time_remaining
 
-            # 计算价值与 Greeks
-            if time_left > 0:
+            # 期权价值每根 bar 都要：它进入净值曲线与盈亏分解。
+            if time_left >= 0:
                 val = eval_opt.get_price()
                 V[i] = val if val is not None else 0.0
-                greeks = eval_opt.get_greeks()
-                delta[i], gamma[i], vega[i], theta[i], rho[i] = greeks
-            elif time_left == 0:
-                val = eval_opt.get_price()
-                V[i] = val if val is not None else 0.0
-                delta[i] = gamma[i] = vega[i] = theta[i] = rho[i] = 0.0
             else:
-                V[i] = delta[i] = gamma[i] = vega[i] = theta[i] = rho[i] = 0.0
+                V[i] = 0.0
+
+            # 触发判定不依赖 Greeks，因此提到 Greeks 之前：本 bar 是否调仓
+            # 决定了要不要支付整套 Greeks 的定价开销。末 bar 走平仓分支，
+            # 但仍需按真实剩余期限披露完整 Greeks（H<T 的 MTM 场景）。
+            if i == n:
+                strategy_triggered = False
+                fallback_only = False
+                needs_full_greeks = True
+            else:
+                # 组装策略 context
+                ctx = {
+                    "i": i,
+                    "S": float(S[i]),
+                    "S_last": S_last,
+                    "i_last": i_last,
+                    "dt_bar": dt_bar,
+                    "steps_per_day": spd,
+                    "crosses_day": crosses_day,
+                    "is_day_close": is_day_close,
+                    "timestamp": timestamp,
+                    "next_timestamp": next_timestamp,
+                    "sigma_impl": float(option.sigma),
+                    # 对数收益历史（到当前 bar 为止），仅 realized σ 时用到
+                    "log_ret_hist": np.concatenate((
+                        warmup_log_returns,
+                        path_log_returns[:i],
+                    )),
+                    "log_ret_warmup_bars": len(warmup_log_returns),
+                    "strict_realized_sigma": self.strict_sigma_warmup,
+                }
+                # 原策略无论兜底是否开启都只评估一次，确保固定时刻等
+                # 有状态策略按原有逻辑推进。公共规则只对非终止收盘 bar
+                # 做 OR 合并；原策略已触发时不会再产生第二笔交易。
+                strategy_triggered = bool(strategy.should_hedge(ctx))
+                fallback_only = bool(
+                    self.force_day_close_hedge
+                    and is_day_close
+                    and not strategy_triggered
+                )
+                needs_full_greeks = strategy_triggered or fallback_only
+
+            # Greeks 只在实际调仓的 bar 上重算，其余沿用上一根：它们不参与
+            # 触发判定（策略只看价格），Delta 也只在调仓时被 _compute_target
+            # 读取。1 分钟粒度下每根 bar 全量算 Greeks 是 11 次定价，而每天
+            # 真正用到的只有那几次调仓，其余全是为展示付的开销。
+            if time_left > 0:
+                if needs_full_greeks:
+                    greeks = eval_opt.get_greeks()
+                    delta[i], gamma[i], vega[i], theta[i], rho[i] = greeks
+                else:
+                    delta[i], gamma[i], vega[i], theta[i], rho[i] = (
+                        delta[i - 1], gamma[i - 1], vega[i - 1],
+                        theta[i - 1], rho[i - 1])
+            else:
+                delta[i] = gamma[i] = vega[i] = theta[i] = rho[i] = 0.0
 
             # 敲出日（截断后的末日）：用敲出结算票息覆盖 MC 价值，Greeks 归零
             # （期权已了结，下方 i==n 分支会平掉对冲头寸）。
@@ -1453,36 +1606,7 @@ class HedgeBacktest:
                 delta_real_qty[i] = 0
                 hedge_triggered[i] = True
             else:
-                # 组装策略 context
-                ctx = {
-                    "i": i,
-                    "S": float(S[i]),
-                    "S_last": S_last,
-                    "i_last": i_last,
-                    "dt_bar": dt_bar,
-                    "steps_per_day": spd,
-                    "crosses_day": crosses_day,
-                    "is_day_close": is_day_close,
-                    "timestamp": timestamp,
-                    "next_timestamp": next_timestamp,
-                    "sigma_impl": float(option.sigma),
-                    # 对数收益历史（到当前 bar 为止），仅 realized σ 时用到
-                    "log_ret_hist": np.concatenate((
-                        warmup_log_returns,
-                        path_log_returns[:i],
-                    )),
-                    "log_ret_warmup_bars": len(warmup_log_returns),
-                    "strict_realized_sigma": self.strict_sigma_warmup,
-                }
-                # 原策略无论兜底是否开启都只评估一次，确保固定时刻等
-                # 有状态策略按原有逻辑推进。公共规则只对非终止收盘 bar
-                # 做 OR 合并；原策略已触发时不会再产生第二笔交易。
-                strategy_triggered = bool(strategy.should_hedge(ctx))
-                fallback_only = bool(
-                    self.force_day_close_hedge
-                    and is_day_close
-                    and not strategy_triggered
-                )
+                # 触发判定已在 Greeks 之前完成，这里只执行交易。
                 if strategy_triggered or fallback_only:
                     target, theo, real = _compute_target(delta[i])
                     trade = target - H[i]

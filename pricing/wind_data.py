@@ -744,6 +744,23 @@ def get_intraday_bars(code, start_date, end_date, bar_size="60",
     return df
 
 
+_INTRADAY_CACHE_WARNED = False
+
+
+def _warn_intraday_cache_unavailable(exc):
+    """日内缓存不可用时提示一次，避免静默退化成每次重拉 Wind。"""
+    global _INTRADAY_CACHE_WARNED
+    if _INTRADAY_CACHE_WARNED:
+        return
+    _INTRADAY_CACHE_WARNED = True
+    print(
+        "[wind_data] 警告：日内行情缓存写入失败，本次运行的每次取数都会重新"
+        "请求 Wind。1 分钟粒度下批量回测会慢一个数量级。\n"
+        f"  原因: {type(exc).__name__}: {exc}\n"
+        "  修复: pip install pyarrow（requirements.txt 已声明该依赖）"
+    )
+
+
 def _intraday_cache_path(code, start, end, bar_size, adjust="F"):
     """intraday 缓存文件路径
 
@@ -821,9 +838,10 @@ def get_intraday_close(code, start, end, bar_size="60", adjust="F"):
     # 写入缓存
     try:
         ser.to_frame(name="close").to_parquet(path)
-    except Exception:
-        # 缓存失败不影响主流程
-        pass
+    except Exception as exc:
+        # 缓存失败不影响主流程，但必须让调用方知道：没有缓存时每次取数
+        # 都会重新请求 Wind，1 分钟粒度的批量回测会慢一个数量级。
+        _warn_intraday_cache_unavailable(exc)
     return ser
 
 

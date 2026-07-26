@@ -515,18 +515,18 @@ def metric_labels(*, uses_strict_metric, uses_product_pool):
         return {
             "score": "诊断总得分↓",
             "baseline": "每日收盘诊断分",
-            "improvement": "较每日收盘改善",
+            "improvement": "较收盘诊断改善",
         }
     if uses_strict_metric:
         return {
             "score": "区间得分↓",
             "baseline": "每日收盘区间得分",
-            "improvement": "较每日收盘改善",
+            "improvement": "较收盘改善",
         }
     return {
         "score": "汇总得分↓",
         "baseline": "每日收盘汇总得分",
-        "improvement": "较旧版基准改善",
+        "improvement": "较旧版改善",
     }
 
 

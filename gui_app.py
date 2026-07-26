@@ -359,7 +359,13 @@ _WIND_BAR_MINUTES = {
 # 采样粒度只有 WIND_BAR_SIZE_OPTIONS 一套标签；自动推荐与 Wind 请求参数
 # 都从 _WIND_BAR_MINUTES 派生，避免下拉改名后留下对不上的字面量。
 _WIND_FIXED_TIME_BAR_LABELS = ("15分钟", "5分钟", "1分钟")
-_WIND_BAND_DEFAULT_BAR_LABEL = "15分钟"
+# 价格波动触发只比较 bar 收盘价（HedgeBandStrategy.should_hedge），bar 内
+# 穿带后回落的行情完全不可见，且漏掉的方向是单边的：少调仓 -> 低估交易
+# 成本 -> 高估策略表现。因此自动粒度一律取最细的 1 分钟，不按带宽分档：
+# 分档会让同一个候选的评分依赖“本批次里最窄的候选是谁”，而宽带下省下
+# 的数据量也换不到可测量的精度。带宽与粒度的关系只用于量化手动选粗时
+# 的代价，见 _WIND_BAND_MISS_RATES。
+_WIND_BAND_BAR_LABEL = "1分钟"
 _WIND_DATE_BUFFER_DAYS = 21
 
 HISTORY_CHART_MODE_DISPLAY = {
@@ -1115,28 +1121,17 @@ class BacktestApp(tk.Tk):
             self._wind_frame, textvariable=self._wind_end_var, width=15)
         self._wind_end_entry.grid(row=2, column=3, padx=(6, 0), pady=2)
 
-        # Wind 的请求 BarSize 同时也是策略观察粒度，不再与自动推导的
-        # steps_per_day / 每日 Bar 数混为一个概念。
+        # 行情采样粒度不再由用户选择：每种策略的正确粒度是唯一确定的
+        # （收盘=日频、固定时刻=能覆盖目标时刻的最粗、价格波动=1 分钟），
+        # 手动调粗只会静默让结论偏乐观。这里只展示本次将要使用的粒度。
         ttk.Label(self._wind_frame, text="行情采样粒度:",
                   style="Surface.TLabel").grid(
             row=3, column=0, sticky="w", pady=2)
-        self._wind_bar_size_var = tk.StringVar(value=WIND_AUTO_BAR_SIZE)
-        self._wind_bar_size_combo = ttk.Combobox(
-            self._wind_frame, textvariable=self._wind_bar_size_var, width=13,
-            values=WIND_BAR_SIZE_OPTIONS,
-            state="readonly",
-        )
-        self._wind_bar_size_combo.grid(row=3, column=1, padx=(6, 8),
-                                       pady=2, sticky="w")
-        self._wind_bar_size_combo.bind(
-            "<<ComboboxSelected>>",
-            lambda _event: self._refresh_wind_frequency_hint(),
-        )
         self._wind_frequency_hint_var = tk.StringVar()
         ttk.Label(
             self._wind_frame, textvariable=self._wind_frequency_hint_var,
             style="SurfaceMuted.TLabel",
-        ).grid(row=3, column=2, columnspan=2, sticky="w", pady=2)
+        ).grid(row=3, column=1, columnspan=3, sticky="w", padx=(6, 0), pady=2)
         self._toggle_wind_auto_end()
         self._refresh_wind_frequency_hint()
         self._wind_code_var.trace_add(
@@ -1274,7 +1269,9 @@ class BacktestApp(tk.Tk):
         close_fallback_frame = ttk.Frame(sec3, style="Surface.TFrame")
         close_fallback_frame.grid(
             row=row_h, column=0, columnspan=2, sticky="w", pady=3)
-        self._force_day_close_hedge_var = tk.BooleanVar(value=False)
+        # 默认开启：日内触发策略若不在收盘补一次，隔夜会裸露一整晚的
+        # Δ 敞口，而回测把这段风险记为零成本，结果偏乐观。
+        self._force_day_close_hedge_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(
             close_fallback_frame, text="每日收盘保底对冲",
             variable=self._force_day_close_hedge_var,
@@ -1637,24 +1634,9 @@ class BacktestApp(tk.Tk):
         self._history_wind_asof_entry.grid(
             row=0, column=1, sticky="w", padx=(7, 18), pady=2)
 
-        ttk.Label(
-            self._history_wind_frame, text="统一行情粒度:",
-            style="Surface.TLabel",
-        ).grid(row=0, column=2, sticky="w", pady=2)
-        self._history_wind_bar_size_var = tk.StringVar(
-            value=WIND_AUTO_BAR_SIZE)
-        self._history_wind_bar_size_combo = ttk.Combobox(
-            self._history_wind_frame,
-            textvariable=self._history_wind_bar_size_var,
-            values=WIND_BAR_SIZE_OPTIONS, width=13, state="readonly",
-        )
-        self._history_wind_bar_size_combo.grid(
-            row=0, column=3, sticky="w", padx=(7, 0), pady=2)
-        self._history_wind_bar_size_combo.bind(
-            "<<ComboboxSelected>>",
-            lambda _event: self._toggle_history_wind_controls(),
-        )
-
+        # 择优页同样不提供粒度选择：这一页的产出是候选之间的排名，而调粗
+        # 粒度对各候选的伤害不均等（窄带候选被低估更多），会系统性地把排名
+        # 推向更激进的带宽。实际粒度按本次勾选的候选集合自动取最细的一档。
         self._history_wind_auto_start_var = tk.BooleanVar(value=True)
         self._history_wind_auto_start_label_var = tk.StringVar()
         self._history_wind_auto_start_check = ttk.Checkbutton(
@@ -1854,6 +1836,36 @@ class BacktestApp(tk.Tk):
                    else "disabled"))
         BacktestApp._toggle_history_wind_controls(self)
 
+    def _history_summary_bar_label(self):
+        """择优摘要展示的实际粒度；参数尚未就绪时返回占位符。
+
+        粒度不再是可选项，摘要必须显示解析结果而不是“自动”字面量——
+        1 分钟与日频差 240 倍数据量，用户在启动前有权知道是哪一档。
+        """
+        include_fixed_var = getattr(
+            self, "_history_include_fixed_times_var", None)
+        include_band_var = getattr(self, "_history_include_band_var", None)
+        fixed_var = getattr(self, "_history_fixed_times_var", None)
+        wind_code_var = getattr(self, "_wind_code_var", None)
+        try:
+            return BacktestApp._resolve_wind_bar_size(
+                WIND_AUTO_BAR_SIZE,
+                fixed_times=(
+                    fixed_var.get().strip() if fixed_var is not None else ""),
+                include_fixed_times=(
+                    bool(include_fixed_var.get())
+                    if include_fixed_var is not None else False),
+                include_band=(
+                    bool(include_band_var.get())
+                    if include_band_var is not None else False),
+                wind_code=(
+                    wind_code_var.get().strip()
+                    if wind_code_var is not None else ""),
+            )
+        except ValueError:
+            # 固定时刻还没填合法值时不阻塞摘要；启动任务时才是权威校验点。
+            return "—"
+
     def _refresh_history_base_summary(self):
         """刷新历史实验将冻结的公共回测环境摘要。"""
         variable = getattr(self, "_history_base_summary_var", None)
@@ -1871,13 +1883,12 @@ class BacktestApp(tk.Tk):
                 f" · {column or 'close'}")
         elif source == "wind":
             code_var = getattr(self, "_wind_code_var", None)
-            bar_var = getattr(self, "_history_wind_bar_size_var", None)
             start_var = getattr(self, "_history_wind_start_var", None)
             end_var = getattr(self, "_history_wind_asof_var", None)
             auto_start_var = getattr(
                 self, "_history_wind_auto_start_var", None)
             code = code_var.get().strip() if code_var is not None else "—"
-            bar = bar_var.get().strip() if bar_var is not None else "—"
+            bar = BacktestApp._history_summary_bar_label(self)
             if auto_start_var is not None and auto_start_var.get():
                 lookbacks = BacktestApp._history_lookbacks_from_controls(
                     self, require_one=False)
@@ -2079,11 +2090,9 @@ class BacktestApp(tk.Tk):
 
     def _refresh_wind_frequency_hint(self):
         hint = getattr(self, "_wind_frequency_hint_var", None)
-        requested_var = getattr(self, "_wind_bar_size_var", None)
         strategy_var = getattr(self, "_strategy_var", None)
-        if hint is None or requested_var is None or strategy_var is None:
+        if hint is None or strategy_var is None:
             return
-        requested = requested_var.get().strip() or WIND_AUTO_BAR_SIZE
         strategy_name = STRATEGY_FROM_DISPLAY.get(
             strategy_var.get(), strategy_var.get())
         fixed_var = getattr(self, "_fixed_times_var", None)
@@ -2093,22 +2102,17 @@ class BacktestApp(tk.Tk):
             wind_code_var.get().strip() if wind_code_var is not None else "")
         try:
             actual = BacktestApp._resolve_wind_bar_size(
-                requested, strategy_name=strategy_name,
+                WIND_AUTO_BAR_SIZE, strategy_name=strategy_name,
                 fixed_times=fixed_times, wind_code=wind_code)
         except ValueError as exc:
             hint.set(str(exc))
             return
-        if requested == WIND_AUTO_BAR_SIZE:
-            reason = {
-                "close_to_close": "收盘策略",
-                "fixed_times": "覆盖目标时刻",
-                "hedge_band": "观察盘中穿带",
-            }.get(strategy_name, "策略需要")
-            hint.set(f"自动采用 {actual}（{reason}）")
-        elif strategy_name == "hedge_band" and actual == "日频":
-            hint.set("手动日频：固定间隔仅检查收盘穿带")
-        else:
-            hint.set(f"手动采用 {actual}")
+        reason = {
+            "close_to_close": "收盘策略",
+            "fixed_times": "覆盖目标时刻",
+            "hedge_band": "不漏 bar 内穿带",
+        }.get(strategy_name, "策略需要")
+        hint.set(f"{actual}（{reason}）")
 
     def _toggle_history_wind_controls(self):
         source_var = getattr(self, "_source_var", None)
@@ -2119,9 +2123,6 @@ class BacktestApp(tk.Tk):
         asof_entry = getattr(self, "_history_wind_asof_entry", None)
         if asof_entry is not None:
             asof_entry.configure(state="normal" if is_wind else "disabled")
-        combo = getattr(self, "_history_wind_bar_size_combo", None)
-        if combo is not None:
-            combo.configure(state="readonly" if is_wind else "disabled")
         check = getattr(self, "_history_wind_auto_start_check", None)
         if check is not None:
             check.configure(state="normal" if is_wind else "disabled")
@@ -2142,11 +2143,6 @@ class BacktestApp(tk.Tk):
             hint.set("CSV 使用文件内完整日期与时间索引；本组 Wind 参数不参与。")
             return
 
-        requested_var = getattr(
-            self, "_history_wind_bar_size_var", None)
-        requested = (
-            requested_var.get().strip()
-            if requested_var is not None else WIND_AUTO_BAR_SIZE)
         include_fixed_var = getattr(
             self, "_history_include_fixed_times_var", None)
         include_band_var = getattr(self, "_history_include_band_var", None)
@@ -2161,7 +2157,7 @@ class BacktestApp(tk.Tk):
             wind_code_var.get().strip() if wind_code_var is not None else "")
         try:
             actual = BacktestApp._resolve_wind_bar_size(
-                requested, fixed_times=fixed_times,
+                WIND_AUTO_BAR_SIZE, fixed_times=fixed_times,
                 include_fixed_times=include_fixed,
                 include_band=include_band, wind_code=wind_code)
         except ValueError as exc:
@@ -2193,8 +2189,8 @@ class BacktestApp(tk.Tk):
             except (TypeError, ValueError):
                 warmup_days = 0
             range_text += f" + HV预热 {warmup_days} 日"
-        prefix = "自动统一采用" if requested == WIND_AUTO_BAR_SIZE else "统一采用"
-        hint.set(f"{prefix} {actual}；{range_text}")
+        # 全部候选共用同一份行情，粒度取各自所需里最细的一档，保证可比。
+        hint.set(f"统一采用 {actual}；{range_text}")
 
     def _toggle_source(self):
         src = self._source_var.get()
@@ -2350,7 +2346,8 @@ class BacktestApp(tk.Tk):
                 "每日固定时刻策略需要真实日内时间戳；模拟路径不可用。")
         if src == "wind" and gs.get("wind_bar_size", "日频") == "日频":
             raise ValueError(
-                "每日固定时刻策略不支持 Wind 日频；请选择分钟频率。")
+                "每日固定时刻策略不支持 Wind 日频行情。粒度现在按策略自动"
+                "推导，出现该错误说明用的是旧快照里保存的手动日频配置。")
 
     def _sync_history_button_state(self):
         """使策略优选入口始终与真实数据来源及后台任务状态一致。"""
@@ -2867,21 +2864,50 @@ class BacktestApp(tk.Tk):
         return int(np.ceil(days * 365.0 / ANNUAL_DAYS)) + _WIND_DATE_BUFFER_DAYS
 
     @staticmethod
-    def _recommended_fixed_time_bar_size(fixed_times, *, wind_code=None):
-        """返回能稳健覆盖目标 HH:MM 的推荐分钟粒度。"""
+    def _local_trading_sessions(wind_code):
+        """只读本地可确定规则的交易时段；无代码或元数据未知时返回 None。
+
+        GUI 主线程的参数联动会频繁调用，因此固定 ``allow_wind=False``，
+        绝不为了解析一个下拉值去启动 Wind 终端或发 ``wss``。
+        """
+        if not str(wind_code or "").strip():
+            return None
+        from pricing.wind_data import get_trading_session_clock_ranges
+        return get_trading_session_clock_ranges(
+            str(wind_code).strip(), allow_wind=False)
+
+    @staticmethod
+    def _recommended_fixed_time_bar_size(fixed_times, *, sessions=None):
+        """返回能稳健覆盖目标 HH:MM 的推荐分钟粒度。
+
+        Wind 的 bar 标签约定随粒度而变（实测 510050.SH）：1 分钟用左标签
+        （09:30~14:59），5/15/60 分钟用右标签（09:35/09:45/10:30~15:00）。
+        因此 session 开盘那一刻只有 1 分钟粒度取得到——整除判据只看墙钟，
+        会把 09:30 误判成 15 分钟可覆盖。
+        """
         strategy = FixedTimeStrategy(fixed_times)
-        if str(wind_code or "").strip():
-            from pricing.wind_data import get_trading_session_clock_ranges
-            strategy.set_trading_sessions(
-                get_trading_session_clock_ranges(
-                    str(wind_code).strip(), allow_wind=False))
+        if sessions is not None:
+            strategy.set_trading_sessions(sessions)
         parsed = strategy.effective_times
+        opens = {start for start, _end in (strategy.trading_sessions or ())}
+        if any(value in opens for value in parsed):
+            return _WIND_FIXED_TIME_BAR_LABELS[-1]
         minute_marks = tuple(t.hour * 60 + t.minute for t in parsed)
         for label in _WIND_FIXED_TIME_BAR_LABELS:
             bar_minutes = _WIND_BAR_MINUTES[label]
             if all(mark % bar_minutes == 0 for mark in minute_marks):
                 return label
         return _WIND_FIXED_TIME_BAR_LABELS[-1]
+
+    @staticmethod
+    def _recommended_band_bar_size():
+        """价格波动触发一律用最细粒度观察穿带。
+
+        不按带宽分档：带宽宽窄不改变“bar 内穿带后回落看不见”这一机制，
+        只改变漏采的绝对数量，因此没有哪一档粗粒度是无条件安全的；分档
+        还会让同一个候选的评分依赖“本批次里最窄的候选是谁”。
+        """
+        return _WIND_BAND_BAR_LABEL
 
     @staticmethod
     def _resolve_wind_bar_size(
@@ -2895,22 +2921,26 @@ class BacktestApp(tk.Tk):
         needs_fixed = bool(
             include_fixed_times or strategy_name == "fixed_times")
         needs_band = bool(include_band or strategy_name == "hedge_band")
+        # 交易时段只解析一次，供开盘瞬间拦截和固定时刻推荐共用。
+        sessions = (
+            BacktestApp._local_trading_sessions(wind_code)
+            if needs_fixed else None)
         if requested != WIND_AUTO_BAR_SIZE:
             if requested == "日频" and needs_fixed:
                 raise ValueError(
-                    "固定时刻策略需要分钟行情；请把 Wind 行情采样粒度设为"
-                    "“自动（推荐）”或分钟频率。")
+                    "固定时刻策略需要分钟行情，收到日频。粒度已改为按策略"
+                    "自动推导，显式传入日频的调用方需要改传分钟粒度或"
+                    f"{WIND_AUTO_BAR_SIZE!r}。")
             return requested
 
         recommendations = []
         if needs_band:
-            # 固定间隔在日频上只能观察收盘穿带；15 分钟是准确性与一年历史
-            # 批量回测成本之间的默认折中，用户仍可手动覆盖到更细粒度。
-            recommendations.append(_WIND_BAND_DEFAULT_BAR_LABEL)
+            recommendations.append(
+                BacktestApp._recommended_band_bar_size())
         if needs_fixed:
             recommendations.append(
                 BacktestApp._recommended_fixed_time_bar_size(
-                    fixed_times, wind_code=wind_code))
+                    fixed_times, sessions=sessions))
         if not recommendations:
             return "日频"
         return min(
@@ -3139,7 +3169,8 @@ class BacktestApp(tk.Tk):
         wind_auto_end_var = getattr(self, "_wind_auto_end_var", None)
         wind_auto_end = bool(
             wind_auto_end_var.get()) if wind_auto_end_var is not None else False
-        wind_bar_size_requested = self._wind_bar_size_var.get().strip()
+        # 粒度不再可选；解析阶段按当前策略推导实际值。
+        wind_bar_size_requested = WIND_AUTO_BAR_SIZE
 
         return {
             "cls_name": cls_name,
@@ -3260,8 +3291,6 @@ class BacktestApp(tk.Tk):
         history_start_var = getattr(self, "_history_wind_start_var", None)
         history_auto_start_var = getattr(
             self, "_history_wind_auto_start_var", None)
-        history_bar_size_var = getattr(
-            self, "_history_wind_bar_size_var", None)
         state.update({
             "history_wind_asof": (
                 history_asof_var.get().strip()
@@ -3274,10 +3303,8 @@ class BacktestApp(tk.Tk):
             "history_wind_auto_start": (
                 bool(history_auto_start_var.get())
                 if history_auto_start_var is not None else False),
-            "history_wind_bar_size_requested": (
-                history_bar_size_var.get().strip()
-                if history_bar_size_var is not None
-                else state.get("wind_bar_size_requested", "日频")),
+            # 粒度按本次勾选的候选集合自动取最细的一档。
+            "history_wind_bar_size_requested": WIND_AUTO_BAR_SIZE,
         })
         state = BacktestApp._resolve_history_wind_state(state)
         if include_band:
@@ -4912,6 +4939,10 @@ class BacktestApp(tk.Tk):
             if widget is not staging:
                 widget.destroy()
         staging.pack(fill="both", expand=True)
+        # 结果就绪后收起候选配置：配置已经冻结进本次实验，继续占据上半屏
+        # 只会把排名和图表挤出视口。用户仍可用同一个按钮展开改参数。
+        if getattr(self, "_history_config_visible", True):
+            BacktestApp._toggle_history_config_panel(self)
         self._nb.select(self._history_tab)
 
     def _build_current_comparison_view(
@@ -5204,12 +5235,12 @@ class BacktestApp(tk.Tk):
     # 周期结论表与周期内排名表共用同一组指标列。指标表头随排名口径变化，
     # 集中定义可避免改口径时两张表走样成不同措辞。表头为 None 时取
     # history_selection.metric_labels 的同名字段。
+    # 只保留决策所需的三列：得分与基准得分是诊断值（RMS 常年是 0.00 量级，
+    # 在表里占宽却不参与判断），已由选中行的详情串完整给出，不再占表宽。
     _HISTORY_METRIC_COLUMNS = (
-        ("score", None, 98),
-        ("baseline", None, 98),
-        ("improvement", None, 88),
-        ("win_rate", "回测分段胜率", 84),
-        ("windows", "配对回测分段/每日收盘", 100),
+        ("improvement", None, 96),
+        ("win_rate", "胜率", 62),
+        ("windows", "配对", 58),
     )
 
     @staticmethod
@@ -5271,16 +5302,15 @@ class BacktestApp(tk.Tk):
         parent.columnconfigure(0, weight=1)
         parent.rowconfigure(2, weight=1)
         parent.rowconfigure(3, weight=2)
-        ttk.Label(
-            parent,
-            text=(history_selection.scope_explanation(
-                " / ".join(label for _key, label in selected_periods),
-                uses_strict_metric=flags["uses_strict_metric"],
-                uses_product_pool=flags["uses_product_pool"],
-            ) + "短周期更贴近当前，长周期覆盖更多市场阶段、更稳健但反应更慢。"
-                "各周期结论仅作历史参考，不代表未来表现。"),
-            style="SurfaceMuted.TLabel",
-        ).grid(row=0, column=0, sticky="w", padx=6, pady=(7, 3))
+        # 口径说明是一次性知识，长期占据结果区顶部只会挤压表格与图表。
+        # 常驻一行主指标定义，完整口径折进按钮后面按需查看。
+        BacktestApp._build_history_scope_note(
+            self, parent,
+            periods_text=" / ".join(
+                label for _key, label in selected_periods),
+            uses_strict_metric=flags["uses_strict_metric"],
+            uses_product_pool=flags["uses_product_pool"],
+        )
 
         self._build_history_period_box(
             parent, recommendations, ranking, labels, len(selected_periods))
@@ -5320,6 +5350,52 @@ class BacktestApp(tk.Tk):
         self._history_chart_color_map = color_map
         self._history_chart_marker_map = marker_map
 
+    def _build_history_scope_note(
+            self, parent, *, periods_text, uses_strict_metric,
+            uses_product_pool):
+        """渲染一行主指标摘要 + 可展开的完整计算口径。"""
+        bar = ttk.Frame(parent, style="Surface.TFrame")
+        bar.grid(row=0, column=0, sticky="ew", padx=6, pady=(7, 3))
+        bar.columnconfigure(0, weight=1)
+
+        if not uses_strict_metric:
+            summary = "旧版终点抽样口径结果，建议重新运行以生成严格区间排名"
+        elif uses_product_pool:
+            summary = "主指标：各回测分段有界诊断分改善，按实际评分日数加权"
+        else:
+            summary = "主指标：L 日合并日净损益 RMS 相对每日收盘的有界改善"
+        ttk.Label(
+            bar, text=f"{periods_text}　·　{summary}",
+            style="SurfaceMuted.TLabel",
+        ).grid(row=0, column=0, sticky="w")
+
+        detail = ttk.Label(
+            parent,
+            text=(history_selection.scope_explanation(
+                periods_text,
+                uses_strict_metric=uses_strict_metric,
+                uses_product_pool=uses_product_pool,
+            ) + "短周期更贴近当前，长周期覆盖更多市场阶段、更稳健但反应更慢。"
+                "各周期结论仅作历史参考，不代表未来表现。"),
+            style="SurfaceMuted.TLabel", wraplength=980, justify="left",
+        )
+        button = ttk.Button(bar, text="计算口径 ▾", width=11)
+        button.grid(row=0, column=1, sticky="e", padx=(8, 0))
+
+        def _toggle():
+            if getattr(self, "_history_scope_note_visible", False):
+                detail.grid_remove()
+                self._history_scope_note_visible = False
+                button.configure(text="计算口径 ▾")
+            else:
+                detail.grid(row=0, column=0, sticky="w",
+                            padx=6, pady=(30, 3))
+                self._history_scope_note_visible = True
+                button.configure(text="计算口径 ▴")
+
+        button.configure(command=_toggle)
+        self._history_scope_note_visible = False
+
     def _build_history_period_box(
             self, parent, recommendations, ranking, labels, period_count):
         """渲染每个已选周期的历史最优参考一览。"""
@@ -5355,8 +5431,6 @@ class BacktestApp(tk.Tk):
                     item["window_win_rate_vs_c2c"], 1, percent=True)
             values = (
                 item["period"], item["strategy_label"],
-                self._format_comparison_value(item["score"], 2),
-                self._format_comparison_value(item["baseline_score"], 2),
                 improvement_text, win_rate_text,
                 f"{item['paired']}/{item['baseline_windows']}",
                 item["status"],
@@ -6359,9 +6433,6 @@ class BacktestApp(tk.Tk):
                     "基准" if is_baseline else "☐",
                     self._comparison_safe_int(
                         row.get("rank"), row_no + 1), strategy_label,
-                    self._format_comparison_value(score, 2),
-                    self._format_comparison_value(
-                        row.get("baseline_score"), 2),
                     ("基准" if is_baseline else
                      self._format_comparison_value(
                          improvement, 1, signed=True, percent=True)),
@@ -7071,6 +7142,13 @@ class BacktestApp(tk.Tk):
         for gn in ("delta", "gamma", "vega", "theta", "rho"):
             gv = BacktestApp._result_greek_series(r, gn)
             _ins(f"  {gn.capitalize():15s}  {gv[0]:>10.4f}  {np.mean(gv):>10.4f}  {np.max(np.abs(gv)):>10.4f}\n")
+        # 回测只在调仓 bar 重算 Greeks，非调仓 bar 沿用上一次的值。存在
+        # 非调仓 bar 时必须点明，否则这几行均值会被误读成日内全采样。
+        triggered = np.asarray(r.get("hedge_triggered", ()), dtype=bool)
+        if triggered.size and not triggered.all():
+            _ins("  注：Greeks 仅在调仓 bar 重算，非调仓 bar 沿用上一次的值，\n"
+                 "      故以上均值为调仓时点采样，不是日内全采样。\n",
+                 "label")
         _sep()
 
         rebal = int(np.sum(np.abs(np.diff(r['shares'])) > 1e-10))

@@ -390,7 +390,9 @@ def test_fixed_times_active_session_target_missing_still_fails():
         trading_sessions=[("09:00", "11:30"), ("13:30", "15:00")],
     )
 
-    with pytest.raises(ValueError, match=r"2026-01-06.*缺失 \[11:30\]"):
+    with pytest.raises(
+            ValueError,
+            match=r"11:30 在 1/2 个交易日组中缺失（如 2026-01-06）"):
         HedgeBacktest(
             _option(days=2), prices, steps_per_day=2, multiplier=0,
             strategy=strategy,
@@ -452,7 +454,7 @@ def test_fixed_times_requires_every_requested_time():
         "2026-01-07 10:00",
     ])
     prices = pd.Series([100, 101, 102, 103, 104], index=idx)
-    with pytest.raises(ValueError, match="未全部匹配|缺失"):
+    with pytest.raises(ValueError, match="未能逐交易日组匹配"):
         HedgeBacktest(
             _option(days=2), prices, steps_per_day=2, multiplier=0,
             strategy=FixedTimeStrategy(["11:30", "15:00"]),
@@ -467,7 +469,9 @@ def test_fixed_times_requires_targets_in_each_included_trading_day_group():
         "2026-01-07 10:00", "2026-01-07 11:30", "2026-01-07 15:00",
     ])
     prices = pd.Series(np.arange(len(idx), dtype=float) + 100, index=idx)
-    with pytest.raises(ValueError, match=r"2026-01-06.*缺失 \[11:30\]"):
+    with pytest.raises(
+            ValueError,
+            match=r"11:30 在 1/2 个交易日组中缺失（如 2026-01-06）"):
         HedgeBacktest(
             _option(days=2), prices, steps_per_day=3, multiplier=0,
             strategy=FixedTimeStrategy(["11:30", "15:00"]),
@@ -3169,10 +3173,12 @@ def test_rolling_fixed_time_all_windows_keep_real_failure_reason():
     assert row["rolling_windows"] == 0
     assert row["skipped_endpoints"] == 3
     assert row["failure_scope"] == "strategy"
-    assert "缺失 [11:30]" in row["failure_reason"]
+    assert "11:30" in row["failure_reason"]
+    assert "未能逐交易日组匹配" in row["failure_reason"]
     assert all(
         "_window_error" not in item
-        and "缺失 [11:30]" in item["fixed"]["error"]
+        and "11:30" in item["fixed"]["error"]
+        and "未能逐交易日组匹配" in item["fixed"]["error"]
         for item in windows["week"].values()
     )
 
@@ -3383,3 +3389,381 @@ def test_history_replay_index_skips_windows_without_successful_candidate():
 
     assert "broken" not in index["sample"]
     assert set(index["sample"]).issubset(set(windows["sample"]))
+
+
+def _intraday_15min_series(days, seed=11):
+    """A 股 15 分钟右标签序列：每日 16 根 bar（09:45 ~ 15:00）。"""
+    clocks = []
+    for start, total in ((9 * 60 + 30, 120), (13 * 60, 120)):
+        done = 0
+        while done < total:
+            done += 15
+            mark = start + done
+            clocks.append(f"{mark // 60:02d}:{mark % 60:02d}")
+    dates = pd.bdate_range("2026-01-05", periods=days)
+    idx = pd.DatetimeIndex([pd.Timestamp(f"{d.date()} {c}")
+                            for d in dates for c in clocks])
+    rng = np.random.default_rng(seed)
+    steps = 0.2 * np.sqrt(1.0 / (ANNUAL_DAYS * len(clocks))) * (
+        rng.standard_normal(len(idx) - 1))
+    values = 100.0 * np.exp(np.concatenate(([0.0], np.cumsum(steps))))
+    return pd.Series(values, index=idx), len(clocks)
+
+
+def test_greeks_are_only_repriced_on_hedging_bars():
+    """Greeks 只在调仓 bar 重算，其余 bar 沿用上一根。
+
+    触发判定只看价格，Delta 也只在调仓时被 _compute_target 读取，因此
+    非调仓 bar 上重算 Greeks 纯属为展示付费——1 分钟粒度下这是回测的
+    主要开销。
+    """
+    prices, spd = _intraday_15min_series(days=4)
+    result = HedgeBacktest(
+        _option(days=4), prices, steps_per_day=spd, multiplier=0,
+        strategy=FixedTimeStrategy("14:45"),
+    ).run()
+
+    triggered = np.asarray(result["hedge_triggered"], dtype=bool)
+    assert triggered.sum() < len(triggered), "场景里必须存在非调仓 bar"
+    for name in ("delta", "gamma", "vega", "theta", "rho"):
+        values = np.asarray(result[name], dtype=float)
+        for i in range(1, len(values)):
+            if not triggered[i]:
+                assert values[i] == values[i - 1], (
+                    f"{name} 在非调仓 bar {i} 上被重算了")
+
+
+def test_hedging_bars_carry_true_greeks():
+    """调仓 bar 上的 Greeks 必须是该 bar 的真值，而非沿用值。
+
+    参照组用 ``FixedFreqStrategy(1)``：它每根 bar 都触发，因此走全量
+    ``get_greeks`` 路径。期权状态只由交易日边界推进、与是否调仓无关，
+    所以它给出的就是逐 bar 真值。
+    """
+    prices, spd = _intraday_15min_series(days=3)
+    lazy_result = HedgeBacktest(
+        _option(days=3), prices, steps_per_day=spd, multiplier=0,
+        strategy=FixedTimeStrategy("14:45")).run()
+    full_result = HedgeBacktest(
+        _option(days=3), prices, steps_per_day=spd, multiplier=0,
+        strategy=FixedFreqStrategy(hedge_freq=1)).run()
+
+    triggered = np.flatnonzero(
+        np.asarray(lazy_result["hedge_triggered"], dtype=bool))
+    assert len(triggered) >= 3, "参照场景至少要有几次调仓才有意义"
+    for name in ("delta", "gamma", "vega", "theta", "rho"):
+        lazy = np.asarray(lazy_result[name], dtype=float)[triggered]
+        full = np.asarray(full_result[name], dtype=float)[triggered]
+        assert np.array_equal(lazy, full), f"{name} 在调仓 bar 上不是真值"
+
+    # 反证懒算确实生效：非调仓 bar 上与全量值不同。
+    non_trigger = np.setdiff1d(
+        np.arange(1, len(lazy_result["delta"])), triggered)
+    assert not np.array_equal(
+        np.asarray(lazy_result["delta"], dtype=float)[non_trigger],
+        np.asarray(full_result["delta"], dtype=float)[non_trigger])
+
+
+def test_lazy_greeks_do_not_change_pnl_delta_or_trades():
+    """懒算只影响展示用的高阶 Greeks，绝不能碰盈亏与调仓。"""
+    prices, spd = _intraday_15min_series(days=4)
+    result = HedgeBacktest(
+        _option(days=4), prices, steps_per_day=spd, multiplier=0,
+        strategy=HedgeBandStrategy(band_type="relative", threshold=0.004),
+        tc_rate=0.0005,
+    ).run()
+
+    # 盈亏分解恒等式在懒算路径下仍然成立。
+    net = np.asarray(result["net_daily"], dtype=float)
+    rebuilt = (np.asarray(result["hedge_daily"], dtype=float)
+               + np.asarray(result["option_daily"], dtype=float)
+               - np.asarray(result["tc_paid"], dtype=float))
+    assert np.allclose(net, rebuilt, rtol=0, atol=0)
+    assert np.allclose(
+        np.asarray(result["cumulative_pnl"], dtype=float),
+        np.cumsum(net), rtol=0, atol=0)
+    # Delta 与实际持仓仍然逐 bar 对应（multiplier=0 即不取整）。
+    assert np.allclose(
+        np.asarray(result["shares"], dtype=float)[result["hedge_triggered"]],
+        np.asarray(result["delta"], dtype=float)[result["hedge_triggered"]])
+
+
+def _a_share_1min_days(n_days, drop_from_first=0, drop_from_last=0):
+    """A 股 1 分钟序列（09:30~11:30 + 13:00~15:00，每日 242 根）。
+
+    Wind 实测每日 bar 数在 240~242 之间浮动——没有成交的分钟不返回 bar，
+    尾盘无成交时末根停在 14:59。这里用参数复刻这两种缺失位置。
+    """
+    clocks = []
+    for start, total in ((9 * 60 + 30, 120), (13 * 60, 120)):
+        for step in range(total + 1):
+            mark = start + step
+            clocks.append(f"{mark // 60:02d}:{mark % 60:02d}")
+    dates = pd.bdate_range("2026-03-02", periods=n_days)
+    stamps = []
+    for i, date in enumerate(dates):
+        day_clocks = clocks
+        if i == 0 and drop_from_first:
+            day_clocks = clocks[:-drop_from_first]
+        elif i == n_days - 1 and drop_from_last:
+            day_clocks = clocks[:-drop_from_last]
+        stamps.extend(pd.Timestamp(f"{date.date()} {c}") for c in day_clocks)
+    index = pd.DatetimeIndex(stamps)
+    return pd.Series(
+        100.0 + np.arange(len(index), dtype=float) * 0.001, index=index)
+
+
+def _last_day_close(prices):
+    last_date = prices.index[-1].date()
+    return prices.index[prices.index.date == last_date][-1].strftime("%H:%M")
+
+
+@pytest.mark.parametrize("dropped", [1, 10, 30])
+def test_historical_group_sparsity_never_blocks_backtest(dropped):
+    """中间交易日组早已收盘，尾盘无成交不该阻断回测。
+
+    Wind 分钟行情按成交返回 bar，510050 这类高流动性 ETF 也有约四分之一
+    的交易日末根停在 14:59。历史组的稀疏是数据特性，不是盘中残段。
+    """
+    prices = _a_share_1min_days(3, drop_from_first=dropped)
+    first_date = prices.index[0].date()
+    first_day = prices.index[prices.index.date == first_date]
+    assert len(first_day) == 242 - dropped
+
+    result = HedgeBacktest(
+        _option(days=2), prices, steps_per_day=242, multiplier=0,
+        strategy=CloseToCloseStrategy(),
+    ).run()
+    assert result["n_days"] == 2
+
+
+def test_terminal_group_missing_one_tail_bar_counts_as_closed():
+    """样本末尾缺最后一根（末 14:59）仍是已收盘的交易日。"""
+    prices = _a_share_1min_days(2, drop_from_last=1)
+    assert _last_day_close(prices) == "14:59"
+
+    result = HedgeBacktest(
+        _option(days=2), prices, steps_per_day=242, multiplier=0,
+        strategy=CloseToCloseStrategy(),
+    ).run()
+    assert result["n_days"] == 2
+
+
+def test_terminal_group_still_mid_session_is_rejected():
+    """样本末尾停在 14:50 可能是“今天还没收盘”，必须继续拒绝。"""
+    prices = _a_share_1min_days(2, drop_from_last=10)
+    assert _last_day_close(prices) == "14:50"
+
+    with pytest.raises(ValueError, match=r"交易日组不完整"):
+        HedgeBacktest(
+            _option(days=2), prices, steps_per_day=242, multiplier=0,
+            strategy=CloseToCloseStrategy(),
+        )
+
+
+def test_close_gap_minutes_handles_overnight_session_close():
+    """夜盘收盘（02:30）与末 bar 相减不得因跨午夜得出错误间隔。"""
+    from pricing.hedge_backtest import _close_gap_minutes
+    assert _close_gap_minutes(
+        datetime.time(2, 29), datetime.time(2, 30)) == 1
+    assert _close_gap_minutes(
+        datetime.time(14, 59), datetime.time(15, 0)) == 1
+    assert _close_gap_minutes(
+        datetime.time(14, 0), datetime.time(15, 0)) == 60
+    # 末时刻晚于典型收盘属于异常数据，应得到远超容差的间隔。
+    assert _close_gap_minutes(
+        datetime.time(15, 1), datetime.time(15, 0)) > 60
+
+
+_A_SHARE_CLOCK_SESSIONS = (
+    (datetime.time(9, 30), datetime.time(11, 30)),
+    (datetime.time(13, 0), datetime.time(15, 0)),
+)
+
+
+def _fixed_strategy(times, sessions=_A_SHARE_CLOCK_SESSIONS):
+    strategy = FixedTimeStrategy(times)
+    if sessions is not None:
+        strategy.set_trading_sessions(sessions)
+    return strategy
+
+
+def test_fixed_time_prefers_exact_bar_over_backfill():
+    """目标时刻本身有 bar 时必须在那一根触发，不能提前。"""
+    strategy = _fixed_strategy("15:00")
+    ctx = {"timestamp": pd.Timestamp("2026-03-02 14:58"),
+           "next_timestamp": pd.Timestamp("2026-03-02 14:59")}
+    assert strategy.should_hedge(ctx) is False
+    ctx = {"timestamp": pd.Timestamp("2026-03-02 14:59"),
+           "next_timestamp": pd.Timestamp("2026-03-02 15:00")}
+    assert strategy.should_hedge(ctx) is False
+    ctx = {"timestamp": pd.Timestamp("2026-03-02 15:00"),
+           "next_timestamp": pd.Timestamp("2026-03-03 09:30")}
+    assert strategy.should_hedge(ctx) is True
+
+
+def test_fixed_time_backfills_to_last_bar_before_target():
+    """目标时刻没有 bar 时，用之前最近一根承接（实务上就是最后一笔）。"""
+    strategy = _fixed_strategy("15:00")
+    ctx = {"timestamp": pd.Timestamp("2026-03-02 14:58"),
+           "next_timestamp": pd.Timestamp("2026-03-02 14:59")}
+    assert strategy.should_hedge(ctx) is False
+    ctx = {"timestamp": pd.Timestamp("2026-03-02 14:59"),
+           "next_timestamp": pd.Timestamp("2026-03-03 09:30")}
+    assert strategy.should_hedge(ctx) is True
+
+
+def test_fixed_time_backfill_respects_lunch_break():
+    """11:30 缺失时由 11:29 承接，而不是等到下午第一根。"""
+    strategy = _fixed_strategy("11:30")
+    ctx = {"timestamp": pd.Timestamp("2026-03-02 11:29"),
+           "next_timestamp": pd.Timestamp("2026-03-02 13:00")}
+    assert strategy.should_hedge(ctx) is True
+
+
+def test_fixed_time_backfill_never_crosses_into_another_session():
+    """日盘末根不得顶替夜盘时刻——两者相距 8 小时且不同 session。"""
+    sessions = (
+        (datetime.time(21, 0), datetime.time(23, 0)),
+        (datetime.time(9, 0), datetime.time(15, 0)),
+    )
+    strategy = _fixed_strategy("23:00", sessions=sessions)
+    ctx = {"timestamp": pd.Timestamp("2026-03-02 14:59"),
+           "next_timestamp": pd.Timestamp("2026-03-03 09:00")}
+    assert strategy.should_hedge(ctx) is False
+    # 夜盘自己的末根仍然可以承接 23:00。
+    ctx = {"timestamp": pd.Timestamp("2026-03-02 22:59"),
+           "next_timestamp": pd.Timestamp("2026-03-03 09:00")}
+    assert strategy.should_hedge(ctx) is True
+
+
+def test_fixed_time_backfill_has_a_distance_ceiling():
+    """回退距离有上限，避免用几小时前的价格冒充目标时刻。"""
+    strategy = _fixed_strategy("15:00", sessions=None)
+    assert strategy.can_serve(datetime.time(14, 59), datetime.time(15, 0))
+    assert strategy.can_serve(datetime.time(14, 0), datetime.time(15, 0))
+    assert not strategy.can_serve(datetime.time(13, 59), datetime.time(15, 0))
+    # 不能用目标之后的 bar 回补——那是 look-ahead。
+    assert not strategy.can_serve(datetime.time(15, 1), datetime.time(15, 0))
+
+
+def test_fixed_time_backfill_triggers_each_target_once_per_day():
+    strategy = _fixed_strategy("15:00")
+    first = {"timestamp": pd.Timestamp("2026-03-02 14:59"),
+             "next_timestamp": pd.Timestamp("2026-03-03 09:30")}
+    assert strategy.should_hedge(first) is True
+    assert strategy.should_hedge(first) is False
+    # 次日重新计数。
+    second = {"timestamp": pd.Timestamp("2026-03-03 14:59"),
+              "next_timestamp": pd.Timestamp("2026-03-04 09:30")}
+    assert strategy.should_hedge(second) is True
+
+
+def test_fixed_time_trade_count_is_invariant_to_granularity():
+    """同一段行情下，调仓次数不应随采样粒度改变。
+
+    这正是让择优可以统一用 1 分钟的前提：固定时刻候选不会因为粒度变细
+    而丢失调仓。
+    """
+    fine = _a_share_1min_days(4)
+    # 降采样成 15 分钟右标签网格（09:45、10:00 …… 15:00）。
+    coarse_clocks = set()
+    for start, total in ((9 * 60 + 30, 120), (13 * 60, 120)):
+        for step in range(15, total + 1, 15):
+            mark = start + step
+            coarse_clocks.add(f"{mark // 60:02d}:{mark % 60:02d}")
+    coarse = fine[[t.strftime("%H:%M") in coarse_clocks for t in fine.index]]
+
+    counts = []
+    for series, spd in ((fine, 242), (coarse, 16)):
+        result = HedgeBacktest(
+            _option(days=3), series, steps_per_day=spd, multiplier=0,
+            strategy=_fixed_strategy("11:30,15:00"),
+        ).run()
+        counts.append(int(np.sum(result["hedge_triggered"])))
+    assert counts[0] == counts[1]
+
+
+def test_adjacent_targets_do_not_steal_each_others_bar():
+    """相邻目标不得互相抢占同一根 bar。
+
+    15:00 缺失时由 14:59 承接，而 14:59 本身也是目标——若先匹配的那个把
+    bar 独占，另一个目标当天就凭空丢失了。
+    """
+    strategy = _fixed_strategy("14:59,15:00")
+    ctx = {"timestamp": pd.Timestamp("2026-03-02 14:59"),
+           "next_timestamp": pd.Timestamp("2026-03-03 09:30")}
+    assert strategy.should_hedge(ctx) is True
+    # 两个目标都应记为当日已消费，次日才重新计数。
+    assert strategy._triggered == {
+        (datetime.date(2026, 3, 2), datetime.time(14, 59)),
+        (datetime.date(2026, 3, 2), datetime.time(15, 0)),
+    }
+
+
+def test_later_target_still_waits_for_a_closer_bar():
+    """有更接近目标的 bar 时不得提前消费该目标。"""
+    strategy = _fixed_strategy("14:30,15:00")
+    # 14:29 可以承接 14:30，但 15:00 后面还有 14:59，应继续等待。
+    ctx = {"timestamp": pd.Timestamp("2026-03-02 14:29"),
+           "next_timestamp": pd.Timestamp("2026-03-02 14:59")}
+    assert strategy.should_hedge(ctx) is True
+    assert (datetime.date(2026, 3, 2), datetime.time(15, 0)) \
+        not in strategy._triggered
+    ctx = {"timestamp": pd.Timestamp("2026-03-02 14:59"),
+           "next_timestamp": pd.Timestamp("2026-03-03 09:30")}
+    assert strategy.should_hedge(ctx) is True
+
+
+def _a_share_1min_days_missing_midday(n_days, drop_per_day=2):
+    """每日都缺几根盘中 bar：根数不到声明值，但末根仍是正常收盘 15:00。"""
+    clocks = []
+    for start, total in ((9 * 60 + 30, 120), (13 * 60, 120)):
+        for step in range(total + 1):
+            mark = start + step
+            clocks.append(f"{mark // 60:02d}:{mark % 60:02d}")
+    dates = pd.bdate_range("2026-03-02", periods=n_days)
+    stamps = []
+    for i, date in enumerate(dates):
+        # 去掉的是盘中 bar，不动首尾，保证末根仍为 15:00。
+        day = [c for k, c in enumerate(clocks)
+               if not (0 < k < len(clocks) - 1
+                       and k % 97 < drop_per_day)]
+        stamps.extend(pd.Timestamp(f"{date.date()} {c}") for c in day)
+    index = pd.DatetimeIndex(stamps)
+    return pd.Series(
+        100.0 + np.arange(len(index), dtype=float) * 0.001, index=index)
+
+
+def test_short_window_without_any_typical_length_day_still_validates():
+    """短窗口里可能没有任何一天达到全样本的典型 bar 数。
+
+    Wind 分钟行情按成交返回 bar，每日根数在 240~242 浮动。若用“bar 数达标”
+    当门槛去推断正常收盘时刻，最近 5 个交易日很可能一天都不达标，
+    expected_close 退化成 None，进而落到过严的根数判定上，把一整个正常的
+    “近周”窗口判死——这正是策略优选里近周空白的成因。
+    """
+    prices = _a_share_1min_days_missing_midday(5)
+    per_day = {}
+    for stamp in prices.index:
+        per_day[stamp.date()] = per_day.get(stamp.date(), 0) + 1
+    assert max(per_day.values()) < 242, "构造前提：没有一天达到声明的 242 根"
+    last_date = prices.index[-1].date()
+    assert prices.index[prices.index.date == last_date][-1].strftime(
+        "%H:%M") == "15:00"
+
+    result = HedgeBacktest(
+        _option(days=4), prices, steps_per_day=242, multiplier=0,
+        strategy=CloseToCloseStrategy(),
+    ).run()
+    assert result["n_days"] == 4
+
+
+def test_single_group_sample_still_falls_back_to_bar_count():
+    """只有一个交易日组时无从统计正常收盘，仍按声明根数判定。"""
+    prices = _a_share_1min_days(1, drop_from_last=30)
+    with pytest.raises(ValueError, match=r"交易日组不完整"):
+        HedgeBacktest(
+            _option(days=1), prices, steps_per_day=242, multiplier=0,
+            strategy=CloseToCloseStrategy(),
+        )
