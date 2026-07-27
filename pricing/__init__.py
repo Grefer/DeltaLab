@@ -28,6 +28,7 @@ from .hedge_analysis import (
     summarize_strategy_result,
     recommend_by_lookback,
     recommend_by_rolling_history,
+    rerank_history,
     recommend_by_contract_history_pool,
     LOOKBACK_DAYS,
     HISTORY_SELECTION_METRIC,

@@ -49,6 +49,22 @@ STRICT_LOOKBACK_SELECTION_METRIC = (
     "strict_lookback_daily_rms_advantage_vs_c2c"
 )
 
+# 可选的排名口径。对冲的目的是让 gamma scalping 收益最大，其次才是让这份
+# 收益更稳，因此排名看的是“日内额外调仓相对「日内不动」的增量”，而不是
+# 各策略的绝对波动——绝对口径会奖励那些把收益也一起抹平的过度对冲。
+SELECTION_OBJECTIVES = ("incremental_pnl", "incremental_sharpe")
+DEFAULT_SELECTION_OBJECTIVE = "incremental_pnl"
+INCREMENTAL_PNL_METRIC = "incremental_net_pnl_vs_c2c"
+INCREMENTAL_SHARPE_METRIC = "incremental_sharpe_vs_c2c"
+_OBJECTIVE_COLUMNS = {
+    "incremental_pnl": "incremental_pnl_vs_c2c",
+    "incremental_sharpe": "incremental_sharpe_vs_c2c",
+}
+_OBJECTIVE_METRICS = {
+    "incremental_pnl": INCREMENTAL_PNL_METRIC,
+    "incremental_sharpe": INCREMENTAL_SHARPE_METRIC,
+}
+
 
 def _normalize_option_position(value, *, context, allow_missing=False):
     """把期权头寸方向规范为 ``+1``(short) / ``-1``(long)。
@@ -849,6 +865,39 @@ def _history_improvement_vs_c2c(score, baseline_score):
     return float((baseline - candidate) / abs(baseline))
 
 
+def _incremental_metrics(candidate_daily, baseline_daily):
+    """候选相对「日内不动」基线的逐日增量贡献。
+
+    两者跑在同一段行情、同一批交易日上，逐日相减即得“这套日内调仓多赚
+    了多少”。增量 Sharpe 取 ``mean/std``，恰好等于配对 t 值除以 ``sqrt(n)``，
+    因此它在给出性价比的同时也编码了这个增量有多可靠：样本内偶然赚到的
+    一两天大钱会被自身波动稀释，不会顶上第一名。
+    """
+    empty = {"incremental_pnl": np.nan, "incremental_sharpe": np.nan}
+    if candidate_daily is None or baseline_daily is None:
+        return empty
+    candidate = np.asarray(candidate_daily.get("net_pnl", []), dtype=float)
+    baseline = np.asarray(baseline_daily.get("net_pnl", []), dtype=float)
+    if len(candidate) == 0 or len(candidate) != len(baseline):
+        # 天数对不齐说明并非同一批交易日，相减没有意义。
+        return empty
+    diff = candidate - baseline
+    if not np.all(np.isfinite(diff)):
+        return empty
+    total = float(np.sum(diff))
+    if len(diff) < 2:
+        return {"incremental_pnl": total, "incremental_sharpe": np.nan}
+    spread = float(np.std(diff, ddof=1))
+    if np.isclose(spread, 0.0, rtol=1e-12, atol=1e-12):
+        # 增量逐日完全相同：与基线一致时记为持平；恒定非零差在数学上是
+        # 无穷大 Sharpe，但 inf 会污染排序与展示，且只可能出现在合成数据
+        # 里，因此按“无法计算”处理，让调用方回退到别的口径。
+        sharpe = 0.0 if np.isclose(total, 0.0, atol=1e-12) else np.nan
+    else:
+        sharpe = float(np.mean(diff) / spread)
+    return {"incremental_pnl": total, "incremental_sharpe": sharpe}
+
+
 def _history_selection_advantage_vs_c2c(score, baseline_score):
     """返回有界的同段/同证据区间 C2C 优势。
 
@@ -871,8 +920,49 @@ def _history_selection_advantage_vs_c2c(score, baseline_score):
     return float((baseline - candidate) / scale)
 
 
-def _rank_history_rows(rows):
-    """按当前历史模式声明的同窗 C2C 改善排序。"""
+def _history_recommendations(ranking):
+    """从已排序的 ranking 中取出每个周期的首选。"""
+    if ranking.empty:
+        return ranking.copy()
+    recommendation_rows = []
+    for _lookback, group in ranking.groupby("lookback", sort=False):
+        eligible = group[group["recommendation_eligible"].astype(bool)]
+        non_baseline = eligible[
+            eligible["strategy_type"].astype(str) != "close_to_close"]
+        if eligible.empty or non_baseline.empty:
+            continue
+        recommendation_rows.append(
+            eligible.sort_values("rank", kind="stable").iloc[0])
+    return (
+        pd.DataFrame(recommendation_rows).reset_index(drop=True)
+        if recommendation_rows else ranking.iloc[:0].copy())
+
+
+def rerank_history(ranking, objective):
+    """按新口径重排已有结果，不重跑回测。
+
+    两个口径所需的指标在回测时就已一并算出，切换排名依据只是对同一批
+    数据重新排序；一年 1 分钟行情重跑一次要几十秒，没有理由为换个看法
+    再等一遍。
+    """
+    if ranking is None or getattr(ranking, "empty", True):
+        empty = ranking if ranking is not None else pd.DataFrame()
+        return empty.copy(), empty.copy()
+    reranked = _rank_history_rows(
+        ranking.to_dict("records"), objective=objective)
+    return _history_recommendations(reranked), reranked
+
+
+def _rank_history_rows(rows, objective=DEFAULT_SELECTION_OBJECTIVE):
+    """按选定口径排序。
+
+    ``objective`` 决定主排序依据：``incremental_pnl`` 看日内额外调仓多赚
+    了多少，``incremental_sharpe`` 看这份增量的性价比。缺少增量字段的旧
+    结果自动退回原来的 RMS 改善，保证老快照仍能排序。
+    """
+    if objective not in SELECTION_OBJECTIVES:
+        raise ValueError(
+            f"未知排名口径: {objective!r}；可选 {SELECTION_OBJECTIVES}")
     ranking = pd.DataFrame(rows)
     if ranking.empty:
         return ranking
@@ -907,6 +997,18 @@ def _rank_history_rows(rows):
     # 有效改善统一变成 -inf。
     selection_values = selection_values.where(
         pd.notna(selection_values), legacy_values)
+    # 选定口径优先；该口径没有取到值的行（旧快照、失败段）退回 RMS 改善，
+    # 否则它们会因为 NaN 被一律压到最后，与其真实表现无关。
+    objective_column = _OBJECTIVE_COLUMNS[objective]
+    objective_values = ranking.get(
+        objective_column,
+        pd.Series(np.nan, index=ranking.index, dtype=float),
+    )
+    objective_values = pd.to_numeric(objective_values, errors="coerce")
+    selection_values = objective_values.where(
+        pd.notna(objective_values), selection_values)
+    ranking["selection_objective"] = objective
+    ranking["selection_objective_metric"] = _OBJECTIVE_METRICS[objective]
     ranking["_selection_sort"] = pd.to_numeric(
         selection_values, errors="coerce").fillna(-np.inf)
     win_rate_values = ranking.get(
@@ -1338,6 +1440,7 @@ def recommend_by_rolling_history(
     step_days=5,
     target_endpoints=None,
     steps_per_day=None,
+    objective=DEFAULT_SELECTION_OBJECTIVE,
 ):
     """在截至最新完整交易日的严格连续 ``L`` 日区间比较策略。
 
@@ -1704,6 +1807,8 @@ def recommend_by_rolling_history(
             if case.name == baseline_case.name and np.isfinite(score):
                 improvement = 0.0
                 selection_advantage = 0.0
+                incremental = {
+                    "incremental_pnl": 0.0, "incremental_sharpe": 0.0}
             else:
                 improvement = _history_improvement_vs_c2c(
                     score, baseline_score)
@@ -1711,6 +1816,8 @@ def recommend_by_rolling_history(
                     _history_selection_advantage_vs_c2c(
                         score, baseline_score)
                 )
+                incremental = _incremental_metrics(
+                    combined, baseline_combined)
 
             segment_improvements = []
             segment_wins = 0
@@ -1856,32 +1963,29 @@ def recommend_by_rolling_history(
                     median_segment_improvement),
                 "selection_metric": STRICT_LOOKBACK_SELECTION_METRIC,
                 "selection_improvement_vs_c2c": selection_advantage,
+                # 日内额外调仓相对「日内不动」的增量贡献，供排名口径选用。
+                "incremental_pnl_vs_c2c": incremental["incremental_pnl"],
+                "incremental_sharpe_vs_c2c": incremental[
+                    "incremental_sharpe"],
+                # 多调仓要多花的成本：判断这份增量是否划算的另一半。
+                "baseline_tc": baseline_metrics["total_tc"],
+                "incremental_tc_vs_c2c": (
+                    metrics["total_tc"] - baseline_metrics["total_tc"]),
                 "relative_comparison_windows": (
                     1 if np.isfinite(selection_advantage) else 0),
                 **{f"meta_{key}": value
                    for key, value in case.metadata.items()},
             })
 
-    ranking = _rank_history_rows(rows)
+    ranking = _rank_history_rows(rows, objective=objective)
     if ranking.empty:
         return ranking.copy(), ranking, window_results
-    recommendation_rows = []
-    for _lookback, group in ranking.groupby("lookback", sort=False):
-        eligible = group[group["recommendation_eligible"].astype(bool)]
-        non_baseline = eligible[
-            eligible["strategy_type"].astype(str) != "close_to_close"]
-        if eligible.empty or non_baseline.empty:
-            continue
-        recommendation_rows.append(
-            eligible.sort_values("rank", kind="stable").iloc[0])
-    recommendations = (
-        pd.DataFrame(recommendation_rows).reset_index(drop=True)
-        if recommendation_rows else ranking.iloc[:0].copy())
-    return recommendations, ranking, window_results
+    return _history_recommendations(ranking), ranking, window_results
 
 
 def _recommend_from_explicit_history_plans(
-        option, cases, kwargs, spd, baseline_case, plans):
+        option, cases, kwargs, spd, baseline_case, plans,
+        objective=DEFAULT_SELECTION_OBJECTIVE):
     """运行已经按具体合约边界切好的严格连续历史分段计划。"""
     batch_position = _backtest_batch_position(
         kwargs, context="跨合约历史择优")
@@ -2250,27 +2354,16 @@ def _recommend_from_explicit_history_plans(
                    for key, value in case.metadata.items()},
             })
 
-    ranking = _rank_history_rows(rows)
+    ranking = _rank_history_rows(rows, objective=objective)
     if ranking.empty:
         return ranking.copy(), ranking, window_results
-    recommendation_rows = []
-    for _lookback, group in ranking.groupby("lookback", sort=False):
-        eligible = group[group["recommendation_eligible"].astype(bool)]
-        non_baseline = eligible[
-            eligible["strategy_type"].astype(str) != "close_to_close"]
-        if eligible.empty or non_baseline.empty:
-            continue
-        recommendation_rows.append(
-            eligible.sort_values("rank", kind="stable").iloc[0])
-    recommendations = (
-        pd.DataFrame(recommendation_rows).reset_index(drop=True)
-        if recommendation_rows else ranking.iloc[:0].copy())
-    return recommendations, ranking, window_results
+    return _history_recommendations(ranking), ranking, window_results
 
 
 def recommend_by_contract_history_pool(
         option, pool, cases, backtest_kwargs=None, *, lookbacks=None,
-        step_days=5, target_endpoints=None, steps_per_day=None):
+        step_days=5, target_endpoints=None, steps_per_day=None,
+        objective=DEFAULT_SELECTION_OBJECTIVE):
     """在最近连续 ``L`` 个主力映射日上按具体合约边界比较策略。
 
     证据区间中的主力换月会强制切段；同一具体合约的连续区间再按不重叠
@@ -2691,4 +2784,5 @@ def recommend_by_contract_history_pool(
             },
         })
     return _recommend_from_explicit_history_plans(
-        option, cases, kwargs, default_spd, baseline_case, plans)
+        option, cases, kwargs, default_spd, baseline_case, plans,
+        objective=objective)

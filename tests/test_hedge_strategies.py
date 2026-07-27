@@ -62,7 +62,12 @@ def _three_day_intraday_prices():
     )
 
 
-def test_day_close_fallback_disabled_preserves_old_band_behavior():
+def test_day_close_fallback_defaults_to_on_and_can_be_disabled():
+    """收盘保底默认开启；显式关闭时退回纯策略触发。
+
+    实务上收盘总要对冲一次，所以默认开；但它仍是可选项，关掉后不应留下
+    任何兜底调仓。带宽取得极宽，策略自身不会触发，两者差异全部来自兜底。
+    """
     prices = _three_day_intraday_prices()
     default_result = HedgeBacktest(
         _option(days=3), prices, steps_per_day=2, multiplier=0,
@@ -74,15 +79,14 @@ def test_day_close_fallback_disabled_preserves_old_band_behavior():
         force_day_close_hedge=False,
     ).run()
 
+    assert disabled_result["force_day_close_hedge"] is False
     assert np.flatnonzero(disabled_result["hedge_triggered"]).tolist() == [0, 6]
     assert not disabled_result["day_close_fallback_triggered"].any()
-    assert disabled_result["force_day_close_hedge"] is False
-    np.testing.assert_array_equal(
-        disabled_result["hedge_triggered"], default_result["hedge_triggered"])
-    np.testing.assert_allclose(
-        disabled_result["shares"], default_result["shares"])
-    np.testing.assert_allclose(
-        disabled_result["tc_paid"], default_result["tc_paid"])
+
+    assert default_result["force_day_close_hedge"] is True
+    assert default_result["day_close_fallback_triggered"].any()
+    assert (np.flatnonzero(default_result["hedge_triggered"]).size
+            > np.flatnonzero(disabled_result["hedge_triggered"]).size)
 
 
 def test_day_close_fallback_hedges_band_strategy_when_band_was_not_crossed():
@@ -224,7 +228,8 @@ def test_day_close_fallback_uses_end_of_night_session_trading_day_group():
 def test_legacy_fixed_frequency_remains_backend_api_compatibility_only():
     prices = np.array([100, 101, 102, 103, 104], dtype=float)
     bt = HedgeBacktest(
-        _option(), prices, hedge_freq=2, multiplier=0, strategy=None)
+        _option(), prices, hedge_freq=2, multiplier=0, strategy=None,
+        force_day_close_hedge=False)
     assert isinstance(bt.strategy, FixedFreqStrategy)
     result = bt.run()
     assert np.flatnonzero(result["hedge_triggered"]).tolist() == [0, 2, 4]
@@ -320,7 +325,7 @@ def test_fixed_times_uses_real_datetime_index():
     prices = pd.Series([100, 101, 102, 101, 103, 104, 102, 103, 105], index=idx)
     result = HedgeBacktest(
         _option(), prices, steps_per_day=2, multiplier=0,
-        strategy=FixedTimeStrategy(["11:30"]),
+        strategy=FixedTimeStrategy(["11:30"]), force_day_close_hedge=False,
     ).run()
     # 末 bar 始终是到期平仓，因此固定时刻触发为 1/3/5/7，另含 0/8。
     assert np.flatnonzero(result["hedge_triggered"]).tolist() == [0, 1, 3, 5, 7, 8]
@@ -404,7 +409,7 @@ def test_fixed_times_all_targets_skipped_is_valid_noop_without_timestamps(capsys
         ["23:00"], trading_sessions=[("09:00", "15:00")])
     result = HedgeBacktest(
         _option(), np.array([100, 101, 102, 103, 104], dtype=float),
-        multiplier=0, strategy=strategy,
+        multiplier=0, strategy=strategy, force_day_close_hedge=False,
     ).run()
 
     assert np.flatnonzero(result["hedge_triggered"]).tolist() == [0, 4]
@@ -2751,9 +2756,9 @@ def test_rolling_history_ranks_candidates_by_same_window_c2c_improvement(
     )
     cases = [
         StrategyCase("c2c_reference", CloseToCloseStrategy()),
-        StrategyCase("candidate_good", FixedFreqStrategy(1)),
+        StrategyCase("earns_less", FixedFreqStrategy(1)),
         StrategyCase(
-            "candidate_bad", HedgeBandStrategy("absolute", threshold=1.0)),
+            "earns_more", HedgeBandStrategy("absolute", threshold=1.0)),
     ]
 
     recommendations, ranking, windows = recommend_by_rolling_history(
@@ -2762,17 +2767,20 @@ def test_rolling_history_ranks_candidates_by_same_window_c2c_improvement(
         lookbacks={"week": 4}, step_days=1,
     )
 
-    assert recommendations["strategy"].tolist() == ["candidate_good"]
+    # 排名口径是“日内额外调仓多赚了多少”：每天稳赚 8 元的候选优于基线的
+    # 4 元，而每天只赚 1 元的候选劣于基线——即便后者的 RMS 更小。旧口径
+    # 按 RMS 排会得到完全相反的顺序，那正是它奖励“把收益也一起抹平”的表现。
+    assert recommendations["strategy"].tolist() == ["earns_more"]
     assert ranking["strategy"].tolist() == [
-        "candidate_good", "c2c_reference", "candidate_bad",
+        "earns_more", "c2c_reference", "earns_less",
     ]
     assert ranking["recommendation_eligible"].all()
     assert ranking["comparison_eligible"].all()
     assert ranking["comparison_status"].eq("formal").all()
 
     baseline = ranking[ranking["strategy"] == "c2c_reference"].iloc[0]
-    better = ranking[ranking["strategy"] == "candidate_good"].iloc[0]
-    worse = ranking[ranking["strategy"] == "candidate_bad"].iloc[0]
+    better = ranking[ranking["strategy"] == "earns_less"].iloc[0]
+    worse = ranking[ranking["strategy"] == "earns_more"].iloc[0]
     assert baseline["score"] == pytest.approx(4.0)
     assert baseline["baseline_score"] == pytest.approx(4.0)
     assert baseline["improvement_vs_c2c"] == pytest.approx(0.0)
@@ -2850,8 +2858,12 @@ def test_strict_ranking_uses_combined_l_day_rms_not_equal_segment_votes(
     assert candidate["relative_comparison_windows"] == 1
     assert candidate["median_window_improvement_vs_c2c"] == pytest.approx(0.5)
     assert candidate["window_win_rate_vs_c2c"] == pytest.approx(2.0 / 3.0)
-    assert ranking.iloc[0]["strategy"] == "c2c_reference"
-    assert recommendations["strategy"].tolist() == ["c2c_reference"]
+    # 合并 L 日 RMS 仍按上面的公式计算并保留为诊断值，但名次已改由增量
+    # 收益决定：candidate 三段合计 110 元、基线 20 元，因此它排第一——
+    # 即使它的 RMS 更差。这正是“收益优先、波动其次”的口径变更。
+    assert candidate["incremental_pnl_vs_c2c"] == pytest.approx(90.0)
+    assert ranking.iloc[0]["strategy"] == "candidate"
+    assert recommendations["strategy"].tolist() == ["candidate"]
 
 
 def test_history_ranking_falls_back_per_row_for_legacy_results():
@@ -2912,10 +2924,13 @@ def test_rolling_history_zero_c2c_score_never_produces_infinite_improvement(
     assert np.isnan(candidate["improvement_vs_c2c"])
     assert np.isnan(candidate["median_window_improvement_vs_c2c"])
     assert candidate["selection_improvement_vs_c2c"] == pytest.approx(-1.0)
-    assert recommendations["strategy"].tolist() == ["c2c_reference"]
+    # 基线在该窗口完美对冲（日损益恒为 0），候选有正的日损益，因此按
+    # 增量收益口径候选排第一；RMS 口径下则相反。两种口径都不得溢出。
+    assert recommendations["strategy"].tolist() == ["candidate"]
     for column in (
             "improvement_vs_c2c", "median_window_improvement_vs_c2c",
-            "selection_improvement_vs_c2c"):
+            "selection_improvement_vs_c2c",
+            "incremental_pnl_vs_c2c", "incremental_sharpe_vs_c2c"):
         values = pd.to_numeric(ranking[column], errors="coerce").to_numpy()
         assert not np.isinf(values).any()
 
@@ -3278,7 +3293,8 @@ def test_rolling_history_rebases_absolute_band_for_each_price_window():
     ]
     recommendations, ranking, windows = recommend_by_rolling_history(
         _option(days=2), prices, cases,
-        {"multiplier": 0, "tc_rate": 0.0},
+        # 本例验证的是带宽随窗口重新基准化，收盘兜底会混入额外触发。
+        {"multiplier": 0, "tc_rate": 0.0, "force_day_close_hedge": False},
         lookbacks={"latest": 2}, step_days=1,
     )
 
@@ -3767,3 +3783,147 @@ def test_single_group_sample_still_falls_back_to_bar_count():
             _option(days=1), prices, steps_per_day=242, multiplier=0,
             strategy=CloseToCloseStrategy(),
         )
+
+
+def test_ranking_objective_switches_between_profit_and_sharpe(monkeypatch):
+    """两个排名口径都基于“相对日内不动的增量”，但侧重不同。
+
+    构造一个高增量、高波动的候选和一个低增量、极稳的候选：收益口径应选
+    前者，性价比口径应选后者。
+    """
+    import pricing.hedge_analysis as hedge_analysis
+
+    prices = pd.Series(
+        np.linspace(100.0, 106.0, 7),
+        index=pd.date_range("2026-01-05", periods=7, freq="B"),
+    )
+
+    class FakeBacktest:
+        def __init__(self, option, path_source=None, external_path=None,
+                     strategy=None, steps_per_day=1, **kwargs):
+            self.external_path = external_path
+            self.strategy = strategy
+            self.steps_per_day = steps_per_day
+
+        def run(self):
+            n = len(self.external_path)
+            rng = np.random.default_rng(7)
+            if self.strategy.name == "close_to_close":
+                net = np.zeros(n)
+            elif self.strategy.name == "fixed_freq":
+                # 增量大但忽高忽低。
+                net = np.zeros(n)
+                net[1:] = 10.0 + rng.normal(0.0, 40.0, n - 1)
+            else:
+                # 增量小但几乎不波动。
+                net = np.zeros(n)
+                net[1:] = 3.0 + rng.normal(0.0, 0.5, n - 1)
+            return {
+                "net_daily": net, "tc_paid": np.zeros_like(net),
+                "steps_per_day": self.steps_per_day,
+                "strategy_name": self.strategy.name,
+                "prices": np.asarray(self.external_path, dtype=float),
+                "timestamps": self.external_path.index,
+            }
+
+    monkeypatch.setattr(hedge_analysis, "HedgeBacktest", FakeBacktest)
+    cases = [
+        StrategyCase("基线", CloseToCloseStrategy()),
+        StrategyCase("高增量高波动", FixedFreqStrategy(1)),
+        StrategyCase("低增量极稳", HedgeBandStrategy("absolute", threshold=1.0)),
+    ]
+    common = dict(lookbacks={"week": 4}, step_days=1)
+
+    by_pnl = recommend_by_rolling_history(
+        _option(days=2), prices, cases, {"multiplier": 0, "tc_rate": 0.0},
+        objective="incremental_pnl", **common)[1]
+    by_sharpe = recommend_by_rolling_history(
+        _option(days=2), prices, cases, {"multiplier": 0, "tc_rate": 0.0},
+        objective="incremental_sharpe", **common)[1]
+
+    assert by_pnl.iloc[0]["strategy"] == "高增量高波动"
+    assert by_sharpe.iloc[0]["strategy"] == "低增量极稳"
+    assert by_pnl.iloc[0]["selection_objective"] == "incremental_pnl"
+    assert by_sharpe.iloc[0]["selection_objective"] == "incremental_sharpe"
+
+
+def test_unknown_ranking_objective_is_rejected():
+    with pytest.raises(ValueError, match="未知排名口径"):
+        recommend_by_rolling_history(
+            _option(days=2),
+            pd.Series(np.linspace(100.0, 104.0, 5),
+                      index=pd.date_range("2026-01-05", periods=5, freq="B")),
+            [StrategyCase("c2c", CloseToCloseStrategy())],
+            {"multiplier": 0, "tc_rate": 0.0},
+            lookbacks={"week": 3}, objective="max_profit")
+
+
+def test_rerank_history_switches_objective_without_rerunning(monkeypatch):
+    """切换排名依据只重排已有结果，不得重跑回测。
+
+    两个口径所需的指标在回测时已一并算出；一年 1 分钟行情重跑一次要几十
+    秒，换个看法不该让人再等一遍。
+    """
+    import pricing.hedge_analysis as hedge_analysis
+    from pricing import rerank_history
+
+    runs = {"count": 0}
+    prices = pd.Series(
+        np.linspace(100.0, 106.0, 7),
+        index=pd.date_range("2026-01-05", periods=7, freq="B"))
+
+    class FakeBacktest:
+        def __init__(self, option, path_source=None, external_path=None,
+                     strategy=None, steps_per_day=1, **kwargs):
+            self.external_path = external_path
+            self.strategy = strategy
+            self.steps_per_day = steps_per_day
+
+        def run(self):
+            runs["count"] += 1
+            n = len(self.external_path)
+            rng = np.random.default_rng(11)
+            net = np.zeros(n)
+            if self.strategy.name == "fixed_freq":
+                net[1:] = 10.0 + rng.normal(0.0, 40.0, n - 1)
+            elif self.strategy.name != "close_to_close":
+                net[1:] = 3.0 + rng.normal(0.0, 0.5, n - 1)
+            return {
+                "net_daily": net, "tc_paid": np.zeros_like(net),
+                "steps_per_day": self.steps_per_day,
+                "strategy_name": self.strategy.name,
+                "prices": np.asarray(self.external_path, dtype=float),
+                "timestamps": self.external_path.index,
+            }
+
+    monkeypatch.setattr(hedge_analysis, "HedgeBacktest", FakeBacktest)
+    cases = [
+        StrategyCase("基线", CloseToCloseStrategy()),
+        StrategyCase("高增量高波动", FixedFreqStrategy(1)),
+        StrategyCase("低增量极稳", HedgeBandStrategy("absolute", threshold=1.0)),
+    ]
+    _rec, ranking, _win = recommend_by_rolling_history(
+        _option(days=2), prices, cases, {"multiplier": 0, "tc_rate": 0.0},
+        lookbacks={"week": 4}, step_days=1, objective="incremental_pnl")
+    runs_after_backtest = runs["count"]
+    assert ranking.iloc[0]["strategy"] == "高增量高波动"
+
+    rec2, reranked = rerank_history(ranking, "incremental_sharpe")
+
+    # 关键：重排期间一次回测都不应发生。
+    assert runs["count"] == runs_after_backtest
+    assert reranked.iloc[0]["strategy"] == "低增量极稳"
+    assert reranked.iloc[0]["selection_objective"] == "incremental_sharpe"
+    assert rec2["strategy"].tolist() == ["低增量极稳"]
+    # 重排不改变任何指标值，只改变名次。
+    for name in ("高增量高波动", "低增量极稳"):
+        before = ranking[ranking["strategy"] == name].iloc[0]
+        after = reranked[reranked["strategy"] == name].iloc[0]
+        assert after["incremental_pnl_vs_c2c"] == before["incremental_pnl_vs_c2c"]
+        assert after["window_pnl"] == before["window_pnl"]
+
+
+def test_rerank_history_tolerates_empty_ranking():
+    from pricing import rerank_history
+    rec, ranking = rerank_history(pd.DataFrame(), "incremental_pnl")
+    assert rec.empty and ranking.empty

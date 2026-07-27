@@ -1480,8 +1480,15 @@ def test_history_button_sync_updates_independent_workspace_hint():
 
     BacktestApp._sync_history_button_state(fake)
 
+    # 数据源可用时按钮直接放行，不再多说一句“已就绪”占版面。
     assert fake._history_btn.state == "normal"
-    assert "真实历史来源已就绪" in fake._history_source_hint_var.get()
+    assert fake._history_source_hint_var.get() == ""
+
+    # 只有真正跑不了的时候才需要出声解释原因。
+    fake._source_var = _Var("simulate")
+    BacktestApp._sync_history_button_state(fake)
+    assert fake._history_btn.state == "disabled"
+    assert "仅支持 CSV / Wind" in fake._history_source_hint_var.get()
 
 
 def test_history_loader_rejects_simulation_even_with_retained_series():
@@ -2012,7 +2019,7 @@ def test_history_multi_chart_uses_strict_common_windows_and_one_c2c_series():
     assert model["primary_strategy"] == "每日固定时刻"
     assert all("window_" not in item["label"]
                for item in model["window_options"])
-    assert all(item["label"].startswith("回测分段 ")
+    assert all(item["label"].startswith("第 ")
                for item in model["window_options"])
 
 
@@ -2039,7 +2046,7 @@ def test_history_full_chart_concatenates_common_segments_in_strict_order():
     assert model["complete_evidence"] is False
     np.testing.assert_allclose(baseline["y"], [3.0, 8.0, 13.0, 20.0])
     np.testing.assert_allclose(band["y"], [4.0, 10.0, 16.0, 24.0])
-    assert "共同交集" in model["title"]
+    assert "共同可比区间" in model["title"]
 
 
 def test_history_full_chart_drops_failed_segment_from_common_intersection():
@@ -2315,7 +2322,7 @@ def test_history_multi_chart_renderer_draws_c2c_and_all_candidates(mode):
     assert labels[1].startswith("固定间隔(1σ)")
     assert labels[2].startswith("每日固定时刻")
     assert len(app._history_chart_ax.lines) >= 3
-    assert "共同回测分段 2 个" in app._history_chart_hint_var.get()
+    assert "可比 2 段" in app._history_chart_hint_var.get()
 
 
 def _history_period_view_model_fixture():
@@ -2398,7 +2405,7 @@ def test_recommendation_view_model_compares_each_period_with_fixed_c2c():
     assert [row["lookback"] for row in rows] == [
         "week", "month", "quarter", "half_year", "year",
     ]
-    assert rows[0]["status"] == "严格区间完整"
+    assert rows[0]["status"] == "数据完整"
     assert rows[0]["strategy_label"] == "固定间隔(1σ)"
     assert rows[0]["improvement_vs_c2c"] == pytest.approx(0.20)
     assert rows[0]["gap_ratio"] == pytest.approx(0.20)
@@ -2409,7 +2416,7 @@ def test_recommendation_view_model_compares_each_period_with_fixed_c2c():
     assert (rows[0]["paired"], rows[0]["baseline_windows"]) == (4, 4)
     assert rows[0]["best_is_baseline"] is False
 
-    assert rows[1]["status"] == "区间不足，仅诊断"
+    assert rows[1]["status"] == "数据不足（仅参考）"
     assert rows[1]["strategy_label"] == "诊断：每日收盘（基准最优）"
     assert rows[1]["improvement_vs_c2c"] == pytest.approx(0.0)
     assert rows[1]["best_is_baseline"] is True
@@ -2418,8 +2425,8 @@ def test_recommendation_view_model_compares_each_period_with_fixed_c2c():
         2, 4, 2,
     )
 
-    assert rows[2]["status"] == "无完整配对候选"
-    assert rows[2]["strategy_label"] == "仅基准（无完整配对候选）"
+    assert rows[2]["status"] == "无可比候选"
+    assert rows[2]["strategy_label"] == "仅基准（无可比候选）"
     assert rows[2]["has_comparable_candidate"] is False
     assert rows[3]["period"] == "近半年"
     assert rows[3]["status"] == "无可评估回测分段"
@@ -2435,8 +2442,8 @@ def test_recommendation_view_model_only_returns_selected_period_subset():
 
     assert [row["lookback"] for row in rows] == ["week", "quarter"]
     assert [row["period"] for row in rows] == ["近周", "近季"]
-    assert rows[0]["status"] == "严格区间完整"
-    assert rows[1]["status"] == "无完整配对候选"
+    assert rows[0]["status"] == "数据完整"
+    assert rows[1]["status"] == "无可比候选"
 
 
 def test_product_pool_view_uses_strict_metric_and_contract_list():
@@ -2570,7 +2577,7 @@ def test_history_period_view_model_accepts_legacy_ranking_and_proxy_alias():
     assert week["improvement_vs_c2c"] == pytest.approx(0.3)
     assert week["uses_strict_metric"] is False
     assert week["uses_window_equal_metric"] is True
-    assert week["status"] == "旧口径样本完整"
+    assert week["status"] == "旧版数据完整"
     assert week["evaluation_mode"] is None
     assert week["evidence_days"] == 0
     assert week["days_used"] == 22
@@ -3870,7 +3877,7 @@ def test_history_replay_label_shows_segment_dates_and_contract():
 
     label = BacktestApp._history_replay_label(spec)
 
-    assert label == "回测分段 3 · 2026-03-02~2026-03-05 · P2605.DCE · 市值估算"
+    assert label == "第 3 段 · 2026-03-02~2026-03-05 · P2605.DCE · 按市价结算"
 
 
 def test_history_replay_options_keep_only_segments_running_the_candidate():
@@ -4028,8 +4035,9 @@ def test_history_action_hint_states_the_scope_the_button_will_run():
     BacktestApp._refresh_history_action_hint(fake)
     single_hint = fake._history_action_hint_var.get()
 
-    assert "已勾选的 2 个候选" in batch_hint
-    assert "只回测排名表中选中的那一条候选" in single_hint
+    # 提示必须说清这次按钮实际会跑几个策略，措辞保持平实。
+    assert "勾选的 2 个策略" in batch_hint
+    assert "选中的那一个策略" in single_hint
 
 
 def test_history_action_hint_is_silent_before_the_result_page_exists():
@@ -4169,21 +4177,145 @@ def test_history_ranking_flags_stay_neutral_on_empty_ranking():
 
 
 @pytest.mark.parametrize("uses_product_pool, expected", [
-    (False, "主指标为完整 L 日合并日净损益 RMS 的有界 每日收盘 改善；"),
-    (True, "汇总金额 RMS 只作诊断；"),
+    (False, "排名依据：整段日损益的波动幅度比「每日收盘」低多少。"),
+    (True, "整体金额波动只作参考，不参与排名。"),
 ])
 def test_history_scope_explanation_tracks_the_ranking_route(
         uses_product_pool, expected):
     text = history_selection.scope_explanation(
         "近月", uses_strict_metric=True, uses_product_pool=uses_product_pool)
 
-    assert text.startswith("本次所选严格连续区间：近月。")
+    assert text.startswith("本次周期：近月。")
     assert text.endswith(expected)
+    # 面向使用者的说明里不该出现只在实现中有意义的符号与自造词。
+    for jargon in ("L 日", "T ", "V 日", "严格区间", "代理合约", "有界", "RMS"):
+        assert jargon not in text
 
 
 def test_history_scope_explanation_flags_pre_upgrade_results():
     text = history_selection.scope_explanation(
         "近月 / 近季", uses_strict_metric=False, uses_product_pool=False)
 
-    assert "升级前的历史终点" in text
-    assert "不能解释为严格连续最近 L 日" in text
+    assert "旧版的取样方式" in text
+    assert "建议重新运行" in text
+
+
+def test_history_consensus_note_flags_agreement_across_periods():
+    """各周期指向同一策略，本身就是比单个周期数字更强的证据。"""
+    items = [
+        {"period": "近周", "strategy": "固定间隔0.75σ"},
+        {"period": "近月", "strategy": "固定间隔0.75σ"},
+        {"period": "近年", "strategy": "固定间隔0.75σ"},
+    ]
+    note, state = BacktestApp._history_consensus_note(items)
+    assert state == "agree"
+    assert "3 个周期一致推荐 固定间隔0.75σ" in note
+
+
+def test_history_consensus_note_warns_and_points_to_long_periods():
+    """出现分歧时要说清各周期各选了什么，并给出取舍方向。"""
+    items = [
+        {"period": "近周", "strategy": "固定时刻"},
+        {"period": "近年", "strategy": "固定间隔0.5σ"},
+    ]
+    note, state = BacktestApp._history_consensus_note(items)
+    assert state == "disagree"
+    assert "近周 固定时刻" in note and "近年 固定间隔0.5σ" in note
+    assert "以长周期为准" in note
+
+
+def test_history_consensus_note_handles_empty_conclusions():
+    note, state = BacktestApp._history_consensus_note([
+        {"period": "近周", "strategy": "—"},
+    ])
+    assert state == "empty"
+    assert "没有形成可比结论" in note
+
+
+@pytest.mark.parametrize(
+    ("status", "paired", "total", "expected"),
+    [
+        # 一切正常时不占字数——这两项逐行重复且不传递信息。
+        ("数据完整", 12, 12, "✓"),
+        ("可比", 1, 1, "✓"),
+        # 有失败段：段数才是重点。
+        ("数据完整", 3, 6, "3/6 段"),
+        # 数据本身有问题：显示原因。
+        ("数据不足（仅参考）", 5, 5, "数据不足（仅参考）"),
+        ("不可比", 0, 3, "不可比·0/3"),
+    ],
+)
+def test_history_status_column_only_spends_width_on_problems(
+        status, paired, total, expected):
+    assert BacktestApp._format_history_status(
+        status, paired, total) == expected
+
+
+def test_only_objective_columns_are_clickable_headers():
+    """七列里只有两个排名口径列可点。
+
+    给其余列也装上排序会暗示它们同样能当排名依据，而后端只支持这两种；
+    用户会困惑“顺序变了为什么推荐没变”。
+    """
+    import tkinter as tk
+    from tkinter import ttk
+    try:
+        root = tk.Tk()
+    except tk.TclError:
+        pytest.skip("无可用显示环境")
+    root.withdraw()
+    clicked = []
+    try:
+        tree = BacktestApp._build_history_metric_tree(
+            ttk.Frame(root),
+            lead_columns=(("period", "分析周期", 90),
+                          ("strategy", "历史最优参考", 260)),
+            status_heading="状态", status_width=114,
+            labels={"score": "s", "baseline": "b", "improvement": "i"},
+            height=5, on_objective_click=clicked.append,
+        )
+        clickable = [c for c in tree["columns"] if tree.heading(c)["command"]]
+        assert clickable == ["incremental_pnl", "incremental_sharpe"]
+        # 可点的表头带有排序提示符号。
+        assert tree.heading("incremental_pnl")["text"].endswith("⇅")
+        assert not tree.heading("period")["text"].endswith("⇅")
+    finally:
+        root.destroy()
+
+
+def test_history_result_page_exposes_its_interactive_entry_points():
+    """结果页的交互入口必须真实存在。
+
+    这些方法散落在几个渲染函数之间，容易在重构相邻代码时被整段切掉，而
+    “表头绑定了 command”之类的断言抓不到——command 指向一个已不存在的
+    方法时，绑定本身依然成立，只有真正点下去才会炸。
+    """
+    for name in (
+            "_set_history_objective",       # 点列头换排名依据
+            "_rerank_history_results",      # 就地重排
+            "_history_rerender",            # 重排后重建结果页
+            "_select_history_period",       # 切换分析周期
+            "_refresh_history_period_chips",
+            "_history_consensus_note",      # 跨周期一致性结论
+            "_attach_tooltip",
+            "_make_scrollable_area",
+    ):
+        assert callable(getattr(BacktestApp, name, None)), f"{name} 缺失"
+
+
+def test_clicking_objective_header_actually_reranks(monkeypatch):
+    """点列头要真的走到重排，而不只是绑定了一个回调。"""
+    calls = []
+    fake = SimpleNamespace(
+        _history_result_objective_var=_Var("incremental_pnl"),
+        _rerank_history_results=lambda: calls.append("reranked"),
+    )
+
+    BacktestApp._set_history_objective(fake, "incremental_sharpe")
+    assert fake._history_result_objective_var.get() == "incremental_sharpe"
+    assert calls == ["reranked"]
+
+    # 非法口径既不改状态也不触发重排。
+    BacktestApp._set_history_objective(fake, "max_profit")
+    assert fake._history_result_objective_var.get() == "incremental_sharpe"
+    assert calls == ["reranked"]

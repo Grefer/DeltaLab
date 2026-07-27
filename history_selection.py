@@ -489,24 +489,29 @@ def ranking_flags(ranking):
 
 
 def scope_explanation(period_names, *, uses_strict_metric, uses_product_pool):
-    """生成结果页顶部的区间口径说明。"""
+    """生成“计算口径”展开后的完整说明。
+
+    面向使用者，不用 L / T / V 这类内部符号，也不用“严格区间”“代理合约”
+    “有界改善”这类只在实现里有意义的说法。
+    """
     if not uses_strict_metric:
         return (
-            f"本次所选周期：{period_names}。该结果来自升级前的历史终点"
-            "抽样口径，不能解释为严格连续最近 L 日；建议重新运行以生成"
-            "新版严格区间排名；")
+            f"本次周期：{period_names}。\n"
+            "这批结果来自旧版的取样方式，不是连续回放最近 N 个交易日，"
+            "建议重新运行一次。")
     text = (
-        f"本次所选严格连续区间：{period_names}。每档都从共同分析"
-        "截止日向前回放最近 L 日；期权期限 T 只决定代理合约每段"
-        "最长存续期，L>T 时自动续接回测分段，最后不足 T 的尾段按"
-        "剩余期限公允价值 市值估算。realized σ 候选另要求区间前完整"
-        " V 日 HV 预热；排名只使用同一严格区间内与 每日收盘 成功配对"
-        "的证据日；")
+        f"本次周期：{period_names}。\n"
+        "怎么算的：每个周期都从同一个截止日往前，连续回放对应的交易日数"
+        "（近周 5 日、近月 20 日，依此类推）。期权期限只决定每份合约最多"
+        "持有多久——回放天数超过期限时会拆成几段、依次开新合约，最后不满"
+        "一段的部分按当时市价结算。用历史波动率的策略还需要区间之前有足够"
+        "的预热数据。排名只统计各策略与「每日收盘」都跑出结果的交易日。\n")
     if uses_product_pool:
         return text + (
-            "品种池主指标为各非重叠回测分段的有界 每日收盘诊断分 改善按"
-            "实际评分日数加权，汇总金额 RMS 只作诊断；")
-    return text + "主指标为完整 L 日合并日净损益 RMS 的有界 每日收盘 改善；"
+            "排名依据：各段的日损益波动比「每日收盘」低多少，按各段实际"
+            "天数加权。整体金额波动只作参考，不参与排名。")
+    return text + (
+        "排名依据：整段日损益的波动幅度比「每日收盘」低多少。")
 
 
 def metric_labels(*, uses_strict_metric, uses_product_pool):
@@ -685,6 +690,8 @@ def recommendation_rows(
                 "strategy_label": "—", "score": None,
                 "baseline_score": None, "improvement_vs_c2c": None,
                 "selection_improvement_vs_c2c": None,
+                "incremental_pnl": None, "incremental_sharpe": None,
+                "incremental_tc": None, "max_drawdown": None,
                 "gap_ratio": None, "window_win_rate_vs_c2c": None,
                 "paired": 0, "baseline_windows": 0,
                 "effective": 0,
@@ -727,22 +734,22 @@ def recommendation_rows(
         win_rate = finite_value(
             leader.get("window_win_rate_vs_c2c"))
         if not has_comparable_candidate:
-            strategy_label = "仅基准（无完整配对候选）"
-            status = "无完整配对候选"
+            strategy_label = "仅基准（无可比候选）"
+            status = "无可比候选"
         elif best_is_baseline:
             strategy_label = "每日收盘（基准最优）"
             if not formal:
                 strategy_label = f"诊断：{strategy_label}"
             if uses_strict_metric:
-                status = "严格区间完整" if formal else "区间不足，仅诊断"
+                status = "数据完整" if formal else "数据不足（仅参考）"
             else:
-                status = "旧口径样本完整" if formal else "旧口径，仅诊断"
+                status = "旧版数据完整" if formal else "旧版数据不足（仅参考）"
         else:
             strategy_label = strategy if formal else f"诊断领先：{strategy}"
             if uses_strict_metric:
-                status = "严格区间完整" if formal else "区间不足，仅诊断"
+                status = "数据完整" if formal else "数据不足（仅参考）"
             else:
-                status = "旧口径样本完整" if formal else "旧口径，仅诊断"
+                status = "旧版数据完整" if formal else "旧版数据不足（仅参考）"
         rows.append({
             "lookback": key,
             "period": display,
@@ -753,6 +760,14 @@ def recommendation_rows(
             "improvement_vs_c2c": improvement,
             "selection_improvement_vs_c2c": (
                 improvement if uses_strict_metric else None),
+            # 两个排名口径的增量值，供周期结论表并排展示。
+            "incremental_pnl": finite_value(
+                leader.get("incremental_pnl_vs_c2c")),
+            "incremental_sharpe": finite_value(
+                leader.get("incremental_sharpe_vs_c2c")),
+            "incremental_tc": finite_value(
+                leader.get("incremental_tc_vs_c2c")),
+            "max_drawdown": finite_value(leader.get("max_drawdown")),
             # 旧展示模型字段保留同值软兼容；其语义已固定为较 每日收盘 改善。
             "gap_ratio": improvement,
             "window_win_rate_vs_c2c": win_rate,
@@ -934,7 +949,7 @@ def chart_model(
         window_options.append({
             "window_id": str(row["window_id"]),
             "end_ts": end_ts,
-            "label": f"回测分段 {sample_no} · {date_text}",
+            "label": f"第 {sample_no} 段 · {date_text}",
         })
     base = {
         "state": "ok", "mode": mode, "metric": metric,
@@ -1218,7 +1233,7 @@ def multi_chart_model(
         window_options.append({
             "window_id": common_id,
             "end_ts": end_ts,
-            "label": f"回测分段 {sample_no} · {date_text}{contract_text}",
+            "label": f"第 {sample_no} 段 · {date_text}{contract_text}",
         })
 
     base = {
@@ -1323,9 +1338,9 @@ def multi_chart_model(
             normalized_labels if uses_normalized_notional
             else raw_labels)[metric]
         title_prefix = (
-            "完整 L 日累计路径"
+            "完整回放区间"
             if complete_evidence else
-            f"共同交集累计路径（{common_day_count}/{expected_day_count} 日）"
+            f"共同可比区间（{common_day_count}/{expected_day_count} 日）"
         )
         return {
             **base,

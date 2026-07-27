@@ -1109,7 +1109,7 @@ class HedgeBacktest:
                  path_source="gbm", external_path=None, detrend=False,
                  is_future=False, contract_multiplier=1.0,
                  strategy=None, steps_per_day=1, slippage_bps=0.0,
-                 base_seed=20, force_day_close_hedge=False,
+                 base_seed=20, force_day_close_hedge=True,
                  sigma_warmup_log_returns=None,
                  strict_sigma_warmup=False, evaluation_days=None):
         """
@@ -2234,7 +2234,7 @@ class HedgeBacktest:
                   hedge_freq=1, tc_rate=0.0, position=1, adjust="F",
                   quantity=1.0, multiplier=5,
                   strategy=None, steps_per_day=None, slippage_bps=0.0,
-                  bar_size=None, force_day_close_hedge=False,
+                  bar_size=None, force_day_close_hedge=True,
                   evaluation_days=None):
         """
         使用 Wind 历史行情创建回测实例
@@ -2475,7 +2475,7 @@ class HedgeBacktest:
                  date_col=None, hedge_freq=1, tc_rate=0.0, position=1,
                  quantity=1.0, multiplier=5,
                  strategy=None, steps_per_day=None, slippage_bps=0.0,
-                 force_day_close_hedge=False, evaluation_days=None):
+                 force_day_close_hedge=True, evaluation_days=None):
         """
         从 CSV 文件加载价格数据创建回测实例（无需 Wind 终端）
 
