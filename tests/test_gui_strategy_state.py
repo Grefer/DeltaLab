@@ -4319,3 +4319,246 @@ def test_clicking_objective_header_actually_reranks(monkeypatch):
     BacktestApp._set_history_objective(fake, "max_profit")
     assert fake._history_result_objective_var.get() == "incremental_sharpe"
     assert calls == ["reranked"]
+
+
+def _pill_ranking(picks_by_period, baseline_first=False):
+    rows = []
+    for lookback, best in picks_by_period.items():
+        rows.append({
+            "lookback": lookback, "strategy": best,
+            "strategy_type": "hedge_band", "rank": 2 if baseline_first else 1,
+            "recommendation_eligible": True,
+        })
+        rows.append({
+            "lookback": lookback, "strategy": "每日收盘",
+            "strategy_type": "close_to_close",
+            "rank": 1 if baseline_first else 2,
+            "recommendation_eligible": True,
+        })
+    return pd.DataFrame(rows)
+
+
+def test_header_pill_agrees_with_the_consistency_banner():
+    """顶部结论 pill 不得与下方的一致性横幅互相打架。
+
+    rank 是按周期分组算的，每个周期都有一条 rank==1；直接取第一条拿到的
+    是「近周」——样本最少、横幅明确建议不要单独采信的那个周期。
+    """
+    app = SimpleNamespace(
+        _history_header_summary_frame=None,
+        _history_ranking=_pill_ranking({
+            "week": "固定间隔0.75σ", "year": "固定间隔0.5σ"}),
+    )
+    # 容器为 None 时应安全返回，不抛异常。
+    assert BacktestApp._update_history_header_summary(app) is None
+
+    picks = []
+    ranking = app._history_ranking
+    for _lb, group in ranking.groupby("lookback", sort=False):
+        eligible = group[group["recommendation_eligible"].astype(bool)]
+        cand = eligible[eligible["strategy_type"] != "close_to_close"]
+        picks.append(cand.sort_values("rank").iloc[0]["strategy"])
+    # 两个周期给出不同结论时，绝不能只挑一个说成“最佳推荐”。
+    assert len(set(picks)) == 2
+
+
+def test_header_pill_never_promotes_the_baseline():
+    """基准是对照组不是推荐；它排第一时也不该出现在结论 pill 里。"""
+    ranking = _pill_ranking({"week": "固定间隔2σ"}, baseline_first=True)
+    eligible = ranking[ranking["recommendation_eligible"].astype(bool)]
+    cand = eligible[eligible["strategy_type"] != "close_to_close"]
+    best = cand.sort_values("rank", kind="stable").iloc[0]
+    assert best["strategy"] == "固定间隔2σ"
+    assert best["strategy_type"] != "close_to_close"
+
+
+def test_active_sort_column_is_marked_in_the_header():
+    """当前排序列用 ↓ 标出，另一个可点列用 ⇅。
+
+    这样排名依据不必再单独占一行文字——表头自己就说清了「现在按哪列排」
+    和「哪列还能点」。
+    """
+    import tkinter as tk
+    from tkinter import ttk
+    try:
+        root = tk.Tk()
+    except tk.TclError:
+        pytest.skip("无可用显示环境")
+    root.withdraw()
+    try:
+        labels = {"score": "s", "baseline": "b", "improvement": "i"}
+        lead = (("period", "分析周期", 90), ("strategy", "历史最优参考", 260))
+        tree = BacktestApp._build_history_metric_tree(
+            ttk.Frame(root), lead_columns=lead, status_heading="状态",
+            status_width=114, labels=labels, height=5,
+            on_objective_click=lambda _k: None,
+            active_objective="incremental_pnl")
+        assert tree.heading("incremental_pnl")["text"].endswith("↓")
+        assert tree.heading("incremental_sharpe")["text"].endswith("⇅")
+
+        other = BacktestApp._build_history_metric_tree(
+            ttk.Frame(root), lead_columns=lead, status_heading="状态",
+            status_width=114, labels=labels, height=5,
+            on_objective_click=lambda _k: None,
+            active_objective="incremental_sharpe")
+        assert other.heading("incremental_sharpe")["text"].endswith("↓")
+        assert other.heading("incremental_pnl")["text"].endswith("⇅")
+
+        # 非排名口径的列不该带任何排序标记。
+        assert not tree.heading("max_drawdown")["text"].endswith(("↓", "⇅"))
+    finally:
+        root.destroy()
+
+
+def test_source_hint_is_rendered_once_as_a_pill():
+    """数据源提示只在顶部 pill 出现一次。
+
+    这句话曾经同时挂在 pill 和按钮左侧的 Label 上，同屏出现两遍会被误读
+    成两条不同的提示。变量要保留（pill 从它取文案），但不能再有第二个
+    控件绑定它。
+    """
+    import tkinter as tk
+    try:
+        root = tk.Tk()
+    except tk.TclError:
+        pytest.skip("无可用显示环境")
+    root.destroy()
+
+    import gui_app as module
+    app = module.BacktestApp()
+    try:
+        app.withdraw()
+        app.update_idletasks()
+        bound = []
+
+        def walk(widget):
+            for child in widget.winfo_children():
+                try:
+                    if child.cget("textvariable") == str(
+                            app._history_source_hint_var):
+                        bound.append(child.winfo_class())
+                except tk.TclError:
+                    pass
+                walk(child)
+
+        walk(app)
+        assert bound == [], f"仍有控件重复绑定该提示: {bound}"
+
+        # pill 仍然会在数据源不可用时给出提示。
+        app._source_var.set("simulate")
+        BacktestApp._sync_history_button_state(app)
+        app.update_idletasks()
+        texts = [w.cget("text")
+                 for w in app._history_header_summary_frame.winfo_children()]
+        assert any("仅支持 CSV / Wind" in t for t in texts), texts
+        assert str(app._history_btn.cget("state")) == "disabled"
+    finally:
+        app.destroy()
+
+
+def test_band_only_params_gray_out_with_their_owning_strategy():
+    """固定间隔的四项参数必须整组跟着它的勾选启停。
+
+    σ 来源与回看天数只在勾选了固定间隔时才会被读取（见
+    _collect_history_state），界面上也应表现为从属于它，而不是看起来像
+    一组全局设置。
+    """
+    import tkinter as tk
+    import gui_app as module
+    try:
+        probe = tk.Tk()
+    except tk.TclError:
+        pytest.skip("无可用显示环境")
+    probe.destroy()
+
+    app = module.BacktestApp()
+    try:
+        app.withdraw()
+        app.update_idletasks()
+        band_widgets = (
+            app._history_band_candidate_entry,
+            app._history_current_band_check,
+            app._history_sigma_src_combo,
+        )
+
+        app._history_include_band_var.set(False)
+        app._toggle_history_candidate_controls()
+        for widget in band_widgets:
+            assert str(widget.cget("state")) == "disabled"
+        # 固定时刻不受牵连。
+        assert str(app._history_fixed_times_entry.cget("state")) == "normal"
+
+        app._history_include_band_var.set(True)
+        app._history_include_fixed_times_var.set(False)
+        app._toggle_history_candidate_controls()
+        assert str(app._history_fixed_times_entry.cget("state")) == "disabled"
+        assert str(app._history_band_candidate_entry.cget("state")) == "normal"
+    finally:
+        app.destroy()
+
+
+def test_candidate_config_pairs_each_strategy_with_its_params_on_one_row():
+    """候选空间左栏勾选、右栏参数，必须逐行对齐且无单元格重叠。
+
+    从属关系靠「同一 grid 行」表达，一旦行号错位，界面上参数就会挪到别
+    的策略名下——而 tkinter 对行号写错是完全沉默的，重叠时后放的控件直
+    接盖住先放的，只表现为「某个控件不见了」。
+    """
+    import tkinter as tk
+    import gui_app as module
+    try:
+        probe = tk.Tk()
+    except tk.TclError:
+        pytest.skip("无可用显示环境")
+    probe.destroy()
+
+    app = module.BacktestApp()
+    try:
+        app.withdraw()
+        app.update_idletasks()
+        settings = app._history_wind_frame.master
+
+        occupied = {}
+        for child in settings.winfo_children():
+            info = child.grid_info()
+            if not info:
+                continue
+            row = int(info["row"])
+            column = int(info["column"])
+            span = int(info.get("columnspan", 1))
+            for col in range(column, column + span):
+                occupied.setdefault((row, col), []).append(child)
+        overlaps = {k: v for k, v in occupied.items() if len(v) > 1}
+        assert not overlaps, f"grid 单元格重叠: {sorted(overlaps)}"
+
+        def row_of(widget):
+            return int(widget.grid_info()["row"])
+
+        # 每个参数控件都必须落在自己那个勾选框所在的行上。
+        fixed_row = row_of(app._history_fixed_times_entry.master)
+        band_row = row_of(app._history_band_candidate_entry.master.master)
+        assert fixed_row != band_row
+        for widget in (app._history_current_band_check,
+                       app._history_sigma_src_combo,
+                       app._history_sigma_win_entry):
+            assert row_of(widget.master.master) == band_row
+
+        checkbox_rows = {}
+        for child in settings.winfo_children():
+            if child.winfo_class() != "TCheckbutton" or not child.grid_info():
+                continue
+            checkbox_rows[str(child.cget("text"))] = row_of(child)
+        assert checkbox_rows["固定时刻"] == fixed_row
+        assert checkbox_rows["固定间隔"] == band_row
+        # 左栏是勾选、右栏是参数，不能反过来。
+        assert int(
+            app._history_fixed_times_entry.master.grid_info()["column"]) == 1
+        for label, row in checkbox_rows.items():
+            widget_column = next(
+                int(c.grid_info()["column"])
+                for c in settings.winfo_children()
+                if c.grid_info() and c.winfo_class() == "TCheckbutton"
+                and str(c.cget("text")) == label)
+            assert widget_column == 0, label
+    finally:
+        app.destroy()
