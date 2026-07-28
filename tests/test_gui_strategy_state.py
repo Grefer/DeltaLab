@@ -997,9 +997,6 @@ def _fake_history_collect_state(candidate_text="0.5，1,2"):
     fake._history_include_current_band_var = _BoolVar(True)
     fake._history_fixed_times_var = _Var("10:30,14:30")
     fake._history_band_candidate_sigmas_var = _Var(candidate_text)
-    fake._history_sigma_src_var = _Var(
-        gui_app.SIGMA_SOURCE_DISPLAY["realized"])
-    fake._history_sigma_win_var = _Var("30")
     fake._sync_band_inputs = lambda _source, strict=False: {
         "absolute": 1.0, "relative": 0.01, "sigma": 0.779423,
     }
@@ -1048,16 +1045,17 @@ def test_single_and_history_state_freeze_left_position_as_unique_source(
 
 def test_history_collects_its_own_candidates_times_and_sigma_configuration():
     fake = _fake_history_collect_state()
-    # 候选时刻与 σ 配置独立于普通回测区；收盘兜底是唯一共享例外。
+    # 候选时刻独立于普通回测区；收盘兜底是唯一共享例外。单次回测那边即使
+    # 选了历史波动率，也不能渗进择优候选——择优的 σ 恒为输入波动率。
     fake._fixed_times_var.set("09:45")
-    fake._sigma_src_var.set(gui_app.SIGMA_SOURCE_DISPLAY["implied"])
-    fake._sigma_win_var.set("20")
+    fake._sigma_src_var.set(gui_app.SIGMA_SOURCE_DISPLAY["realized"])
+    fake._sigma_win_var.set("30")
 
     state = BacktestApp._collect_history_state(fake)
 
     assert state["band_candidate_sigmas"] == (0.5, 1.0, 2.0)
-    assert state["sigma_source"] == "realized"
-    assert state["sigma_window"] == 30
+    assert state["sigma_source"] == "implied"
+    assert state["sigma_window"] == 20
     assert state["fixed_times"] == "10:30,14:30"
     assert state["history_include_close"] is True
     assert state["history_include_fixed_times"] is True
@@ -1145,7 +1143,8 @@ def test_history_wind_collection_uses_independent_asof_range_and_frequency():
     fake._history_wind_auto_start_var = _BoolVar(True)
 
     state = BacktestApp._collect_history_state(fake)
-    required = ANNUAL_DAYS + state["sigma_window"] + 1
+    # σ 恒取输入波动率，不再需要 HV 预热日；区间只留 Day 0 锚点那 1 日。
+    required = ANNUAL_DAYS + 1
     expected_start = (
         datetime.date(2025, 6, 30) - datetime.timedelta(
             days=BacktestApp._calendar_span_for_trading_days(required))
@@ -1156,7 +1155,7 @@ def test_history_wind_collection_uses_independent_asof_range_and_frequency():
     assert state["history_wind_start"] == expected_start
     assert state["wind_start"] == expected_start
     assert state["wind_required_trade_days"] == required
-    assert state["wind_sigma_warmup_days"] == state["sigma_window"]
+    assert state["wind_sigma_warmup_days"] == 0
     assert state["history_wind_bar_size_requested"] == WIND_AUTO_BAR_SIZE
     # 默认固定时刻 + 固定间隔候选冻结为同一实际粒度，保持公平比较；
     # 该粒度由最窄的 σ 候选（默认 0.5σ）决定，否则窄带候选会被系统性
@@ -1269,25 +1268,28 @@ def test_history_rejects_c2c_only_before_reading_disabled_candidate_controls():
     fake._history_fixed_times_var = _ForbiddenVar()
     fake._history_band_candidate_sigmas_var = _ForbiddenVar()
     fake._history_include_current_band_var = _ForbiddenVar()
-    fake._history_sigma_src_var = _ForbiddenVar()
-    fake._history_sigma_win_var = _ForbiddenVar()
 
     with pytest.raises(ValueError, match="至少再启用一种候选策略"):
         BacktestApp._collect_history_state(fake)
 
 
-def test_history_implied_sigma_does_not_read_unused_hv_window():
+def test_history_band_sigma_never_reads_any_volatility_source_control():
+    """择优候选的 σ 恒为输入波动率，不得从任何界面控件取来源或回看期。
+
+    择优只比带宽倍数本身，全部候选必须共用同一个 σ 才可比；一旦有人把
+    单次回测的「波动率来源」重新接进来，排名就会混进另一条策略维度。
+    """
     class _ForbiddenVar:
         def get(self):
-            raise AssertionError("implied σ 不应读取 HV 窗口")
+            raise AssertionError("择优不应读取波动率来源/回看期控件")
 
     fake = _fake_history_collect_state()
-    fake._history_sigma_src_var.set(
-        gui_app.SIGMA_SOURCE_DISPLAY["implied"])
-    fake._history_sigma_win_var = _ForbiddenVar()
+    fake._sigma_src_var = _ForbiddenVar()
+    fake._sigma_win_var = _ForbiddenVar()
 
     state = BacktestApp._collect_history_state(fake)
 
+    assert state["history_include_band"] is True
     assert state["sigma_source"] == "implied"
     assert state["sigma_window"] == 20
 
@@ -1336,13 +1338,9 @@ def test_history_candidate_controls_only_follow_history_strategy_switches():
     fake = SimpleNamespace(
         _history_include_fixed_times_var=_BoolVar(False),
         _history_include_band_var=_BoolVar(True),
-        _history_sigma_src_var=_Var(
-            gui_app.SIGMA_SOURCE_DISPLAY["realized"]),
         _history_fixed_times_entry=_Widget(),
         _history_band_candidate_entry=_Widget(),
         _history_current_band_check=_Widget(),
-        _history_sigma_src_combo=_Widget(),
-        _history_sigma_win_entry=_Widget(),
     )
 
     BacktestApp._toggle_history_candidate_controls(fake)
@@ -1350,13 +1348,6 @@ def test_history_candidate_controls_only_follow_history_strategy_switches():
     assert fake._history_fixed_times_entry.state == "disabled"
     assert fake._history_band_candidate_entry.state == "normal"
     assert fake._history_current_band_check.state == "normal"
-    assert fake._history_sigma_src_combo.state == "readonly"
-    assert fake._history_sigma_win_entry.state == "normal"
-
-    fake._history_sigma_src_var.set(
-        gui_app.SIGMA_SOURCE_DISPLAY["implied"])
-    BacktestApp._toggle_history_candidate_controls(fake)
-    assert fake._history_sigma_win_entry.state == "disabled"
 
     fake._history_include_fixed_times_var.set(True)
     fake._history_include_band_var.set(False)
@@ -1365,16 +1356,12 @@ def test_history_candidate_controls_only_follow_history_strategy_switches():
     assert fake._history_fixed_times_entry.state == "normal"
     assert fake._history_band_candidate_entry.state == "disabled"
     assert fake._history_current_band_check.state == "disabled"
-    assert fake._history_sigma_src_combo.state == "disabled"
-    assert fake._history_sigma_win_entry.state == "disabled"
 
 
 def test_ordinary_backtest_does_not_parse_hidden_history_candidates():
     fake = _fake_collect_state()
     fake._history_band_candidate_sigmas_var = _Var("not-a-number")
     fake._history_fixed_times_var = _Var("not-a-time")
-    fake._history_sigma_src_var = _Var("invalid-hidden-value")
-    fake._history_sigma_win_var = _Var("also-invalid")
 
     state = BacktestApp._collect_gui_state(fake)
 
@@ -2832,9 +2819,8 @@ def _fake_history_apply_target():
     fake._fixed_times_var = _Var("11:30,15:00")
     fake._sigma_src_var = _Var(gui_app.SIGMA_SOURCE_DISPLAY["implied"])
     fake._sigma_win_var = _Var("20")
-    fake._history_sigma_src_var = _Var(
-        gui_app.SIGMA_SOURCE_DISPLAY["implied"])
-    fake._history_sigma_win_var = _Var("20")
+    fake._history_band_candidate_sigmas_var = _Var("0.5,1,2")
+    fake._history_fixed_times_var = _Var("10:30,14:30")
     fake._comparison_finite = BacktestApp._comparison_finite
     fake._comparison_safe_int = BacktestApp._comparison_safe_int
     fake._comparison_safe_bool = BacktestApp._comparison_safe_bool
@@ -2910,8 +2896,8 @@ def test_apply_history_recommendation_restores_public_close_fallback(enabled):
 
 def test_apply_history_band_recommendation_updates_only_backtest_band_controls():
     fake, navigated, _statuses = _fake_history_apply_target()
-    history_sigma_source_before = fake._history_sigma_src_var.get()
-    history_sigma_window_before = fake._history_sigma_win_var.get()
+    history_candidates_before = fake._history_band_candidate_sigmas_var.get()
+    history_fixed_times_before = fake._history_fixed_times_var.get()
     row = {
         "strategy": "固定间隔(1.5σ)",
         "meta_strategy_name": "hedge_band",
@@ -2938,8 +2924,9 @@ def test_apply_history_band_recommendation_updates_only_backtest_band_controls()
     assert fake._sigma_src_var.get() == gui_app.SIGMA_SOURCE_DISPLAY["realized"]
     assert fake._sigma_win_var.get() == "30"
     # “应用”只写回单次回测表单，历史候选空间不能被反向污染。
-    assert fake._history_sigma_src_var.get() == history_sigma_source_before
-    assert fake._history_sigma_win_var.get() == history_sigma_window_before
+    assert (fake._history_band_candidate_sigmas_var.get()
+            == history_candidates_before)
+    assert fake._history_fixed_times_var.get() == history_fixed_times_before
     assert navigated == []
 
 
@@ -4478,7 +4465,6 @@ def test_band_only_params_gray_out_with_their_owning_strategy():
         band_widgets = (
             app._history_band_candidate_entry,
             app._history_current_band_check,
-            app._history_sigma_src_combo,
         )
 
         app._history_include_band_var.set(False)
@@ -4538,10 +4524,7 @@ def test_candidate_config_pairs_each_strategy_with_its_params_on_one_row():
         fixed_row = row_of(app._history_fixed_times_entry.master)
         band_row = row_of(app._history_band_candidate_entry.master.master)
         assert fixed_row != band_row
-        for widget in (app._history_current_band_check,
-                       app._history_sigma_src_combo,
-                       app._history_sigma_win_entry):
-            assert row_of(widget.master.master) == band_row
+        assert row_of(app._history_current_band_check.master.master) == band_row
 
         checkbox_rows = {}
         for child in settings.winfo_children():

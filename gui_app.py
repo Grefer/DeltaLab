@@ -1647,30 +1647,13 @@ class BacktestApp(tk.Tk):
             band_extra, textvariable=self._history_current_band_label_var,
             variable=self._history_include_current_band_var,
         )
-        self._history_current_band_check.pack(side="left", padx=(0, 22))
+        self._history_current_band_check.pack(side="left", padx=(0, 18))
+        # σ 恒取左侧输入的波动率，界面上不再给选项：选「历史波动率」会让
+        # 带宽随行情伸缩，那是另一条策略维度，而这里的排名只比带宽倍数，
+        # 全部候选共用同一个 σ 才可比。引擎侧仍支持 realized。
         ttk.Label(
-            band_extra, text="σ 来源:", style="Surface.TLabel",
-        ).pack(side="left")
-        self._history_sigma_src_var = tk.StringVar(
-            value=SIGMA_SOURCE_DISPLAY["implied"])
-        self._history_sigma_src_combo = ttk.Combobox(
-            band_extra, textvariable=self._history_sigma_src_var, width=14,
-            values=tuple(SIGMA_SOURCE_DISPLAY.values()), state="readonly",
-        )
-        self._history_sigma_src_combo.pack(side="left", padx=(8, 18))
-        self._history_sigma_src_combo.bind(
-            "<<ComboboxSelected>>",
-            lambda _event: self._toggle_history_candidate_controls(),
-        )
-        ttk.Label(
-            band_extra, text="回看:", style="Surface.TLabel",
-        ).pack(side="left")
-        self._history_sigma_win_var = tk.StringVar(value="20")
-        self._history_sigma_win_entry = ttk.Entry(
-            band_extra, textvariable=self._history_sigma_win_var, width=6)
-        self._history_sigma_win_entry.pack(side="left", padx=(8, 4))
-        ttk.Label(
-            band_extra, text="日", style="SurfaceMuted.TLabel",
+            band_extra, text="σ 统一取左侧输入的波动率",
+            style="SurfaceMuted.TLabel",
         ).pack(side="left")
 
         ttk.Separator(settings, orient="horizontal").grid(
@@ -2095,21 +2078,12 @@ class BacktestApp(tk.Tk):
         """只联动历史页自己的候选输入，不影响单次回测控件。"""
         fixed_enabled = bool(self._history_include_fixed_times_var.get())
         band_enabled = bool(self._history_include_band_var.get())
-        sigma_source = SIGMA_SOURCE_FROM_DISPLAY.get(
-            self._history_sigma_src_var.get(),
-            self._history_sigma_src_var.get(),
-        )
         self._history_fixed_times_entry.configure(
             state="normal" if fixed_enabled else "disabled")
         self._history_band_candidate_entry.configure(
             state="normal" if band_enabled else "disabled")
         self._history_current_band_check.configure(
             state="normal" if band_enabled else "disabled")
-        self._history_sigma_src_combo.configure(
-            state="readonly" if band_enabled else "disabled")
-        self._history_sigma_win_entry.configure(
-            state=("normal" if band_enabled and sigma_source == "realized"
-                   else "disabled"))
         BacktestApp._toggle_history_wind_controls(self)
 
     def _history_summary_bar_label(self):
@@ -2452,19 +2426,7 @@ class BacktestApp(tk.Tk):
                 " + Day 0 锚点")
         else:
             range_text = "使用自定义历史起始日"
-        sigma_source_var = getattr(self, "_history_sigma_src_var", None)
-        sigma_window_var = getattr(self, "_history_sigma_win_var", None)
-        sigma_source = SIGMA_SOURCE_FROM_DISPLAY.get(
-            sigma_source_var.get() if sigma_source_var is not None else "",
-            sigma_source_var.get() if sigma_source_var is not None else "",
-        )
-        if include_band and sigma_source == "realized":
-            try:
-                warmup_days = int(
-                    sigma_window_var.get() if sigma_window_var is not None else 0)
-            except (TypeError, ValueError):
-                warmup_days = 0
-            range_text += f" + HV预热 {warmup_days} 日"
+        # 候选带宽的 σ 固定取左侧输入的波动率，不再需要 HV 预热区间。
         # 全部候选共用同一份行情，粒度取各自所需里最细的一档，保证可比。
         hint.set(f"统一采用 {actual}；{range_text}")
 
@@ -3124,7 +3086,14 @@ class BacktestApp(tk.Tk):
 
     @staticmethod
     def _history_realized_warmup_days(state):
-        """返回历史候选在 Day 0 前必须具备的 realized-HV 预热日数。"""
+        """返回历史候选在 Day 0 前必须具备的 realized-HV 预热日数。
+
+        界面已不再提供 σ 来源选项，``_collect_history_state`` 恒写入
+        ``implied``，因此当前返回值恒为 0。保留这条判断是因为回测引擎仍
+        支持 realized，而分析层用的是 ``strict_sigma_warmup=True``——一旦
+        有 realized 状态从别处（旧配置、后端直调）流进来却没预热区间，会
+        直接抛错而不是降级，那时静默返回 0 比现在更难查。
+        """
         if not bool(state.get("history_include_band", False)):
             return 0
         if str(state.get("sigma_source", "implied")) != "realized":
@@ -3530,6 +3499,8 @@ class BacktestApp(tk.Tk):
             FixedTimeStrategy(fixed_times)
 
         band_candidates = ()
+        # 候选带宽的 σ 恒为左侧输入的波动率：全部候选共用同一个 σ，排名
+        # 才是在比带宽倍数本身。引擎仍支持 realized，只是不再从这里进入。
         sigma_source = "implied"
         sigma_window = 20
         if include_band:
@@ -3539,18 +3510,6 @@ class BacktestApp(tk.Tk):
                 raise ValueError(
                     "固定间隔已勾选，请至少输入一个 σ 候选，"
                     "或勾选『加入当前回测带宽』。")
-            sigma_source = SIGMA_SOURCE_FROM_DISPLAY.get(
-                self._history_sigma_src_var.get(),
-                self._history_sigma_src_var.get(),
-            )
-            if sigma_source not in SIGMA_SOURCE_DISPLAY:
-                raise ValueError(f"未知历史候选 σ 来源: {sigma_source}")
-            if sigma_source == "realized":
-                sigma_window = int(self._history_sigma_win_var.get())
-                if sigma_window < 2:
-                    raise ValueError("历史候选 HV 回看期必须至少为 2 日。")
-            else:
-                sigma_window = 20
 
         state.update({
             "history_lookbacks": history_lookbacks,
