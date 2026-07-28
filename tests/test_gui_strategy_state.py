@@ -4432,6 +4432,85 @@ def test_source_hint_is_rendered_once_as_a_pill():
         app.destroy()
 
 
+def _history_scoring_note_context(*, relative_windows, paired):
+    """渲染一次周期说明，返回那一行文案。
+
+    ``relative_comparison_windows`` 与配对段数一致时不该出现“参与评分”
+    补充说明——它是异常提示，不是常驻信息。
+    """
+    import tkinter as tk
+    import gui_app as module
+    try:
+        probe = tk.Tk()
+    except tk.TclError:
+        pytest.skip("无可用显示环境")
+    probe.destroy()
+
+    def rank_row(rank, strategy, strategy_type, score):
+        return {
+            "lookback": "quarter", "rank": rank, "strategy": strategy,
+            "strategy_type": strategy_type, "score": score,
+            "baseline_score": 10.0, "improvement_vs_c2c": 0.1,
+            "selection_improvement_vs_c2c": 0.1,
+            "selection_metric":
+                history_selection.STRICT_LOOKBACK_SELECTION_METRIC,
+            "window_win_rate_vs_c2c": 1.0,
+            "paired_windows": paired, "baseline_windows": paired,
+            "comparison_eligible": True, "rolling_windows": paired,
+            "eligible_endpoints": paired, "skipped_endpoints": 0,
+            "history_days_available": 61, "lookback_days": 61,
+            "complete_window": True, "maturity_days": 22,
+            "evidence_days": 61, "days_used": 61,
+            "evaluation_mode": "strict_lookback",
+            "sampling_mode": "strict_contiguous",
+            "segment_count": paired, "expiry_segments": paired - 1,
+            "mtm_segments": 1, "terminal_mode": "mixed",
+            "relative_comparison_windows": relative_windows,
+            "incremental_pnl_vs_c2c": 0.01,
+            "incremental_sharpe_vs_c2c": 0.2,
+            "incremental_tc_vs_c2c": 0.001,
+            "max_drawdown": 0.03,
+        }
+
+    ranking = pd.DataFrame([
+        rank_row(1, "固定间隔(1σ)", "hedge_band", 9.0),
+        rank_row(2, "每日收盘", "close_to_close", 10.0),
+    ])
+    recommendations = ranking[ranking["rank"].eq(1)].copy()
+
+    app = module.BacktestApp()
+    try:
+        app.withdraw()
+        BacktestApp._show_history_recommendation(
+            app, recommendations, ranking, notes=None,
+            source_label="CSV · 测试", window_results=None,
+            history_state={"history_lookbacks": {"quarter": 61}})
+        app.update_idletasks()
+        return app._history_period_context_var.get()
+    finally:
+        app.destroy()
+
+
+def test_history_period_note_stays_silent_when_every_segment_scored():
+    """全部分段都进了相对评分时，不得再打“参与评分 N/M 段”。
+
+    该字段在严格区间模式下曾被写成 `1 if isfinite(...) else 0` 的是/否
+    标志，而展示层拿它跟段数比，于是分段多于一段就恒打这句话，读起来像
+    丢掉了 M-1 段证据——实际一段没丢。
+    """
+    text = _history_scoring_note_context(relative_windows=3, paired=3)
+
+    assert "参与评分" not in text, text
+    assert "分成 3 段" in text
+
+
+def test_history_period_note_still_fires_when_segments_drop_out():
+    """确实有分段算不出相对口径时，提示要照常出现。"""
+    text = _history_scoring_note_context(relative_windows=2, paired=3)
+
+    assert "参与评分 2/3 段" in text
+
+
 def test_band_only_params_gray_out_with_their_owning_strategy():
     """固定间隔的四项参数必须整组跟着它的勾选启停。
 

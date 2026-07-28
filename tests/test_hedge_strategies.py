@@ -1729,6 +1729,10 @@ def test_strict_lookbacks_cover_each_evidence_day_once():
         assert row["history_complete"]
         assert row["selection_metric"] == (
             "strict_lookback_daily_rms_advantage_vs_c2c")
+        # 数据健康时，参与相对评分的段数必须等于配对段数——它是段数，
+        # 不是是/否标志。展示层拿它跟配对段数比来决定要不要提示“参与评分
+        # N/M 段”，两者单位一旦不同，提示就会恒亮。
+        assert row["relative_comparison_windows"] == row["paired_windows"]
 
         paths = _history_window_indices(windows, lookback, "daily")
         assert len(paths) == segment_count
@@ -2901,7 +2905,10 @@ def test_strict_ranking_uses_combined_l_day_rms_not_equal_segment_votes(
         expected_advantage)
     assert candidate["selection_metric"] == (
         "strict_lookback_daily_rms_advantage_vs_c2c")
-    assert candidate["relative_comparison_windows"] == 1
+    # 参与相对评分的段数，不是是/否标志：三段里有一段基线 RMS 为 0，
+    # 改善率算不出来（_history_improvement_vs_c2c 遇到零基线返回 nan），
+    # 所以只有 2 段进了相对口径。
+    assert candidate["relative_comparison_windows"] == 2
     assert candidate["median_window_improvement_vs_c2c"] == pytest.approx(0.5)
     assert candidate["window_win_rate_vs_c2c"] == pytest.approx(2.0 / 3.0)
     # 合并 L 日 RMS 仍按上面的公式计算并保留为诊断值，但名次已改由增量

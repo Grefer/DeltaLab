@@ -1988,8 +1988,11 @@ def recommend_by_rolling_history(
                 "baseline_tc": baseline_metrics["total_tc"],
                 "incremental_tc_vs_c2c": (
                     metrics["total_tc"] - baseline_metrics["total_tc"]),
-                "relative_comparison_windows": (
-                    1 if np.isfinite(selection_advantage) else 0),
+                # 参与相对评分的**段数**，与合约池模式同单位。此前这里写的
+                # 是 `1 if isfinite(...) else 0`，一个是/否标志——展示层拿它
+                # 和段数比，于是只要分段多于一段就恒打出“参与评分 1/N 段”，
+                # 读起来像丢掉了 N-1 段证据，实际一段没丢。
+                "relative_comparison_windows": len(segment_improvements),
                 **{f"meta_{key}": value
                    for key, value in case.metadata.items()},
             })
