@@ -386,18 +386,13 @@ _OBJECTIVE_COLUMN_KEYS = {
     "incremental_sharpe": "incremental_sharpe",
 }
 
-HISTORY_CHART_MODE_DISPLAY = {
-    "full": "完整回放累积路径",
-    "single": "单次分段路径",
-    "typical": "多分段中位路径",
-}
+# 图表口径固定为整段接续（模式 "full"），不再有模式下拉，因此这里只留
+# 指标的显示名。history_selection 的模型层仍实现着 single / typical，供
+# 直接调用，但界面不再提供入口——它们与排名口径不一致。
 HISTORY_CHART_METRIC_DISPLAY = {
     "net": "净损益",
     "gross": "成本前损益",
     "tc": "交易成本",
-}
-HISTORY_CHART_MODE_FROM_DISPLAY = {
-    value: key for key, value in HISTORY_CHART_MODE_DISPLAY.items()
 }
 HISTORY_CHART_METRIC_FROM_DISPLAY = {
     value: key for key, value in HISTORY_CHART_METRIC_DISPLAY.items()
@@ -4741,29 +4736,31 @@ class BacktestApp(tk.Tk):
             command=self._prompt_delete_saved_backtest,
         ).pack(side="left", padx=(4, 0))
 
-        columns = ("shown", "name", "origin", "strategy", "parameters",
+        columns = ("name", "origin", "strategy", "parameters",
                    "source", "saved_at")
         headings = {
-            "shown": "显示", "name": "结果名称", "origin": "产生方式",
+            "name": "结果名称", "origin": "产生方式",
             "strategy": "策略", "parameters": "策略参数",
             "source": "行情来源", "saved_at": "保留时间",
         }
         widths = {
-            "shown": 46, "name": 138, "origin": 74, "strategy": 104,
+            "name": 138, "origin": 74, "strategy": 104,
             "parameters": 212, "source": 132, "saved_at": 104,
         }
         tree_frame = ttk.Frame(pool, style="Surface.TFrame")
         tree_frame.pack(fill="x")
         tree = ttk.Treeview(
-            tree_frame, columns=columns, show="headings", height=5,
+            tree_frame, columns=columns, show="tree headings", height=5,
             selectmode="browse",
         )
+        tree.heading("#0", text="显示")
+        tree.column("#0", width=46, minwidth=44, stretch=False, anchor="center")
         for column in columns:
             tree.heading(column, text=headings[column])
             tree.column(
                 column, width=widths[column], minwidth=44,
                 anchor="center" if column in (
-                    "shown", "origin", "strategy", "saved_at") else "w",
+                    "origin", "strategy", "saved_at") else "w",
                 stretch=column in ("name", "parameters"),
             )
         scrollbar = ttk.Scrollbar(tree_frame, orient="vertical", command=tree.yview)
@@ -4813,10 +4810,11 @@ class BacktestApp(tk.Tk):
         for item in tree.get_children():
             tree.delete(item)
         for snapshot in self._saved_backtests.values():
+            is_selected = snapshot.result_id in self._saved_comparison_selection
             tree.insert(
                 "", "end", iid=snapshot.result_id,
+                image=self._cb_sf_checked if is_selected else self._cb_sf_unchecked,
                 values=(
-                    "☑" if snapshot.result_id in self._saved_comparison_selection else "☐",
                     snapshot.name,
                     BacktestApp._saved_snapshot_origin_label(snapshot),
                     (f"{snapshot.strategy_label} · 基准"
@@ -4851,7 +4849,7 @@ class BacktestApp(tk.Tk):
             return "break"
         tree = self._saved_pool_tree
         result_id = tree.identify_row(event.y)
-        if not result_id or tree.identify_column(event.x) != "#1":
+        if not result_id or tree.identify_column(event.x) != "#0":
             return None
         tree.selection_set(result_id)
         tree.focus(result_id)
@@ -5103,11 +5101,8 @@ class BacktestApp(tk.Tk):
             "_history_window_summary", "_history_replay_index",
             "_history_replay_window_var", "_history_replay_window_combo",
             "_history_chart_figure", "_history_chart_ax",
-            "_history_chart_canvas", "_history_chart_mode_var",
-            "_history_chart_metric_var", "_history_chart_window_var",
-            "_history_chart_mode_combo", "_history_chart_metric_combo",
-            "_history_chart_window_combo", "_history_chart_window_labels",
-            "_history_chart_hint_var",
+            "_history_chart_canvas", "_history_chart_metric_var",
+            "_history_chart_metric_combo", "_history_chart_hint_var",
             "_history_chart_selected_by_period", "_history_pairs_cache",
             "_history_chart_color_map", "_history_chart_marker_map",
             "_history_action_hint_var",
@@ -5555,8 +5550,10 @@ class BacktestApp(tk.Tk):
         )
         tree = ttk.Treeview(
             parent, columns=tuple(key for key, _text, _width in specs),
-            show="headings", height=height, selectmode="browse",
+            show="tree headings", height=height, selectmode="browse",
         )
+        tree.heading("#0", text="勾选")
+        tree.column("#0", width=46, stretch=False, anchor="center")
         for key, heading, width in specs:
             text = heading or labels[key]
             if key in _OBJECTIVE_COLUMN_KEYS:
@@ -5868,7 +5865,6 @@ class BacktestApp(tk.Tk):
         rank_tree = BacktestApp._build_history_metric_tree(
             detail_box,
             lead_columns=(
-                ("shown", "勾选", 50),
                 ("rank", "#", 38),
                 ("strategy", "策略 / 参数", 232),
             ),
@@ -5909,25 +5905,16 @@ class BacktestApp(tk.Tk):
         self._build_history_action_bar(detail_box)
 
     def _build_history_action_bar(self, detail_box):
-        """把历史证据回放与当前环境重跑收拢到同一条动作栏。"""
+        """把结论用到当下的动作栏；逐段下钻另在图表下方，两者对象不同。"""
         actions = tk.Frame(
             detail_box, bg=PALETTE["surface_alt"],
             highlightbackground=PALETTE["border_soft"], highlightthickness=1,
             padx=12, pady=6)
         actions.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(6, 2))
         tk.Label(
-            actions, text="加载分段:", bg=PALETTE["surface_alt"], fg=PALETTE["text_muted"],
+            actions, text="把选中策略用到当前回测:",
+            bg=PALETTE["surface_alt"], fg=PALETTE["text_muted"],
             font=(_UI_FONT_FAMILY, 9, "bold"),
-        ).pack(side="left")
-        self._history_replay_window_var = tk.StringVar(value="")
-        self._history_replay_window_combo = ttk.Combobox(
-            actions, textvariable=self._history_replay_window_var,
-            values=(), width=40, state="readonly",
-        )
-        self._history_replay_window_combo.pack(side="left", padx=(6, 8))
-        ttk.Button(
-            actions, text="加载分段到展示页",
-            command=self._load_history_window_backtest,
         ).pack(side="left")
         tk.Frame(actions, bg=PALETTE["surface_alt"]).pack(
             side="left", fill="x", expand=True)
@@ -6055,7 +6042,14 @@ class BacktestApp(tk.Tk):
         hint_var.set(scope)
 
     def _build_history_chart_box(self, parent):
-        """渲染共同回测分段损益图表及其模式 / 口径 / 分段控件。"""
+        """渲染整段接续的损益图表、口径切换与逐段下钻入口。
+
+        图表口径固定为「完整回放累积路径」，不再提供单段 / 中位段视图：
+        排名指标是把各段日损益接成一条后统计的（见 hedge_analysis 里的
+        ``pd.concat(daily_windows)``），单段曲线与整段排名可以给出相反的
+        印象，而界面无从提示这是两个口径。想看某一段的细节走下方的
+        「查看某段明细」，那是下钻，不是换口径。
+        """
         chart_box = ttk.LabelFrame(
             parent,
             text=" 累计损益对比 ",
@@ -6067,21 +6061,6 @@ class BacktestApp(tk.Tk):
             highlightbackground=PALETTE["border_soft"], highlightthickness=1,
             padx=12, pady=6)
         controls.pack(fill="x", pady=(0, 4))
-        tk.Label(
-            controls, text="模式:", bg=PALETTE["surface_alt"], fg=PALETTE["text_muted"],
-            font=(_UI_FONT_FAMILY, 9, "bold"),
-        ).pack(side="left")
-        self._history_chart_mode_var = tk.StringVar(
-            value=HISTORY_CHART_MODE_DISPLAY["full"])
-        self._history_chart_mode_combo = ttk.Combobox(
-            controls, textvariable=self._history_chart_mode_var,
-            values=tuple(HISTORY_CHART_MODE_DISPLAY.values()),
-            width=15, state="readonly",
-        )
-        self._history_chart_mode_combo.pack(side="left", padx=(6, 14))
-        self._history_chart_mode_combo.bind(
-            "<<ComboboxSelected>>", self._update_history_chart_controls)
-
         tk.Label(
             controls, text="指标:", bg=PALETTE["surface_alt"], fg=PALETTE["text_muted"],
             font=(_UI_FONT_FAMILY, 9, "bold"),
@@ -6096,19 +6075,6 @@ class BacktestApp(tk.Tk):
         self._history_chart_metric_combo.pack(side="left", padx=(5, 12))
         self._history_chart_metric_combo.bind(
             "<<ComboboxSelected>>", self._update_history_chart_controls)
-
-        tk.Label(
-            controls, text="图表分段:", bg=PALETTE["surface_alt"], fg=PALETTE["text_muted"],
-        ).pack(side="left")
-        self._history_chart_window_var = tk.StringVar(value="")
-        self._history_chart_window_combo = ttk.Combobox(
-            controls, textvariable=self._history_chart_window_var,
-            values=(), width=35, state="readonly",
-        )
-        self._history_chart_window_combo.pack(side="left", padx=(5, 8))
-        self._history_chart_window_combo.bind(
-            "<<ComboboxSelected>>", self._draw_history_chart)
-        self._history_chart_window_labels = {}
         self._history_chart_hint_var = tk.StringVar(value="")
         tk.Label(
             controls, textvariable=self._history_chart_hint_var,
@@ -6127,6 +6093,37 @@ class BacktestApp(tk.Tk):
             self._history_chart_figure, master=chart_box)
         self._history_chart_canvas.get_tk_widget().pack(
             fill="both", expand=True)
+        self._build_history_replay_bar(chart_box)
+
+    def _build_history_replay_bar(self, chart_box):
+        """逐段下钻入口：紧贴图表，因为选段这个动作是从图上发起的。
+
+        展示页结构上只能装一次回测，而排名口径是各段合并——整段没法塞进
+        展示页，所以下钻天然要选一段。
+        """
+        replay = tk.Frame(
+            chart_box, bg=PALETTE["surface_alt"],
+            highlightbackground=PALETTE["border_soft"], highlightthickness=1,
+            padx=12, pady=6)
+        replay.pack(fill="x", pady=(6, 0))
+        tk.Label(
+            replay, text="查看某段明细:", bg=PALETTE["surface_alt"],
+            fg=PALETTE["text_muted"], font=(_UI_FONT_FAMILY, 9, "bold"),
+        ).pack(side="left")
+        self._history_replay_window_var = tk.StringVar(value="")
+        self._history_replay_window_combo = ttk.Combobox(
+            replay, textvariable=self._history_replay_window_var,
+            values=(), width=40, state="readonly",
+        )
+        self._history_replay_window_combo.pack(side="left", padx=(6, 8))
+        ttk.Button(
+            replay, text="加载到展示页",
+            command=self._load_history_window_backtest,
+        ).pack(side="left")
+        tk.Label(
+            replay, text="把选中策略的这一段单独跑出 Greeks 与逐 bar 明细",
+            bg=PALETTE["surface_alt"], fg=PALETTE["text_muted"],
+        ).pack(side="left", padx=(12, 0))
 
     def _history_chart_candidates(self, lookback=None):
         """按排名顺序返回当前周期勾选的图表候选，不包含固定 每日收盘。"""
@@ -6200,19 +6197,19 @@ class BacktestApp(tk.Tk):
                 row.get("strategy_type", "")) == "close_to_close"
             paired = self._comparison_safe_int(
                 row.get("paired_windows", row.get("rolling_windows")), 0)
-            mark = (
-                "基准" if is_baseline else
-                "☑" if strategy in selected else
-                "☐" if paired > 0 else "—"
-            )
-            tree.set(iid, "shown", mark)
+            if is_baseline:
+                tree.item(iid, image="", text="基准")
+            elif paired > 0:
+                tree.item(iid, image=self._cb_sf_checked if strategy in selected else self._cb_sf_unchecked, text="")
+            else:
+                tree.item(iid, image="", text="—")
         # 勾选集合同时决定图表曲线与批量验证范围，标记刷新处一并同步说明。
         self._refresh_history_action_hint()
 
     def _toggle_history_chart_click(self, event):
         tree = self._history_rank_tree
         iid = tree.identify_row(event.y)
-        if not iid or tree.identify_column(event.x) != "#1":
+        if not iid or tree.identify_column(event.x) != "#0":
             return None
         tree.selection_set(iid)
         tree.focus(iid)
@@ -6308,18 +6305,16 @@ class BacktestApp(tk.Tk):
         return period.get("lookback"), self._selected_history_rank_row()
 
     def _history_chart_view_options(self):
-        """读取图表模式与口径下拉的当前取值。
+        """返回绘图口径。模式恒为 ``full``，只有指标可切。
 
-        旧热更新控件可能仍残留已删除的“逐窗优势”显示值；四处调用点统一
-        走这里降级到与严格区间排名证据一致的完整 L 日累计路径。
+        排名指标统计的是各段日损益接成一条之后的整段，图表必须同口径。
+        单段 / 中位段视图在后端仍然实现着，但不再从界面进入——同一个策略
+        整段为正、某一段为负是常态，两个口径并列摆着只会误导。
         """
-        mode_var = getattr(self, "_history_chart_mode_var", None)
         metric_var = getattr(self, "_history_chart_metric_var", None)
-        mode = HISTORY_CHART_MODE_FROM_DISPLAY.get(
-            mode_var.get() if mode_var is not None else "", "full")
         metric = HISTORY_CHART_METRIC_FROM_DISPLAY.get(
             metric_var.get() if metric_var is not None else "", "net")
-        return mode, metric
+        return "full", metric
 
     def _history_chart_pairs_cache(self):
         """返回本次结果页的策略配对缓存；结果页重建时由渲染入口清空。"""
@@ -6330,28 +6325,7 @@ class BacktestApp(tk.Tk):
         return cache
 
     def _update_history_chart_controls(self, _event=None):
-        """按当前周期及图表候选刷新共同回测分段和控件可用性。"""
-        mode, metric = self._history_chart_view_options()
-        lookback, _row = self._history_chart_selection()
-        candidates = self._history_chart_candidates(lookback)
-        model = BacktestApp._history_multi_chart_model(
-            getattr(self, "_history_window_summary", None),
-            lookback, candidates, mode=mode, metric=metric,
-            primary_strategy=self._history_chart_primary_candidate(candidates),
-            pairs_cache=self._history_chart_pairs_cache(),
-        )
-        labels = {
-            str(item["label"]): str(item["window_id"])
-            for item in model.get("window_options", ())
-        }
-        self._history_chart_window_labels = labels
-        window_combo = self._history_chart_window_combo
-        window_combo.configure(values=tuple(labels))
-        current = self._history_chart_window_var.get()
-        if current not in labels:
-            self._history_chart_window_var.set(next(reversed(labels), ""))
-        window_combo.configure(
-            state="readonly" if mode == "single" and labels else "disabled")
+        """切换指标后重绘；图表口径固定，没有别的控件需要联动。"""
         self._history_chart_metric_combo.configure(state="readonly")
         self._draw_history_chart()
 
@@ -6474,7 +6448,9 @@ class BacktestApp(tk.Tk):
         except tk.TclError:
             return options
         if var.get() not in labels:
-            var.set(labels[0] if labels else "")
+            # 默认落在最近一段：段按时间升序排列，末项离当下最近，也是
+            # 用户最可能想复核的那一笔。
+            var.set(labels[-1] if labels else "")
         return options
 
     def _selected_history_replay_spec(self):
@@ -6488,8 +6464,9 @@ class BacktestApp(tk.Tk):
         options = self._history_replay_options(strategy_name)
         if not options:
             return None, strategy_name
+        # 与下拉的默认值保持一致：标签对不上时落到最近一段，不是最早那段。
         chosen = next(
-            (item for item in options if item["label"] == label), options[0])
+            (item for item in options if item["label"] == label), options[-1])
         return chosen["spec"], strategy_name
 
     def _load_history_window_backtest(self):
@@ -6617,13 +6594,9 @@ class BacktestApp(tk.Tk):
         candidates = self._history_chart_candidates(lookback)
         primary_strategy = self._history_chart_primary_candidate(candidates)
         mode, metric = self._history_chart_view_options()
-        window_label = self._history_chart_window_var.get()
-        window_id = getattr(
-            self, "_history_chart_window_labels", {}).get(window_label)
         model = BacktestApp._history_multi_chart_model(
             getattr(self, "_history_window_summary", None),
             lookback, candidates, mode=mode, metric=metric,
-            window_id=window_id,
             primary_strategy=primary_strategy,
             pairs_cache=self._history_chart_pairs_cache(),
         )
@@ -6659,100 +6632,48 @@ class BacktestApp(tk.Tk):
         scope_note = (
             "；可比段数少于单个策略各自的段数，与排名表不同"
             if model.get("sample_scope_differs") else "")
-        if mode in {"full", "single"}:
-            candidate_index = 0
-            for series in model["series"]:
-                baseline = series["role"] == "baseline"
-                strategy = str(series.get("strategy", series.get("label", "")))
-                if baseline:
-                    color, marker = baseline_color, None
-                else:
-                    color, marker = _candidate_style(
-                        strategy, candidate_index)
-                    candidate_index += 1
-                emphasized = strategy == primary_strategy
-                y_values = np.asarray(series["y"], dtype=float)
-                ax.plot(
-                    series["x"], y_values, label=series["label"],
-                    color=color,
-                    linestyle="--" if baseline else "-",
-                    linewidth=(2.1 if baseline else 2.5 if emphasized else 1.8),
-                    marker=marker, markersize=3.2,
-                    markevery=(None if baseline else max(1, len(y_values) // 9)),
-                    alpha=1.0 if baseline or emphasized else 0.86,
-                )
-            # X 轴标签与下方图例位置冲突，且“横轴是交易日”一望即知。
-            ax.set_xlabel("")
-            ax.set_ylabel(model["metric_label"], fontsize=8)
-            if mode == "full":
-                for boundary in model.get("segment_boundaries", ()):
-                    ax.axvline(
-                        float(boundary) + 0.5,
-                        color=PALETTE["text_muted"], linestyle=":",
-                        linewidth=0.7, alpha=0.55)
-                common_days = self._comparison_safe_int(
-                    model.get("common_day_count"), 0)
-                expected_days = self._comparison_safe_int(
-                    model.get("expected_day_count"), common_days)
-                completeness = (
-                    "完整" if model.get("complete_evidence")
-                    else "部分重叠")
-                self._history_chart_hint_var.set(
-                    f"可比 {common_count} 段 · {completeness} "
-                    f"{common_days}/{expected_days} 日 · "
-                    f"每日收盘 + {len(candidates)} 个策略{scope_note}")
-                if model.get("uses_normalized_notional"):
-                    self._history_chart_hint_var.set(
-                        self._history_chart_hint_var.get()
-                        + "；跨合约按各段 "
-                        "损益/(S0×乘数×|数量|) 安全归一化后拼接")
+        # 口径固定为整段接续，只剩这一条绘制分支。
+        candidate_index = 0
+        for series in model["series"]:
+            baseline = series["role"] == "baseline"
+            strategy = str(series.get("strategy", series.get("label", "")))
+            if baseline:
+                color, marker = baseline_color, None
             else:
-                self._history_chart_hint_var.set(
-                    f"可比 {common_count} 段 · "
-                    f"当前 {window_label or '—'} · "
-                    f"每日收盘 + {len(candidates)} 个策略{scope_note}")
-        elif mode == "typical":
-            candidate_index = 0
-            for band in model["bands"]:
-                baseline = band["role"] == "baseline"
-                strategy = str(band.get("strategy", band.get("label", "")))
-                if baseline:
-                    color, marker = baseline_color, None
-                else:
-                    color, marker = _candidate_style(
-                        strategy, candidate_index)
-                    candidate_index += 1
-                emphasized = strategy == primary_strategy
-                show_interval = bool(
-                    band.get("show_interval")
-                    and (baseline or emphasized))
-                if show_interval:
-                    ax.fill_between(
-                        band["x"], band["p25"], band["p75"],
-                        color=color, alpha=0.13, linewidth=0,
-                    )
-                ax.plot(
-                    band["x"], band["median"], label=band["label"],
-                    color=color, linestyle="--" if baseline else "-",
-                    linewidth=(2.1 if baseline else 2.5 if emphasized else 1.8),
-                    marker=marker, markersize=3.2,
-                    markevery=(None if baseline else max(
-                        1, len(band["median"]) // 9)),
-                    alpha=1.0 if baseline or emphasized else 0.86,
-                )
-            ax.set_xlabel("")
-            ax.set_ylabel(model["metric_label"], fontsize=8)
-            interval_text = (
-                "阴影仅显示 每日收盘 与主候选的 P25/P75（非置信区间）"
-                if common_count >= 2 else "仅1个共同回测分段，不绘制区间带")
+                color, marker = _candidate_style(strategy, candidate_index)
+                candidate_index += 1
+            emphasized = strategy == primary_strategy
+            y_values = np.asarray(series["y"], dtype=float)
+            ax.plot(
+                series["x"], y_values, label=series["label"],
+                color=color,
+                linestyle="--" if baseline else "-",
+                linewidth=(2.1 if baseline else 2.5 if emphasized else 1.8),
+                marker=marker, markersize=3.2,
+                markevery=(None if baseline else max(1, len(y_values) // 9)),
+                alpha=1.0 if baseline or emphasized else 0.86,
+            )
+        # X 轴标签与下方图例位置冲突，且“横轴是交易日”一望即知。
+        ax.set_xlabel("")
+        ax.set_ylabel(model["metric_label"], fontsize=8)
+        for boundary in model.get("segment_boundaries", ()):
+            ax.axvline(
+                float(boundary) + 0.5,
+                color=PALETTE["text_muted"], linestyle=":",
+                linewidth=0.7, alpha=0.55)
+        common_days = self._comparison_safe_int(
+            model.get("common_day_count"), 0)
+        expected_days = self._comparison_safe_int(
+            model.get("expected_day_count"), common_days)
+        completeness = (
+            "完整" if model.get("complete_evidence") else "部分重叠")
+        self._history_chart_hint_var.set(
+            f"{completeness} {common_days}/{expected_days} 日 · "
+            f"每日收盘 + {len(candidates)} 个策略{scope_note}")
+        if model.get("uses_normalized_notional"):
             self._history_chart_hint_var.set(
-                f"可比 {common_count} 段 · "
-                f"每日收盘 + {len(candidates)} 个策略；"
-                f"{interval_text}{scope_note}")
-            if model.get("uses_normalized_notional"):
-                self._history_chart_hint_var.set(
-                    self._history_chart_hint_var.get()
-                    + "；多段路径已按 损益/(S0×乘数×|数量|) 归一化")
+                self._history_chart_hint_var.get()
+                + "；跨合约按各段 损益/(S0×乘数×|数量|) 安全归一化后拼接")
 
         ax.axhline(
             0.0, color=PALETTE["text_muted"],
@@ -6862,7 +6783,6 @@ class BacktestApp(tk.Tk):
                     rank_str = "🥉 " + rank_str
 
                 values = (
-                    "基准" if is_baseline else "☐",
                     rank_str, strategy_label,
                     BacktestApp._format_objective_value(
                         row.get("incremental_pnl_vs_c2c"), 4),
@@ -6883,9 +6803,16 @@ class BacktestApp(tk.Tk):
                     tag = "incomplete"
                 else:
                     tag = ""
+                image_val = ""
+                text_val = ""
+                if is_baseline:
+                    text_val = "基准"
+                else:
+                    image_val = self._cb_sf_unchecked
+
                 iid = f"history_rank_{row_no}"
                 rank_tree.insert(
-                    "", "end", iid=iid, values=values,
+                    "", "end", iid=iid, image=image_val, text=text_val, values=values,
                     tags=(tag,) if tag else ())
                 self._history_rank_rows[iid] = row.to_dict()
 
@@ -6938,10 +6865,11 @@ class BacktestApp(tk.Tk):
                 segment_text += (
                     f"（持有到期 {expiry_segments} / 按市价结算 {mtm_segments}）")
             extra.append(segment_text)
+        # 残段在最老那一端（段边界从区间末端倒推对齐），不再是“末段”。
         terminal_labels = {
             "expiry": "持有到期",
-            "mark_to_market": "末段按市价结算",
-            "mixed": "到期 + 末段按市价结算",
+            "mark_to_market": "按市价结算",
+            "mixed": "到期 + 最老一段按市价结算",
         }
         terminal_mode = str(period_item.get("terminal_mode") or "")
         # 分段明细的括号里已经写了“持有到期 X / 按市价结算 Y”，此时再说一次

@@ -1894,12 +1894,22 @@ def _history_cross_contract_normalized_summary():
     return summary
 
 
-def test_history_chart_exposes_full_interval_and_proxy_diagnostic_modes():
-    assert gui_app.HISTORY_CHART_MODE_DISPLAY == {
-        "full": "完整回放累积路径",
-        "single": "单次分段路径",
-        "typical": "多分段中位路径",
-    }
+def test_history_chart_view_options_are_pinned_to_full_interval():
+    """图表口径必须恒为整段接续，只有指标可切。
+
+    排名指标统计的是各段日损益 concat 之后的整段（hedge_analysis 里的
+    ``pd.concat(daily_windows)``）。若图表能切成单段或中位段，同一策略
+    完全可能整段为正、某一段为负，两条口径并列而界面无从区分。
+    """
+    app = object.__new__(BacktestApp)
+    app._history_chart_metric_var = _Var(
+        gui_app.HISTORY_CHART_METRIC_DISPLAY["tc"])
+
+    assert BacktestApp._history_chart_view_options(app) == ("full", "tc")
+
+    # 界面上已没有模式控件；即便残留一个旧变量也不得改变口径。
+    app._history_chart_mode_var = _Var("多分段中位路径")
+    assert BacktestApp._history_chart_view_options(app)[0] == "full"
 
 
 def test_history_chart_pairs_by_window_and_sorts_by_end_timestamp():
@@ -2181,62 +2191,21 @@ def test_history_multi_chart_recomputes_common_windows_for_selected_metric():
     ]
 
 
-def test_history_chart_controls_clear_stale_window_after_metric_change():
-    summary = _history_multi_chart_summary()
-    index = summary.index[
-        summary["strategy"].eq("每日固定时刻")
-        & summary["window_id"].eq("window_2")
-    ][0]
-    summary.at[index, "cumulative_tc"] = np.asarray([], dtype=float)
-
+def test_history_chart_controls_only_redraw_after_metric_change():
+    """指标切换只需重绘；分段控件已移除，不得再有联动残留。"""
     app = object.__new__(BacktestApp)
-    app._history_window_summary = summary
-    app._history_chart_mode_var = _Var(
-        gui_app.HISTORY_CHART_MODE_DISPLAY["single"])
     app._history_chart_metric_var = _Var(
         gui_app.HISTORY_CHART_METRIC_DISPLAY["net"])
-    app._history_chart_window_var = _Var("")
-    app._history_chart_window_combo = _Widget()
     app._history_chart_metric_combo = _Widget()
-    app._history_chart_selection = lambda: ("week", None)
-    app._history_chart_candidates = lambda _lookback: [
-        "固定间隔(1σ)", "每日固定时刻",
-    ]
-    app._history_chart_primary_candidate = lambda candidates: candidates[0]
-    app._draw_history_chart = lambda: None
+    drawn = []
+    app._draw_history_chart = lambda: drawn.append(True)
 
     BacktestApp._update_history_chart_controls(app)
-    stale_label = next(
-        label for label, window_id in app._history_chart_window_labels.items()
-        if window_id == "window_2")
-    app._history_chart_window_var.set(stale_label)
     app._history_chart_metric_var.set(
         gui_app.HISTORY_CHART_METRIC_DISPLAY["tc"])
-
     BacktestApp._update_history_chart_controls(app)
 
-    assert list(app._history_chart_window_labels.values()) == ["window_3"]
-    assert app._history_chart_window_var.get() in app._history_chart_window_labels
-    assert app._history_chart_window_combo.state == "readonly"
-
-
-def test_history_chart_controls_fall_back_from_removed_relative_mode():
-    app = object.__new__(BacktestApp)
-    app._history_window_summary = _history_multi_chart_summary()
-    app._history_chart_mode_var = _Var("逐窗有界C2C优势")
-    app._history_chart_metric_var = _Var(
-        gui_app.HISTORY_CHART_METRIC_DISPLAY["net"])
-    app._history_chart_window_var = _Var("")
-    app._history_chart_window_combo = _Widget()
-    app._history_chart_metric_combo = _Widget()
-    app._history_chart_selection = lambda: ("week", None)
-    app._history_chart_candidates = lambda _lookback: ["固定间隔(1σ)"]
-    app._history_chart_primary_candidate = lambda candidates: candidates[0]
-    app._draw_history_chart = lambda: None
-
-    BacktestApp._update_history_chart_controls(app)
-
-    assert app._history_chart_window_combo.state == "disabled"
+    assert drawn == [True, True]
     assert app._history_chart_metric_combo.state == "readonly"
 
 
@@ -2259,8 +2228,6 @@ def test_history_chart_rejects_candidate_that_removes_all_common_windows():
     app._history_chart_selected_by_period = {
         "week": {"固定间隔(1σ)"},
     }
-    app._history_chart_mode_var = _Var(
-        gui_app.HISTORY_CHART_MODE_DISPLAY["typical"])
     app._history_chart_metric_var = _Var(
         gui_app.HISTORY_CHART_METRIC_DISPLAY["net"])
     app._history_chart_selection = lambda: ("week", None)
@@ -2276,8 +2243,9 @@ def test_history_chart_rejects_candidate_that_removes_all_common_windows():
     assert "共同" in statuses[-1]
 
 
-@pytest.mark.parametrize("mode", ["full", "single", "typical"])
-def test_history_multi_chart_renderer_draws_c2c_and_all_candidates(mode):
+@pytest.mark.parametrize(
+    "metric", ["net", "gross", "tc"])
+def test_history_multi_chart_renderer_draws_c2c_and_all_candidates(metric):
     from matplotlib.backends.backend_agg import FigureCanvasAgg
     from matplotlib.figure import Figure
 
@@ -2287,12 +2255,8 @@ def test_history_multi_chart_renderer_draws_c2c_and_all_candidates(mode):
     app._history_chart_ax = figure.add_subplot(111)
     app._history_chart_canvas = FigureCanvasAgg(figure)
     app._history_window_summary = _history_multi_chart_summary()
-    app._history_chart_mode_var = _Var(
-        gui_app.HISTORY_CHART_MODE_DISPLAY[mode])
     app._history_chart_metric_var = _Var(
-        gui_app.HISTORY_CHART_METRIC_DISPLAY["net"])
-    app._history_chart_window_var = _Var("")
-    app._history_chart_window_labels = {}
+        gui_app.HISTORY_CHART_METRIC_DISPLAY[metric])
     app._history_chart_hint_var = _Var("")
     app._history_chart_color_map = {}
     app._history_chart_marker_map = {}
@@ -2309,7 +2273,10 @@ def test_history_multi_chart_renderer_draws_c2c_and_all_candidates(mode):
     assert labels[1].startswith("固定间隔(1σ)")
     assert labels[2].startswith("每日固定时刻")
     assert len(app._history_chart_ax.lines) >= 3
-    assert "可比 2 段" in app._history_chart_hint_var.get()
+    # 段数写在标题里（loc="left"），提示条留给数据完整度。曲线是 N 段
+    # 接起来的，不写出来容易被当成一笔交易。
+    assert "2 段接续" in app._history_chart_ax.get_title(loc="left")
+    assert "日 ·" in app._history_chart_hint_var.get()
 
 
 def _history_period_view_model_fixture():
@@ -3896,13 +3863,35 @@ def test_selected_history_replay_spec_follows_the_window_dropdown():
     assert spec.window_id == "segment_2"
 
 
-def test_selected_history_replay_spec_falls_back_to_first_segment():
+def test_refresh_history_replay_windows_defaults_to_latest_segment():
+    """下拉默认停在最近一段——离当下最近，也是最可能要复核的那一笔。"""
+    fake = _fake_history_replay_gui(selected="每日收盘")
+    fake._history_replay_window_combo = _Widget()
+
+    options = BacktestApp._refresh_history_replay_windows(fake)
+
+    labels = [item["label"] for item in options]
+    assert [item["window_id"] for item in options] == [
+        "segment_1", "segment_2"]
+    assert fake._history_replay_window_var.get() == labels[-1]
+    # 已选中的合法标签不得被默认值顶掉。
+    fake._history_replay_window_var.set(labels[0])
+    BacktestApp._refresh_history_replay_windows(fake)
+    assert fake._history_replay_window_var.get() == labels[0]
+
+
+def test_selected_history_replay_spec_falls_back_to_latest_segment():
+    """标签失效时落到最近一段，而不是最早那段。
+
+    下拉的默认值也是末项（见 _refresh_history_replay_windows），两处必须
+    一致——否则下拉显示「第 3 段」而加载的是第 1 段，且不会报任何错。
+    """
     fake = _fake_history_replay_gui(selected="每日收盘")
     fake._history_replay_window_var.set("已失效的旧标签")
 
     spec, _strategy_name = BacktestApp._selected_history_replay_spec(fake)
 
-    assert spec.window_id == "segment_1"
+    assert spec.window_id == "segment_2"
 
 
 def test_load_history_window_refuses_without_a_replayable_candidate(

@@ -1337,10 +1337,17 @@ def multi_chart_model(
         metric_label = (
             normalized_labels if uses_normalized_notional
             else raw_labels)[metric]
+        # 段数写进标题：这条曲线是把 N 段首尾接起来画的，和排名指标同一
+        # 个口径（各段日损益 concat 后统计）。不写出来容易被当成一笔交易。
+        segment_note = (
+            f"，{len(ordered_ids)} 段接续" if len(ordered_ids) > 1 else "")
         title_prefix = (
+            f"完整回放区间（{len(ordered_ids)} 段接续）"
+            if complete_evidence and len(ordered_ids) > 1 else
             "完整回放区间"
             if complete_evidence else
-            f"共同可比区间（{common_day_count}/{expected_day_count} 日）"
+            f"共同可比区间（{common_day_count}/{expected_day_count} 日"
+            f"{segment_note}）"
         )
         return {
             **base,

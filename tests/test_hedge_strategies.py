@@ -29,7 +29,50 @@ from pricing import (
     recommend_by_contract_history_pool,
 )
 from pricing.constants import ANNUAL_DAYS
+from pricing.hedge_analysis import _strict_lookback_segment_lengths
 from pricing.hedge_backtest import _infer_intraday_steps, _trading_day_groups
+
+
+def _segment_end_offsets(lengths):
+    """把段长还原成「各段终点距区间末端的偏移」，0 = 末端那一天。"""
+    offsets, accumulated = [], 0
+    for segment in reversed(lengths):
+        offsets.append(accumulated)
+        accumulated += segment
+    return offsets
+
+
+def test_strict_segments_put_the_remainder_at_the_oldest_end():
+    """残段必须落在最老的一端，最近一段是完整到期交易。
+
+    区间是从截止日往回数 L 天定的；若段边界改从起点正推，最相关的近端
+    会被切成半截 MTM 交易——近年 243 日就会让「最近一段」只有 1 天。
+    """
+    assert _strict_lookback_segment_lengths(243, 22) == (1,) + (22,) * 11
+    assert _strict_lookback_segment_lengths(61, 22) == (17, 22, 22)
+    assert _strict_lookback_segment_lengths(122, 22) == (12,) + (22,) * 5
+    # 整除时没有残段。
+    assert _strict_lookback_segment_lengths(44, 22) == (22, 22)
+    # 不足一个期限时只有一段，不该凭空造出零长段。
+    assert _strict_lookback_segment_lengths(20, 22) == (20,)
+
+
+def test_strict_segment_boundaries_near_the_end_do_not_move_with_lookback():
+    """L 抖动只准改变最老那一段，近端边界一根都不能动。
+
+    自然日口径下「近年」会在 241~243 之间浮动。若近端边界跟着 L 移动，
+    同一批候选的名次会互换——排名对边界位置是敏感的。
+    """
+    offsets = {
+        days: _segment_end_offsets(_strict_lookback_segment_lengths(days, 22))
+        for days in (241, 242, 243)
+    }
+    shared = min(len(value) for value in offsets.values())
+    assert offsets[241][:shared] == offsets[242][:shared] == \
+        offsets[243][:shared]
+    # 多出来的那一段挂在最老端，且它就是残段。
+    assert offsets[243][shared:] == [242]
+    assert _strict_lookback_segment_lengths(243, 22)[0] == 1
 
 
 def _option(days=4):
@@ -2373,7 +2416,7 @@ def test_contract_pool_windows_follow_endpoint_main_without_crossing_roll(
     assert summary["history_endpoint_date"].notna().all()
 
 
-def test_contract_pool_rolls_split_strict_evidence_and_short_runs_end_mtm():
+def test_contract_pool_rolls_split_strict_evidence_and_short_runs_start_mtm():
     mapping_dates = pd.bdate_range("2026-01-05", periods=8)
     mapping = pd.Series(
         ["P2601.DCE"] * 3 + ["P2605.DCE"] * 5,
@@ -2415,8 +2458,11 @@ def test_contract_pool_rolls_split_strict_evidence_and_short_runs_end_mtm():
     assert ranking["mtm_segments"].eq(2).all()
     assert ranking["terminal_mode"].eq("mixed").all()
     assert ranking["contract_run_count"].eq(2).all()
+    # 每条主力连续段内部都从末端对齐：残段落在该段最老的一头，最近那
+    # 一笔是完整到期交易。P2601 跑了 3 日 -> (1, 2)，P2605 跑了 5 日 ->
+    # (1, 2, 2)。
     assert ranking["segment_lengths"].apply(
-        lambda value: value == (2, 1, 2, 2, 1)).all()
+        lambda value: value == (1, 2, 1, 2, 2)).all()
 
     observed_evidence_dates = []
     observed_segments = []
@@ -2432,11 +2478,11 @@ def test_contract_pool_rolls_split_strict_evidence_and_short_runs_end_mtm():
         assert len(result["prices"]) == result["evaluation_days"] + 1
     assert pd.DatetimeIndex(observed_evidence_dates).equals(mapping_dates)
     assert observed_segments == [
-        ("P2601.DCE", 2, "expiry"),
         ("P2601.DCE", 1, "mark_to_market"),
-        ("P2605.DCE", 2, "expiry"),
-        ("P2605.DCE", 2, "expiry"),
+        ("P2601.DCE", 2, "expiry"),
         ("P2605.DCE", 1, "mark_to_market"),
+        ("P2605.DCE", 2, "expiry"),
+        ("P2605.DCE", 2, "expiry"),
     ]
 
 

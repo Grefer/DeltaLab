@@ -1398,13 +1398,28 @@ def _history_warmup_log_returns(
 
 
 def _strict_lookback_segment_lengths(evidence_days, maturity_days):
-    """把连续证据区间拆成不重叠的完整到期段与末尾 MTM 段。"""
+    """把连续证据区间拆成不重叠的分段，**残段放在最老的一端**。
+
+    区间本身是从截止日往回数 L 天定的，段边界因此也必须从末端对齐——
+    两件事同向，最近一段才会是一笔完整的到期交易。曾经的做法是从起点
+    正推、残段落在末尾，那是"起点倒推、边界正推"两种对齐撞在一起的产
+    物：最相关的近端被切成半截 MTM 交易，最不相关的一年前反倒完整。
+
+    从末端对齐还有个决定性的好处：L 抖动只改变最老那一段，近端边界一
+    根不动。以 T=22 为例，各段终点距区间末端的偏移——
+
+        L=241 → (21, 22×10)     偏移 [0, 22, 44, …, 220]
+        L=242 → (22×11)         偏移 [0, 22, 44, …, 220]
+        L=243 → (1,  22×11)     偏移 [0, 22, 44, …, 220, 242]
+
+    三者近端完全重合。正推时这三个 L 会给出三套互不相同的边界，而排名
+    对边界位置是敏感的（实测同一批候选的名次会互换）。
+    """
     days = _positive_int(evidence_days, "evidence_days")
     maturity = _positive_int(maturity_days, "maturity_days")
     full_segments, remainder = divmod(days, maturity)
-    lengths = [maturity] * full_segments
-    if remainder:
-        lengths.append(remainder)
+    lengths = [remainder] if remainder else []
+    lengths.extend([maturity] * full_segments)
     return tuple(lengths)
 
 
@@ -1447,8 +1462,10 @@ def recommend_by_rolling_history(
     ``lookbacks`` 中的每个 ``L`` 都是实际参与评分、累计 PnL 与图表的证据
     天数，不再只是旧实现中的“到期终点范围”。当 ``L <= T`` 时，运行一个
     ``evaluation_days=L`` 的期权段：``L == T`` 正常到期，``L < T`` 在区间
-    末按剩余期限市值结算。当 ``L > T`` 时，从证据区间起点依次运行互不重叠
-    的 ``T`` 日到期段，最后不足 ``T`` 日的尾段按 MTM 结束。C2C 与所有候选
+    末按剩余期限市值结算。当 ``L > T`` 时，段边界从证据区间**末端**倒推
+    对齐：最近一段起连续运行互不重叠的 ``T`` 日到期段，把不足 ``T`` 日的
+    残段留在最老的一头按 MTM 结束（见
+    ``_strict_lookback_segment_lengths``）。C2C 与所有候选
     共享完全相同的分段边界；正常完成时拼接后恰好有 ``L`` 个日 PnL，每个
     行情日只计一次。若期权提前敲出导致某段不足，则保留实际天数并把该周期
     标为 diagnostic/incomplete，不用补零把它伪装成完整区间。
@@ -2367,8 +2384,9 @@ def recommend_by_contract_history_pool(
     """在最近连续 ``L`` 个主力映射日上按具体合约边界比较策略。
 
     证据区间中的主力换月会强制切段；同一具体合约的连续区间再按不重叠
-    ``T`` 日段拆分。每段只使用该具体合约自身的 Day 0、行情和 HV 预热，
-    绝不跨合约拼价格；长度小于 ``T`` 的换月段或尾段以 MTM 结束。各段
+    ``T`` 日段拆分，边界从该连续区间的末端倒推对齐，残段留在其最老的一
+    头。每段只使用该具体合约自身的 Day 0、行情和 HV 预热，绝不跨合约拼
+    价格；长度小于 ``T`` 的换月段或残段以 MTM 结束。各段
     PnL 日期互不重叠，正常完成时合计恰好 ``L`` 日。主排名先计算每段相对
     C2C 的有界 RMS 优势，再按段内证据天数加权，避免不同合约价格量级
     支配结果。
