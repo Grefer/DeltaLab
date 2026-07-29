@@ -385,6 +385,12 @@ _OBJECTIVE_COLUMN_KEYS = {
     "incremental_pnl": "incremental_pnl",
     "incremental_sharpe": "incremental_sharpe",
 }
+# ranking 里承载这两个口径的列名。品种池模式不产出它们（跨合约不能直接
+# 把金额 PnL 相加），展示层据此降级——见 _build_history_metric_tree。
+_OBJECTIVE_RANKING_COLUMNS = (
+    "incremental_pnl_vs_c2c",
+    "incremental_sharpe_vs_c2c",
+)
 
 # 图表口径固定为整段接续（模式 "full"），不再有模式下拉，因此这里只留
 # 指标的显示名。history_selection 的模型层仍实现着 single / typical，供
@@ -2004,7 +2010,6 @@ class BacktestApp(tk.Tk):
         history_selection.row_uses_strict_metric)
     _history_row_uses_window_equal_metric = staticmethod(
         history_selection.row_uses_window_equal_metric)
-    _history_metric_labels = staticmethod(history_selection.metric_labels)
     _history_contract_codes_text = staticmethod(
         history_selection.contract_codes_text)
     _comparison_recommendation_rows = staticmethod(
@@ -5474,9 +5479,7 @@ class BacktestApp(tk.Tk):
         self._comparison_detail_vars["rehedge_count"].set(rehedge_text)
         self._draw_comparison_cumulative_chart()
 
-    # 周期结论表与周期内排名表共用同一组指标列。指标表头随排名口径变化，
-    # 集中定义可避免改口径时两张表走样成不同措辞。表头为 None 时取
-    # history_selection.metric_labels 的同名字段。
+    # 排名表的指标列。表头文案写死在这里，改口径时只有这一处要动。
     # 两个排名口径并排显示：一列驱动本次排序，另一列供对照——两者给出
     # 相反顺序的地方，正是需要人来判断的地方。RMS 得分与胜率是旧口径的
     # 诊断值，已移入选中行的详情串，不再占表宽。
@@ -5532,15 +5535,22 @@ class BacktestApp(tk.Tk):
 
     @staticmethod
     def _build_history_metric_tree(parent, *, lead_columns, status_heading,
-                                   status_width, labels, height,
+                                   status_width, height,
                                    on_objective_click=None,
-                                   active_objective=None):
-        """构建周期结论 / 周期排名共用的指标表格骨架。
+                                   active_objective=None,
+                                   objectives_available=True):
+        """构建周期排名表格。
 
         ``on_objective_click`` 提供时，两个排名口径列的表头可点击切换排名
         依据；其余列的表头保持不可点，避免暗示它们也能当排名依据。
+
+        ``objectives_available=False`` 表示本次结果里根本没有增量指标
+        （品种池模式跨合约无法直接相加金额，只产出逐段有界改善）。此时两
+        列表头必须一并去掉 ⇅ 和点击回调：留着的话点下去是**静默 no-op**
+        ——``_rank_history_rows`` 两个口径都回退到同一个 RMS 改善，标记移
+        动了、顺序一动不动。
         """
-        if on_objective_click is None:
+        if on_objective_click is None or not objectives_available:
             def on_objective_click(_key):
                 return None
         specs = (
@@ -5555,8 +5565,8 @@ class BacktestApp(tk.Tk):
         tree.heading("#0", text="勾选")
         tree.column("#0", width=46, stretch=False, anchor="center")
         for key, heading, width in specs:
-            text = heading or labels[key]
-            if key in _OBJECTIVE_COLUMN_KEYS:
+            text = heading
+            if key in _OBJECTIVE_COLUMN_KEYS and objectives_available:
                 # 只有这两列是合法的排名依据，点表头即按它重排；其余列不
                 # 可点——七列里给五列装上排序会让人以为推荐也跟着变，而
                 # 后端并没有对应的排名口径。
@@ -5614,11 +5624,12 @@ class BacktestApp(tk.Tk):
         self._history_uses_strict_metric = flags["uses_strict_metric"]
         self._history_uses_window_equal_metric = flags[
             "uses_window_equal_metric"]
+        # 按列是否真的存在判断，而不是按模式判断：旧快照同样可能没有增量
+        # 列，它和品种池结果在展示上应该走同一条降级路径。
+        self._history_objectives_available = any(
+            column in ranking.columns
+            for column in _OBJECTIVE_RANKING_COLUMNS)
         self._assign_history_chart_styles(flags["candidate_names"], ranking)
-        labels = BacktestApp._history_metric_labels(
-            uses_strict_metric=flags["uses_strict_metric"],
-            uses_product_pool=flags["uses_product_pool"],
-        )
         selected_periods = [
             (key, label) for key, label in HISTORY_PERIOD_DEFS
             if key in self._history_lookbacks
@@ -5632,16 +5643,11 @@ class BacktestApp(tk.Tk):
         # 口径说明是一次性知识，长期占据结果区顶部只会挤压表格与图表。
         # 常驻一行主指标定义，完整口径折进按钮后面按需查看。
         BacktestApp._build_history_scope_note(
-            self, parent,
-            periods_text=" / ".join(
-                label for _key, label in selected_periods),
-            uses_strict_metric=flags["uses_strict_metric"],
-            uses_product_pool=flags["uses_product_pool"],
-        )
+            self, parent, uses_strict_metric=flags["uses_strict_metric"])
 
         self._build_history_period_box(
-            parent, recommendations, ranking, labels, len(selected_periods))
-        self._build_history_detail_box(parent, labels)
+            parent, recommendations, ranking)
+        self._build_history_detail_box(parent)
         self._build_history_chart_box(parent)
 
         if getattr(self, "_history_period_rows", None):
@@ -5672,9 +5678,7 @@ class BacktestApp(tk.Tk):
         self._history_chart_color_map = color_map
         self._history_chart_marker_map = marker_map
 
-    def _build_history_scope_note(
-            self, parent, *, periods_text, uses_strict_metric,
-            uses_product_pool):
+    def _build_history_scope_note(self, parent, *, uses_strict_metric):
         """初始化当前排名口径。
 
         排名依据不再单独占一行文字：顶部摘要标签里已有一枚 pill，表格里
@@ -5768,7 +5772,7 @@ class BacktestApp(tk.Tk):
                 "短周期样本少更易受噪声影响，建议以长周期为准"), "disagree"
 
     def _build_history_period_box(
-            self, parent, recommendations, ranking, labels, period_count):
+            self, parent, recommendations, ranking):
         """渲染跨周期结论横幅 + 周期切换按钮。"""
         box = ttk.Frame(parent, style="Surface.TFrame")
         box.grid(row=1, column=0, sticky="ew", padx=2, pady=(3, 0))
@@ -5836,7 +5840,7 @@ class BacktestApp(tk.Tk):
             style="SurfaceMuted.TLabel", justify="left",
         ).pack(side="left", padx=(16, 0))
 
-    def _build_history_detail_box(self, parent, labels):
+    def _build_history_detail_box(self, parent):
         """渲染选中周期的候选排名、图表勾选栏与统一动作条。"""
         detail_box = ttk.LabelFrame(
             parent, text=" 该周期内各策略排名 ", padding=(14, 8))
@@ -5868,10 +5872,11 @@ class BacktestApp(tk.Tk):
                 ("rank", "#", 38),
                 ("strategy", "策略 / 参数", 232),
             ),
-            status_heading="状态", status_width=129,
-            labels=labels, height=8,
+            status_heading="状态", status_width=129, height=8,
             on_objective_click=self._set_history_objective,
             active_objective=getattr(self, "_history_result_objective", None),
+            objectives_available=getattr(
+                self, "_history_objectives_available", True),
         )
         rank_tree.grid(row=2, column=0, sticky="nsew")
         rank_scrollbar = ttk.Scrollbar(
@@ -6345,8 +6350,9 @@ class BacktestApp(tk.Tk):
                     row.get("score"), 2)
                 baseline_text = self._format_comparison_value(
                     row.get("baseline_score"), 2)
-                # 改善率、胜率、可比段数都是排名表里的列，详情行只补表格
-                # 没有的原始损益波动值，不再抄一遍。
+                # 详情行只补表格没有的原始损益波动值。表格现在的四列是
+                # 增量收益/增量性价比/多花成本/最大回撤，改善率与胜率都
+                # 不在其中——它们是刻意收敛掉的旧口径，不再单独渲染。
                 uses_strict_metric = (
                     BacktestApp._history_row_uses_strict_metric(row))
                 uses_product_pool = (
@@ -6741,12 +6747,9 @@ class BacktestApp(tk.Tk):
         if group is not None:
             baseline = BacktestApp._comparison_baseline(group)
             for row_no, (_idx, row) in enumerate(group.iterrows()):
-                score = self._comparison_finite(row.get("score"))
                 rank_item = row.to_dict()
                 is_baseline = str(
                     row.get("strategy_type", "")) == "close_to_close"
-                improvement = BacktestApp._history_row_improvement(
-                    rank_item, baseline)
                 paired = self._comparison_safe_int(
                     row.get("paired_windows", row.get("rolling_windows")), 0)
                 baseline_windows = self._comparison_safe_int(
@@ -6938,6 +6941,13 @@ class BacktestApp(tk.Tk):
         if period_item.get("trailing_dropped", 0):
             extra.append(
                 f"末尾剔除 {period_item['trailing_dropped']} 个未收盘交易日")
+        # 增量指标缺失时，表格里那两列全是「—」，而真正的排序依据没有任何
+        # 一列体现出来。必须说出来排的是什么，否则用户看到的是一张没有决
+        # 策依据的排名表。
+        if not getattr(self, "_history_objectives_available", True):
+            extra.append(
+                "本次按「各段日损益波动较每日收盘的改善」排名"
+                "（跨合约金额不可直接相加，增量口径不可用）")
         if (group is not None
                 and not period_item.get("has_comparable_candidate", False)):
             candidate_failures = group[

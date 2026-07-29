@@ -1804,25 +1804,15 @@ def test_history_row_improvement_prefers_window_equal_selection_metric():
     assert improvement == pytest.approx(0.20)
 
 
-def test_history_metric_labels_mark_product_pool_raw_rms_as_diagnostic():
-    single = BacktestApp._history_metric_labels(
-        uses_strict_metric=True, uses_product_pool=False)
-    pool = BacktestApp._history_metric_labels(
-        uses_strict_metric=True, uses_product_pool=True)
+def test_history_metric_labels_removed_with_hardcoded_headers():
+    """表头文案已全部写死在列 spec 里，metric_labels 整条链路是死的。
 
-    assert single == {
-        "score": "区间得分↓",
-        "baseline": "每日收盘区间得分",
-        "improvement": "较收盘改善",
-    }
-    # 品种池的原始 RMS 只是诊断值，三个字段都必须带上“诊断”字样，
-    # 不能与严格区间主指标共用同一套措辞。
-    assert pool == {
-        "score": "诊断总得分↓",
-        "baseline": "每日收盘诊断分",
-        "improvement": "较收盘诊断改善",
-    }
-
+    `_build_history_metric_tree` 的每个列 spec 都自带 heading，
+    `text = heading or labels[key]` 的右半边永远取不到；labels 从
+    `_build_history_comparison_view` 一路传下来只是空转。
+    """
+    assert not hasattr(history_selection, "metric_labels")
+    assert not hasattr(BacktestApp, "_history_metric_labels")
 
 def _history_chart_summary():
     rows = []
@@ -4152,28 +4142,55 @@ def test_history_ranking_flags_stay_neutral_on_empty_ranking():
     }
 
 
-@pytest.mark.parametrize("uses_product_pool, expected", [
-    (False, "排名依据：整段日损益的波动幅度比「每日收盘」低多少。"),
-    (True, "整体金额波动只作参考，不参与排名。"),
+def _payload_ranking(**overrides):
+    row = {
+        "lookback": "week", "strategy": "s", "strategy_type": "hedge_band",
+        "rolling_windows": 0, "score": float("nan"),
+    }
+    row.update(overrides)
+    return pd.DataFrame([row])
+
+
+def test_validate_payload_reports_short_history_when_failure_columns_missing():
+    """缺失败原因列时要给出「历史区间不足」，不能崩成 traceback。
+
+    两组失败原因共用 failure_scopes / failure_reasons。它们曾分处两个
+    try：旧快照缺这两列时第一个 try 在赋值前抛 KeyError，第二个 try 再
+    引用同名变量就是 UnboundLocalError——它绕过 except，最终由
+    _history_recommendation_worker 把 traceback 弹给用户。
+    """
+    with pytest.raises(ValueError, match="真实历史长度不足"):
+        history_selection.validate_payload(
+            pd.DataFrame([{"lookback": "week"}]),
+            _payload_ranking(),
+            {"week": {"segment_1": {}}})
+
+
+@pytest.mark.parametrize(("overrides", "expected"), [
+    ({"strategy_type": "fixed_times", "failure_scope": "strategy",
+      "failure_reason": "14:22 无对应 Bar"}, "固定时刻策略没有形成"),
+    ({"failure_scope": "endpoint", "failure_reason": "主力映射日不足"},
+     "历史具体合约池没有形成"),
+    ({"failure_scope": "", "failure_reason": ""}, "真实历史长度不足"),
 ])
-def test_history_scope_explanation_tracks_the_ranking_route(
-        uses_product_pool, expected):
-    text = history_selection.scope_explanation(
-        "近月", uses_strict_metric=True, uses_product_pool=uses_product_pool)
-
-    assert text.startswith("本次周期：近月。")
-    assert text.endswith(expected)
-    # 面向使用者的说明里不该出现只在实现中有意义的符号与自造词。
-    for jargon in ("L 日", "T ", "V 日", "严格区间", "代理合约", "有界", "RMS"):
-        assert jargon not in text
+def test_validate_payload_keeps_each_failure_message(overrides, expected):
+    """把两段合并进同一个 try 之后，三条分支的原有文案都不能变。"""
+    with pytest.raises(ValueError, match=expected):
+        history_selection.validate_payload(
+            pd.DataFrame([{"lookback": "week"}]),
+            _payload_ranking(**overrides),
+            {"week": {"segment_1": {}}})
 
 
-def test_history_scope_explanation_flags_pre_upgrade_results():
-    text = history_selection.scope_explanation(
-        "近月 / 近季", uses_strict_metric=False, uses_product_pool=False)
+def test_history_scope_explanation_is_gone_with_its_panel():
+    """“计算口径”面板已移除，配套文案不该留在代码里。
 
-    assert "旧版的取样方式" in text
-    assert "建议重新运行" in text
+    这不是洁癖：那段文案写死了“排名依据：整段日损益的波动幅度比「每日
+    收盘」低多少”，而单序列路径现在按增量收益排。它进不了界面，却有一
+    条常绿的测试断言着这句话——一个绿色的、断言着错误排名依据的测试，
+    比没有测试更危险。
+    """
+    assert not hasattr(history_selection, "scope_explanation")
 
 
 def test_history_consensus_note_flags_agreement_across_periods():
@@ -4247,7 +4264,6 @@ def test_only_objective_columns_are_clickable_headers():
             lead_columns=(("period", "分析周期", 90),
                           ("strategy", "历史最优参考", 260)),
             status_heading="状态", status_width=114,
-            labels={"score": "s", "baseline": "b", "improvement": "i"},
             height=5, on_objective_click=clicked.append,
         )
         clickable = [c for c in tree["columns"] if tree.heading(c)["command"]]
@@ -4362,11 +4378,10 @@ def test_active_sort_column_is_marked_in_the_header():
         pytest.skip("无可用显示环境")
     root.withdraw()
     try:
-        labels = {"score": "s", "baseline": "b", "improvement": "i"}
         lead = (("period", "分析周期", 90), ("strategy", "历史最优参考", 260))
         tree = BacktestApp._build_history_metric_tree(
             ttk.Frame(root), lead_columns=lead, status_heading="状态",
-            status_width=114, labels=labels, height=5,
+            status_width=114, height=5,
             on_objective_click=lambda _k: None,
             active_objective="incremental_pnl")
         assert tree.heading("incremental_pnl")["text"].endswith("↓")
@@ -4374,7 +4389,7 @@ def test_active_sort_column_is_marked_in_the_header():
 
         other = BacktestApp._build_history_metric_tree(
             ttk.Frame(root), lead_columns=lead, status_heading="状态",
-            status_width=114, labels=labels, height=5,
+            status_width=114, height=5,
             on_objective_click=lambda _k: None,
             active_objective="incremental_sharpe")
         assert other.heading("incremental_sharpe")["text"].endswith("↓")
@@ -4509,6 +4524,98 @@ def test_history_period_note_still_fires_when_segments_drop_out():
     text = _history_scoring_note_context(relative_windows=2, paired=3)
 
     assert "参与评分 2/3 段" in text
+
+
+def _objective_header_state(*, with_incremental_columns):
+    """按有无增量列渲染一次排名表，返回表头可点性与文案。"""
+    import tkinter as tk
+    import gui_app as module
+    try:
+        probe = tk.Tk()
+    except tk.TclError:
+        pytest.skip("无可用显示环境")
+    probe.destroy()
+
+    def rank_row(rank, strategy, strategy_type):
+        row = {
+            "lookback": "quarter", "rank": rank, "strategy": strategy,
+            "strategy_type": strategy_type, "score": 10.0 - rank,
+            "baseline_score": 10.0, "improvement_vs_c2c": 0.1,
+            "selection_improvement_vs_c2c": 0.1,
+            "selection_metric":
+                history_selection.STRICT_LOOKBACK_SELECTION_METRIC,
+            "window_win_rate_vs_c2c": 1.0, "paired_windows": 3,
+            "baseline_windows": 3, "comparison_eligible": True,
+            "rolling_windows": 3, "eligible_endpoints": 3,
+            "skipped_endpoints": 0, "history_days_available": 61,
+            "lookback_days": 61, "complete_window": True, "maturity_days": 22,
+            "evidence_days": 61, "days_used": 61,
+            "evaluation_mode": "strict_lookback",
+            "sampling_mode": "strict_contiguous", "segment_count": 3,
+            "expiry_segments": 2, "mtm_segments": 1, "terminal_mode": "mixed",
+            "relative_comparison_windows": 3, "max_drawdown": 0.03,
+        }
+        if with_incremental_columns:
+            row.update({
+                "incremental_pnl_vs_c2c": 0.01,
+                "incremental_sharpe_vs_c2c": 0.2,
+                "incremental_tc_vs_c2c": 0.001,
+                "selection_objective": "incremental_pnl",
+            })
+        return row
+
+    ranking = pd.DataFrame([
+        rank_row(1, "固定间隔(1σ)", "hedge_band"),
+        rank_row(2, "每日收盘", "close_to_close"),
+    ])
+    recommendations = ranking[ranking["rank"].eq(1)].copy()
+
+    app = module.BacktestApp()
+    try:
+        app.withdraw()
+        BacktestApp._show_history_recommendation(
+            app, recommendations, ranking, notes=None,
+            source_label="测试", window_results=None,
+            history_state={"history_lookbacks": {"quarter": 61}})
+        app.update_idletasks()
+        tree = app._history_rank_tree
+        return {
+            "available": app._history_objectives_available,
+            "clickable": [c for c in tree["columns"]
+                          if tree.heading(c)["command"]],
+            "headings": {c: tree.heading(c)["text"]
+                         for c in ("incremental_pnl", "incremental_sharpe")},
+            "note": app._history_period_context_var.get(),
+        }
+    finally:
+        app.destroy()
+
+
+def test_objective_headers_stay_clickable_when_increments_exist():
+    state = _objective_header_state(with_incremental_columns=True)
+
+    assert state["available"] is True
+    assert state["clickable"] == ["incremental_pnl", "incremental_sharpe"]
+    assert "↓" in state["headings"]["incremental_pnl"]
+    assert "⇅" in state["headings"]["incremental_sharpe"]
+    assert "本次按" not in state["note"]
+
+
+def test_objective_headers_degrade_when_ranking_has_no_increments():
+    """没有增量列时表头不得可点，且必须说出真正的排名依据。
+
+    品种池模式跨合约不能把金额 PnL 直接相加，因此只产出逐段有界改善。
+    此时留着 ⇅ 会让点击变成**静默 no-op**——`_rank_history_rows` 两个口
+    径都回退到同一个值，↓ 标记移动了、顺序一动不动。而四列指标里三列全
+    是「—」，真正的排序依据没有任何一列体现。
+    """
+    state = _objective_header_state(with_incremental_columns=False)
+
+    assert state["available"] is False
+    assert state["clickable"] == []
+    assert "⇅" not in state["headings"]["incremental_sharpe"]
+    assert "↓" not in state["headings"]["incremental_pnl"]
+    assert "较每日收盘的改善" in state["note"]
 
 
 def test_band_only_params_gray_out_with_their_owning_strategy():
