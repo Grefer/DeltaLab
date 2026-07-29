@@ -2951,6 +2951,53 @@ def test_history_ranking_falls_back_per_row_for_legacy_results():
     assert selection_only.iloc[0]["rank"] == 1
 
 
+def test_history_ranking_never_compares_an_amount_against_a_ratio():
+    """回退行必须整体沉到本 tier 末尾，不能混进有效增量里比大小。
+
+    ``incremental_pnl`` 是金额，``selection_improvement_vs_c2c`` 是
+    [-1,1] 的比率。回退曾直接把比率填进同一个排序键，于是一个 0.50 的
+    比率能压过 0.20 的金额增量。回退的本意只是别让 NaN 行被无差别垫底。
+
+    触发条件是真实的：候选段提前敲出导致天数与基准不齐时
+    ``_incremental_metrics`` 返回 NaN；``incremental_sharpe`` 在恒定非零
+    增量时也明确返回 NaN。
+    """
+    import pricing.hedge_analysis as hedge_analysis
+
+    common = {
+        "lookback": "year", "lookback_days": 243,
+        "recommendation_eligible": True, "comparison_eligible": True,
+        "complete_window": True, "paired_windows": 11,
+        "baseline_windows": 11, "rolling_windows": 11,
+        "comparison_coverage": 1.0, "window_win_rate_vs_c2c": 0.5,
+        "score": 1.0, "baseline_score": 1.0,
+        "selection_metric": "strict_lookback_daily_rms_advantage_vs_c2c",
+    }
+
+    def row(strategy, incremental, improvement, kind="hedge_band"):
+        return {
+            **common, "strategy": strategy, "strategy_type": kind,
+            "improvement_vs_c2c": improvement,
+            "selection_improvement_vs_c2c": improvement,
+            "incremental_pnl_vs_c2c": incremental,
+        }
+
+    ranking = hedge_analysis._rank_history_rows([
+        row("amount_small", 0.20, 0.01),
+        row("ratio_large", np.nan, 0.50),
+        row("ratio_small", np.nan, 0.05),
+        row("c2c", 0.0, 0.0, kind="close_to_close"),
+    ], objective="incremental_pnl")
+    order = ranking.sort_values("rank")["strategy"].tolist()
+
+    # 金额 0.20 排在比率 0.50 之前——两者不再直接比大小。
+    assert order.index("amount_small") < order.index("ratio_large")
+    # 基准增量恒为 0，也属于“有增量”，同样排在回退行之前。
+    assert order.index("c2c") < order.index("ratio_large")
+    # 回退行内部仍按旧的 RMS 改善排序，不是随机沉底。
+    assert order.index("ratio_large") < order.index("ratio_small")
+
+
 def test_rolling_history_zero_c2c_score_never_produces_infinite_improvement(
         monkeypatch):
     _install_deterministic_history_backtest(monkeypatch, {

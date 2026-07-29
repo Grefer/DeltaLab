@@ -116,17 +116,29 @@ def validate_payload(
         # fixed_times 的逐代理段失败已由历史分析层保留原始原因。若全部
         # 代理段都因目标时刻缺失而失败，应把真实数据问题直接反馈给
         # 用户，而不是误报成历史区间长度不足。
+        # 两组失败原因必须在同一个 try 里取：它们共用 failure_scopes /
+        # failure_reasons。旧快照或第三方调用缺这两列时，第一个 try 会在
+        # 赋值前就抛 KeyError，随后引用同名变量拿到的是 UnboundLocalError
+        # ——它绕过下面的 except，最终以 traceback 弹窗替掉了本该给出的
+        # “历史区间不足”提示。
+        fixed_failures = []
+        endpoint_failures = []
         try:
             strategy_types = ranking["strategy_type"].astype(str)
             failure_scopes = ranking["failure_scope"].astype(str)
             failure_reasons = ranking["failure_reason"].fillna("").astype(str)
+            has_reason = failure_reasons.str.strip().ne("")
             fixed_failures = failure_reasons[
                 strategy_types.eq("fixed_times")
                 & failure_scopes.eq("strategy")
-                & failure_reasons.str.strip().ne("")
+                & has_reason
             ]
-        except (KeyError, TypeError, ValueError):
+            endpoint_failures = failure_reasons[
+                failure_scopes.eq("endpoint") & has_reason
+            ]
+        except (KeyError, AttributeError, TypeError, ValueError):
             fixed_failures = []
+            endpoint_failures = []
         if len(fixed_failures):
             first_failure = str(fixed_failures.iloc[0])
             raise ValueError(
@@ -134,13 +146,6 @@ def validate_payload(
                 f"首个失败原因：{first_failure} "
                 "请确认行情粒度以及各交易日的 Bar 时间戳与设定时刻一致。"
             )
-        try:
-            endpoint_failures = failure_reasons[
-                failure_scopes.eq("endpoint")
-                & failure_reasons.str.strip().ne("")
-            ]
-        except (AttributeError, TypeError):
-            endpoint_failures = []
         if len(endpoint_failures):
             first_failure = str(endpoint_failures.iloc[0])
             raise ValueError(
@@ -485,53 +490,6 @@ def ranking_flags(ranking):
         "uses_window_equal_metric": uses_window_equal_metric,
         "uses_product_pool": uses_product_pool,
         "candidate_names": candidate_names,
-    }
-
-
-def scope_explanation(period_names, *, uses_strict_metric, uses_product_pool):
-    """生成“计算口径”展开后的完整说明。
-
-    面向使用者，不用 L / T / V 这类内部符号，也不用“严格区间”“代理合约”
-    “有界改善”这类只在实现里有意义的说法。
-    """
-    if not uses_strict_metric:
-        return (
-            f"本次周期：{period_names}。\n"
-            "这批结果来自旧版的取样方式，不是连续回放最近 N 个交易日，"
-            "建议重新运行一次。")
-    text = (
-        f"本次周期：{period_names}。\n"
-        "怎么算的：每个周期都从同一个截止日往前，连续回放对应的交易日数"
-        "（近周 5 日、近月 20 日，依此类推）。期权期限只决定每份合约最多"
-        "持有多久——回放天数超过期限时会拆成几段、依次开新合约，最后不满"
-        "一段的部分按当时市价结算。用历史波动率的策略还需要区间之前有足够"
-        "的预热数据。排名只统计各策略与「每日收盘」都跑出结果的交易日。\n")
-    if uses_product_pool:
-        return text + (
-            "排名依据：各段的日损益波动比「每日收盘」低多少，按各段实际"
-            "天数加权。整体金额波动只作参考，不参与排名。")
-    return text + (
-        "排名依据：整段日损益的波动幅度比「每日收盘」低多少。")
-
-
-def metric_labels(*, uses_strict_metric, uses_product_pool):
-    """返回与历史数据路由一致的表头，避免把品种池诊断值写成主指标。"""
-    if uses_strict_metric and uses_product_pool:
-        return {
-            "score": "诊断总得分↓",
-            "baseline": "每日收盘诊断分",
-            "improvement": "较收盘诊断改善",
-        }
-    if uses_strict_metric:
-        return {
-            "score": "区间得分↓",
-            "baseline": "每日收盘区间得分",
-            "improvement": "较收盘改善",
-        }
-    return {
-        "score": "汇总得分↓",
-        "baseline": "每日收盘汇总得分",
-        "improvement": "较旧版改善",
     }
 
 

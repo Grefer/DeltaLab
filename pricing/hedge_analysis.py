@@ -1005,6 +1005,11 @@ def _rank_history_rows(rows, objective=DEFAULT_SELECTION_OBJECTIVE):
         pd.Series(np.nan, index=ranking.index, dtype=float),
     )
     objective_values = pd.to_numeric(objective_values, errors="coerce")
+    # 回退行必须先沉到本 tier 末尾，再和同样回退的行互相比较。增量收益
+    # 是金额、RMS 改善是 [-1,1] 的比率，两者放进同一个排序键就是拿量纲
+    # 不同的数直接比大小——一个 0.50 的比率能压过 0.20 的金额增量。回退
+    # 的本意只是“别让 NaN 行被无差别垫底”，不是让它们混进有效值里排。
+    ranking["_objective_missing"] = (~pd.notna(objective_values)).astype(int)
     selection_values = objective_values.where(
         pd.notna(objective_values), selection_values)
     ranking["selection_objective"] = objective
@@ -1029,15 +1034,15 @@ def _rank_history_rows(rows, objective=DEFAULT_SELECTION_OBJECTIVE):
     ranking = ranking.sort_values(
         [
             "lookback_days", "_comparison_tier", "_coverage_sort",
-            "_selection_sort", "_baseline_tiebreak", "_win_rate_sort",
-            "strategy",
+            "_objective_missing", "_selection_sort", "_baseline_tiebreak",
+            "_win_rate_sort", "strategy",
         ],
-        ascending=[True, True, False, False, True, False, True],
+        ascending=[True, True, False, True, False, True, False, True],
         kind="stable",
     ).reset_index(drop=True)
     ranking = ranking.drop(columns=[
-        "_comparison_tier", "_selection_sort", "_win_rate_sort",
-        "_coverage_sort", "_baseline_tiebreak",
+        "_comparison_tier", "_objective_missing", "_selection_sort",
+        "_win_rate_sort", "_coverage_sort", "_baseline_tiebreak",
     ])
     ranking["rank"] = ranking.groupby("lookback", sort=False).cumcount() + 1
     return ranking
