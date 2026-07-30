@@ -4290,7 +4290,7 @@ def test_history_result_page_exposes_its_interactive_entry_points():
             "_refresh_history_period_chips",
             "_history_consensus_note",      # 跨周期一致性结论
             "_attach_tooltip",
-            "_make_scrollable_area",
+            "_init_history_splitter_ratio",  # 排名/图表分割线的初始比例
     ):
         assert callable(getattr(BacktestApp, name, None)), f"{name} 缺失"
 
@@ -4591,6 +4591,160 @@ def _objective_header_state(*, with_incremental_columns):
         app.destroy()
 
 
+def test_chart_candidate_limit_covers_a_default_run():
+    """图表上限必须装得下一次默认运行的全部候选。
+
+    默认候选是 5 档带宽 + 可选「加入当前回测带宽」+ 固定时刻 = 7 个非基准
+    候选。上限低于它就意味着永远看不全——而候选之间的差别恰恰要靠曲线叠
+    在一起才看得出来。正确性由「加入前预演共同分段交集」单独保证，这个数
+    只管可读性。
+    """
+    default_band = len(history_selection.DEFAULT_BAND_CANDIDATE_SIGMAS)
+    default_candidates = default_band + 1 + 1  # 带宽 + 当前带宽 + 固定时刻
+
+    assert history_selection.MAX_HISTORY_CHART_CANDIDATES >= default_candidates
+    # 标记只有 10 个，超过之后不同候选会共用同一个标记。
+    assert history_selection.MAX_HISTORY_CHART_CANDIDATES <= len(
+        gui_app.STRATEGY_CHART_MARKERS)
+    assert (gui_app.MAX_HISTORY_CHART_CANDIDATES
+            == history_selection.MAX_HISTORY_CHART_CANDIDATES)
+
+
+@pytest.mark.parametrize(("value", "expected"), [
+    (5.6096, "+5.6096"),
+    (-0.0057, "-0.0057"),
+    # 零就写成零。此前一律显示「基准」，会把「带宽宽到全程没触发、增量恰
+    # 好为零」的候选伪装成基线行；而基线的身份已经写在策略列里了。
+    # 前导空格是符号位占位：列是右对齐的，少一个字符会让小数点错开一格。
+    (0.0, " 0.0000"),
+    (1e-15, " 0.0000"),
+    (None, "—"),
+    (float("nan"), "—"),
+    (float("inf"), "—"),
+])
+def test_objective_value_formatting_writes_zero_as_zero(value, expected):
+    assert BacktestApp._format_objective_value(value) == expected
+
+
+def test_consensus_conclusion_is_rendered_exactly_once():
+    """跨周期一致性全页只能有一枚 pill，且必须带「几种结论」。
+
+    此前顶部摘要与结果区各渲染一枚，相隔约 30px 同屏出现、措辞还略有出入
+    （一个带计数一个不带），读者会以为是两条不同的结论。
+    """
+    import tkinter as tk
+    import gui_app as module
+    try:
+        probe = tk.Tk()
+    except tk.TclError:
+        pytest.skip("无可用显示环境")
+    probe.destroy()
+
+    def rank_row(lookback, rank, strategy, strategy_type):
+        return {
+            "lookback": lookback, "rank": rank, "strategy": strategy,
+            "strategy_type": strategy_type, "score": 10.0 - rank,
+            "baseline_score": 10.0, "improvement_vs_c2c": 0.1,
+            "selection_improvement_vs_c2c": 0.1,
+            "selection_metric":
+                history_selection.STRICT_LOOKBACK_SELECTION_METRIC,
+            "window_win_rate_vs_c2c": 1.0, "paired_windows": 3,
+            "baseline_windows": 3, "comparison_eligible": True,
+            "recommendation_eligible": True, "rolling_windows": 3,
+            "eligible_endpoints": 3, "skipped_endpoints": 0,
+            "history_days_available": 61, "lookback_days": 61,
+            "complete_window": True, "maturity_days": 22,
+            "evidence_days": 61, "days_used": 61,
+            "evaluation_mode": "strict_lookback",
+            "sampling_mode": "strict_contiguous", "segment_count": 3,
+            "expiry_segments": 2, "mtm_segments": 1, "terminal_mode": "mixed",
+            "relative_comparison_windows": 3, "max_drawdown": 0.03,
+            "incremental_pnl_vs_c2c": 0.01,
+            "incremental_sharpe_vs_c2c": 0.2,
+            "incremental_tc_vs_c2c": 0.001,
+            "selection_objective": "incremental_pnl",
+        }
+
+    # 两个周期给出不同的最优候选 -> disagree 分支。
+    ranking = pd.DataFrame([
+        rank_row("week", 1, "固定间隔(1σ)", "hedge_band"),
+        rank_row("week", 2, "每日收盘", "close_to_close"),
+        rank_row("quarter", 1, "固定时刻(10:30)", "fixed_times"),
+        rank_row("quarter", 2, "每日收盘", "close_to_close"),
+    ])
+    recommendations = ranking[ranking["rank"].eq(1)].copy()
+
+    app = module.BacktestApp()
+    try:
+        app.withdraw()
+        # 顶部摘要在来源警告非空时会提前 return（默认来源是「模拟」，那条
+        # 警告一直占着位）。不清掉它，顶部这条路径根本不会渲染，测试也就
+        # 盯不住「顶部不得再放一枚一致性 pill」这件事。
+        app._history_source_hint_var.set("")
+        BacktestApp._show_history_recommendation(
+            app, recommendations, ranking, notes=None,
+            source_label="Wind · 测试 · 1分钟", window_results=None,
+            history_state={"history_lookbacks": {"week": 5, "quarter": 61}})
+        app.update_idletasks()
+
+        found = []
+
+        def walk(widget):
+            for child in widget.winfo_children():
+                try:
+                    text = child.cget("text")
+                except tk.TclError:
+                    text = ""
+                if isinstance(text, str) and "一致" in text:
+                    found.append(text)
+                walk(child)
+
+        walk(app)
+    finally:
+        app.destroy()
+
+    assert len(found) == 1, found
+    assert "不一致" in found[0]
+    # 顶部那枚重复的携带着「几种结论」，移除它时这个计数不能跟着丢。
+    assert "2 种" in found[0], found[0]
+
+
+def test_objective_value_zero_carries_no_sign():
+    """零不带正负号——加号会暗示它是个正的增量。"""
+    text = BacktestApp._format_objective_value(0.0)
+
+    assert not text.strip().startswith(("+", "-"))
+    assert "基准" not in text
+
+
+def test_objective_value_zero_still_occupies_the_sign_column():
+    """零要占住符号位，否则整列的小数点对不齐。
+
+    这一列是右对齐的：``0.0000`` 比 ``-0.0211`` 短一个字符，基准行的小数
+    点就会比其它行错开一格，看着像换了一种数字格式。
+    """
+    zero = BacktestApp._format_objective_value(0.0)
+    negative = BacktestApp._format_objective_value(-0.0211)
+    positive = BacktestApp._format_objective_value(0.0061)
+
+    assert len(zero) == len(negative) == len(positive)
+    # 小数点在同一个字符位上。
+    assert zero.index(".") == negative.index(".") == positive.index(".")
+
+
+def test_baseline_row_label_only_marks_identity():
+    """基线行只标明身份，不再往策略列里拼分界说明。
+
+    同一行的 # 列与三个指标格已经都显示「基准」，策略列再挂一句
+    「以上有正贡献」/「以上更优 · 以下更差」既重复又越写越长。
+    """
+    label = BacktestApp._history_baseline_row_label("每日收盘")
+
+    assert label == "每日收盘（基准）"
+    for stale in ("贡献", "以上", "以下", "——"):
+        assert stale not in label
+
+
 def test_objective_headers_stay_clickable_when_increments_exist():
     state = _objective_header_state(with_incremental_columns=True)
 
@@ -4718,5 +4872,504 @@ def test_candidate_config_pairs_each_strategy_with_its_params_on_one_row():
                 if c.grid_info() and c.winfo_class() == "TCheckbutton"
                 and str(c.cget("text")) == label)
             assert widget_column == 0, label
+    finally:
+        app.destroy()
+
+
+def _render_history_result_page(*, agree=True):
+    """用合成排名渲染一次结果页，返回已构建的 app（调用方负责 destroy）。"""
+    import tkinter as tk
+    try:
+        probe = tk.Tk()
+    except tk.TclError:
+        pytest.skip("无可用显示环境")
+    probe.destroy()
+
+    def rank_row(lookback, rank, strategy, strategy_type, *,
+                 inc_pnl, paired=9, eligible=True):
+        return {
+            "lookback": lookback, "rank": rank, "strategy": strategy,
+            "strategy_type": strategy_type, "score": 10.0 - rank,
+            "baseline_score": 10.0, "improvement_vs_c2c": 0.12,
+            "selection_improvement_vs_c2c": 0.12,
+            "selection_metric":
+                history_selection.STRICT_LOOKBACK_SELECTION_METRIC,
+            "selection_objective": "incremental_pnl",
+            "window_win_rate_vs_c2c": 0.67,
+            "paired_windows": paired, "baseline_windows": paired,
+            "comparison_eligible": eligible,
+            "recommendation_eligible": eligible,
+            "rolling_windows": paired, "eligible_endpoints": paired,
+            "skipped_endpoints": 0, "history_days_available": 252,
+            "lookback_days": 252, "complete_window": eligible,
+            "maturity_days": 30, "evidence_days": 252, "days_used": 252,
+            "evaluation_mode": "strict_lookback",
+            "sampling_mode": "strict_contiguous",
+            "segment_count": paired, "expiry_segments": paired - 1,
+            "mtm_segments": 1, "terminal_mode": "mixed",
+            "relative_comparison_windows": paired,
+            "incremental_pnl_vs_c2c": inc_pnl,
+            "incremental_sharpe_vs_c2c": inc_pnl / 10000.0,
+            "incremental_tc_vs_c2c": -0.0031, "max_drawdown": 0.0342,
+        }
+
+    rows = []
+    for lookback, best in (
+            ("quarter", "固定间隔(0.75σ)"),
+            ("year", "固定间隔(0.75σ)" if agree else "固定时刻(10:30)")):
+        rows += [
+            rank_row(lookback, 1, best, "hedge_band", inc_pnl=1248.35),
+            rank_row(lookback, 2, "每日收盘", "close_to_close", inc_pnl=0.0),
+            rank_row(lookback, 3, "固定间隔(2σ)", "hedge_band",
+                     inc_pnl=-655.4, paired=4, eligible=False),
+        ]
+    ranking = pd.DataFrame(rows)
+    recommendations = ranking[ranking["rank"].eq(1)].copy()
+
+    app = gui_app.BacktestApp()
+    app.withdraw()
+    BacktestApp._show_history_recommendation(
+        app, recommendations, ranking, notes=None, source_label="测试",
+        window_results=None,
+        history_state={"history_lookbacks": {"quarter": 61, "year": 252}})
+    app.update_idletasks()
+    return app
+
+
+def test_history_result_blocks_never_share_a_grid_row():
+    """结果页四个区块必须各占一行。
+
+    它们都 grid 在同一个父容器上，行号是手写的常量；插入新区块时漏改后
+    面某一个，两块就会叠在同一行互相压住——而 grid 不会报错，界面只是
+    少了一块，跑测试也全绿。
+    """
+    app = _render_history_result_page()
+    try:
+        parent = app._history_conclusion_card.master
+        rows = {}
+        for child in parent.winfo_children():
+            info = child.grid_info()
+            if not info:
+                continue
+            rows.setdefault(int(info["row"]), []).append(child.winfo_class())
+        duplicated = {k: v for k, v in rows.items() if len(v) > 1}
+        assert not duplicated, f"同一 grid 行上有多个区块: {duplicated}"
+
+        # 结论卡必须排在分割区之前：它是结论，不是表格的脚注。
+        card_row = int(app._history_conclusion_card.grid_info()["row"])
+        splitter_row = int(app._history_splitter.grid_info()["row"])
+        assert card_row < splitter_row
+
+        # 排名表与图表是分割区的两格，顺序为上表下图。
+        panes = [str(p) for p in app._history_splitter.panes()]
+        assert panes == [
+            str(app._history_rank_tree.master),
+            str(app._history_chart_canvas.get_tk_widget().master),
+        ], panes
+    finally:
+        app.destroy()
+
+
+def test_history_result_page_has_no_nested_scrolling_canvas():
+    """结果页不得再把可滚动画布套在表格和图表外面。
+
+    三层嵌套滚动要靠 ``bind_all`` 在画布、表格、图表之间抢滚轮；两块内容
+    各自合适的高度改由用户拖分割线决定，这里守住不回退。
+    """
+    app = _render_history_result_page()
+    try:
+        def walk(widget, found):
+            for child in widget.winfo_children():
+                if child.winfo_class() == "Canvas":
+                    found.append(str(child))
+                walk(child, found)
+            return found
+
+        chart_widget = str(app._history_chart_canvas.get_tk_widget())
+        canvases = [
+            name for name in walk(app._history_results_container, [])
+            if name != chart_widget
+        ]
+        # 图表自己那块 Canvas 之外，结果区不该再有别的画布。
+        assert canvases == [], canvases
+    finally:
+        app.destroy()
+
+
+class _FakeSplitter:
+    """只实现 `_init_history_splitter_ratio` 用到的那几个 PanedWindow 接口。
+
+    真窗口在 withdraw 状态下不做布局，`winfo_height()` 恒为 1，用真控件测
+    不出比例逻辑；而这套逻辑本身与渲染无关。
+
+    ``echo`` 复现真实页面里的那条反馈链：摆放分割线会让图表重绘、
+    LabelFrame 的请求尺寸变化、外层 grid 再把 splitter 的高度改掉二十来
+    像素，于是 ``<Configure>`` 又打回来。最初这个假控件是"摆放不产生任
+    何后果"的空壳，于是漏掉了一个把界面彻底卡死的死循环。
+    """
+
+    def __init__(self, height, echo=0):
+        self.height = height
+        self.echo = echo
+        self.sash = 0
+        self.placed = []
+        self._handlers = {}
+        self._depth = 0
+
+    def winfo_height(self):
+        return self.height
+
+    def sash_coord(self, index):
+        return (0, self.sash)
+
+    def sash_place(self, index, x, y):
+        self.placed.append((index, x, y))
+        self.sash = y
+        if self.echo and self._depth < 60:
+            # 高度在两个值之间来回，正是实测到的 621↔645。
+            self._depth += 1
+            self.height += self.echo
+            self.echo = -self.echo
+            self.fire("<Configure>")
+            self._depth -= 1
+
+    def bind(self, sequence, func, add=None):
+        self._handlers[sequence] = func
+
+    def after_idle(self, func):
+        func()
+
+    def fire(self, sequence):
+        handler = self._handlers.get(sequence)
+        if handler is not None:
+            handler()
+
+
+def test_history_splitter_ignores_its_own_layout_echo():
+    """摆放分割线引起的高度回弹不得再触发摆放。
+
+    这是把整个界面卡死的那条闭环：sash_place → 图表重绘 → 请求尺寸变化
+    → grid 重排 → splitter 高度变 → <Configure> → sash_place。实测单次
+    渲染里 sash_place 被调用 300+ 次、一帧都画不出来、内存被 Agg 缓冲区
+    撑到 GB 级。
+    """
+    splitter = _FakeSplitter(621, echo=24)
+    BacktestApp._init_history_splitter_ratio(
+        SimpleNamespace(), splitter, ratio=0.45)
+
+    assert splitter.placed == [(0, 0, int(621 * 0.45))], splitter.placed
+
+
+def test_history_splitter_placement_budget_bounds_any_unforeseen_wobble():
+    """即使抖动幅度大到绕过回波判定，摆放次数也必须有硬上限。"""
+    # 回弹幅度远超容忍比例，模拟未预料的剧烈抖动。
+    splitter = _FakeSplitter(600, echo=400)
+    BacktestApp._init_history_splitter_ratio(
+        SimpleNamespace(), splitter, ratio=0.45)
+
+    assert len(splitter.placed) <= BacktestApp._HISTORY_SASH_PLACEMENT_BUDGET
+
+
+def test_history_splitter_follows_the_ratio_until_the_user_drags():
+    """分割线按比例跟随容器高度，用户一拖就彻底交权。
+
+    只在第一次 `<Configure>` 落一次是不够的：那一刻拿到的常是还没排完版
+    的临时高度，比例会被冻结在一个偏小的位置上，排名表一上来只剩四五行。
+    但用户拖过之后再跟随，就会把他刚调好的比例冲掉。
+    """
+    splitter = _FakeSplitter(600)
+    BacktestApp._init_history_splitter_ratio(
+        SimpleNamespace(), splitter, ratio=0.45)
+
+    # after_idle 立刻摆一次，不必等第一个 <Configure>。
+    assert splitter.placed[-1] == (0, 0, 270)
+
+    # 容器变高、用户还没拖过 —— 继续按比例跟随。
+    splitter.height = 900
+    splitter.fire("<Configure>")
+    assert splitter.placed[-1] == (0, 0, 405)
+
+    # 高度还没算出来时不摆放，免得把比例冻结在临时值上。
+    splitter.height = 1
+    placements = len(splitter.placed)
+    splitter.fire("<Configure>")
+    assert len(splitter.placed) == placements
+
+    # 极矮容器下不得把排名表压没：下限 150 优先于比例。
+    splitter.height = 200
+    splitter.fire("<Configure>")
+    assert splitter.placed[-1] == (0, 0, 150)
+
+    # 用户按住分割线之后交权：后续尺寸变化不得再改动位置。
+    splitter.fire("<ButtonPress-1>")
+    placements = len(splitter.placed)
+    splitter.height = 1000
+    splitter.fire("<Configure>")
+    assert len(splitter.placed) == placements
+
+
+def test_history_conclusion_card_tracks_the_selected_rank_row():
+    """结论卡显示的必须是动作按钮真正会作用的那一行。
+
+    两个按钮取的是排名表的选中行；卡片若固定显示周期冠军，用户选中别的
+    策略后看到的结论与点下去实际跑的策略就是两回事。
+    """
+    app = _render_history_result_page()
+    try:
+        # 默认选中 rank 1，卡片即本周期推荐。
+        assert "本周期最优" in app._history_conclusion_badge_var.get()
+        assert app._history_conclusion_name_var.get() == "固定间隔(0.75σ)"
+
+        tree = app._history_rank_tree
+        children = tree.get_children()
+        tree.selection_set(children[1])
+        tree.focus(children[1])
+        BacktestApp._update_history_rank_selection(app)
+        app.update_idletasks()
+        assert app._history_conclusion_name_var.get() == "每日收盘"
+        assert "基准" in app._history_conclusion_badge_var.get()
+
+        # 数据不足的候选要在卡片上直说，不能只靠表格底色暗示。
+        tree.selection_set(children[2])
+        tree.focus(children[2])
+        BacktestApp._update_history_rank_selection(app)
+        app.update_idletasks()
+        assert app._history_conclusion_name_var.get() == "固定间隔(2σ)"
+        assert "数据不足" in app._history_conclusion_badge_var.get()
+    finally:
+        app.destroy()
+
+
+def test_history_run_button_sits_in_the_page_header_with_its_own_progress():
+    """主行动与进度都必须留在本页。
+
+    按钮此前跟在候选配置下方，折叠配置时会随之上跳；而进度条只有左侧参
+    数栏那一条，用户正看着本页时那边的动静完全看不到。
+    """
+    import tkinter as tk
+    try:
+        probe = tk.Tk()
+    except tk.TclError:
+        pytest.skip("无可用显示环境")
+    probe.destroy()
+
+    app = gui_app.BacktestApp()
+    try:
+        app.withdraw()
+        app.update_idletasks()
+        header = app._history_btn.master
+        # 主按钮与折叠开关同处页首一行，折叠候选配置不会挪动它。
+        assert int(app._history_btn.grid_info()["row"]) == 0
+        assert header is app._history_config_toggle_btn.master
+        before = app._history_btn.grid_info()
+        BacktestApp._toggle_history_config_panel(app)
+        app.update_idletasks()
+        assert app._history_btn.grid_info() == before
+
+        # 折叠后仍能展开，且配置面板回到结果区之上。
+        BacktestApp._toggle_history_config_panel(app)
+        app.update_idletasks()
+        assert app._history_config_panel.winfo_manager() == "pack"
+
+        assert not app._history_progress.grid_info()
+        BacktestApp._set_history_progress(app, "正在优选（近一年）…")
+        app.update_idletasks()
+        assert app._history_progress.grid_info()
+        assert "近一年" in app._history_progress_var.get()
+        BacktestApp._set_history_progress(app, "")
+        app.update_idletasks()
+        assert not app._history_progress.grid_info()
+        assert app._history_progress_var.get() == ""
+    finally:
+        app.destroy()
+
+
+def test_history_row_padding_follows_each_column_anchor():
+    """内边距要按列的对齐方向补在正确的一侧。"""
+    keys = ("rank", "strategy", "max_drawdown", "status")
+    padded = BacktestApp._pad_history_row(
+        ("1", "每日收盘", "0.3948", "✓"), keys)
+
+    # 居中列不动；左对齐补在前面、右对齐补在后面。
+    assert padded == ("1", " 每日收盘", "0.3948 ", "✓")
+    # 空单元格不补，否则会凭空多出一格看不见的宽度。
+    assert BacktestApp._pad_history_row(
+        ("", ""), ("strategy", "max_drawdown")) == ("", "")
+
+
+def test_history_rank_columns_never_let_neighbouring_cells_touch():
+    """相邻两列的文本之间必须留出可见间隙。
+
+    ttk.Treeview 没有单元格内边距：右对齐的数字紧贴本列右边界，左对齐的
+    文本紧贴下一列左边界。右对齐的「最大回撤」后面原本跟着左对齐的「样本
+    完整度」，两者间隙实测正好是 0 像素——`0.3948` 和 `✓` 直接粘成一团。
+    """
+    import tkinter as tk
+    import tkinter.font as tkfont
+    from tkinter import ttk
+    try:
+        root = tk.Tk()
+    except tk.TclError:
+        pytest.skip("无可用显示环境")
+    try:
+        root.withdraw()
+        tree = BacktestApp._build_history_metric_tree(
+            root,
+            lead_columns=(("rank", "#", 38), ("strategy", "策略 / 参数", 232)),
+            status_heading="样本完整度", status_width=129, height=8)
+        columns = list(tree["columns"])
+        # 结构性约束：右对齐列后面绝不能紧跟左对齐列。这两种对齐各自把文
+        # 本推到相邻的那条边界上，中间不留任何余地——补空格只是把症状盖住
+        # 了，列一窄照样会碰。
+        anchors = [BacktestApp._history_column_anchor(c) for c in columns]
+        collisions = [
+            f"{columns[i]}(e)→{columns[i + 1]}(w)"
+            for i in range(len(columns) - 1)
+            if anchors[i] == "e" and anchors[i + 1] == "w"
+        ]
+        assert not collisions, f"右对齐列后面紧跟左对齐列: {collisions}"
+
+        # 取实际会出现的最长内容：负号 + 四位小数，以及最长的策略名。
+        values = BacktestApp._pad_history_row(
+            ("🥇 1", "固定时刻(23:00,11:30,15:00)", "-2.6190", "-0.1134",
+             "+0.1190", "0.3948", "✓"), columns)
+        font = tkfont.Font(
+            font=ttk.Style().lookup("Treeview", "font") or "TkDefaultFont")
+
+        spans = {}
+        offset = tree.column("#0", "width")
+        for column in columns:
+            width = tree.column(column, "width")
+            spans[column] = (offset, offset + width, width,
+                             BacktestApp._history_column_anchor(column))
+            offset += width
+
+        def visible(column, text):
+            """可见字形的像素区间——补的空格占位但不显形，两端要扣掉。"""
+            left, right, width, anchor = spans[column]
+            total = font.measure(text)
+            lead = total - font.measure(text.lstrip())
+            trail = total - font.measure(text.rstrip())
+            if anchor == "w":
+                return left + lead, left + total - trail
+            if anchor == "e":
+                return right - total + lead, right - trail
+            return (left + (width - total) / 2 + lead,
+                    left + (width + total) / 2 - trail)
+
+        extents = [visible(c, v) for c, v in zip(columns, values)]
+        tight = {
+            f"{columns[i]}→{columns[i + 1]}":
+                round(extents[i + 1][0] - extents[i][1], 1)
+            for i in range(len(columns) - 1)
+            if extents[i + 1][0] - extents[i][1] < 4
+        }
+        assert not tight, f"相邻列文本几乎贴在一起: {tight}"
+    finally:
+        root.destroy()
+
+
+def test_history_rank_headers_align_with_their_column_data():
+    """表头必须和本列数据同向对齐。
+
+    表头一律居中、数字却右对齐时，一列里没有任何一条共同的竖边，眼睛就
+    找不到列的界限——这比缺少分割线更影响可读性。
+    """
+    import tkinter as tk
+    try:
+        root = tk.Tk()
+    except tk.TclError:
+        pytest.skip("无可用显示环境")
+    try:
+        root.withdraw()
+        tree = BacktestApp._build_history_metric_tree(
+            root,
+            lead_columns=(("rank", "#", 38), ("strategy", "策略 / 参数", 232)),
+            status_heading="样本完整度", status_width=129, height=8)
+        mismatched = {
+            column: (tree.heading(column, "anchor"),
+                     tree.column(column, "anchor"))
+            for column in tree["columns"]
+            if str(tree.heading(column, "anchor"))
+            != str(tree.column(column, "anchor"))
+        }
+        assert not mismatched, f"表头与数据对齐方向不一致: {mismatched}"
+
+        # 数字列必须右对齐：居中会打乱数位，让同一列的数值无法按位比较。
+        for column in ("incremental_pnl", "incremental_sharpe",
+                       "incremental_tc", "max_drawdown"):
+            assert str(tree.column(column, "anchor")) == "e", column
+    finally:
+        root.destroy()
+
+
+def test_baseline_row_is_not_tinted_like_the_table_header():
+    """基准行底色不得与表头同色。
+
+    两者都取 primary_light 时，紧挨在表头下面的基准行看着像是第二行表
+    头，而不是一条数据。
+    """
+    import tkinter as tk
+    from tkinter import ttk
+    try:
+        probe = tk.Tk()
+    except tk.TclError:
+        pytest.skip("无可用显示环境")
+    probe.destroy()
+
+    # 必须用真实 app：表头底色是 BacktestApp 启动时配进 ttk 样式的，裸
+    # Tk() 上 lookup 拿到的是系统默认值，断言会变成空转。
+    app = gui_app.BacktestApp()
+    try:
+        app.withdraw()
+        style = ttk.Style(app)
+        heading_bg = str(
+            style.lookup("Treeview.Heading", "background")).lower()
+        assert heading_bg == gui_app.PALETTE["primary_light"].lower(), (
+            f"表头底色不再是 primary_light（{heading_bg}），这条断言的前提变了")
+
+        reference = gui_app.PALETTE["reference"].lower()
+        assert reference != heading_bg
+        # 也不能和普通行同色，否则基准行就完全看不出来了。
+        assert reference != str(
+            style.lookup("Treeview", "background")).lower()
+    finally:
+        app.destroy()
+
+
+def test_rank_table_row_tags_keep_the_monospaced_body_font():
+    """行标签不得把表格字体换成比例字体。
+
+    基准行曾用 `_UI_FONT_FAMILY` 加粗——那是比例字体，实测同一个数字在它
+    下面只有 28~32px 宽，而表格正文 (Menlo 9) 恒为 35px，于是基准行的数位
+    与上下各行全部错开，读起来就是"另一种数字格式"。等宽字体的加粗步进宽
+    度与常规一致，可以放心用来强调。
+    """
+    import tkinter.font as tkfont
+    from tkinter import ttk
+
+    samples = (" 0.0000", "-0.0211", "+0.6708", "-0.5102")
+    app = _render_history_result_page()
+    try:
+        tree = app._history_rank_tree
+        body = tkfont.Font(
+            root=app, font=ttk.Style(app).lookup("Treeview", "font"))
+
+        # 正文本身必须等宽，否则右对齐也救不了数位对齐。
+        widths = {body.measure(s) for s in samples}
+        assert len(widths) == 1, f"表格正文不是等宽字体: {widths}"
+
+        # 任何覆盖了字体的行标签，都必须与正文同族同宽。
+        for tag in ("baseline", "leader", "incomplete"):
+            spec = tree.tag_configure(tag, "font")
+            if not spec:
+                continue          # 没覆盖字体的标签天然安全
+            tagged = tkfont.Font(root=app, font=spec)
+            assert tagged.actual("family") == body.actual("family"), (
+                f"{tag} 换了字体族: {tagged.actual('family')} "
+                f"≠ {body.actual('family')}")
+            for sample in samples:
+                assert tagged.measure(sample) == body.measure(sample), (
+                    f"{tag} 的 {sample!r} 宽度与正文不一致")
     finally:
         app.destroy()

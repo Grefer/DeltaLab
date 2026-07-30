@@ -27,6 +27,10 @@ archive/
 
 # Data cache (runtime generated)
 data/cache/
+
+# 策略优选结果包（用户产出，不是缓存：Wind 区间随分析截至日移动，
+# 同样参数换个月跑出来不是同一段数据，删了无法重建）
+data/history_results/
 *.parquet
 
 # Test cache

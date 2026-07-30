@@ -92,6 +92,10 @@ PALETTE = {
     "selected":     "#DBEAFE",   # 选中高亮
     "gold":         "#B8860B",   # 金色 (装饰线)
     "tab_inactive": "#E2E8F0",   # 未选中 tab 底色
+    # 基准/参照行底色。刻意取中性灰而不是 primary_light——表头就是
+    # primary_light，基准行常常紧挨在表头下面，同色会让人以为那是第二行
+    # 表头而不是一条数据。
+    "reference":    "#ECEFF4",
 }
 
 # matplotlib 整体风格配置 (与 Tk 主题协调)
@@ -372,10 +376,10 @@ _WIND_BAND_BAR_LABEL = "1分钟"
 _WIND_DATE_BUFFER_DAYS = 21
 
 # 排名依据的中英映射。两个口径都相对“日内不动”的基线取增量，区别只在于
-# 看绝对多赚了多少，还是看这份增量的性价比。
+# 看绝对多赚了多少，还是看这份增量的信噪比（每单位波动换来多少增量）。
 HISTORY_OBJECTIVE_DISPLAY = {
     "incremental_pnl": "增量收益（赚更多）",
-    "incremental_sharpe": "增量性价比（更稳）",
+    "incremental_sharpe": "增量信噪比（更稳）",
 }
 HISTORY_OBJECTIVE_FROM_DISPLAY = {
     value: key for key, value in HISTORY_OBJECTIVE_DISPLAY.items()
@@ -1524,6 +1528,7 @@ class BacktestApp(tk.Tk):
         header.pack(fill="x", padx=8, pady=(8, 6))
         header.columnconfigure(0, weight=1)
         header.columnconfigure(1, weight=0)
+        header.columnconfigure(2, weight=0)
 
         self._history_header_summary_frame = ttk.Frame(
             header, style="Surface.TFrame")
@@ -1536,7 +1541,27 @@ class BacktestApp(tk.Tk):
             command=self._toggle_history_config_panel,
         )
         self._history_config_toggle_btn.grid(
-            row=0, column=1, sticky="e", padx=(8, 0))
+            row=0, column=1, sticky="e", padx=(8, 6))
+
+        # 变量保留：顶部摘要里的警示 pill 从它取文案。这里不再重复渲染
+        # 同一句话——同屏出现两遍只会让人以为是两条不同的提示。
+        self._history_source_hint_var = tk.StringVar()
+        # 主行动固定在页首：它此前跟在候选配置下方，折叠配置时会随之上跳，
+        # 出结果后又被推到滚动区上方，想改参数重跑得先往回滚。
+        self._history_btn = ttk.Button(
+            header, text="开始策略优选", style="Run.TButton",
+            command=self._run_history_recommendation,
+        )
+        self._history_btn.grid(row=0, column=2, sticky="e", ipadx=12, ipady=2)
+
+        # 优选跑在后台，而共享进度条在左侧参数栏里；用户此刻正盯着这一页，
+        # 那边的动静完全看不到，只能看见一个变灰的按钮。这里给本页一份。
+        self._history_progress = ttk.Progressbar(
+            header, mode="indeterminate")
+        self._history_progress_var = tk.StringVar(value="")
+        self._history_progress_label = ttk.Label(
+            header, textvariable=self._history_progress_var,
+            style="SurfaceMuted.TLabel", anchor="w")
 
         self._history_config_panel = ttk.Frame(
             container, style="Surface.TFrame")
@@ -1741,18 +1766,6 @@ class BacktestApp(tk.Tk):
             ),
         )
 
-        actions = ttk.Frame(container, style="Surface.TFrame")
-        actions.pack(fill="x", padx=8, pady=(2, 6))
-        self._history_actions_frame = actions
-        # 变量保留：顶部摘要里的警示 pill 从它取文案。这里不再重复渲染
-        # 同一句话——同屏出现两遍只会让人以为是两条不同的提示。
-        self._history_source_hint_var = tk.StringVar()
-        self._history_btn = ttk.Button(
-            actions, text="开始策略优选", style="Run.TButton",
-            command=self._run_history_recommendation,
-        )
-        self._history_btn.pack(side="right", ipadx=14, ipady=3)
-
         self._history_results_container = ttk.Frame(
             container, style="Surface.TFrame")
         self._history_results_container.pack(
@@ -1801,41 +1814,10 @@ class BacktestApp(tk.Tk):
             )
             src_pill.pack(side="left", padx=(0, 6))
 
-        # 结论 pill 必须与下方的一致性横幅说同一件事。直接取
-        # ranking["rank"] == 1 的第一行有两个坑：rank 是按周期分组算的，
-        # 每个周期都有一条 rank==1，iloc[0] 拿到的是「近周」——恰恰是样本
-        # 最少、横幅明确建议不要单独采信的那个；而且基准（每日收盘）在所
-        # 有候选都是负增量时也会排第一，但它是对照组，不是推荐。
-        picks = []
-        ranking = getattr(self, "_history_ranking", None)
-        if ranking is not None and not getattr(ranking, "empty", True):
-            for _lookback, group in ranking.groupby("lookback", sort=False):
-                eligible = group[
-                    group["recommendation_eligible"].fillna(False).astype(bool)]
-                candidates = eligible[
-                    eligible["strategy_type"].astype(str) != "close_to_close"]
-                if candidates.empty:
-                    continue
-                best = candidates.sort_values("rank", kind="stable").iloc[0]
-                name = str(best.get("strategy", "")).strip()
-                if name and name != "—":
-                    picks.append(name)
-        if picks:
-            unique = set(picks)
-            if len(unique) == 1:
-                text = f"🏆 {len(picks)} 个周期一致推荐: {picks[0]}"
-                pill_bg, pill_fg = (
-                    PALETTE["success_light"], PALETTE["success"])
-            else:
-                text = f"⚠ 各周期结论不一致（{len(unique)} 种）"
-                pill_bg, pill_fg = (
-                    PALETTE["warning_light"], PALETTE["warning"])
-            pick_pill = tk.Label(
-                container, text=text, bg=pill_bg, fg=pill_fg,
-                font=(_UI_FONT_FAMILY, 9, "bold"), padx=10, pady=3,
-            )
-            pick_pill.pack(side="left", padx=(0, 6))
-
+        # 跨周期一致性只在结果区渲染一枚 pill（紧挨周期切换条，见
+        # _build_history_period_box）。这里曾经再放一枚说同一件事的：两枚
+        # 相隔约 30px 同屏出现，措辞还略有出入，读者会以为是两条不同的
+        # 结论。顶部这条摘要留给「本次跑的是什么」——数据源与排名口径。
         objective_var = getattr(self, "_history_result_objective_var", None)
         if objective_var is not None:
             obj_val = objective_var.get().strip()
@@ -1857,7 +1839,7 @@ class BacktestApp(tk.Tk):
             self._history_config_visible = False
             button.configure(text="展开候选配置")
         else:
-            before = getattr(self, "_history_actions_frame", None)
+            before = getattr(self, "_history_results_container", None)
             pack_options = {
                 "fill": "x", "padx": 8, "pady": (0, 5),
             }
@@ -1866,6 +1848,33 @@ class BacktestApp(tk.Tk):
             panel.pack(**pack_options)
             self._history_config_visible = True
             button.configure(text="收起候选配置")
+
+    def _set_history_progress(self, text):
+        """在本页主按钮下方显示/隐藏优选任务进度。
+
+        ``text`` 为空表示任务结束，收起进度条并让出版面。左侧那条共享
+        进度条仍照常工作，这里只补上本页看得见的一份。
+        """
+        bar = getattr(self, "_history_progress", None)
+        label = getattr(self, "_history_progress_label", None)
+        variable = getattr(self, "_history_progress_var", None)
+        if bar is None or label is None or variable is None:
+            return
+        try:
+            if text:
+                variable.set(text)
+                label.grid(row=1, column=0, sticky="w", pady=(6, 0))
+                bar.grid(row=1, column=1, columnspan=2, sticky="ew",
+                         padx=(12, 0), pady=(6, 0))
+                bar.start(15)
+            else:
+                bar.stop()
+                bar.grid_remove()
+                label.grid_remove()
+                variable.set("")
+        except tk.TclError:
+            # 容忍窗口销毁期间的收尾回调。
+            pass
 
     @staticmethod
     def _attach_tooltip(widget, text):
@@ -1902,66 +1911,6 @@ class BacktestApp(tk.Tk):
         widget.bind("<Enter>", _show, add="+")
         widget.bind("<Leave>", _hide, add="+")
         widget.bind("<Destroy>", _hide, add="+")
-
-    def _make_scrollable_area(self, parent):
-        """把 ``parent`` 变成可纵向滚动的区域，返回放内容的内层 Frame。
-
-        结果页的各个区块（周期结论、排名、图表）都有各自的自然高度，硬挤
-        在一屏里只会互相压缩——图表被压到百来像素时坐标轴和图例就糊成一
-        团。这里让内容按自然高度铺开，超出视口的部分交给滚动条；窗口足够
-        高时内层会撑满视口，不会出现“上面一块、下面留白”的空档。
-        """
-        canvas = tk.Canvas(
-            parent, highlightthickness=0, bd=0, bg=PALETTE["surface"])
-        scrollbar = ttk.Scrollbar(
-            parent, orient="vertical", command=canvas.yview)
-        canvas.configure(yscrollcommand=scrollbar.set)
-        scrollbar.pack(side="right", fill="y")
-        canvas.pack(side="left", fill="both", expand=True)
-
-        inner = ttk.Frame(canvas, style="Surface.TFrame")
-        inner_id = canvas.create_window((0, 0), window=inner, anchor="nw")
-
-        def _on_inner_configure(_event=None):
-            canvas.configure(scrollregion=canvas.bbox("all"))
-
-        def _on_canvas_configure(event):
-            # 内容不足一屏时撑满视口，超出时保持自然高度以便滚动。
-            canvas.itemconfigure(
-                inner_id, width=event.width,
-                height=max(event.height, inner.winfo_reqheight()))
-
-        inner.bind("<Configure>", _on_inner_configure)
-        canvas.bind("<Configure>", _on_canvas_configure)
-
-        # 滚轮只在指针位于本区域时接管，避免抢走表格和图表自己的滚动。
-        def _on_wheel(event):
-            canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
-            return "break"
-
-        def _on_wheel_linux(event):
-            canvas.yview_scroll(-3 if event.num == 4 else 3, "units")
-            return "break"
-
-        def _bind_wheel(_event=None):
-            if _SYSTEM == "Linux":
-                canvas.bind_all("<Button-4>", _on_wheel_linux)
-                canvas.bind_all("<Button-5>", _on_wheel_linux)
-            else:
-                canvas.bind_all("<MouseWheel>", _on_wheel)
-
-        def _unbind_wheel(_event=None):
-            if _SYSTEM == "Linux":
-                canvas.unbind_all("<Button-4>")
-                canvas.unbind_all("<Button-5>")
-            else:
-                canvas.unbind_all("<MouseWheel>")
-
-        canvas.bind("<Enter>", _bind_wheel)
-        canvas.bind("<Leave>", _unbind_wheel)
-        inner.bind("<Enter>", _bind_wheel)
-        inner.bind("<Leave>", _unbind_wheel)
-        return inner
 
     def _show_empty_history_results(self):
         container = getattr(self, "_history_results_container", None)
@@ -2663,6 +2612,7 @@ class BacktestApp(tk.Tk):
         self._progress.pack_forget()
         self._progress_label.pack_forget()
         self._progress_label.configure(text="")
+        BacktestApp._set_history_progress(self, "")
         self._active_job = None
         for button in BacktestApp._job_guarded_buttons(self):
             button.configure(state="normal")
@@ -2718,6 +2668,7 @@ class BacktestApp(tk.Tk):
                 "history",
                 f"正在使用真实历史行情执行批量优选（{selected_text}）…"):
             return False
+        self._set_history_progress(f"正在优选（{selected_text}）…")
         self._progress.configure(mode="indeterminate")
         self._progress.pack(fill="x", pady=(6, 0))
         self._progress.start(15)
@@ -3815,6 +3766,17 @@ class BacktestApp(tk.Tk):
                 return BacktestApp._strategy_style_key(
                     f"hedge_band_{band_type}_{threshold:.6g}")
         return BacktestApp._strategy_style_key("hedge_band", sigma=sigma)
+
+    @staticmethod
+    def _history_baseline_row_label(strategy_label):
+        """基线行在策略列里的显示名。
+
+        基线在三种排序口径下取值都恒为 0——增量收益、增量信噪比、以及品种
+        池降级时用的逐段改善率——所以它排在哪一位本身就是分界线。这里只标
+        明身份，不再拼接分界说明：那句话越写越长，而同一行的 # 列与三个指
+        标格已经都显示「基准」了。
+        """
+        return f"{strategy_label}（基准）"
 
     @staticmethod
     def _history_row_style_key(row):
@@ -5111,6 +5073,9 @@ class BacktestApp(tk.Tk):
             "_history_chart_selected_by_period", "_history_pairs_cache",
             "_history_chart_color_map", "_history_chart_marker_map",
             "_history_action_hint_var",
+            "_history_conclusion_card", "_history_conclusion_accent",
+            "_history_conclusion_badge_var", "_history_conclusion_name_var",
+            "_history_conclusion_stats", "_history_splitter",
             "_history_batch_outcome_bar", "_history_batch_outcome_var",
             "_history_batch_outcome_label",
             "_history_batch_outcome_detail_btn",
@@ -5149,10 +5114,10 @@ class BacktestApp(tk.Tk):
                     "历史择优说明", "\n\n".join(str(note) for note in notes)),
             ).pack(side="right", padx=(6, 0))
 
-        # 结果页整体可纵向滚动：各区块按自然高度铺开，不再互相挤压。
-        scroll_host = ttk.Frame(staging, style="Surface.TFrame")
-        scroll_host.pack(fill="both", expand=True, padx=4, pady=(2, 2))
-        history_body = BacktestApp._make_scrollable_area(self, scroll_host)
+        # 结果页不再整体滚动：顶部结论固定，排名表与图表由一条可拖分割线
+        # 分配剩余高度，各自内部该滚的照旧滚。
+        history_body = ttk.Frame(staging, style="Surface.TFrame")
+        history_body.pack(fill="both", expand=True, padx=4, pady=(2, 2))
         history_lookbacks = (
             history_state.get("history_lookbacks")
             if isinstance(history_state, Mapping) else None)
@@ -5483,19 +5448,58 @@ class BacktestApp(tk.Tk):
     # 两个排名口径并排显示：一列驱动本次排序，另一列供对照——两者给出
     # 相反顺序的地方，正是需要人来判断的地方。RMS 得分与胜率是旧口径的
     # 诊断值，已移入选中行的详情串，不再占表宽。
-    # 一套完整的决策依据：多赚多少、性价比如何、为此多花多少成本、
+    # 一套完整的决策依据：多赚多少、信噪比如何、为此多花多少成本、
     # 最坏一段亏多少。只给前两项时右侧会空出大片版面，而后两项恰恰是
     # 判断“这份增量划不划算”缺不了的另一半。
     _HISTORY_METRIC_COLUMNS = (
         ("incremental_pnl", "增量收益", 130),
-        ("incremental_sharpe", "增量性价比", 140),
-        ("incremental_tc", "多花成本", 130),
+        ("incremental_sharpe", "增量信噪比", 140),
+        ("incremental_tc", "增量成本", 130),
         ("max_drawdown", "最大回撤", 130),
     )
 
+    # 各列的对齐方向。未列出的都是数字列，一律右对齐。
+    # 状态列曾经是左对齐，紧跟在右对齐的最大回撤后面——右对齐文本贴着本列
+    # 右边界、左对齐文本贴着下一列左边界，中间一个像素都不剩，于是
+    # 「0.3948」和「✓」直接粘成一团。改成居中后两侧都留出空隙。
+    _HISTORY_COLUMN_ANCHORS = {
+        "check": "center", "rank": "center", "period": "center",
+        "strategy": "w", "status": "center",
+    }
+    _HISTORY_NUMERIC_ANCHOR = "e"
+
+    @staticmethod
+    def _history_column_anchor(key):
+        return BacktestApp._HISTORY_COLUMN_ANCHORS.get(
+            key, BacktestApp._HISTORY_NUMERIC_ANCHOR)
+
+    @staticmethod
+    def _pad_history_row(values, keys):
+        """按对齐方向给单元格补一个空格的内边距，返回可直接写入的值。
+
+        ttk.Treeview 没有单元格内边距这回事：文本严格贴着 anchor 那一侧的
+        列边界。列宽又随窗口伸缩，靠把某一列调宽治不了根——窗口一窄，右对
+        齐的数字仍然会顶到边界上，和邻列内容挤在一起。这里在**显示文本**
+        两端补空格，等价于给每格加内边距；表格值不参与任何解析（行数据另
+        存在 ``_history_rank_rows``），补空格不影响逻辑。
+        """
+        padded = []
+        for key, value in zip(keys, values):
+            text = str(value)
+            anchor = BacktestApp._history_column_anchor(key)
+            if not text:
+                padded.append(text)
+            elif anchor == "e":
+                padded.append(f"{text} ")
+            elif anchor == "w":
+                padded.append(f" {text}")
+            else:
+                padded.append(text)
+        return tuple(padded)
+
     @staticmethod
     def _format_history_status(status, paired, total):
-        """把“可比段数 + 数据完整度”压成一列。
+        """把“可比段数 + 数据完整度”压成一列（表头「样本完整度」）。
 
         正常情况下这两项分别是 ``n/n`` 和“数据完整”，逐行重复且不传递
         任何信息；只有出现失败段或数据不足时才值得占版面。
@@ -5525,12 +5529,23 @@ class BacktestApp(tk.Tk):
 
     @staticmethod
     def _format_objective_value(value, digits=4):
-        """格式化增量指标：基线自身是 0，缺失时显示占位符。"""
+        """格式化增量指标；缺失时显示占位符。
+
+        零就写成零。此前零一律显示为「基准」，有两个问题：基线的身份已经
+        写在策略列的「（基准）」里，三个指标格再各写一遍是同一行内的重复；
+        更要紧的是候选也可能拿到零增量（带宽宽到全程没触发，与基线完全一
+        致），那时「基准」会把它伪装成基线行。零不带正负号——加号会暗示它
+        是个正的增量。
+
+        但零仍要占住符号位：这一列是右对齐的，``0.0000`` 比 ``-0.0211``
+        短一个字符，小数点就会错开一格，基准行看着像换了一种格式。补一个
+        空格既不显形，又让整列的小数点对齐。
+        """
         number = BacktestApp._comparison_finite(value)
         if number is None:
             return "—"
         if np.isclose(number, 0.0, atol=1e-12):
-            return "基准"
+            return f" {0.0:.{digits}f}"
         return f"{number:+.{digits}f}"
 
     @staticmethod
@@ -5566,6 +5581,10 @@ class BacktestApp(tk.Tk):
         tree.column("#0", width=46, stretch=False, anchor="center")
         for key, heading, width in specs:
             text = heading
+            # 表头与本列数据同向对齐。此前表头一律居中而数字右对齐，一列
+            # 里没有任何一条共同的竖边，眼睛就找不到列的界限——这比缺少分
+            # 割线更要命。同向之后每列的右边界（或左边界）自己连成一条线。
+            anchor = BacktestApp._history_column_anchor(key)
             if key in _OBJECTIVE_COLUMN_KEYS and objectives_available:
                 # 只有这两列是合法的排名依据，点表头即按它重排；其余列不
                 # 可点——七列里给五列装上排序会让人以为推荐也跟着变，而
@@ -5574,17 +5593,17 @@ class BacktestApp(tk.Tk):
                 # 的排序依据」，省掉上方那句重复的文字说明。
                 marker = " ↓" if key == active_objective else " ⇅"
                 tree.heading(
-                    key, text=f"{text}{marker}",
+                    key, text=f"{text}{marker}", anchor=anchor,
                     command=lambda k=key: on_objective_click(k))
             else:
-                tree.heading(key, text=text)
+                tree.heading(key, text=text, anchor=anchor)
             # 所有列一起 stretch：只让某一列可拉伸时它会独吞全部剩余空间
             # （实测策略名列被撑到 656px，内容只占 120px）。各列的初始宽度
             # 已按表头与内容实际需要分配，总和接近容器宽度，因此窗口缩放
             # 时平均摊到每列的增量很小，比例不会走样。
             tree.column(
                 key, width=width, minwidth=max(40, width - 30),
-                anchor="w" if key in ("strategy", "status") else ("center" if key in ("check", "rank", "period") else "e"),
+                anchor=BacktestApp._history_column_anchor(key),
                 stretch=True,
             )
         return tree
@@ -5636,10 +5655,9 @@ class BacktestApp(tk.Tk):
         ]
 
         parent.columnconfigure(0, weight=1)
-        # 外层已可滚动，各区块按自身内容占高即可，无需再互相争抢；
-        # 图表行仍留一点权重，好让窗口很高时多出来的空间归给它。
-        parent.rowconfigure(2, weight=0)
-        parent.rowconfigure(3, weight=1, minsize=330)
+        # 顶部三块（口径提示 / 周期条 / 结论卡）按自然高度固定，剩余高度全
+        # 部交给可拖分割区。
+        parent.rowconfigure(3, weight=1)
         # 口径说明是一次性知识，长期占据结果区顶部只会挤压表格与图表。
         # 常驻一行主指标定义，完整口径折进按钮后面按需查看。
         BacktestApp._build_history_scope_note(
@@ -5647,8 +5665,31 @@ class BacktestApp(tk.Tk):
 
         self._build_history_period_box(
             parent, recommendations, ranking)
-        self._build_history_detail_box(parent)
-        self._build_history_chart_box(parent)
+
+        # 排名表与图表改由一条可拖的分割线分配高度，取代此前“外层滚动画布
+        # 里再套一张自带滚动条的表格和一块图表”的三层嵌套：那样滚轮要靠
+        # bind_all 在三者之间抢来抢去，而两块内容各自的合适高度只有用户知
+        # 道。opaqueresize=False 让拖动时只画一条线，松手才重排——matplotlib
+        # 逐帧重绘跟不上拖动。
+        splitter = tk.PanedWindow(
+            parent, orient="vertical", bg=PALETTE["border_soft"],
+            sashwidth=6, sashrelief="flat", borderwidth=0,
+            opaqueresize=False)
+        splitter.grid(row=3, column=0, sticky="nsew", padx=2, pady=(4, 2))
+        self._history_splitter = splitter
+
+        detail_box = self._build_history_detail_box(splitter)
+        splitter.add(detail_box, minsize=150, stretch="always")
+        # 结论卡占 row=2（表格之上），但必须在排名表之后构建：它内嵌的动作
+        # 条要读排名表的勾选状态来决定文案。grid 的位置与构建顺序无关。
+        self._build_history_conclusion_card(parent)
+        chart_box = self._build_history_chart_box(splitter)
+        # 图表那一格的下限要扣掉指标条、下钻条与边框（合计约 120px）才是真
+        # 正的绘图高度：给 280 才剩得下约 160px，坐标轴与图例不至于连成一
+        # 团。把表格拖到最高时图表仍可读，正是此前给整页套滚动条要解决的
+        # 那个问题。
+        splitter.add(chart_box, minsize=280, stretch="always")
+        self._init_history_splitter_ratio(splitter)
 
         if getattr(self, "_history_period_rows", None):
             self._update_history_selection()
@@ -5773,36 +5814,25 @@ class BacktestApp(tk.Tk):
 
     def _build_history_period_box(
             self, parent, recommendations, ranking):
-        """渲染跨周期结论横幅 + 周期切换按钮。"""
+        """渲染周期切换条与一枚跨周期一致性 pill。
+
+        一致性此前是一条通栏横幅，和顶部摘要里的 pill 说的是同一件事，两
+        者上下相邻地重复占了两行。这里压成周期条右端的一枚 pill，完整措辞
+        （含“短周期样本少”的提醒）移进悬浮提示。
+        """
         box = ttk.Frame(parent, style="Surface.TFrame")
         box.grid(row=1, column=0, sticky="ew", padx=2, pady=(3, 0))
 
         items = list(self._comparison_recommendation_rows(
             recommendations, ranking, self._history_lookbacks))
         note, state = BacktestApp._history_consensus_note(items)
-        banner_bg = {
-            "agree": PALETTE["success_light"],
-            "disagree": PALETTE["warning_light"],
-        }.get(state, PALETTE["surface_alt"])
-        banner_fg = {
-            "agree": PALETTE["success"],
-            "disagree": PALETTE["warning"],
-        }.get(state, PALETTE["text_muted"])
-        banner = tk.Frame(box, bg=banner_bg, bd=0)
-        banner.pack(fill="x", pady=(0, 6))
-        tk.Frame(banner, bg=banner_fg, width=3).pack(side="left", fill="y")
-        inner = tk.Frame(banner, bg=banner_bg, padx=12, pady=6)
-        inner.pack(side="left", fill="x", expand=True)
-        tk.Label(
-            inner, text=("✓ " if state == "agree" else "⚠ ") + note,
-            bg=banner_bg, fg=banner_fg, font=(_UI_FONT_FAMILY, 9, "bold"),
-            anchor="w", justify="left", wraplength=1080,
-        ).pack(side="left", fill="x", expand=True)
 
         period_bar = ttk.Frame(box, style="Surface.TFrame")
         period_bar.pack(fill="x", pady=(2, 4))
+        # 配置区那个「分析周期」是要跑哪些，这里是在看哪一个；同名不同义，
+        # 结果区改用「查看周期」。
         ttk.Label(
-            period_bar, text="分析周期:", style="Surface.TLabel",
+            period_bar, text="查看周期:", style="Surface.TLabel",
             font=(_UI_FONT_FAMILY, 9, "bold"),
         ).pack(side="left", padx=(0, 10))
         self._history_selected_period_var = tk.StringVar()
@@ -5834,17 +5864,49 @@ class BacktestApp(tk.Tk):
                 next(iter(self._history_period_rows)))
             BacktestApp._refresh_history_period_chips(self)
 
+        pill_bg = {
+            "agree": PALETTE["success_light"],
+            "disagree": PALETTE["warning_light"],
+        }.get(state, PALETTE["surface_alt"])
+        pill_fg = {
+            "agree": PALETTE["success"],
+            "disagree": PALETTE["warning"],
+        }.get(state, PALETTE["text_muted"])
+        # 这是全页唯一一枚一致性 pill，因此把「几种结论」也写进来——顶部
+        # 那枚重复的已经移除，它携带的计数不能跟着丢。
+        distinct = len({
+            str(item.get("strategy", "")) for item in items
+            if item.get("strategy") and str(item.get("strategy")) != "—"
+        })
+        pill_text = {
+            "agree": f"✓ {len(items)} 个周期结论一致",
+            "disagree": f"⚠ 各周期结论不一致（{distinct} 种）",
+        }.get(state, "各周期均无可比结论")
+        consensus_pill = tk.Label(
+            period_bar, text=pill_text, bg=pill_bg, fg=pill_fg,
+            font=(_UI_FONT_FAMILY, 9, "bold"), padx=10, pady=4,
+        )
+        consensus_pill.pack(side="right")
+        BacktestApp._attach_tooltip(consensus_pill, note)
+
+        # 周期本身的取样口径（合约期限、回放天数、分段构成…）另起一行：
+        # 它常长到七八项，挤在周期按钮同一行会把 pill 顶出可视区。
         self._history_period_context_var = tk.StringVar(value="")
         ttk.Label(
-            period_bar, textvariable=self._history_period_context_var,
-            style="SurfaceMuted.TLabel", justify="left",
-        ).pack(side="left", padx=(16, 0))
+            box, textvariable=self._history_period_context_var,
+            style="SurfaceMuted.TLabel", justify="left", wraplength=1080,
+        ).pack(fill="x", pady=(0, 2))
 
     def _build_history_detail_box(self, parent):
-        """渲染选中周期的候选排名、图表勾选栏与统一动作条。"""
+        """渲染选中周期的候选排名与图表勾选栏，返回待挂载的区块。
+
+        动作按钮与结论文字已上移到结论卡：它们描述的是“选中的那条策略”，
+        放在八行表格下方时，人要先滚过表格才看得到自己刚选出来的结论。
+
+        自己不做布局：它是分割区的一格，由调用方 ``add`` 进去。
+        """
         detail_box = ttk.LabelFrame(
             parent, text=" 该周期内各策略排名 ", padding=(14, 8))
-        detail_box.grid(row=2, column=0, sticky="nsew", padx=2, pady=(4, 4))
         detail_box.columnconfigure(0, weight=1)
         detail_box.rowconfigure(2, weight=1)
         self._history_detail_var = tk.StringVar(value="请选择周期")
@@ -5872,7 +5934,7 @@ class BacktestApp(tk.Tk):
                 ("rank", "#", 38),
                 ("strategy", "策略 / 参数", 232),
             ),
-            status_heading="状态", status_width=129, height=8,
+            status_heading="样本完整度", status_width=129, height=8,
             on_objective_click=self._set_history_objective,
             active_objective=getattr(self, "_history_result_objective", None),
             objectives_available=getattr(
@@ -5885,8 +5947,13 @@ class BacktestApp(tk.Tk):
         rank_tree.configure(yscrollcommand=rank_scrollbar.set)
         rank_tree.tag_configure("leader", background=PALETTE["success_light"])
         rank_tree.tag_configure(
-            "baseline", background=PALETTE["primary_light"],
-            font=(_UI_FONT_FAMILY, 9, "bold"))
+            "baseline", background=PALETTE["reference"],
+            # 必须沿用表格正文的等宽族，只加粗。此前用的是 _UI_FONT_FAMILY
+            # ——那是比例字体，实测同一个数字在它下面宽 28~32px 而正文
+            # (Menlo 9) 恒为 35px，于是基准行的数位和上下各行全部错开，看
+            # 着就是"另一种数字格式"。等宽加粗的步进宽度与常规一致，既保住
+            # 强调又不破坏对齐。
+            font=(_MONO_FONT_FAMILY, 9, "bold"))
         rank_tree.tag_configure(
             "incomplete", background=PALETTE["warning_light"])
         rank_tree.bind("<Button-1>", self._toggle_history_chart_click)
@@ -5895,51 +5962,136 @@ class BacktestApp(tk.Tk):
             "<<TreeviewSelect>>", self._update_history_rank_selection)
         self._history_rank_tree = rank_tree
 
-        detail_card = tk.Frame(
-            detail_box, bg=PALETTE["surface_alt"],
-            highlightbackground=PALETTE["border_soft"], highlightthickness=1,
-            padx=12, pady=6)
-        detail_card.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(6, 2))
-        tk.Label(
-            detail_card, textvariable=self._history_detail_var,
-            bg=PALETTE["surface_alt"], fg=PALETTE["text"],
-            font=(_UI_FONT_FAMILY, 9), anchor="w", justify="left",
-            wraplength=1100,
-        ).pack(fill="x")
+        # 选中策略的原始损益波动值：表格七列之外的补充，仍留在表格脚下，
+        # 但不再套一层灰卡片——同屏的灰底条已经太多。
+        ttk.Label(
+            detail_box, textvariable=self._history_detail_var,
+            style="SurfaceMuted.TLabel", justify="left", wraplength=1100,
+        ).grid(row=3, column=0, columnspan=2, sticky="ew", pady=(6, 0))
+        return detail_box
 
-        self._build_history_action_bar(detail_box)
+    # 自动摆放分割线的次数上限，兜底任何未预料的抖动。正常一次就位。
+    _HISTORY_SASH_PLACEMENT_BUDGET = 6
+    # 小于这个相对幅度的高度变化视为自己引起的回波，不是窗口真的变了。
+    _HISTORY_SASH_ECHO_TOLERANCE = 0.15
 
-    def _build_history_action_bar(self, detail_box):
-        """把结论用到当下的动作栏；逐段下钻另在图表下方，两者对象不同。"""
-        actions = tk.Frame(
-            detail_box, bg=PALETTE["surface_alt"],
-            highlightbackground=PALETTE["border_soft"], highlightthickness=1,
-            padx=12, pady=6)
-        actions.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(6, 2))
-        tk.Label(
-            actions, text="把选中策略用到当前回测:",
+    def _init_history_splitter_ratio(self, splitter, ratio=0.45):
+        """按比例摆放排名表与图表的初始分割线，直到用户第一次拖它为止。
+
+        不管的话，初始分配走两格各自的请求高度，而图表请求得更高，排名表
+        一上来只剩四五行可见。
+
+        **难点全在"不自激"。** ``sash_place`` 改变窗格尺寸 → 图表那一格里
+        的 matplotlib 跟着 resize → LabelFrame 的请求尺寸变化 → 外层 grid
+        重排 → splitter 自己的高度被改掉二十来像素 → ``<Configure>`` 又落
+        回这里。无条件重摆就是一个闭环：实测单次渲染中 ``sash_place`` 被
+        调用 300+ 次，高度在 621↔645 之间反复横跳，界面永远画不完一帧，
+        内存被 Agg 缓冲区反复分配撑到 GB 级。
+
+        所以只响应**真实**的尺寸变化：相对幅度小于
+        ``_HISTORY_SASH_ECHO_TOLERANCE`` 的高度变化是自己引起的回波，直接
+        忽略；用户拉窗口那种大幅变化才重新按比例摆。另有两道兜底——已经在
+        目标位就不动（minsize 钳住目标时不会反复试），以及一个硬性次数预
+        算。平时也不需要持续跟随：两格都是 ``stretch="always"``，窗口缩放
+        时 tk 自己会按比例分配。
+        """
+        state = {"owned": False, "height": None,
+                 "left": BacktestApp._HISTORY_SASH_PLACEMENT_BUDGET}
+
+        def _place(_event=None):
+            if state["owned"] or state["left"] <= 0:
+                return
+            height = splitter.winfo_height()
+            if height <= 1:
+                return
+            previous = state["height"]
+            if previous is not None and abs(height - previous) <= (
+                    previous * BacktestApp._HISTORY_SASH_ECHO_TOLERANCE):
+                return
+            state["height"] = height
+            target = max(150, int(height * ratio))
+            try:
+                if abs(splitter.sash_coord(0)[1] - target) <= 2:
+                    return
+                state["left"] -= 1
+                splitter.sash_place(0, 0, target)
+            except tk.TclError:
+                pass
+
+        def _hand_over(_event=None):
+            # 分割线属于 PanedWindow 自身；点在表格或图表里是子控件的事件，
+            # 不会落到这里。所以这一下就是“用户抓住了分割线”。
+            state["owned"] = True
+
+        splitter.bind("<Configure>", _place, add="+")
+        splitter.bind("<ButtonPress-1>", _hand_over, add="+")
+        splitter.after_idle(_place)
+
+    def _build_history_conclusion_card(self, parent):
+        """结论卡：选中策略是什么、凭什么、以及拿它做什么，集中在一处。
+
+        结论此前散在四个地方——顶部 pill、一致性横幅、排名表首行、表格下
+        方的详情条，而真正要用它的两个按钮又在表格另一侧。这里把“选中的
+        策略 + 它的关键数字 + 两个动作”并成一张卡放在表格上方；表格默认
+        选中 rank 1，所以刚出结果时这张卡显示的就是本周期推荐。
+        """
+        card = tk.Frame(
+            parent, bg=PALETTE["surface_alt"],
+            highlightbackground=PALETTE["border_soft"], highlightthickness=1)
+        card.grid(row=2, column=0, sticky="ew", padx=2, pady=(6, 2))
+        self._history_conclusion_card = card
+
+        # 左侧色条随结论性质变色：领先绿、基准蓝、数据不全黄。
+        self._history_conclusion_accent = tk.Frame(
+            card, bg=PALETTE["border_soft"], width=4)
+        self._history_conclusion_accent.pack(side="left", fill="y")
+
+        body = tk.Frame(card, bg=PALETTE["surface_alt"], padx=14, pady=10)
+        body.pack(side="left", fill="both", expand=True)
+        body.columnconfigure(0, weight=1)
+
+        self._history_conclusion_badge_var = tk.StringVar(value="")
+        self._history_conclusion_badge = tk.Label(
+            body, textvariable=self._history_conclusion_badge_var,
             bg=PALETTE["surface_alt"], fg=PALETTE["text_muted"],
-            font=(_UI_FONT_FAMILY, 9, "bold"),
-        ).pack(side="left")
-        tk.Frame(actions, bg=PALETTE["surface_alt"]).pack(
-            side="left", fill="x", expand=True)
+            font=(_UI_FONT_FAMILY, 9, "bold"), anchor="w")
+        self._history_conclusion_badge.grid(row=0, column=0, sticky="w")
+
+        self._history_conclusion_name_var = tk.StringVar(value="请选择策略")
+        tk.Label(
+            body, textvariable=self._history_conclusion_name_var,
+            bg=PALETTE["surface_alt"], fg=PALETTE["text"],
+            font=(_UI_FONT_FAMILY, 16, "bold"), anchor="w", justify="left",
+        ).grid(row=1, column=0, sticky="w", pady=(1, 6))
+
+        self._history_conclusion_stats = tk.Frame(
+            body, bg=PALETTE["surface_alt"])
+        self._history_conclusion_stats.grid(row=2, column=0, sticky="w")
+
+        self._build_history_action_bar(body)
+        BacktestApp._refresh_history_conclusion_card(self)
+
+    def _build_history_action_bar(self, body):
+        """把结论用到当下的动作栏；逐段下钻另在图表下方，两者对象不同。"""
+        actions = tk.Frame(body, bg=PALETTE["surface_alt"])
+        actions.grid(row=0, column=1, rowspan=3, sticky="ne", padx=(18, 0))
         ttk.Button(
-            actions, text="只填参数",
-            command=self._apply_history_recommendation,
-        ).pack(side="left", padx=(8, 0))
-        ttk.Button(
-            actions, text="用当前行情回测",
+            actions, text="用当前行情回测", width=14,
             command=self._verify_history_on_current_path,
-        ).pack(side="left", padx=(8, 0))
+        ).pack(fill="x")
+        ttk.Button(
+            actions, text="只填参数", width=14,
+            command=self._apply_history_recommendation,
+        ).pack(fill="x", pady=(5, 0))
 
         self._history_action_hint_var = tk.StringVar(value="")
         ttk.Label(
-            detail_box, textvariable=self._history_action_hint_var,
-            style="SurfaceMuted.TLabel", justify="left", wraplength=1100,
-        ).grid(row=5, column=0, columnspan=2, sticky="ew", pady=(4, 0))
+            body, textvariable=self._history_action_hint_var,
+            style="SurfaceMuted.TLabel", justify="left", wraplength=1080,
+        ).grid(row=3, column=0, columnspan=2, sticky="ew", pady=(8, 0))
 
         self._history_batch_outcome_bar = tk.Frame(
-            detail_box, bg=PALETTE["surface_alt"],
+            body, bg=PALETTE["surface_alt"],
             highlightbackground=PALETTE["border_soft"], highlightthickness=1,
             padx=10, pady=5)
         self._history_batch_outcome_var = tk.StringVar(value="")
@@ -5963,6 +6115,126 @@ class BacktestApp(tk.Tk):
         self._history_batch_failure_details = []
         self._history_batch_last_result_ids = []
         self._refresh_history_action_hint()
+
+    def _history_conclusion_stat_specs(self, row):
+        """结论卡上的数字：优先给增量口径，缺失时退回损益波动原值。
+
+        品种池模式（跨合约金额不可直接相加）下增量列整列为空，此时若照抄
+        表格就是四个破折号——那等于把结论卡做成了装饰。
+        """
+        finite = BacktestApp._comparison_finite
+        win_rate = finite(row.get("window_win_rate_vs_c2c"))
+        paired = BacktestApp._comparison_safe_int(
+            row.get("paired_windows", row.get("rolling_windows")), 0)
+        baseline_windows = BacktestApp._comparison_safe_int(
+            row.get("baseline_windows", paired), paired)
+        tail = (
+            ("胜段占比", BacktestApp._format_comparison_value(
+                win_rate, 0, percent=True), win_rate),
+            ("可比样本", f"{paired}/{baseline_windows} 段", None),
+        )
+        if getattr(self, "_history_objectives_available", True):
+            incremental_pnl = finite(row.get("incremental_pnl_vs_c2c"))
+            incremental_sharpe = finite(row.get("incremental_sharpe_vs_c2c"))
+            return (
+                ("增量收益 vs 每日收盘",
+                 BacktestApp._format_objective_value(incremental_pnl, 2),
+                 incremental_pnl),
+                ("增量信噪比",
+                 BacktestApp._format_objective_value(incremental_sharpe, 4),
+                 incremental_sharpe),
+            ) + tail
+        return (
+            ("损益波动", BacktestApp._format_comparison_value(
+                row.get("score"), 2), None),
+            ("每日收盘", BacktestApp._format_comparison_value(
+                row.get("baseline_score"), 2), None),
+        ) + tail
+
+    def _refresh_history_conclusion_card(self):
+        """让结论卡始终等于排名表里当前选中的那一行。
+
+        绑定到选中行而不是固定的周期冠军：动作按钮作用的对象就是选中行，
+        卡片若一直显示冠军，用户选了别的策略再点按钮就会跑到另一个上面。
+        表格默认选中 rank 1，因此默认态仍是本周期推荐。
+        """
+        name_var = getattr(self, "_history_conclusion_name_var", None)
+        badge_var = getattr(self, "_history_conclusion_badge_var", None)
+        stats = getattr(self, "_history_conclusion_stats", None)
+        if name_var is None or badge_var is None or stats is None:
+            return
+        try:
+            for widget in list(stats.winfo_children()):
+                widget.destroy()
+        except tk.TclError:
+            return
+
+        period_var = getattr(self, "_history_selected_period_var", None)
+        period_item = (
+            getattr(self, "_history_period_rows", {}) or {}).get(
+                period_var.get() if period_var is not None else "", {})
+        period_label = str(period_item.get("period", "") or "")
+        row = self._selected_history_rank_row()
+        if not row:
+            badge_var.set(period_label)
+            name_var.set("请选择策略")
+            BacktestApp._set_history_conclusion_accent(
+                self, PALETTE["border_soft"])
+            return
+
+        is_baseline = str(
+            row.get("strategy_type", "")) == "close_to_close"
+        recommendation_eligible = BacktestApp._comparison_safe_bool(
+            row.get("recommendation_eligible"),
+            BacktestApp._comparison_safe_bool(
+                row.get("complete_window"), False))
+        rank_val = BacktestApp._comparison_safe_int(row.get("rank"), 0)
+        suffix = f" · {period_label}" if period_label else ""
+        if is_baseline:
+            badge_var.set(f"基准（每日收盘）{suffix}")
+            accent = PALETTE["primary"]
+        elif rank_val == 1 and recommendation_eligible:
+            badge_var.set(f"🏆 本周期最优{suffix}")
+            accent = PALETTE["success"]
+        elif not recommendation_eligible:
+            badge_var.set(f"第 {rank_val or '—'} 名 · 数据不足，仅供参考{suffix}")
+            accent = PALETTE["warning"]
+        else:
+            badge_var.set(f"第 {rank_val or '—'} 名{suffix}")
+            accent = PALETTE["border_soft"]
+        name_var.set(str(row.get("strategy", "—")))
+        BacktestApp._set_history_conclusion_accent(self, accent)
+
+        for column, (caption, text, signed) in enumerate(
+                self._history_conclusion_stat_specs(row)):
+            tile = tk.Frame(stats, bg=PALETTE["surface_alt"])
+            tile.grid(row=0, column=column, sticky="w", padx=(0, 26))
+            tk.Label(
+                tile, text=caption, bg=PALETTE["surface_alt"],
+                fg=PALETTE["text_muted"], font=(_UI_FONT_FAMILY, 8),
+                anchor="w",
+            ).pack(anchor="w")
+            if signed is None or is_baseline:
+                value_fg = PALETTE["text"]
+            elif signed > 0:
+                value_fg = PALETTE["success"]
+            elif signed < 0:
+                value_fg = PALETTE["danger"]
+            else:
+                value_fg = PALETTE["text_muted"]
+            tk.Label(
+                tile, text=text, bg=PALETTE["surface_alt"], fg=value_fg,
+                font=(_UI_FONT_FAMILY, 12, "bold"), anchor="w",
+            ).pack(anchor="w")
+
+    def _set_history_conclusion_accent(self, color):
+        accent = getattr(self, "_history_conclusion_accent", None)
+        if accent is None:
+            return
+        try:
+            accent.configure(bg=color)
+        except tk.TclError:
+            pass
 
     def _publish_history_batch_outcome(self, done, total, failures,
                                        result_ids):
@@ -5993,7 +6265,7 @@ class BacktestApp(tk.Tk):
                 detail_btn.pack_forget()
             self._history_batch_outcome_open_btn.configure(
                 state="normal" if done else "disabled")
-            bar.grid(row=6, column=0, columnspan=2, sticky="ew", pady=(5, 0))
+            bar.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(8, 0))
         except tk.TclError:
             pass
 
@@ -6054,13 +6326,14 @@ class BacktestApp(tk.Tk):
         ``pd.concat(daily_windows)``），单段曲线与整段排名可以给出相反的
         印象，而界面无从提示这是两个口径。想看某一段的细节走下方的
         「查看某段明细」，那是下钻，不是换口径。
+
+        与排名表一样，自己不做布局：它是分割区的一格，由调用方挂载。
         """
         chart_box = ttk.LabelFrame(
             parent,
             text=" 累计损益对比 ",
             padding=14,
         )
-        chart_box.grid(row=3, column=0, sticky="nsew", padx=2, pady=(4, 4))
         controls = tk.Frame(
             chart_box, bg=PALETTE["surface_alt"],
             highlightbackground=PALETTE["border_soft"], highlightthickness=1,
@@ -6088,29 +6361,39 @@ class BacktestApp(tk.Tk):
 
         from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
         from matplotlib.figure import Figure
-        # 图例在绘图区下方，需要额外高度；外层可滚动后不必再省这点空间。
+        # figsize 在分割区里只是**请求**高度，实际高度由用户拖分割线决定。
+        # 它必须和排名表那一格的请求高度相当：图表请求得越高，tk 分配时越
+        # 偏袒图表，并且会在我们摆好分割线之后再把它拉回去——而反复覆盖
+        # 正是把界面卡死的那条闭环。2.8in≈270px 与排名表基本持平。
         self._history_chart_figure = Figure(
-            figsize=(7.2, 3.6), dpi=self._CHART_DPI,
+            figsize=(7.2, 2.8), dpi=self._CHART_DPI,
             facecolor=PALETTE["surface"], constrained_layout=True,
         )
         self._history_chart_ax = self._history_chart_figure.add_subplot(111)
         self._history_chart_canvas = FigureCanvasTkAgg(
             self._history_chart_figure, master=chart_box)
+        # 下钻栏必须先 pack 且 side="bottom"：pack 按顺序分配空间，画布带
+        # expand=True 会把剩余空腔全部吃掉，排在它后面的控件在容器不够高
+        # 时会被压成 0 高度直接消失——而且 tkinter 对此完全沉默。先占住自
+        # 己那条，画布再吃剩下的，缩窗口时缩的是图不是这一行。
+        self._build_history_replay_bar(chart_box)
         self._history_chart_canvas.get_tk_widget().pack(
             fill="both", expand=True)
-        self._build_history_replay_bar(chart_box)
+        return chart_box
 
     def _build_history_replay_bar(self, chart_box):
         """逐段下钻入口：紧贴图表，因为选段这个动作是从图上发起的。
 
         展示页结构上只能装一次回测，而排名口径是各段合并——整段没法塞进
         展示页，所以下钻天然要选一段。
+
+        调用方必须在 pack 画布**之前**调它，见那里的说明。
         """
         replay = tk.Frame(
             chart_box, bg=PALETTE["surface_alt"],
             highlightbackground=PALETTE["border_soft"], highlightthickness=1,
             padx=12, pady=6)
-        replay.pack(fill="x", pady=(6, 0))
+        replay.pack(side="bottom", fill="x", pady=(6, 0))
         tk.Label(
             replay, text="查看某段明细:", bg=PALETTE["surface_alt"],
             fg=PALETTE["text_muted"], font=(_UI_FONT_FAMILY, 9, "bold"),
@@ -6203,7 +6486,10 @@ class BacktestApp(tk.Tk):
             paired = self._comparison_safe_int(
                 row.get("paired_windows", row.get("rolling_windows")), 0)
             if is_baseline:
-                tree.item(iid, image="", text="基准")
+                # 基线恒定入图，没有可勾选的状态，这格留空即可。身份已由
+                # 策略列的「（基准）」标明，勾选列再写一遍「基准」是同一行
+                # 内的第二次重复。
+                tree.item(iid, image="", text="")
             elif paired > 0:
                 tree.item(iid, image=self._cb_sf_checked if strategy in selected else self._cb_sf_unchecked, text="")
             else:
@@ -6351,7 +6637,7 @@ class BacktestApp(tk.Tk):
                 baseline_text = self._format_comparison_value(
                     row.get("baseline_score"), 2)
                 # 详情行只补表格没有的原始损益波动值。表格现在的四列是
-                # 增量收益/增量性价比/多花成本/最大回撤，改善率与胜率都
+                # 增量收益/增量信噪比/增量成本/最大回撤，改善率与胜率都
                 # 不在其中——它们是刻意收敛掉的旧口径，不再单独渲染。
                 uses_strict_metric = (
                     BacktestApp._history_row_uses_strict_metric(row))
@@ -6389,6 +6675,7 @@ class BacktestApp(tk.Tk):
                     selected_detail += f" · 失败原因：{failure_reason}"
                 detail_var.set(
                     f"{prefix} · {selected_detail}" if prefix else selected_detail)
+        BacktestApp._refresh_history_conclusion_card(self)
         self._refresh_history_replay_windows()
         self._update_history_chart_controls()
 
@@ -6772,9 +7059,9 @@ class BacktestApp(tk.Tk):
                     status = "不可比"
                 strategy_label = str(row.get("strategy", "—"))
                 if is_baseline:
-                    # 增量口径下基线的增量恒为 0，因此它就是分界线：排在它
-                    # 上面的日内调仓有正贡献，下面的是负贡献。
-                    strategy_label += "　── 以上有正贡献 ──"
+                    strategy_label = (
+                        BacktestApp._history_baseline_row_label(
+                            strategy_label))
                 rank_val = self._comparison_safe_int(
                     row.get("rank"), row_no + 1)
                 rank_str = str(rank_val)
@@ -6785,18 +7072,21 @@ class BacktestApp(tk.Tk):
                 elif rank_val == 3:
                     rank_str = "🥉 " + rank_str
 
-                values = (
-                    rank_str, strategy_label,
-                    BacktestApp._format_objective_value(
-                        row.get("incremental_pnl_vs_c2c"), 4),
-                    BacktestApp._format_objective_value(
-                        row.get("incremental_sharpe_vs_c2c"), 4),
-                    BacktestApp._format_objective_value(
-                        row.get("incremental_tc_vs_c2c"), 4),
-                    BacktestApp._format_drawdown_value(
-                        row.get("max_drawdown")),
-                    BacktestApp._format_history_status(
-                        status, paired, baseline_windows),
+                values = BacktestApp._pad_history_row(
+                    (
+                        rank_str, strategy_label,
+                        BacktestApp._format_objective_value(
+                            row.get("incremental_pnl_vs_c2c"), 4),
+                        BacktestApp._format_objective_value(
+                            row.get("incremental_sharpe_vs_c2c"), 4),
+                        BacktestApp._format_objective_value(
+                            row.get("incremental_tc_vs_c2c"), 4),
+                        BacktestApp._format_drawdown_value(
+                            row.get("max_drawdown")),
+                        BacktestApp._format_history_status(
+                            status, paired, baseline_windows),
+                    ),
+                    rank_tree["columns"],
                 )
                 if is_baseline:
                     tag = "baseline"

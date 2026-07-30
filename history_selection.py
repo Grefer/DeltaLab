@@ -37,7 +37,12 @@ DEFAULT_BAND_CANDIDATE_SIGMAS = (0.5, 0.75, 1.0, 1.5, 2.0)
 # 按同一交易日的业务顺序排列：前一自然日夜盘 -> 次日日盘。
 DEFAULT_FIXED_TIMES = "23:00,11:30,15:00"
 MAX_BAND_CANDIDATES = 10
-MAX_HISTORY_CHART_CANDIDATES = 3
+# 图表同时显示的候选上限。正确性由「加入前预演共同分段交集」单独保证，
+# 这个数只管可读性：默认候选是 5 档带宽 + 可选当前带宽 + 固定时刻，8 正好
+# 让一次运行的全部候选都能同屏对比。实测 7 条曲线（含基准）颜色互不相同、
+# 图例两行放得下，且能看出「0.75σ 在中段回撤后拉开差距、2σ 基本贴着基准」
+# ——这类判断在只画 3 条时是看不到的。再往上标记会从第 11 个开始重复。
+MAX_HISTORY_CHART_CANDIDATES = 8
 
 
 def normalize_lookbacks(selection=None):
