@@ -1284,8 +1284,8 @@ def test_lookback_rejects_mixed_known_positions_but_allows_legacy_missing():
     assert legacy_ranking["position"].isna().all()
 
     mixed = {
-        "short": {**legacy["a"], "position": 1},
-        "long": {**legacy["b"], "position": -1},
+        "sell": {**legacy["a"], "position": 1},
+        "buy": {**legacy["b"], "position": -1},
     }
     with pytest.raises(ValueError, match="禁止跨方向"):
         recommend_by_lookback(mixed, lookbacks={"sample": 2})
@@ -2193,62 +2193,62 @@ def test_history_batch_rejects_backtest_result_with_opposite_position(
 
 
 @pytest.mark.parametrize("mode", ["rolling", "contract_pool"])
-def test_history_zero_cost_long_short_are_mirrors_with_same_rms_ranking(mode):
-    short_rec, short_rank, short_windows = _direction_history_run(
+def test_history_zero_cost_buy_sell_are_mirrors_with_same_rms_ranking(mode):
+    sell_rec, sell_rank, sell_windows = _direction_history_run(
         mode, position=1, tc_rate=0.0)
-    long_rec, long_rank, long_windows = _direction_history_run(
+    buy_rec, buy_rank, buy_windows = _direction_history_run(
         mode, position=-1, tc_rate=0.0)
 
-    assert short_rank["position"].eq(1).all()
-    assert long_rank["position"].eq(-1).all()
-    assert short_rank["strategy"].tolist() == long_rank["strategy"].tolist()
+    assert sell_rank["position"].eq(1).all()
+    assert buy_rank["position"].eq(-1).all()
+    assert sell_rank["strategy"].tolist() == buy_rank["strategy"].tolist()
     np.testing.assert_allclose(
-        short_rank["score"], long_rank["score"], rtol=1e-12, atol=1e-12)
+        sell_rank["score"], buy_rank["score"], rtol=1e-12, atol=1e-12)
     np.testing.assert_allclose(
-        short_rank["baseline_score"],
-        long_rank["baseline_score"],
+        sell_rank["baseline_score"],
+        buy_rank["baseline_score"],
         rtol=1e-12,
         atol=1e-12,
     )
-    assert short_rec["strategy"].tolist() == long_rec["strategy"].tolist()
+    assert sell_rec["strategy"].tolist() == buy_rec["strategy"].tolist()
 
-    short_results = _successful_direction_windows(short_windows)
-    long_results = _successful_direction_windows(long_windows)
-    assert short_results.keys() == long_results.keys()
-    for key in short_results:
-        short = short_results[key]
-        long = long_results[key]
-        assert short["position"] == 1
-        assert short["position_label"] == "short"
-        assert long["position"] == -1
-        assert long["position_label"] == "long"
-        np.testing.assert_allclose(long["shares"], -short["shares"])
+    sell_results = _successful_direction_windows(sell_windows)
+    buy_results = _successful_direction_windows(buy_windows)
+    assert sell_results.keys() == buy_results.keys()
+    for key in sell_results:
+        sell = sell_results[key]
+        buy = buy_results[key]
+        assert sell["position"] == 1
+        assert sell["position_label"] == "sell"
+        assert buy["position"] == -1
+        assert buy["position_label"] == "buy"
+        np.testing.assert_allclose(buy["shares"], -sell["shares"])
         np.testing.assert_allclose(
-            long["hedge_daily"], -short["hedge_daily"])
+            buy["hedge_daily"], -sell["hedge_daily"])
         np.testing.assert_allclose(
-            long["option_daily"], -short["option_daily"])
-        np.testing.assert_allclose(long["net_daily"], -short["net_daily"])
+            buy["option_daily"], -sell["option_daily"])
+        np.testing.assert_allclose(buy["net_daily"], -sell["net_daily"])
         np.testing.assert_allclose(
-            long["portfolio_gamma"], -short["portfolio_gamma"])
-        assert not np.any(short["tc_paid"])
-        assert not np.any(long["tc_paid"])
+            buy["portfolio_gamma"], -sell["portfolio_gamma"])
+        assert not np.any(sell["tc_paid"])
+        assert not np.any(buy["tc_paid"])
 
 
 @pytest.mark.parametrize("mode", ["rolling", "contract_pool"])
 def test_history_costs_keep_gross_mirrored_and_charge_both_directions(mode):
-    _short_rec, short_rank, short_windows = _direction_history_run(
+    _sell_rec, sell_rank, sell_windows = _direction_history_run(
         mode, position=1, tc_rate=0.001)
-    _long_rec, long_rank, long_windows = _direction_history_run(
+    _buy_rec, buy_rank, buy_windows = _direction_history_run(
         mode, position=-1, tc_rate=0.001)
 
-    assert short_rank["position"].eq(1).all()
-    assert long_rank["position"].eq(-1).all()
-    short_results = _successful_direction_windows(short_windows)
-    long_results = _successful_direction_windows(long_windows)
-    assert short_results.keys() == long_results.keys()
-    for key in short_results:
-        short = short_results[key]
-        long = long_results[key]
+    assert sell_rank["position"].eq(1).all()
+    assert buy_rank["position"].eq(-1).all()
+    sell_results = _successful_direction_windows(sell_windows)
+    buy_results = _successful_direction_windows(buy_windows)
+    assert sell_results.keys() == buy_results.keys()
+    for key in sell_results:
+        short = sell_results[key]
+        long = buy_results[key]
         short_tc = np.asarray(short["tc_paid"], dtype=float)
         long_tc = np.asarray(long["tc_paid"], dtype=float)
         short_net = np.asarray(short["net_daily"], dtype=float)

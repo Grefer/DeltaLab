@@ -1076,7 +1076,15 @@ class HedgeBacktest:
     tc_rate : float
         有限非负的单边交易成本率，默认 0
     position : int
-        期权头寸方向：1 = 卖出（short）期权，-1 = 买入（long）期权
+        期权买卖方向：1 = 卖出期权，-1 = 买入期权。
+
+        **它只表示买卖方向，不是 gamma 敞口。** 业内说的 long/short 通常
+        指 gamma 敞口，而同一个买卖方向在不同产品上对应相反的敞口——实测
+        ``position=1``（卖出）时香草是 short gamma（组合 gamma 均值
+        −0.0706）、雪球却是 long gamma（+0.0678）。更麻烦的是敞口还会在
+        同一条路径内翻转（雪球 41% 的 bar 为正、37% 为负），所以也不存在
+        一张「产品 → gamma 方向」的静态映射表。要判断 gamma 敞口只能读实
+        际算出的 ``portfolio_gamma``。因此这里一律用 buy/sell 命名。
     quantity : float
         有限正交易数量（如 10 吨、1000 股等），用于将 Delta 转换为实际持仓。
         头寸方向只能由 ``position`` 表达，不能用负数量再次翻转。
@@ -1178,19 +1186,19 @@ class HedgeBacktest:
 
         self.hedge_freq = max(1, int(hedge_freq))
 
-        # 头寸方向必须只有一个信息源。过去 position=0 / 2 或负 quantity
-        # 会静默制造“零风险最优策略”或再次翻转 long/short，历史择优仍会
-        # 把它当成合法结果排名，因此在进入任何 Greeks/PnL 计算前 fail fast。
+        # 买卖方向必须只有一个信息源。过去 position=0 / 2 或负 quantity
+        # 会静默制造“零风险最优策略”或再次翻转买卖方向，历史择优仍会把它
+        # 当成合法结果排名，因此在进入任何 Greeks/PnL 计算前 fail fast。
         if isinstance(position, (bool, np.bool_)):
-            raise ValueError("position 只允许 1（short）或 -1（long）")
+            raise ValueError("position 只允许 1（卖出）或 -1（买入）")
         try:
             position_value = float(position)
         except (TypeError, ValueError, OverflowError) as exc:
             raise ValueError(
-                "position 只允许 1（short）或 -1（long）") from exc
+                "position 只允许 1（卖出）或 -1（买入）") from exc
         if (not np.isfinite(position_value)
                 or position_value not in (-1.0, 1.0)):
-            raise ValueError("position 只允许 1（short）或 -1（long）")
+            raise ValueError("position 只允许 1（卖出）或 -1（买入）")
 
         try:
             quantity_value = float(quantity)
@@ -1778,7 +1786,7 @@ class HedgeBacktest:
             'strategy_name': getattr(strategy, 'name', 'unknown'),
             'position': self.position,
             'position_label': (
-                'short' if self.position == 1 else 'long'),
+                'sell' if self.position == 1 else 'buy'),
             # fixed_times 请求/过滤结果。非固定时刻策略为 None；空 tuple
             # 表示显式 session 已证明没有有效目标，而非元数据缺失。
             'fixed_time_requested_times': fixed_time_requested_times,
@@ -1955,7 +1963,7 @@ class HedgeBacktest:
 
         # (2) Delta 与实际持仓
         # 注意：r['shares'] 已经把 position (+1 卖出 / -1 买入) 的方向吸收在里面，
-        # 正负号即对冲方向；过去版本做过 shares/position 的归一化，但会使 short
+        # 正负号即对冲方向；过去版本做过 shares/position 的归一化，但会使卖出
         # 情形下曲线与标题/图例意图相反，这里直接展示 shares 的原始符号。
         ax = axes[0, 1]
         ax.plot(days, r['delta'], 'r-', label='Delta', linewidth=1.2)
@@ -2116,8 +2124,8 @@ class HedgeBacktest:
         -------
         dict with keys:
             n_paths        : int
-            position       : int — 1=short，-1=long
-            position_label : str — "short" 或 "long"
+            position       : int — 1=卖出，-1=买入
+            position_label : str — "sell" 或 "buy"（买卖方向，非 gamma 敞口）
             quantity       : float — 有限正交易数量
             errors         : ndarray — 每条路径的对冲误差
             total_pnl      : ndarray — 每条路径的累计净盈亏 (cum_pnl[-1])
@@ -2187,7 +2195,7 @@ class HedgeBacktest:
             'n_paths': n,
             'position': self.position,
             'position_label': (
-                'short' if self.position == 1 else 'long'),
+                'sell' if self.position == 1 else 'buy'),
             'quantity': self.quantity,
             'force_day_close_hedge': self.force_day_close_hedge,
             'errors': errors,

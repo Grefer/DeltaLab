@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import datetime
+import os
 from types import SimpleNamespace
 
 import numpy as np
@@ -4526,6 +4527,232 @@ def test_history_period_note_still_fires_when_segments_drop_out():
     assert "参与评分 2/3 段" in text
 
 
+def _store_ranking_frame():
+    """两个周期、含基准的最小排名表，够驱动整条保存/载入链路。"""
+    def row(lookback, days, rank, strategy, strategy_type):
+        return {
+            "lookback": lookback, "rank": rank, "strategy": strategy,
+            "strategy_type": strategy_type, "score": 10.0 - rank,
+            "baseline_score": 10.0, "improvement_vs_c2c": 0.1,
+            "selection_improvement_vs_c2c": 0.1,
+            "selection_metric":
+                history_selection.STRICT_LOOKBACK_SELECTION_METRIC,
+            "window_win_rate_vs_c2c": 1.0, "paired_windows": 3,
+            "baseline_windows": 3, "comparison_eligible": True,
+            "recommendation_eligible": True, "rolling_windows": 3,
+            "eligible_endpoints": 3, "skipped_endpoints": 0,
+            "history_days_available": days, "lookback_days": days,
+            "complete_window": True, "maturity_days": 22,
+            "evidence_days": days, "days_used": days,
+            "evaluation_mode": "strict_lookback",
+            "sampling_mode": "strict_contiguous", "segment_count": 3,
+            "expiry_segments": 2, "mtm_segments": 1, "terminal_mode": "mixed",
+            "relative_comparison_windows": 3, "max_drawdown": 0.03,
+            "incremental_pnl_vs_c2c": 0.02 / rank,
+            "incremental_sharpe_vs_c2c": 0.3 / rank,
+            "incremental_tc_vs_c2c": 0.001 * rank,
+            "selection_objective": "incremental_pnl",
+            "segment_lengths": (17, 22, 22),
+            "comparison_coverage": 1.0,
+        }
+    return pd.DataFrame([
+        row("quarter", 61, 1, "固定间隔(1σ)", "hedge_band"),
+        row("quarter", 61, 2, "每日收盘", "close_to_close"),
+        row("year", 243, 1, "固定时刻(10:30)", "fixed_times"),
+        row("year", 243, 2, "每日收盘", "close_to_close"),
+    ])
+
+
+def _render_store_result(app, *, ranking=None):
+    ranking = _store_ranking_frame() if ranking is None else ranking
+    BacktestApp._show_history_recommendation(
+        app, ranking[ranking["rank"].eq(1)].copy(), ranking, notes=None,
+        source_label="Wind · 510050.SH · 1分钟", window_results=None,
+        history_state={
+            "history_lookbacks": {"quarter": 61, "year": 243},
+            "wind_code": "510050.SH", "history_wind_asof": "2026-07-25",
+            # 真实 gs 带着不可序列化的回调，保存必须能丢掉它而不是失败。
+            "cfg": {"build": lambda *a: None},
+        })
+    app.update_idletasks()
+
+
+def _replay_note(app):
+    """取逐段下钻栏里那条说明文字。"""
+    import tkinter as tk
+    bar = app._history_replay_window_combo.master
+    for child in bar.winfo_children():
+        try:
+            text = child.cget("text")
+        except tk.TclError:
+            continue
+        if isinstance(text, str) and ("明细" in text or "下钻" in text):
+            if not text.endswith(":"):
+                return text
+    return None
+
+
+@pytest.fixture
+def history_store_dir(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        gui_app.history_store, "results_dir", lambda: str(tmp_path))
+    return tmp_path
+
+
+def _fresh_app():
+    import tkinter as tk
+    import gui_app as module
+    try:
+        probe = tk.Tk()
+    except tk.TclError:
+        pytest.skip("无可用显示环境")
+    probe.destroy()
+    app = module.BacktestApp()
+    app.withdraw()
+    return app
+
+
+def test_save_button_unlocks_only_after_a_result_exists(history_store_dir):
+    app = _fresh_app()
+    try:
+        assert str(app._history_save_btn.cget("state")) == "disabled"
+        _render_store_result(app)
+        assert str(app._history_save_btn.cget("state")) == "normal"
+    finally:
+        app.destroy()
+
+
+def test_saved_result_reloads_into_an_identical_ranking_table(
+        history_store_dir, monkeypatch):
+    """存盘再读回，排名表必须逐格一致——这是整个功能的意义所在。"""
+    monkeypatch.setattr(
+        gui_app.simpledialog, "askstring", lambda *a, **k: "基线")
+    app = _fresh_app()
+    try:
+        _render_store_result(app)
+        before = [app._history_rank_tree.item(i, "values")
+                  for i in app._history_rank_tree.get_children()]
+        path = BacktestApp._save_history_result(app)
+        assert path is not None and os.path.isfile(path)
+    finally:
+        app.destroy()
+
+    app2 = _fresh_app()
+    try:
+        assert BacktestApp._load_history_result(app2, path) is True
+        app2.update_idletasks()
+        after = [app2._history_rank_tree.item(i, "values")
+                 for i in app2._history_rank_tree.get_children()]
+        assert after == before
+        assert len(app2._history_period_rows) == 2
+    finally:
+        app2.destroy()
+
+
+def test_loaded_result_is_labelled_and_blocks_segment_drilldown(
+        history_store_dir, monkeypatch):
+    """载入的结果必须自报身份，且下钻控件要禁掉而不是点了没反应。
+
+    包里不含 bar 级数组（161 个回测约 153 MB），所以逐段下钻确实做不到；
+    而页面仍允许「只填参数 / 用当前行情回测」——那份结论是过去某天算的，
+    不标出来会被当成刚跑的结果用。
+    """
+    monkeypatch.setattr(
+        gui_app.simpledialog, "askstring", lambda *a, **k: "近季基线")
+    app = _fresh_app()
+    try:
+        _render_store_result(app)
+        # 新跑的结果不该有载入标记；下钻按钮保持可用（此处下拉之所以空，
+        # 是这份合成数据没带分段明细，与「载入」无关）。
+        assert getattr(app, "_history_loaded_meta", None) is None
+        assert str(app._history_replay_button.cget("state")) == "normal"
+        assert _replay_note(app) is not None
+        assert "载入的结果不含" not in _replay_note(app)
+        path = BacktestApp._save_history_result(app)
+    finally:
+        app.destroy()
+
+    app2 = _fresh_app()
+    try:
+        BacktestApp._load_history_result(app2, path)
+        app2.update_idletasks()
+        assert app2._history_loaded_meta["label"] == "近季基线"
+        assert str(
+            app2._history_replay_window_combo.cget("state")) == "disabled"
+        assert str(app2._history_replay_button.cget("state")) == "disabled"
+        # 必须讲清为什么不能下钻，而不是留一个点了没反应的按钮。
+        assert "载入的结果不含逐 bar 明细" in _replay_note(app2)
+
+        banners = []
+
+        def walk(widget):
+            import tkinter as tk
+            for child in widget.winfo_children():
+                try:
+                    text = child.cget("text")
+                except tk.TclError:
+                    text = ""
+                if isinstance(text, str) and "载入结果" in text:
+                    banners.append(text)
+                walk(child)
+
+        walk(app2)
+        assert len(banners) == 1, banners
+        assert "近季基线" in banners[0]
+        assert "保存于" in banners[0]
+        # 应用到当前回测的两条路径仍然开放。
+        assert callable(app2._apply_history_recommendation)
+        assert callable(app2._verify_history_on_current_path)
+
+        # 切排名口径走的是同一个渲染入口。「哪来的结果」不会因为换个看法
+        # 而改变，横幅与下钻限制都必须保住。
+        BacktestApp._set_history_objective(app2, "incremental_sharpe")
+        app2.update_idletasks()
+        assert app2._history_result_objective == "incremental_sharpe"
+        assert app2._history_loaded_meta is not None
+        assert str(app2._history_replay_button.cget("state")) == "disabled"
+    finally:
+        app2.destroy()
+
+
+def test_running_a_fresh_optimisation_clears_the_loaded_marker(
+        history_store_dir, monkeypatch):
+    """真跑一轮之后不能还挂着「载入结果」横幅、也不能继续禁用下钻。"""
+    monkeypatch.setattr(
+        gui_app.simpledialog, "askstring", lambda *a, **k: "旧结果")
+    app = _fresh_app()
+    try:
+        _render_store_result(app)
+        path = BacktestApp._save_history_result(app)
+        BacktestApp._load_history_result(app, path)
+        app.update_idletasks()
+        assert app._history_loaded_meta is not None
+
+        # 再渲染一次而不传 loaded_meta —— 真跑一轮走的就是这条路。标记由
+        # 渲染入口接管，调用方不需要（也不该）自己记得清。
+        _render_store_result(app)
+
+        assert getattr(app, "_history_loaded_meta", None) is None
+        assert str(app._history_replay_button.cget("state")) == "normal"
+        assert "载入的结果不含" not in _replay_note(app)
+    finally:
+        app.destroy()
+
+
+def test_cancelling_the_name_prompt_saves_nothing(
+        history_store_dir, monkeypatch):
+    """点取消不该留下文件——留空名字和取消是两件事。"""
+    monkeypatch.setattr(
+        gui_app.simpledialog, "askstring", lambda *a, **k: None)
+    app = _fresh_app()
+    try:
+        _render_store_result(app)
+        assert BacktestApp._save_history_result(app) is None
+    finally:
+        app.destroy()
+    assert gui_app.history_store.list_results(str(history_store_dir)) == []
+
+
 def _objective_header_state(*, with_incremental_columns):
     """按有无增量列渲染一次排名表，返回表头可点性与文案。"""
     import tkinter as tk
@@ -5373,3 +5600,78 @@ def test_rank_table_row_tags_keep_the_monospaced_body_font():
                     f"{tag} 的 {sample!r} 宽度与正文不一致")
     finally:
         app.destroy()
+
+
+def _default_chart_selection(rows, *, unplottable=(), monkeypatch=None):
+    """在假排名表上跑一次默认勾选，返回被勾中的候选名（按名次序）。"""
+    class _Tree:
+        def get_children(self):
+            return tuple(f"row{i}" for i in range(len(rows)))
+
+    def fake_model(_summary, _lookback, trial, **_kw):
+        if any(name in unplottable for name in trial):
+            return {"state": "no_common_windows"}
+        return {"state": "ok"}
+
+    monkeypatch.setattr(
+        BacktestApp, "_history_multi_chart_model", staticmethod(fake_model))
+    fake = SimpleNamespace(
+        _history_rank_tree=_Tree(),
+        _history_rank_rows={f"row{i}": row for i, row in enumerate(rows)},
+        _history_window_summary=object(),
+        _history_chart_selection=lambda: ("quarter", {}),
+        _history_chart_view_options=lambda: ("full", "net"),
+        _history_chart_pairs_cache=lambda: {},
+    )
+    return BacktestApp._history_top_chart_candidates(fake)
+
+
+def _rank_entry(name, *, baseline=False):
+    return {"strategy": name,
+            "strategy_type": "close_to_close" if baseline else "hedge_band"}
+
+
+def test_default_selection_checks_the_top_three_ranks(monkeypatch):
+    """默认勾选排名最靠前的三个候选。"""
+    rows = [_rank_entry(f"候选{i}") for i in range(1, 6)]
+
+    assert _default_chart_selection(
+        rows, monkeypatch=monkeypatch) == ["候选1", "候选2", "候选3"]
+
+
+def test_baseline_occupies_a_rank_but_is_never_checked(monkeypatch):
+    """基准也占一个名次，所以它排进前三时默认只勾上两个候选。
+
+    基准是固定基准、图上恒在，不参与勾选；为了凑够三个而往下多抓一个名
+    次会让默认勾选不再对应"最靠前的那几名"。
+    """
+    rows = [
+        _rank_entry("候选1"),
+        _rank_entry("每日收盘", baseline=True),
+        _rank_entry("候选3"),
+        _rank_entry("候选4"),
+    ]
+
+    assert _default_chart_selection(
+        rows, monkeypatch=monkeypatch) == ["候选1", "候选3"]
+
+
+def test_default_selection_never_reaches_past_the_third_rank(monkeypatch):
+    """名次窗口之外的候选不得被默认勾上。"""
+    rows = [_rank_entry(f"候选{i}") for i in range(1, 9)]
+
+    selected = _default_chart_selection(rows, monkeypatch=monkeypatch)
+
+    assert "候选4" not in selected
+    assert len(selected) == BacktestApp._HISTORY_DEFAULT_CHART_RANKS
+
+
+def test_unplottable_candidate_is_skipped_without_reaching_deeper(monkeypatch):
+    """窗口内画不进同一张图的候选跳过即可，不顺延到第四名。"""
+    rows = [_rank_entry(f"候选{i}") for i in range(1, 6)]
+
+    selected = _default_chart_selection(
+        rows, unplottable={"候选2"}, monkeypatch=monkeypatch)
+
+    assert selected == ["候选1", "候选3"]
+    assert "候选4" not in selected

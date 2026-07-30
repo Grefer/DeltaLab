@@ -160,17 +160,17 @@ def run_rolling_backtest(
     # 因此必须在进入循环前校验，避免非法方向被静默吞掉后返回空结果。
     position = hk_base.get("position", 1)
     if isinstance(position, (bool, np.bool_)):
-        raise ValueError("hedge_kwargs['position'] 只允许 1（short）或 -1（long）")
+        raise ValueError("hedge_kwargs['position'] 只允许 1（卖出）或 -1（买入）")
     try:
         position_value = float(position)
     except (TypeError, ValueError, OverflowError) as exc:
         raise ValueError(
-            "hedge_kwargs['position'] 只允许 1（short）或 -1（long）"
+            "hedge_kwargs['position'] 只允许 1（卖出）或 -1（买入）"
         ) from exc
     if (not np.isfinite(position_value)
             or position_value not in (-1.0, 1.0)):
         raise ValueError(
-            "hedge_kwargs['position'] 只允许 1（short）或 -1（long）")
+            "hedge_kwargs['position'] 只允许 1（卖出）或 -1（买入）")
     position = int(position_value)
     hk_base["position"] = position
 
@@ -272,7 +272,7 @@ def run_rolling_backtest(
                 {
                     "start_date": log_ret.index[t0],
                     "position": position,
-                    "position_label": "short" if position == 1 else "long",
+                    "position_label": "sell" if position == 1 else "buy",
                     "sigma_pre": sigma_pre,
                     "real_s0": real_s0,
                     "rescale_ratio": float(rescale_info["ratio"]),
@@ -299,6 +299,6 @@ def run_rolling_backtest(
     df.attrs["first_rescale_info"] = first_rescale_info
     df.attrs["s_ref"] = cfg_s0
     df.attrs["position"] = position
-    df.attrs["position_label"] = "short" if position == 1 else "long"
+    df.attrs["position_label"] = "sell" if position == 1 else "buy"
     df.attrs["quantity"] = quantity
     return df

@@ -96,9 +96,9 @@ def test_rolling_backtest_smoke():
             "hedge_pnl_real", "hedge_pnl_mc", "sigma_pre"):
         assert col in df.columns, f"缺列 {col}"
     assert df["position"].eq(1).all()
-    assert df["position_label"].eq("short").all()
+    assert df["position_label"].eq("sell").all()
     assert df.attrs["position"] == 1
-    assert df.attrs["position_label"] == "short"
+    assert df.attrs["position_label"] == "sell"
     assert df.attrs["quantity"] == pytest.approx(1.0)
 
     # 合成数据两边都是 GBM，真实与 MC 的均值差应在 2σ 内（允许放宽到 2.5σ）
@@ -153,14 +153,14 @@ def _small_rolling_direction_fixture(position=-1, quantity=2.0):
         )
 
 
-def test_rolling_backtest_preserves_long_direction_in_rows_and_attrs():
+def test_rolling_backtest_preserves_buy_direction_in_rows_and_attrs():
     result = _small_rolling_direction_fixture(position=-1, quantity=2.0)
 
     assert not result.empty
     assert result["position"].eq(-1).all()
-    assert result["position_label"].eq("long").all()
+    assert result["position_label"].eq("buy").all()
     assert result.attrs["position"] == -1
-    assert result.attrs["position_label"] == "long"
+    assert result.attrs["position_label"] == "buy"
     assert result.attrs["quantity"] == pytest.approx(2.0)
 
 

@@ -192,6 +192,124 @@ def test_listing_reports_metadata_without_decoding_curves(tmp_path):
     assert items[0]["saved_at"] >= items[1]["saved_at"]
 
 
+def _multi_period_ranking(winners):
+    """按 {周期: 冠军策略} 造一张带基准的排名表。"""
+    rows = []
+    for lookback, (days, winner) in winners.items():
+        rows.append({
+            "lookback": lookback, "lookback_days": days, "rank": 1,
+            "strategy": winner, "strategy_type": "hedge_band",
+            "recommendation_eligible": True,
+        })
+        rows.append({
+            "lookback": lookback, "lookback_days": days, "rank": 2,
+            "strategy": "每日收盘", "strategy_type": "close_to_close",
+            "recommendation_eligible": True,
+        })
+    return pd.DataFrame(rows)
+
+
+def test_listing_reports_the_longest_period_as_evidence_span(tmp_path):
+    """「2 个周期」没用：近周+近月和近半年+近年都是 2 个，可信度差着量级。"""
+    path = _save(tmp_path, ranking=_multi_period_ranking({
+        "quarter": (61, "固定间隔(1σ)"), "half_year": (122, "固定间隔(1σ)"),
+    }))
+
+    item = next(i for i in store.list_results(str(tmp_path))
+                if i["path"] == path)
+
+    assert item["evidence_span"] == "近半年"
+
+
+def test_listing_verdict_names_the_strategy_only_when_periods_agree(tmp_path):
+    path = _save(tmp_path, ranking=_multi_period_ranking({
+        "quarter": (61, "固定间隔(1σ)"),
+        "half_year": (122, "固定间隔(1σ)"),
+        "year": (243, "固定间隔(1σ)"),
+    }))
+
+    item = next(i for i in store.list_results(str(tmp_path))
+                if i["path"] == path)
+
+    assert item["verdict"] == "固定间隔(1σ)"
+    assert item["evidence_span"] == "近年"
+
+
+def test_listing_verdict_refuses_to_pick_a_winner_when_periods_disagree(
+        tmp_path):
+    """有分歧就说有分歧——挑一个报出来等于把弱证据伪装成强结论。"""
+    path = _save(tmp_path, ranking=_multi_period_ranking({
+        "quarter": (61, "固定间隔(1σ)"),
+        "half_year": (122, "固定时刻(10:30)"),
+        "year": (243, "固定间隔(2σ)"),
+    }))
+
+    item = next(i for i in store.list_results(str(tmp_path))
+                if i["path"] == path)
+
+    assert item["verdict"] == "不一致（3 种）"
+
+
+def test_listing_verdict_ignores_the_baseline_and_ineligible_rows(tmp_path):
+    """基准是对照组不是推荐；不合格的周期也不该贡献结论。"""
+    ranking = pd.DataFrame([
+        # 只有基准能排第一 —— 不构成推荐
+        {"lookback": "quarter", "lookback_days": 61, "rank": 1,
+         "strategy": "每日收盘", "strategy_type": "close_to_close",
+         "recommendation_eligible": True},
+        # 数据不合格的候选不参与
+        {"lookback": "year", "lookback_days": 243, "rank": 1,
+         "strategy": "固定间隔(1σ)", "strategy_type": "hedge_band",
+         "recommendation_eligible": False},
+    ])
+    path = _save(tmp_path, ranking=ranking)
+
+    item = next(i for i in store.list_results(str(tmp_path))
+                if i["path"] == path)
+
+    assert item["verdict"] == "无可比结论"
+
+
+@pytest.mark.parametrize(("params", "expected"), [
+    ({"T_days": 22, "sigma": 0.18}, "T22 σ0.18"),
+    ({"T_days": 60, "sigma": 0.24}, "T60 σ0.24"),
+    # σ 决定带宽绝对宽度，缺了它两份结果会看着一样
+    ({"T_days": 22}, "T22"),
+    ({"sigma": 0.12}, "σ0.12"),
+    ({}, "—"),
+])
+def test_listing_summarises_the_option_by_maturity_and_vol(
+        tmp_path, params, expected):
+    path = _save(tmp_path, history_state={**_state(), "params": params})
+
+    item = next(i for i in store.list_results(str(tmp_path))
+                if i["path"] == path)
+
+    assert item["option_summary"] == expected
+
+
+@pytest.mark.parametrize(("overrides", "expected"), [
+    ({"position": -1, "tc_rate": 0.0001}, "Buy 费0.01%"),
+    ({"position": 1, "tc_rate": 0.0005}, "Sell 费0.05%"),
+    # 收盘保底默认开启，开着时不占版面
+    ({"position": -1, "tc_rate": 0.0001, "force_day_close_hedge": True},
+     "Buy 费0.01%"),
+    # 关掉了就必须看得见：实测它能让固定间隔 2.0σ 从第 1 名掉到第 6 名
+    ({"position": -1, "tc_rate": 0.0001, "force_day_close_hedge": False},
+     "Buy 费0.01% ⚠无保底"),
+])
+def test_listing_flags_position_cost_and_a_disabled_close_fallback(
+        tmp_path, overrides, expected):
+    state = {k: v for k, v in _state().items()
+             if k != "force_day_close_hedge"}
+    path = _save(tmp_path, history_state={**state, **overrides})
+
+    item = next(i for i in store.list_results(str(tmp_path))
+                if i["path"] == path)
+
+    assert item["position_summary"] == expected
+
+
 def test_listing_skips_corrupt_packages(tmp_path):
     good = _save(tmp_path)
     broken = os.path.join(str(tmp_path), "坏包.json.gz")
@@ -230,6 +348,22 @@ def test_rename_changes_the_label_but_keeps_the_file(tmp_path):
     assert store.list_results(str(tmp_path))[0]["label"] == "近季 · 换月前基准"
 
 
+def test_saving_twice_in_the_same_second_keeps_both(tmp_path):
+    """文件名的时间戳只到秒；撞名必须加序号，不能静默覆盖。
+
+    「存完发现名字打错了立刻重存」是很容易发生的操作序列。此前第二次会
+    直接盖掉第一次，用户以为存了两份、实际只剩最后一份——而 85 秒跑出来
+    的结果被静默丢掉是最不能接受的失败。
+    """
+    first = _save(tmp_path, label="第一份")
+    second = _save(tmp_path, label="第二份")
+    third = _save(tmp_path, label="第三份")
+
+    assert len({first, second, third}) == 3
+    labels = {item["label"] for item in store.list_results(str(tmp_path))}
+    assert labels == {"第一份", "第二份", "第三份"}
+
+
 def test_delete_removes_the_package_and_tolerates_missing(tmp_path):
     path = _save(tmp_path)
 
@@ -247,6 +381,63 @@ def test_results_dir_is_separate_from_the_wind_cache():
 
     assert results != cache
     assert not results.startswith(cache + os.sep)
+
+
+@pytest.mark.parametrize(("state", "expected"), [
+    ({"wind_code": "510050.SH", "position": 1,
+      "history_wind_asof": "2026-07-25"},
+     "510050.SH Sell 2026-07-25"),
+    ({"wind_code": "OI701.CZC", "position": -1,
+      "history_wind_asof": "2026-06-30"},
+     "OI701.CZC Buy 2026-06-30"),
+    # 没有 asof 时退回 wind_end
+    ({"wind_code": "510050.SH", "position": -1, "wind_end": "2026-05-20"},
+     "510050.SH Buy 2026-05-20"),
+    # CSV 来源用文件名当品种
+    ({"csv_path": "/data/沪深300_2026.csv", "position": -1,
+      "history_wind_asof": "2026-07-25"},
+     "沪深300_2026 Buy 2026-07-25"),
+    # 空状态也要给出可用的名字，不能抛
+    ({}, "Sell"),
+])
+def test_default_label_is_code_side_and_asof(state, expected):
+    """预填名 = 品种 + 多空 + 分析截至日。
+
+    第三段取截至日而不是候选摘要：参数相同时摘要也相同，防不了重名，而
+    「区分同参数的结果」正是这一段存在的理由。隔周同参数再跑，Wind 区间
+    整体前移，截至日就把两份分开了。
+    """
+    assert store.default_label(state) == expected
+
+
+def test_default_label_appends_a_serial_when_the_name_is_taken(tmp_path):
+    """同参数同截至日连存两次确实会撞，靠保存时间列区分不够直观。"""
+    state = {"wind_code": "510050.SH", "position": -1,
+             "history_wind_asof": "2026-07-25"}
+    base = "510050.SH Buy 2026-07-25"
+
+    assert store.default_label(state, existing=[]) == base
+    assert store.default_label(state, existing=[base]) == f"{base} #2"
+    assert store.default_label(
+        state, existing=[base, f"{base} #2"]) == f"{base} #3"
+    # 别的名字不影响；空白项不算占用。
+    assert store.default_label(
+        state, existing=["换月前对照", "  ", ""]) == base
+
+
+def test_default_label_gets_the_position_sign_right():
+    """1=卖出、-1=买入（见 HedgeBacktest）。弄反会让名字直接误导。
+
+    用 Buy/Sell 而不是 Long/Short：后者在期权语境里指 gamma 敞口，而同一
+    买卖方向在不同产品上敞口相反，拿它当买卖方向的标签必然对一半错一半。
+    """
+    base = {"wind_code": "510050.SH", "history_wind_asof": "2026-07-25"}
+
+    assert store.default_label({**base, "position": 1}).split()[1] == "Sell"
+    assert store.default_label({**base, "position": -1}).split()[1] == "Buy"
+    # 非法/缺失时按卖出处理，而不是崩掉。
+    assert store.default_label({**base, "position": None}).split()[1] == "Sell"
+    assert store.default_label({**base, "position": "x"}).split()[1] == "Sell"
 
 
 def test_default_filename_is_descriptive_and_filesystem_safe(tmp_path):

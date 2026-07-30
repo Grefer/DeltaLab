@@ -146,6 +146,7 @@ from history_selection import (
     MAX_BAND_CANDIDATES,
     MAX_HISTORY_CHART_CANDIDATES,
 )
+import history_store
 
 # ============================================================
 #  期权类型注册表
@@ -1217,9 +1218,9 @@ class BacktestApp(tk.Tk):
         self._pos_var = tk.StringVar(value="1")
         pos_frame = ttk.Frame(sec3, style="Surface.TFrame")
         pos_frame.grid(row=row_h, column=1, sticky="w", padx=(8, 0), pady=4)
-        ttk.Radiobutton(pos_frame, text="卖出 (short)", variable=self._pos_var,
+        ttk.Radiobutton(pos_frame, text="卖出 (Sell)", variable=self._pos_var,
                         value="1").pack(side="left", padx=(0, 8))
-        ttk.Radiobutton(pos_frame, text="买入 (long)", variable=self._pos_var,
+        ttk.Radiobutton(pos_frame, text="买入 (Buy)", variable=self._pos_var,
                         value="-1").pack(side="left")
 
         row_h += 1
@@ -1527,13 +1528,28 @@ class BacktestApp(tk.Tk):
         header = ttk.Frame(container, style="Surface.TFrame")
         header.pack(fill="x", padx=8, pady=(8, 6))
         header.columnconfigure(0, weight=1)
-        header.columnconfigure(1, weight=0)
-        header.columnconfigure(2, weight=0)
+        for _column in range(1, 5):
+            header.columnconfigure(_column, weight=0)
 
         self._history_header_summary_frame = ttk.Frame(
             header, style="Surface.TFrame")
         self._history_header_summary_frame.grid(
             row=0, column=0, sticky="w")
+
+        # 一次五周期全选要跑八十多秒，跑完只能截图——所以给它一个落盘的去
+        # 处。「已保存结果」任何时候都可用（要去翻旧结果）；「保存结果」只
+        # 在页面上确实有结果时可用。
+        self._history_open_store_btn = ttk.Button(
+            header, text="已保存结果", width=11,
+            command=self._open_history_result_store,
+        )
+        self._history_open_store_btn.grid(
+            row=0, column=1, sticky="e", padx=(8, 4))
+        self._history_save_btn = ttk.Button(
+            header, text="保存结果", width=10, state="disabled",
+            command=self._save_history_result,
+        )
+        self._history_save_btn.grid(row=0, column=2, sticky="e", padx=(0, 4))
 
         self._history_config_visible = True
         self._history_config_toggle_btn = ttk.Button(
@@ -1541,7 +1557,7 @@ class BacktestApp(tk.Tk):
             command=self._toggle_history_config_panel,
         )
         self._history_config_toggle_btn.grid(
-            row=0, column=1, sticky="e", padx=(8, 6))
+            row=0, column=3, sticky="e", padx=(4, 6))
 
         # 变量保留：顶部摘要里的警示 pill 从它取文案。这里不再重复渲染
         # 同一句话——同屏出现两遍只会让人以为是两条不同的提示。
@@ -1552,7 +1568,7 @@ class BacktestApp(tk.Tk):
             header, text="开始策略优选", style="Run.TButton",
             command=self._run_history_recommendation,
         )
-        self._history_btn.grid(row=0, column=2, sticky="e", ipadx=12, ipady=2)
+        self._history_btn.grid(row=0, column=4, sticky="e", ipadx=12, ipady=2)
 
         # 优选跑在后台，而共享进度条在左侧参数栏里；用户此刻正盯着这一页，
         # 那边的动静完全看不到，只能看见一个变灰的按钮。这里给本页一份。
@@ -1787,9 +1803,31 @@ class BacktestApp(tk.Tk):
         except (tk.TclError, AttributeError):
             return
 
+        # 载入的历史结果必须一眼看得出来：页面允许「只填参数 / 用当前行情
+        # 回测」，而这份结论是过去某天算的、行情早已往前走了。不标出来就会
+        # 被当成刚跑的结果用。
+        loaded = getattr(self, "_history_loaded_meta", None)
+        if loaded:
+            stamp = str(loaded.get("saved_at", ""))[:16].replace("T", " ")
+            name = str(loaded.get("label") or "").strip()
+            asof = str(loaded.get("asof") or "").strip()
+            text = "📂 载入结果"
+            if name:
+                text += f"「{name}」"
+            if stamp:
+                text += f" · 保存于 {stamp}"
+            if asof:
+                text += f" · 分析截至 {asof}"
+            loaded_pill = tk.Label(
+                container, text=text,
+                bg=PALETTE["primary_light"], fg=PALETTE["primary"],
+                font=(_UI_FONT_FAMILY, 9, "bold"), padx=10, pady=3,
+            )
+            loaded_pill.pack(side="left", padx=(0, 6))
+
         hint = getattr(self, "_history_source_hint_var", None)
         hint_text = hint.get().strip() if hint is not None else ""
-        if hint_text:
+        if hint_text and not loaded:
             pill = tk.Label(
                 container, text=f"⚠ {hint_text}",
                 bg=PALETTE["warning_light"], fg=PALETTE["warning"],
@@ -1849,6 +1887,307 @@ class BacktestApp(tk.Tk):
             self._history_config_visible = True
             button.configure(text="收起候选配置")
 
+    def _sync_history_save_button(self):
+        """页面上确实有可保存的结果时才放开「保存结果」。"""
+        button = getattr(self, "_history_save_btn", None)
+        if button is None:
+            return
+        ranking = getattr(self, "_history_ranking", None)
+        ready = ranking is not None and not getattr(ranking, "empty", True)
+        try:
+            button.configure(state="normal" if ready else "disabled")
+        except tk.TclError:
+            pass
+
+    def _save_history_result(self):
+        """把当前优选结果落盘。
+
+        只存两张表与冻结参数（gzip 后约 137 KB）。**不存 bar 级结果**：
+        ``window_results`` 每个回测的完整数组平均 971 KB，一次五周期全选
+        161 个约 153 MB。代价是载入后逐段下钻不可用，载入时会明确说明。
+        """
+        ranking = getattr(self, "_history_ranking", None)
+        if ranking is None or getattr(ranking, "empty", True):
+            messagebox.showinfo("没有可保存的结果", "请先运行一次策略优选。")
+            return None
+        label = simpledialog.askstring(
+            "保存优选结果",
+            "给这份结果起个名字（可留空，仅用于列表里辨认）:",
+            initialvalue=history_store.default_label(
+                getattr(self, "_history_last_state", None),
+                existing=[item["label"]
+                          for item in history_store.list_results()]),
+            parent=self)
+        if label is None:      # 用户取消，与留空不同
+            return None
+        try:
+            payload = history_store.build_payload(
+                ranking=ranking,
+                window_summary=getattr(self, "_history_window_summary", None),
+                history_state=getattr(self, "_history_last_state", None),
+                source_label=getattr(self, "_history_last_source_label", None),
+                objective=getattr(self, "_history_result_objective", None),
+                notes=getattr(self, "_history_last_notes", None),
+                label=label,
+            )
+            path = history_store.save_result(payload)
+        except Exception as exc:                      # noqa: BLE001
+            messagebox.showerror("保存失败", str(exc))
+            return None
+        size_kb = os.path.getsize(path) / 1024
+        self._set_status(
+            f"已保存优选结果（{size_kb:.0f} KB）: {os.path.basename(path)}")
+        return path
+
+    def _load_history_result(self, path):
+        """载入结果包并渲染。渲染失败不改动当前页面。"""
+        try:
+            payload = history_store.load_result(path)
+        except history_store.HistoryResultVersionError as exc:
+            messagebox.showerror("版本不兼容", str(exc))
+            return False
+        except Exception as exc:                      # noqa: BLE001
+            messagebox.showerror("载入失败", str(exc))
+            return False
+        ranking = payload.get("ranking")
+        if ranking is None or getattr(ranking, "empty", True):
+            messagebox.showerror("载入失败", "结果包里没有排名数据。")
+            return False
+        state = dict(payload.get("history_state") or {})
+        # 用包里存的排名口径重新排一次，顺带拿到每周期首选。走公开的
+        # rerank_history 而不是自己重算，保证载入结果与新跑结果同一条路径。
+        objective = str(payload.get("objective") or "").strip()
+        if objective not in SELECTION_OBJECTIVES:
+            objective = DEFAULT_SELECTION_OBJECTIVE
+        recommendations, ranking = rerank_history(ranking, objective)
+        if ranking is None or getattr(ranking, "empty", True):
+            messagebox.showerror("载入失败", "结果包里的排名无法重建。")
+            return False
+        # 载入的结果没有 window_results，因此 details 直接给出已还原的分段
+        # 表与一个空的重放索引：逐段下钻会因此不可用，_build_history_replay_bar
+        # 会据此说明原因，而不是留一个点了没反应的按钮。
+        meta = {
+            "path": path,
+            "saved_at": str(payload.get("saved_at") or ""),
+            "label": str(payload.get("label") or ""),
+            "asof": str(state.get("history_wind_asof")
+                        or state.get("wind_end") or ""),
+        }
+        try:
+            BacktestApp._show_history_recommendation(
+                self, recommendations, ranking,
+                notes=payload.get("notes") or None,
+                source_label=payload.get("source_label"),
+                window_results=None, history_state=state,
+                details=(payload.get("window_summary"), {}),
+                loaded_meta=meta,
+            )
+        except Exception as exc:                      # noqa: BLE001
+            messagebox.showerror("载入失败", str(exc))
+            return False
+        stamp = meta["saved_at"][:16].replace("T", " ")
+        self._set_status(f"已载入优选结果（保存于 {stamp}）")
+        return True
+
+    def _open_history_result_store(self):
+        """已保存结果的列表窗口：载入 / 重命名 / 删除。"""
+        try:
+            items = history_store.list_results()
+        except Exception as exc:                      # noqa: BLE001
+            messagebox.showerror("无法读取已保存结果", str(exc))
+            return
+        window = tk.Toplevel(self)
+        window.title("已保存的优选结果")
+        window.geometry("1080x420")
+        window.transient(self)
+        body = ttk.Frame(window, style="Surface.TFrame", padding=12)
+        body.pack(fill="both", expand=True)
+        ttk.Label(
+            body,
+            text=f"目录: {history_store.results_dir()}",
+            style="SurfaceMuted.TLabel",
+        ).pack(fill="x", pady=(0, 6))
+
+        # 标的与大小不单独占列：标的已在默认名里（改名后可从悬停找回），
+        # 大小是诊断信息、没人靠字节数挑结果。腾出的位置给「证据跨度」和
+        # 「结论」——前者决定这份结果值不值得信，后者把文件列表变成研究
+        # 日志。「周期 N 个」被跨度取代：近周+近月与近半年+近年都是「2
+        # 个」，可信度却差着量级。
+        # 一列值不值得占位，看它改不改变你点哪一份。留下的都是「改了会让
+        # 结论不可互换」的：多空（买/卖 gamma 是相反逻辑）、成本率（多调
+        # 仓划不划算的核心权衡）、T 与 σ（σ 直接决定带宽绝对宽度，同一个
+        # 0.75σ 在 σ=0.12 与 0.24 下是两条不同的带）。数量与乘数不入列
+        # ——实测只线性缩放金额、不改名次；行权价每段按段初价重定基；粒度
+        # 现在是自动推导的因变量。这些都在选中后的细节行里。
+        columns = ("label", "code", "option", "position", "asof", "span",
+                   "verdict")
+        headings = {
+            "label": "名称", "code": "标的", "option": "期权",
+            "position": "头寸", "asof": "分析截至日", "span": "证据跨度",
+            "verdict": "结论",
+        }
+        widths = {"label": 190, "code": 100, "option": 105, "position": 150,
+                  "asof": 105, "span": 80, "verdict": 175}
+        # 动作行先占位（见下方 actions 的 pack）：树带 expand=True 会吃掉
+        # 剩余空腔，排在它后面的按钮行会被压成 0 高度直接消失，而 tkinter
+        # 对此完全沉默。
+        tree_frame = ttk.Frame(body, style="Surface.TFrame")
+        tree = ttk.Treeview(
+            tree_frame, columns=columns, show="headings", height=12,
+            selectmode="browse")
+        for key in columns:
+            tree.heading(key, text=headings[key])
+            tree.column(
+                key, width=widths[key], minwidth=60,
+                anchor="w" if key in ("label", "code") else "center",
+                stretch=key == "label")
+        scrollbar = ttk.Scrollbar(
+            tree_frame, orient="vertical", command=tree.yview)
+        tree.configure(yscrollcommand=scrollbar.set)
+        tree.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+        tree.tag_configure("incompatible", background=PALETTE["warning_light"])
+
+        by_iid = {}
+
+        def refresh(selected_path=None):
+            for child in tree.get_children():
+                tree.delete(child)
+            by_iid.clear()
+            for index, item in enumerate(history_store.list_results()):
+                iid = f"result_{index}"
+                by_iid[iid] = item
+                verdict = item["verdict"]
+                if not item["compatible"]:
+                    verdict = f"⚠ 版本 {item['schema_version']}，无法载入"
+                tree.insert(
+                    "", "end", iid=iid,
+                    values=(
+                        item["label"] or item["filename"],
+                        item["wind_code"] or "—",
+                        item["option_summary"],
+                        item["position_summary"],
+                        item["asof"] or "—",
+                        item["evidence_span"],
+                        verdict,
+                    ),
+                    tags=() if item["compatible"] else ("incompatible",))
+                if selected_path and item["path"] == selected_path:
+                    tree.selection_set(iid)
+            BacktestApp._sync_history_store_buttons(
+                tree, by_iid, load_btn, rename_btn, delete_btn)
+
+        def selected():
+            picked = tree.selection()
+            return by_iid.get(picked[0]) if picked else None
+
+        def do_load():
+            item = selected()
+            if item is None:
+                return
+            if self._load_history_result(item["path"]):
+                window.destroy()
+
+        def do_rename():
+            item = selected()
+            if item is None:
+                return
+            label = simpledialog.askstring(
+                "重命名", "新名称:", initialvalue=item["label"], parent=window)
+            if label is None:
+                return
+            try:
+                history_store.rename_result(item["path"], label)
+            except Exception as exc:                  # noqa: BLE001
+                messagebox.showerror("重命名失败", str(exc), parent=window)
+                return
+            refresh(item["path"])
+
+        def do_delete():
+            item = selected()
+            if item is None:
+                return
+            name = item["label"] or item["filename"]
+            if not messagebox.askyesno(
+                    "删除结果", f"删除「{name}」？此操作不可撤销。",
+                    parent=window):
+                return
+            history_store.delete_result(item["path"])
+            refresh()
+
+        actions = ttk.Frame(body, style="Surface.TFrame")
+        actions.pack(side="bottom", fill="x", pady=(8, 0))
+        tree_frame.pack(fill="both", expand=True)
+        self._history_store_hint_var = tk.StringVar(value="")
+        ttk.Label(
+            actions, textvariable=self._history_store_hint_var,
+            style="SurfaceMuted.TLabel",
+        ).pack(side="left", fill="x", expand=True)
+        delete_btn = ttk.Button(actions, text="删除", width=8,
+                                command=do_delete, state="disabled")
+        delete_btn.pack(side="right", padx=(6, 0))
+        rename_btn = ttk.Button(actions, text="重命名", width=9,
+                                command=do_rename, state="disabled")
+        rename_btn.pack(side="right", padx=(6, 0))
+        load_btn = ttk.Button(actions, text="载入", width=8,
+                              command=do_load, state="disabled")
+        load_btn.pack(side="right")
+        def on_select(_event=None):
+            BacktestApp._sync_history_store_buttons(
+                tree, by_iid, load_btn, rename_btn, delete_btn)
+            item = selected()
+            # 标的、周期构成、大小、来源都不单独占列——它们是「确认这是不
+            # 是我要的那份」时才看一眼的细节，放在选中后的这一行足够。
+            self._history_store_hint_var.set(
+                BacktestApp._history_store_detail_line(item) if item else "")
+
+        tree.bind("<<TreeviewSelect>>", on_select)
+        tree.bind("<Double-1>", lambda _event: do_load())
+        refresh()
+        if not by_iid:
+            self._history_store_hint_var.set(
+                "还没有保存过结果。跑完一次优选后点「保存结果」。")
+
+    @staticmethod
+    def _history_store_detail_line(item):
+        """选中某份结果后显示的细节：列表里没占列的那些。"""
+        if not item:
+            return ""
+        periods = "、".join(
+            history_store._PERIOD_LABELS.get(key, key)
+            for key in item.get("lookbacks", ())) or "—"
+        parts = [
+            f"保存于 {str(item.get('saved_at', ''))[:16].replace('T', ' ')}",
+            f"周期 {periods}",
+            f"{item.get('rows', 0)} 行 · {item.get('bytes', 0) / 1024:.0f} KB",
+        ]
+        source = str(item.get("source_label") or "").strip()
+        if source:
+            parts.append(source)
+        if not item.get("compatible", True):
+            parts.append(
+                f"⚠ 包版本 {item.get('schema_version')}，与当前程序"
+                f"（{history_store.SCHEMA_VERSION}）不一致，口径可能已改变")
+        return " · ".join(parts)
+
+    @staticmethod
+    def _sync_history_store_buttons(tree, by_iid, load_btn, rename_btn,
+                                    delete_btn):
+        """按选中项启停按钮；版本不兼容的包不给「载入」。"""
+        picked = tree.selection()
+        item = by_iid.get(picked[0]) if picked else None
+        has = item is not None
+        for button in (rename_btn, delete_btn):
+            try:
+                button.configure(state="normal" if has else "disabled")
+            except tk.TclError:
+                pass
+        try:
+            load_btn.configure(
+                state="normal" if has and item["compatible"] else "disabled")
+        except tk.TclError:
+            pass
+
     def _set_history_progress(self, text):
         """在本页主按钮下方显示/隐藏优选任务进度。
 
@@ -1864,7 +2203,7 @@ class BacktestApp(tk.Tk):
             if text:
                 variable.set(text)
                 label.grid(row=1, column=0, sticky="w", pady=(6, 0))
-                bar.grid(row=1, column=1, columnspan=2, sticky="ew",
+                bar.grid(row=1, column=1, columnspan=4, sticky="ew",
                          padx=(12, 0), pady=(6, 0))
                 bar.start(15)
             else:
@@ -4112,7 +4451,7 @@ class BacktestApp(tk.Tk):
         }
         if len(positions) > 1:
             raise ValueError(
-                "买入(long)与卖出(short)结果不能混选；"
+                "买入与卖出结果不能混选；"
                 "请一次只比较同一头寸方向。")
         close_snapshots = [
             snapshot for snapshot in snapshots
@@ -4168,7 +4507,7 @@ class BacktestApp(tk.Tk):
                 for snapshot in snapshots
         }) > 1:
             return [
-                "买入(long)与卖出(short)结果不能混选；"
+                "买入与卖出结果不能混选；"
                 "请清空后选择同一头寸方向。"
             ]
         warnings = []
@@ -4853,8 +5192,8 @@ class BacktestApp(tk.Tk):
                 # 点击另一方向时切换整个视图分组，绝不沿用上一组的 每日收盘。
                 self._saved_comparison_selection.clear()
                 direction = (
-                    "卖出(short)" if target_position == 1
-                    else "买入(long)")
+                    "卖出" if target_position == 1
+                    else "买入")
                 self._set_status(
                     f"已切换到{direction}结果组；买卖方向不混合比较。")
             self._saved_comparison_selection.add(result_id)
@@ -4901,7 +5240,7 @@ class BacktestApp(tk.Tk):
             self, target_position)
         if skipped:
             direction = (
-                "卖出(short)" if target_position == 1 else "买入(long)")
+                "卖出" if target_position == 1 else "买入")
             self._set_status(
                 f"已全选{direction}结果；另 {skipped} 条相反方向结果未混入。")
         self._refresh_saved_pool_tree()
@@ -4971,7 +5310,7 @@ class BacktestApp(tk.Tk):
         }
         if len(selected_positions) > 1:
             raise ValueError(
-                "买入(long)与卖出(short)结果不能混选；"
+                "买入与卖出结果不能混选；"
                 "请清空后选择同一头寸方向。")
         selected_position = (
             next(iter(selected_positions)) if selected_positions else None)
@@ -5058,8 +5397,16 @@ class BacktestApp(tk.Tk):
 
     def _show_history_recommendation(
             self, recommendations, ranking, notes=None, source_label=None,
-            window_results=None, history_state=None, details=None):
-        """只在历史择优页渲染严格区间结论与排名。"""
+            window_results=None, history_state=None, details=None,
+            loaded_meta=None):
+        """只在历史择优页渲染严格区间结论与排名。
+
+        ``loaded_meta`` 非空表示这是从结果包载入的，页面要标明来源并禁掉
+        逐段下钻。它由渲染入口统一接管而不是让各调用方自己维护标记——真跑
+        一轮却忘了清，新结果就会继续挂着「载入结果」横幅、下钻也被误禁，
+        而这类遗漏不会报错。
+        """
+        self._history_loaded_meta = loaded_meta or None
         container = self._history_results_container
         view_attrs = (
             "_history_ranking", "_history_period_rows",
@@ -5095,6 +5442,7 @@ class BacktestApp(tk.Tk):
         self._history_last_source_label = source_label
         self._history_last_state = history_state
         BacktestApp._update_history_header_summary(self)
+        BacktestApp._sync_history_save_button(self)
         if notes:
             first_note = str(notes[0])
             short_note = first_note if len(first_note) <= 92 else first_note[:89] + "…"
@@ -5784,7 +6132,11 @@ class BacktestApp(tk.Tk):
         self._update_history_selection()
 
     def _history_rerender(self, recommendations, ranking, details):
-        """用新的排名结果重建结果页，沿用本次已有的分段明细。"""
+        """用新的排名结果重建结果页，沿用本次已有的分段明细。
+
+        切排名口径走的也是这条路。载入标记必须原样带过去——它描述的是「这
+        份结果哪来的」，换个看法不会把载入的结果变成刚跑的。
+        """
         if getattr(self, "_history_results_container", None) is None:
             return
         BacktestApp._show_history_recommendation(
@@ -5793,6 +6145,7 @@ class BacktestApp(tk.Tk):
             source_label=getattr(self, "_history_last_source_label", None),
             history_state=getattr(self, "_history_last_state", None),
             details=details,
+            loaded_meta=getattr(self, "_history_loaded_meta", None),
         )
 
     @staticmethod
@@ -5920,10 +6273,6 @@ class BacktestApp(tk.Tk):
             style="SurfaceMuted.TLabel",
         ).pack(side="left", fill="x", expand=True)
         ttk.Button(
-            chart_selection_bar, text="勾选前2名", width=9,
-            command=self._select_top_history_chart_candidates,
-        ).pack(side="right", padx=(4, 0))
-        ttk.Button(
             chart_selection_bar, text="清空勾选", width=8,
             command=self._clear_history_chart_candidates,
         ).pack(side="right", padx=(8, 0))
@@ -5969,6 +6318,10 @@ class BacktestApp(tk.Tk):
             style="SurfaceMuted.TLabel", justify="left", wraplength=1100,
         ).grid(row=3, column=0, columnspan=2, sticky="ew", pady=(6, 0))
         return detail_box
+
+    # 切到某个周期时默认勾选的排名行数。数的是名次，不是候选个数——基准
+    # 也占一个名次却不可勾选，所以它排进前三名时默认只勾上两个候选。
+    _HISTORY_DEFAULT_CHART_RANKS = 3
 
     # 自动摆放分割线的次数上限，兜底任何未预料的抖动。正常一次就位。
     _HISTORY_SASH_PLACEMENT_BUDGET = 6
@@ -6404,12 +6757,23 @@ class BacktestApp(tk.Tk):
             values=(), width=40, state="readonly",
         )
         self._history_replay_window_combo.pack(side="left", padx=(6, 8))
-        ttk.Button(
+        self._history_replay_button = ttk.Button(
             replay, text="加载到展示页",
             command=self._load_history_window_backtest,
-        ).pack(side="left")
+        )
+        self._history_replay_button.pack(side="left")
+        # 载入的结果包里没有 bar 级数组（161 个回测约 153 MB，不进包），
+        # 逐段下钻因此不可用。必须把原因说出来并把控件禁掉——留一个点了没
+        # 反应的按钮比没有按钮更糟。
+        loaded = getattr(self, "_history_loaded_meta", None)
+        if loaded:
+            note = "载入的结果不含逐 bar 明细；重新运行一次优选即可下钻"
+            self._history_replay_window_combo.configure(state="disabled")
+            self._history_replay_button.configure(state="disabled")
+        else:
+            note = "把选中策略的这一段单独跑出 Greeks 与逐 bar 明细"
         tk.Label(
-            replay, text="把选中策略的这一段单独跑出 Greeks 与逐 bar 明细",
+            replay, text=note,
             bg=PALETTE["surface_alt"], fg=PALETTE["text_muted"],
         ).pack(side="left", padx=(12, 0))
 
@@ -6441,8 +6805,19 @@ class BacktestApp(tk.Tk):
         return strategy if strategy in candidates else (
             candidates[0] if candidates else None)
 
-    def _history_top_chart_candidates(self, limit=2):
-        """选择排名靠前且能保持共同回测分段交集的候选。"""
+    def _history_top_chart_candidates(self, limit=None):
+        """默认勾选：前 ``limit`` 个名次里能与已选共同作图的候选。
+
+        ``limit`` 数的是**排名行数**，不是候选个数。基准（每日收盘）也占
+        一个名次，但它是固定基准、图上恒在，不参与勾选——所以基准排进前三
+        名时默认只勾上两个候选，不会为了凑够三个再往下多抓一个名次。
+
+        名次窗口内的候选仍要逐个试算共同分段交集：与已选没有交集的候选画
+        不进同一张图，跳过它而不是往下顺延，默认勾选才始终对应"最靠前的
+        那几名"。
+        """
+        if limit is None:
+            limit = BacktestApp._HISTORY_DEFAULT_CHART_RANKS
         lookback, _row = self._history_chart_selection()
         if not lookback:
             return []
@@ -6452,10 +6827,12 @@ class BacktestApp(tk.Tk):
             return []
         mode, metric = self._history_chart_view_options()
         selected = []
-        for iid in tree.get_children():
+        for position, iid in enumerate(tree.get_children()):
+            if position >= limit:
+                break
             row = rows.get(iid, {})
             if str(row.get("strategy_type", "")) == "close_to_close":
-                continue
+                continue          # 基准占名次但不勾选
             strategy = str(row.get("strategy", "")).strip()
             if not strategy:
                 continue
@@ -6467,7 +6844,7 @@ class BacktestApp(tk.Tk):
             )
             if model.get("state") == "ok":
                 selected.append(strategy)
-            if len(selected) >= min(limit, MAX_HISTORY_CHART_CANDIDATES):
+            if len(selected) >= MAX_HISTORY_CHART_CANDIDATES:
                 break
         return selected
 
@@ -6565,17 +6942,6 @@ class BacktestApp(tk.Tk):
             selected.add(strategy)
         self._refresh_history_chart_marks()
         self._update_history_rank_selection()
-
-    def _select_top_history_chart_candidates(self):
-        lookback, _row = self._history_chart_selection()
-        if not lookback:
-            return
-        selected = set(self._history_top_chart_candidates(limit=2))
-        self._history_chart_selected_by_period[str(lookback)] = selected
-        self._refresh_history_chart_marks()
-        self._update_history_chart_controls()
-        self._set_status(
-            f"图表已显示 每日收盘 与排名靠前的 {len(selected)} 个可比候选。")
 
     def _clear_history_chart_candidates(self):
         lookback, _row = self._history_chart_selection()
@@ -7117,7 +7483,7 @@ class BacktestApp(tk.Tk):
             chart_states = self._history_chart_selected_by_period
         if lookback_key not in chart_states:
             chart_states[lookback_key] = set(
-                self._history_top_chart_candidates(limit=2))
+                self._history_top_chart_candidates())
         self._refresh_history_chart_marks()
 
         rank_children = rank_tree.get_children()
@@ -8473,7 +8839,7 @@ class BacktestApp(tk.Tk):
         # 与下方回测的头寸方向联动：position=1 卖出, position=-1 买入
         position = gui_state.get("position", 1)
         sign = -1.0 if position == 1 else 1.0
-        perspective = "卖方(short)" if position == 1 else "买方(long)"
+        perspective = "卖方" if position == 1 else "买方"
         prices = prices * sign
         deltas = deltas * sign
         gammas = gammas * sign

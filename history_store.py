@@ -216,6 +216,46 @@ def build_payload(*, ranking, window_summary, history_state, source_label,
     }
 
 
+def default_label(state, existing=None):
+    """保存对话框的预填名：``品种 Buy/Sell 分析截至日``。
+
+    第三段取分析截至日，因为它才是「同参数不同结果」的真实分界：隔周用
+    同样参数再跑一次，Wind 区间整体前移，那是另一份结果。候选空间试过但
+    不合适——参数相同时摘要也相同，防不了重名，而那正是要解决的问题。
+
+    ``existing`` 传入已有的名字，完全同名时追加 ``#2``/``#3``。同参数同
+    截至日连存两次确实会撞，靠右边的保存时间列区分不够直观。
+
+    ``position`` 是**买卖方向**：1=卖出、-1=买入（见 HedgeBacktest）。这里
+    用 Buy/Sell 而不是 Long/Short——后者在期权语境里通常指 gamma 敞口，而
+    同一个买卖方向在不同产品上敞口相反（实测卖出时香草是 short gamma、雪
+    球是 long gamma），拿它当买卖方向的标签必然对一半错一半。
+    """
+    state = dict(state or {})
+    code = str(state.get("wind_code") or "").strip()
+    if not code:
+        csv_path = str(state.get("csv_path") or "").strip()
+        code = os.path.splitext(os.path.basename(csv_path))[0] if csv_path else ""
+    try:
+        position = int(state.get("position", 1))
+    except (TypeError, ValueError):
+        position = 1
+    side = "Sell" if position == 1 else "Buy"
+    asof = str(state.get("history_wind_asof")
+               or state.get("wind_end") or "").strip()[:10]
+    base = " ".join(piece for piece in (code, side, asof) if piece)
+    if not base:
+        base = side
+    taken = {str(name).strip() for name in (existing or ()) if str(name).strip()}
+    if base not in taken:
+        return base
+    for serial in range(2, 1000):
+        candidate = f"{base} #{serial}"
+        if candidate not in taken:
+            return candidate
+    return base
+
+
 def default_filename(payload):
     """``<标的>_<截至日>_<周期数>_<时间戳>.json.gz``。"""
     state = dict(payload.get("history_state") or {})
@@ -236,6 +276,18 @@ def save_result(payload, *, directory=None, filename=None):
     if not filename.endswith(_SUFFIX):
         filename += _SUFFIX
     path = os.path.join(directory, filename)
+    # 文件名的时间戳只到秒。同一秒里连存两份（很容易——存完发现名字打错了
+    # 立刻重存）会静默覆盖，用户以为存了两份、实际只剩最后一份。撞名就往
+    # 后加序号，绝不覆盖已有结果。
+    if os.path.exists(path):
+        stem = filename[:-len(_SUFFIX)]
+        for serial in range(2, 1000):
+            candidate = os.path.join(directory, f"{stem}-{serial}{_SUFFIX}")
+            if not os.path.exists(candidate):
+                path = candidate
+                break
+        else:
+            raise OSError(f"同名结果包过多，无法保存: {filename}")
     text = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
     # 先写临时文件再原子替换：85 秒跑出来的结果不能因为写一半崩掉而只留下
     # 一个坏包，而坏包在列表里看起来和好包一样。
@@ -268,8 +320,122 @@ def load_result(path, *, allow_other_version=False):
     return payload
 
 
+_PERIOD_LABELS = dict(
+    (("week", "近周"), ("month", "近月"), ("quarter", "近季"),
+     ("half_year", "近半年"), ("year", "近年")))
+
+
+def _evidence_span(records, lookbacks):
+    """证据跨度 = 最长的那个周期。
+
+    列表里写「2 个周期」没用：近周+近月与近半年+近年都是「2 个」，可信度
+    却差着量级。决定这份结果值不值得信的是最长那一段。
+    """
+    longest, best_days = "", -1
+    for record in records:
+        try:
+            days = int(record.get("lookback_days") or 0)
+        except (TypeError, ValueError):
+            continue
+        if days > best_days:
+            best_days, longest = days, str(record.get("lookback") or "")
+    if not longest:
+        keys = list(lookbacks or ())
+        longest = keys[-1] if keys else ""
+    return _PERIOD_LABELS.get(longest, longest or "—")
+
+
+def _verdict(records):
+    """保存时那个排名口径下的跨周期结论，与结果页那枚一致性 pill 同口径。
+
+    各周期都指向同一策略才写策略名；有分歧就写「不一致（N 种）」而不是
+    挑一个报出来——把弱证据伪装成强结论，正是这个页面一直在避免的事。
+    """
+    best_by_period = {}
+    for record in records:
+        if not record.get("recommendation_eligible"):
+            continue
+        if str(record.get("strategy_type") or "") == "close_to_close":
+            continue
+        name = str(record.get("strategy") or "").strip()
+        if not name or name == "—":
+            continue
+        period = str(record.get("lookback") or "")
+        try:
+            rank = int(record.get("rank") or 0)
+        except (TypeError, ValueError):
+            continue
+        current = best_by_period.get(period)
+        if current is None or rank < current[0]:
+            best_by_period[period] = (rank, name)
+    picks = [name for _rank, name in best_by_period.values()]
+    if not picks:
+        return "无可比结论"
+    unique = set(picks)
+    if len(unique) == 1:
+        return picks[0]
+    return f"不一致（{len(unique)} 种）"
+
+
+def _option_summary(state):
+    """``T22 σ0.18``。
+
+    两者都是决定性的：T 决定 gamma 剖面；σ 直接决定带宽的绝对宽度
+    （``k·S·σ/√243``）——同一个「0.75σ」在 σ=0.12 与 σ=0.24 下是两条完全
+    不同的带，不写出来两份结果会看着一样。
+    """
+    params = dict(state.get("params") or {})
+    pieces = []
+    days = params.get("T_days", params.get("T"))
+    try:
+        if days is not None:
+            pieces.append(f"T{int(days)}")
+    except (TypeError, ValueError):
+        pass
+    try:
+        sigma = float(params.get("sigma"))
+        if np.isfinite(sigma):
+            pieces.append(f"σ{sigma:g}")
+    except (TypeError, ValueError):
+        pass
+    return " ".join(pieces) or "—"
+
+
+def _position_summary(state):
+    """``Buy 费0.01%``，收盘保底被关掉时追加警示。
+
+    买卖方向决定对冲逻辑的方向；成本率决定「多调仓划不划算」这个核心权衡，
+    0.01% 与 0.05% 会选出不同的最优带宽。数量与乘数不入列——实测它们只
+    线性缩放金额，不改变名次。
+
+    收盘保底默认开启且很少改，所以只在**关闭**时标记：正常情况下不占版
+    面，而一旦不同就必须看得见——实测关掉它能让固定间隔 2.0σ 从第 1 名
+    掉到第 6 名。
+    """
+    try:
+        position = int(state.get("position", 1))
+    except (TypeError, ValueError):
+        position = 1
+    pieces = ["Sell" if position == 1 else "Buy"]
+    try:
+        rate = float(state.get("tc_rate"))
+        if np.isfinite(rate):
+            pieces.append(f"费{rate * 100:g}%")
+    except (TypeError, ValueError):
+        pass
+    if "force_day_close_hedge" in state and not state.get(
+            "force_day_close_hedge"):
+        pieces.append("⚠无保底")
+    return " ".join(pieces)
+
+
 def _peek(path):
-    """只读元数据，不还原表格——列表页不需要把曲线全解出来。"""
+    """读元数据供列表页使用；不还原成 DataFrame。
+
+    注意它仍会 ``json.load`` 整个包（曲线也会解成 list），只是不做类型还
+    原。实测约 9 ms/份、30 份 272 ms——量级可以接受，所以没有为列表另建
+    索引文件或 sidecar；真到几百份再说。
+    """
     try:
         with gzip.open(path, "rt", encoding="utf-8") as handle:
             payload = json.load(handle)
@@ -277,6 +443,8 @@ def _peek(path):
         return None
     state = dict(payload.get("history_state") or {})
     ranking = payload.get("ranking") or {}
+    records = list(ranking.get("records", ()))
+    lookbacks = state.get("history_lookbacks") or {}
     return {
         "path": path,
         "filename": os.path.basename(path),
@@ -289,8 +457,12 @@ def _peek(path):
         "wind_code": state.get("wind_code") or "",
         "asof": (state.get("history_wind_asof")
                  or state.get("wind_end") or ""),
-        "lookbacks": list((state.get("history_lookbacks") or {}).keys()),
-        "rows": len(ranking.get("records", ())),
+        "lookbacks": list(lookbacks.keys()),
+        "option_summary": _option_summary(state),
+        "position_summary": _position_summary(state),
+        "evidence_span": _evidence_span(records, lookbacks),
+        "verdict": _verdict(records),
+        "rows": len(records),
         "bytes": os.path.getsize(path),
     }
 

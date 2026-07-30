@@ -67,10 +67,13 @@ _OBJECTIVE_METRICS = {
 
 
 def _normalize_option_position(value, *, context, allow_missing=False):
-    """把期权头寸方向规范为 ``+1``(short) / ``-1``(long)。
+    """把期权买卖方向规范为 ``+1``(卖出) / ``-1``(买入)。
+
+    只表示买卖方向，与 gamma 敞口无关：同一个买卖方向在不同产品上对应
+    相反的敞口（详见 ``HedgeBacktest`` 的 ``position`` 参数说明）。
 
     升级前保存或手工构造的结果可能没有 ``position``；只在明确允许时以
-    ``None`` 返回，不能把未知方向静默解释为默认 short。
+    ``None`` 返回，不能把未知方向静默解释为默认卖出。
     """
     if value is None:
         if allow_missing:
@@ -85,15 +88,15 @@ def _normalize_option_position(value, *, context, allow_missing=False):
             return None
         raise ValueError(f"{context} 缺少 position")
     if isinstance(value, (bool, np.bool_)):
-        raise ValueError(f"{context} position 必须是 1(short) 或 -1(long)")
+        raise ValueError(f"{context} position 必须是 1(卖出) 或 -1(买入)")
     try:
         numeric = float(value)
     except (TypeError, ValueError, OverflowError) as exc:
         raise ValueError(
-            f"{context} position 必须是 1(short) 或 -1(long)"
+            f"{context} position 必须是 1(卖出) 或 -1(买入)"
         ) from exc
     if not np.isfinite(numeric) or numeric not in (-1.0, 1.0):
-        raise ValueError(f"{context} position 必须是 1(short) 或 -1(long)")
+        raise ValueError(f"{context} position 必须是 1(卖出) 或 -1(买入)")
     return int(numeric)
 
 

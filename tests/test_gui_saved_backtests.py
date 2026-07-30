@@ -356,11 +356,11 @@ def test_selected_candidates_automatically_keep_fixed_baseline_in_view():
 
 
 def test_saved_payload_rejects_cross_position_baseline_and_candidate():
-    short_baseline = _snapshot(
+    sell_baseline = _snapshot(
         "result-0001", "卖方每日收盘",
         state=_state(position=1),
     )
-    long_candidate = _snapshot(
+    buy_candidate = _snapshot(
         "result-0002", "买方固定间隔",
         state=_state(
             strategy="hedge_band", threshold=2.0, position=-1),
@@ -369,28 +369,28 @@ def test_saved_payload_rejects_cross_position_baseline_and_candidate():
 
     with pytest.raises(ValueError, match="不能混选"):
         BacktestApp._saved_comparison_payload(
-            [short_baseline, long_candidate],
-            baseline_result_id=short_baseline.result_id,
+            [sell_baseline, buy_candidate],
+            baseline_result_id=sell_baseline.result_id,
         )
     assert any(
         "不能混选" in warning
         for warning in BacktestApp._saved_comparison_warnings(
-            [short_baseline, long_candidate],
-            baseline_result_id=short_baseline.result_id,
+            [sell_baseline, buy_candidate],
+            baseline_result_id=sell_baseline.result_id,
         )
     )
 
 
 def test_saved_selection_switches_position_group_and_uses_matching_baseline():
-    short_baseline = _snapshot(
+    sell_baseline = _snapshot(
         "result-0001", "卖方每日收盘",
         state=_state(position=1),
     )
-    long_baseline = _snapshot(
+    buy_baseline = _snapshot(
         "result-0002", "买方每日收盘",
         state=_state(position=-1),
     )
-    long_candidate = _snapshot(
+    buy_candidate = _snapshot(
         "result-0003", "买方固定间隔",
         state=_state(strategy="hedge_band", position=-1),
         result=_result(strategy="hedge_band"),
@@ -398,26 +398,26 @@ def test_saved_selection_switches_position_group_and_uses_matching_baseline():
     statuses = []
     fake = SimpleNamespace(
         _saved_backtests={
-            short_baseline.result_id: short_baseline,
-            long_baseline.result_id: long_baseline,
-            long_candidate.result_id: long_candidate,
+            sell_baseline.result_id: sell_baseline,
+            buy_baseline.result_id: buy_baseline,
+            buy_candidate.result_id: buy_candidate,
         },
-        _saved_comparison_selection={short_baseline.result_id},
-        _saved_comparison_baseline_id=short_baseline.result_id,
+        _saved_comparison_selection={sell_baseline.result_id},
+        _saved_comparison_baseline_id=sell_baseline.result_id,
         _set_status=statuses.append,
         _refresh_saved_pool_tree=lambda: None,
         _refresh_saved_comparison_view=lambda: None,
     )
 
     BacktestApp._toggle_saved_backtest_selection(
-        fake, long_candidate.result_id)
+        fake, buy_candidate.result_id)
     selected = BacktestApp._selected_saved_backtests(fake)
 
     assert {
         snapshot.result_id for snapshot in selected
-    } == {long_baseline.result_id, long_candidate.result_id}
-    assert short_baseline.result_id not in fake._saved_comparison_selection
-    assert fake._saved_comparison_baseline_id == long_baseline.result_id
+    } == {buy_baseline.result_id, buy_candidate.result_id}
+    assert sell_baseline.result_id not in fake._saved_comparison_selection
+    assert fake._saved_comparison_baseline_id == buy_baseline.result_id
     assert statuses and "不混合比较" in statuses[-1]
 
 

@@ -344,7 +344,11 @@ def test_hedge_backtest_rejects_evaluation_horizon_beyond_maturity():
 
 
 def _vanilla_direction_pair(*, tc_rate=0.0):
-    """返回同一期权/路径的 short 与 long 回测结果。"""
+    """返回同一期权/路径的卖出与买入回测结果。
+
+    刻意不叫 short/long：那两个词在期权语境里指 gamma 敞口，而这里区分的
+    是买卖方向，两者在不同产品上并不同向。
+    """
     option = Option_Vanilla(
         "Vanilla", s0=100.0, sr=[], K=100.0,
         T=4, sigma=0.20, cp=1, r=0.03, q=0.01,
@@ -357,53 +361,99 @@ def _vanilla_direction_pair(*, tc_rate=0.0):
         "multiplier": 0,
         "slippage_bps": 0.0,
     }
-    short = HedgeBacktest(
+    sell = HedgeBacktest(
         option, prices, position=1, **kwargs).run()
-    long = HedgeBacktest(
+    buy = HedgeBacktest(
         option, prices, position=-1, **kwargs).run()
-    return short, long
+    return sell, buy
 
 
-def test_hedge_backtest_long_short_zero_cost_are_exact_mirrors():
-    """零成本下，多空所有经济持仓与 PnL 必须严格互为相反数。"""
-    short, long = _vanilla_direction_pair(tc_rate=0.0)
+def test_position_label_says_buy_sell_not_long_short():
+    """``position_label`` 只能是 buy/sell，不得出现 long/short。
 
-    assert short["position"] == 1
-    assert short["position_label"] == "short"
-    assert long["position"] == -1
-    assert long["position_label"] == "long"
+    long/short 在期权语境里通常指 **gamma 敞口**，而 ``position`` 表示的
+    是**买卖方向**。两者不是一回事，见下一条测试。
+    """
+    sell, buy = _vanilla_direction_pair(tc_rate=0.0)
+
+    assert {sell["position_label"], buy["position_label"]} == {"sell", "buy"}
+    for result in (sell, buy):
+        assert result["position_label"] not in ("long", "short")
+
+
+def test_same_trade_direction_gives_opposite_gamma_across_products():
+    """同一买卖方向下，香草与累计期权的 gamma 敞口方向相反。
+
+    这是「买卖方向 ≠ gamma 敞口」的根据，也是 position_label 不能叫
+    long/short 的原因：同一个 ``position`` 值在两个产品上对应相反的敞口，
+    一个名字不可能同时对。
+
+    敞口还会在同一条路径内翻转（雪球实测 41% 的 bar 为正、37% 为负），所
+    以也不能改用一张「产品 → gamma 方向」的静态映射表——那只是换个方式再
+    错一次。要判断敞口只能读实际算出的 ``portfolio_gamma``。
+    """
+    path = np.linspace(100.0, 104.0, 21)
+
+    def mean_gamma(option):
+        result = HedgeBacktest(
+            option, path_source="historical", external_path=path,
+            position=1, quantity=1, multiplier=0,
+            hedge_freq=1, steps_per_day=1).run()
+        gamma = np.asarray(result["portfolio_gamma"], dtype=float)
+        return float(np.mean(gamma[np.isfinite(gamma)]))
+
+    vanilla = mean_gamma(Option_Vanilla(
+        "Vanilla", s0=100.0, sr=[], K=100.0, T=20, sigma=0.18, cp=1,
+        r=0.03, q=0.03))
+    decumulator = mean_gamma(Option_DE(
+        "Opt_Decumulator", 100.0, [], 90.0, 0, 20, list(range(1, 21)),
+        0.18, 110.0, 2, 1, r=0.03, q=0.03, nPath=20000))
+
+    # 同为 position=1（卖出），两个产品的 gamma 敞口一负一正。
+    assert vanilla < 0, vanilla
+    assert decumulator > 0, decumulator
+
+
+def test_hedge_backtest_buy_sell_zero_cost_are_exact_mirrors():
+    """零成本下，买卖两个方向的经济持仓与 PnL 必须严格互为相反数。"""
+    sell, buy = _vanilla_direction_pair(tc_rate=0.0)
+
+    assert sell["position"] == 1
+    assert sell["position_label"] == "sell"
+    assert buy["position"] == -1
+    assert buy["position_label"] == "buy"
     for raw_key in ("opt_value", "delta", "gamma", "vega", "theta", "rho"):
-        np.testing.assert_allclose(short[raw_key], long[raw_key])
+        np.testing.assert_allclose(sell[raw_key], buy[raw_key])
     for signed_key in (
             "shares", "hedge_daily", "option_daily", "net_daily",
             "cumulative_pnl", "portfolio_delta", "portfolio_gamma",
             "portfolio_vega", "portfolio_theta", "portfolio_rho"):
-        np.testing.assert_allclose(short[signed_key], -long[signed_key])
-    assert short["hedging_error"] == pytest.approx(-long["hedging_error"])
-    np.testing.assert_allclose(short["tc_paid"], 0.0)
-    np.testing.assert_allclose(long["tc_paid"], 0.0)
+        np.testing.assert_allclose(sell[signed_key], -buy[signed_key])
+    assert sell["hedging_error"] == pytest.approx(-buy["hedging_error"])
+    np.testing.assert_allclose(sell["tc_paid"], 0.0)
+    np.testing.assert_allclose(buy["tc_paid"], 0.0)
 
-    scale = short["quantity"]
+    scale = sell["quantity"]
     np.testing.assert_allclose(
-        short["portfolio_gamma"], -scale * short["gamma"])
+        sell["portfolio_gamma"], -scale * sell["gamma"])
     np.testing.assert_allclose(
-        long["portfolio_gamma"], scale * long["gamma"])
+        buy["portfolio_gamma"], scale * buy["gamma"])
 
 
-def test_hedge_backtest_long_short_nonzero_cost_keep_gross_mirror():
+def test_hedge_backtest_buy_sell_nonzero_cost_keep_gross_mirror():
     """成本不改变毛 PnL 镜像；同一绝对交易应让两边成本同为扣减项。"""
-    short, long = _vanilla_direction_pair(tc_rate=0.001)
-    short_gross = short["hedge_daily"] + short["option_daily"]
-    long_gross = long["hedge_daily"] + long["option_daily"]
+    sell, buy = _vanilla_direction_pair(tc_rate=0.001)
+    sell_gross = sell["hedge_daily"] + sell["option_daily"]
+    buy_gross = buy["hedge_daily"] + buy["option_daily"]
 
-    np.testing.assert_allclose(short_gross, -long_gross)
-    np.testing.assert_allclose(short["tc_paid"], long["tc_paid"])
-    assert np.sum(short["tc_paid"]) > 0
-    assert np.all(short["tc_paid"] >= 0)
-    assert np.all(long["tc_paid"] >= 0)
+    np.testing.assert_allclose(sell_gross, -buy_gross)
+    np.testing.assert_allclose(sell["tc_paid"], buy["tc_paid"])
+    assert np.sum(sell["tc_paid"]) > 0
+    assert np.all(sell["tc_paid"] >= 0)
+    assert np.all(buy["tc_paid"] >= 0)
     np.testing.assert_allclose(
-        short["net_daily"] + long["net_daily"],
-        -2.0 * short["tc_paid"],
+        sell["net_daily"] + buy["net_daily"],
+        -2.0 * sell["tc_paid"],
     )
 
 
@@ -646,7 +696,7 @@ def test_run_multi_snowball_final_price_uses_knockout_endpoint():
     res = bt.run_multi(paths, max_workers=1)
 
     assert res["position"] == 1
-    assert res["position_label"] == "short"
+    assert res["position_label"] == "sell"
     assert res["quantity"] == pytest.approx(1.0)
     assert res["knocked_out"][0]
     assert res["ko_days"][0] == 2
