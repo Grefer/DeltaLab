@@ -8,6 +8,7 @@ DeltaLab - 期权对冲回测 GUI 应用
 
 import sys
 import os
+import bisect
 import copy
 import hashlib
 import platform
@@ -92,10 +93,6 @@ PALETTE = {
     "selected":     "#DBEAFE",   # 选中高亮
     "gold":         "#B8860B",   # 金色 (装饰线)
     "tab_inactive": "#E2E8F0",   # 未选中 tab 底色
-    # 基准/参照行底色。刻意取中性灰而不是 primary_light——表头就是
-    # primary_light，基准行常常紧挨在表头下面，同色会让人以为那是第二行
-    # 表头而不是一条数据。
-    "reference":    "#ECEFF4",
 }
 
 # matplotlib 整体风格配置 (与 Tk 主题协调)
@@ -375,6 +372,30 @@ _WIND_FIXED_TIME_BAR_LABELS = ("15分钟", "5分钟", "1分钟")
 # 的代价，见 _WIND_BAND_MISS_RATES。
 _WIND_BAND_BAR_LABEL = "1分钟"
 _WIND_DATE_BUFFER_DAYS = 21
+
+# 进程内交易日历缓存：("ok", [date...]) | ("error", 原因)。
+_LOCAL_TRADING_CALENDAR = None
+
+
+def _local_trading_calendar():
+    """返回本地交易日历（升序 ``datetime.date`` 列表）与解析状态。
+
+    单次回测的建仓日必须落在真实交易日上，``_calendar_span_for_trading_days``
+    那套“自然日 + 节假日缓冲”只能用来估计取数区间，不能用来定位某一天。
+
+    解析结果（含失败原因）在进程内只算一次：日期提示挂在 StringVar trace 上，
+    每次击键都会调用，不能每次都去读文件，更不能反复触发联网刷新。
+    """
+    global _LOCAL_TRADING_CALENDAR
+    if _LOCAL_TRADING_CALENDAR is None:
+        try:
+            from pricing.trade_calendar import load_calendar
+            days = load_calendar().astype("datetime64[D]").astype(object)
+            _LOCAL_TRADING_CALENDAR = ("ok", list(days))
+        except Exception as exc:      # 缺日历文件且联网刷新也失败
+            _LOCAL_TRADING_CALENDAR = (
+                "error", str(exc) or exc.__class__.__name__)
+    return _LOCAL_TRADING_CALENDAR
 
 # 排名依据的中英映射。两个口径都相对“日内不动”的基线取增量，区别只在于
 # 看绝对多赚了多少，还是看这份增量的信噪比（每单位波动换来多少增量）。
@@ -1161,28 +1182,44 @@ class BacktestApp(tk.Tk):
         self._wind_code_var = tk.StringVar(value="510050.SH")
         ttk.Entry(self._wind_frame, textvariable=self._wind_code_var, width=15).grid(
             row=0, column=1, padx=(6, 0), pady=2)
+        # 建仓日排在最上面：它才是读结果时关心的那一天。勾选倒推时这一格
+        # 由「数据截止日」按期权期限沿交易日历往前算出来并回填（置灰只读），
+        # 开关紧跟其后说明这格是谁算的；下一行才是作为主控的截止日。
         ttk.Label(self._wind_frame, text="建仓日:", style="Surface.TLabel").grid(
             row=1, column=0, sticky="w", pady=2)
         _today = datetime.date.today()
+        # 截止日默认落在最近一个「已收盘」交易日：当天盘中拉行情，最后一个
+        # 交易日组只有半天 bar，分钟粒度的策略会被判成盘中残段而直接拒绝。
+        # 这也与历史择优默认截至日（不含当天）保持同一口径。
+        _wind_asof_default = BacktestApp._latest_trading_day(
+            _today - datetime.timedelta(days=1)).isoformat()
+        # 只是取消勾选前的占位：勾选倒推时首次刷新就会用倒推结果覆盖它。
         _wind_start_default = (_today - datetime.timedelta(days=90)).strftime("%Y-%m-%d")
-        _wind_end_default = _today.strftime("%Y-%m-%d")
         self._wind_start_var = tk.StringVar(value=_wind_start_default)
-        ttk.Entry(self._wind_frame, textvariable=self._wind_start_var, width=15).grid(
-            row=1, column=1, padx=(6, 8), pady=2)
-
-        self._wind_auto_end_var = tk.BooleanVar(value=True)
+        self._wind_start_entry = ttk.Entry(
+            self._wind_frame, textvariable=self._wind_start_var, width=15)
+        self._wind_start_entry.grid(row=1, column=1, padx=(6, 8), pady=2)
+        self._wind_auto_start_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(
-            self._wind_frame, text="结束日按期限自动补足",
-            variable=self._wind_auto_end_var,
-            command=self._toggle_wind_auto_end,
-        ).grid(row=2, column=0, columnspan=2, sticky="w", pady=2)
-        ttk.Label(self._wind_frame, text="自定义结束日:",
+            self._wind_frame, text="按数据截止日倒推",
+            variable=self._wind_auto_start_var,
+            command=self._toggle_wind_auto_start,
+        ).grid(row=1, column=2, columnspan=2, sticky="w", padx=(4, 0), pady=2)
+
+        ttk.Label(self._wind_frame, text="数据截止日:",
                   style="Surface.TLabel").grid(
-            row=2, column=2, sticky="w", pady=2)
-        self._wind_end_var = tk.StringVar(value=_wind_end_default)
+            row=2, column=0, sticky="w", pady=2)
+        self._wind_end_var = tk.StringVar(value=_wind_asof_default)
         self._wind_end_entry = ttk.Entry(
             self._wind_frame, textvariable=self._wind_end_var, width=15)
-        self._wind_end_entry.grid(row=2, column=3, padx=(6, 0), pady=2)
+        self._wind_end_entry.grid(row=2, column=1, padx=(6, 8), pady=2)
+        # 界面上不再单列"实际区间"，两个日期框就是本次真实取数区间，因此
+        # 截止日填成休市日时也要落到倒推真正用的那个锚点（不晚于它的最近
+        # 交易日）。逐次击键就落值会打断输入，只在提交时对齐。
+        self._wind_end_entry.bind(
+            "<FocusOut>", lambda _event: self._commit_wind_asof())
+        self._wind_end_entry.bind(
+            "<Return>", lambda _event: self._commit_wind_asof())
 
         # 行情采样粒度不再由用户选择：每种策略的正确粒度是唯一确定的
         # （收盘=日频、固定时刻=能覆盖目标时刻的最粗、价格波动=1 分钟），
@@ -1195,10 +1232,12 @@ class BacktestApp(tk.Tk):
             self._wind_frame, textvariable=self._wind_frequency_hint_var,
             style="SurfaceMuted.TLabel",
         ).grid(row=3, column=1, columnspan=3, sticky="w", padx=(6, 0), pady=2)
-        self._toggle_wind_auto_end()
+        self._toggle_wind_auto_start()
         self._refresh_wind_frequency_hint()
         self._wind_code_var.trace_add(
             "write", lambda *_args: self._refresh_wind_frequency_hint())
+        self._wind_end_var.trace_add(
+            "write", lambda *_args: self._sync_wind_entry_date())
 
         # 轻分割线
         ttk.Separator(sec3, orient="horizontal").grid(
@@ -1257,6 +1296,16 @@ class BacktestApp(tk.Tk):
         )
         self._strategy_combo.pack(side="left")
         self._strategy_combo.bind("<<ComboboxSelected>>", lambda e: self._toggle_strategy())
+        # 紧贴策略下拉：它只修饰所选策略的触发时点，不是第四种策略。原先排在
+        # 固定时刻 / 带宽参数之后，会随策略切换在面板里上下跳。
+        # 默认开启：日内触发策略若不在收盘补一次，隔夜会裸露一整晚的
+        # Δ 敞口，而回测把这段风险记为零成本，结果偏乐观。
+        self._force_day_close_hedge_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(
+            strat_frame, text="每日收盘保底对冲（重复则跳过）",
+            variable=self._force_day_close_hedge_var,
+            command=self._refresh_history_base_summary,
+        ).pack(side="left", padx=(8, 0))
 
         # sigma 单位下的波动率来源参数；带宽数值统一使用下方输入框。
         row_h += 1
@@ -1327,24 +1376,6 @@ class BacktestApp(tk.Tk):
                 "write", lambda *_args, k=kind: self._mark_band_edited(k))
             entry.bind("<FocusOut>", lambda e, k=kind: self._commit_band_input(k))
             entry.bind("<Return>", lambda e, k=kind: self._commit_band_input(k, force=True))
-
-        row_h += 1
-        close_fallback_frame = ttk.Frame(sec3, style="Surface.TFrame")
-        close_fallback_frame.grid(
-            row=row_h, column=0, columnspan=2, sticky="w", pady=3)
-        # 默认开启：日内触发策略若不在收盘补一次，隔夜会裸露一整晚的
-        # Δ 敞口，而回测把这段风险记为零成本，结果偏乐观。
-        self._force_day_close_hedge_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(
-            close_fallback_frame, text="每日收盘保底对冲",
-            variable=self._force_day_close_hedge_var,
-            command=self._refresh_history_base_summary,
-        ).pack(side="left")
-        ttk.Label(
-            close_fallback_frame,
-            text="每个非结算日收盘至少调仓一次；同一采样点不重复计算",
-            style="SurfaceMuted.TLabel",
-        ).pack(side="left", padx=(8, 0))
 
         row_h += 1
         ttk.Label(sec3, text="滑点 (基点):", style="Surface.TLabel").grid(
@@ -1728,35 +1759,12 @@ class BacktestApp(tk.Tk):
             settings, text=" Wind 严格历史区间（独立于单次回测） ", padding=(12, 8))
         self._history_wind_frame.grid(
             row=7, column=0, columnspan=2, sticky="ew", pady=(8, 4))
-        ttk.Label(
-            self._history_wind_frame, text="分析截至日:",
-            style="Surface.TLabel",
-        ).grid(row=0, column=0, sticky="w", pady=3)
-        history_asof_default = (datetime.date.today() - datetime.timedelta(
-            days=1)).isoformat()
-        self._history_wind_asof_var = tk.StringVar(
-            value=history_asof_default)
-        self._history_wind_asof_entry = ttk.Entry(
-            self._history_wind_frame,
-            textvariable=self._history_wind_asof_var, width=13,
-        )
-        self._history_wind_asof_entry.grid(
-            row=0, column=1, sticky="w", padx=(8, 20), pady=3)
-
-        self._history_wind_auto_start_var = tk.BooleanVar(value=True)
-        self._history_wind_auto_start_label_var = tk.StringVar()
-        self._history_wind_auto_start_check = ttk.Checkbutton(
-            self._history_wind_frame,
-            textvariable=self._history_wind_auto_start_label_var,
-            variable=self._history_wind_auto_start_var,
-            command=self._toggle_history_wind_controls,
-        )
-        self._history_wind_auto_start_check.grid(
-            row=1, column=0, columnspan=2, sticky="w", pady=3)
+        # 按区间的自然读法排：先起始日、后截止日。自动推算开关紧跟在它所
+        # 控制的那个输入框后面，而不是另起一列。
         ttk.Label(
             self._history_wind_frame, text="自定义起始日:",
             style="Surface.TLabel",
-        ).grid(row=1, column=2, sticky="w", pady=3)
+        ).grid(row=0, column=0, sticky="w", pady=3)
         history_start_default = (
             datetime.date.today() - datetime.timedelta(days=420)
         ).isoformat()
@@ -1767,13 +1775,48 @@ class BacktestApp(tk.Tk):
             textvariable=self._history_wind_start_var, width=13,
         )
         self._history_wind_start_entry.grid(
-            row=1, column=3, sticky="w", padx=(8, 0), pady=3)
+            row=0, column=1, sticky="w", padx=(8, 20), pady=3)
+
+        self._history_wind_auto_start_var = tk.BooleanVar(value=True)
+        # 静态文案：往前取多少天、以及为什么多取一天，都在下方提示行里按当
+        # 前勾选实时给出，勾选框自己不必再重复一遍口径。
+        self._history_wind_auto_start_check = ttk.Checkbutton(
+            self._history_wind_frame,
+            text="根据周期自动推算起始日",
+            variable=self._history_wind_auto_start_var,
+            command=self._toggle_history_wind_controls,
+        )
+        self._history_wind_auto_start_check.grid(
+            row=0, column=2, columnspan=2, sticky="w", pady=3)
+
+        ttk.Label(
+            self._history_wind_frame, text="分析截至日:",
+            style="Surface.TLabel",
+        ).grid(row=1, column=0, sticky="w", pady=3)
+        history_asof_default = (datetime.date.today() - datetime.timedelta(
+            days=1)).isoformat()
+        self._history_wind_asof_var = tk.StringVar(
+            value=history_asof_default)
+        self._history_wind_asof_entry = ttk.Entry(
+            self._history_wind_frame,
+            textvariable=self._history_wind_asof_var, width=13,
+        )
+        self._history_wind_asof_entry.grid(
+            row=1, column=1, sticky="w", padx=(8, 20), pady=3)
         self._history_wind_hint_var = tk.StringVar()
         ttk.Label(
             self._history_wind_frame,
             textvariable=self._history_wind_hint_var,
             style="SurfaceMuted.TLabel",
         ).grid(row=2, column=0, columnspan=4, sticky="w", pady=(3, 0))
+        # 截至日是自动起始日的推算基准，改一个字就要重算回填。
+        self._history_wind_asof_var.trace_add(
+            "write",
+            lambda *_args: (
+                BacktestApp._refresh_history_auto_wind_start(self),
+                BacktestApp._refresh_history_base_summary(self),
+            ),
+        )
         self._wind_code_var.trace_add(
             "write",
             lambda *_args: (
@@ -2343,20 +2386,71 @@ class BacktestApp(tk.Tk):
                 raise
             return {}
 
-    def _history_period_selection_changed(self):
-        """同步周期勾选对 Wind 自动范围与基准摘要的影响。"""
+    def _refresh_history_auto_wind_start(self):
+        """自动模式下把推算出的起始日回填进那个置灰的输入框。
+
+        此前它在自动模式下显示的是构造界面时写死的「今天 − 420 自然日」，
+        与真正会用的起始日毫无关系（实测截至日 2026-07-29、近年 243 日时，
+        真实起点比它晚了两个多月）。用户看到一个具体日期，很自然会以为就是
+        从那天开始取数——比含糊的措辞更能骗人。
+
+        与单次回测的「按数据截止日倒推」同一个模式：置灰只读，推算结果实时
+        回填到这一格；取消勾选后这个值就成为手工编辑的起点，不再另存一份用
+        户旧输入。手动模式下绝不覆写。
+        """
+        start_var = getattr(self, "_history_wind_start_var", None)
+        auto_var = getattr(self, "_history_wind_auto_start_var", None)
+        if start_var is None or auto_var is None:
+            return
+        try:
+            if not bool(auto_var.get()):
+                return
+        except tk.TclError:
+            return
         lookbacks = BacktestApp._history_lookbacks_from_controls(
             self, require_one=False)
-        auto_label = getattr(
-            self, "_history_wind_auto_start_label_var", None)
-        if auto_label is not None:
-            if lookbacks:
-                longest = max(lookbacks.values())
-                auto_label.set(
-                    f"起始日自动覆盖所选最长连续区间 {longest} 日 + "
-                    "Day 0 锚点 + HV 预热（如需）")
-            else:
-                auto_label.set("请先勾选至少一个分析周期")
+        if not lookbacks:
+            # 一个周期都没勾时推不出起始日。留着上一次的值会变成又一个"看着
+            # 像本次取数起点、实际无关"的假日期——清空，同屏两处提示已经在
+            # 说"请先勾选周期"了。
+            try:
+                start_var.set("")
+            except tk.TclError:
+                pass
+            return
+        asof_var = getattr(self, "_history_wind_asof_var", None)
+        if asof_var is None:
+            return
+        try:
+            asof = BacktestApp._parse_wind_date(
+                asof_var.get(), "历史分析截至日")
+        except (ValueError, tk.TclError):
+            # 截至日正在输入、还不是合法日期时不猜；用户填完自然会再触发。
+            return
+        include_band_var = getattr(self, "_history_include_band_var", None)
+        warmup_days = BacktestApp._history_realized_warmup_days({
+            "history_include_band": (
+                bool(include_band_var.get())
+                if include_band_var is not None else False),
+            # 本页恒用输入波动率，与 _collect_history_state 写入的一致。
+            "sigma_source": "implied",
+        })
+        required = max(lookbacks.values()) + warmup_days + 1
+        start = BacktestApp._history_auto_wind_start(
+            asof, required_trade_days=required)
+        try:
+            start_var.set(start.isoformat())
+        except tk.TclError:
+            pass
+
+    def _history_period_selection_changed(self):
+        """同步周期勾选对 Wind 自动范围与基准摘要的影响。
+
+        勾选框文案已固定为「根据周期自动推算起始日」，不再随勾选变化——具体
+        往前取多少个交易日、以及为什么要多取一天，都由下方提示行按当前勾选
+        实时给出，写在勾选框上只是同屏重复一遍口径。
+        """
+        BacktestApp._refresh_history_auto_wind_start(self)
         if getattr(self, "_history_wind_hint_var", None) is not None:
             BacktestApp._refresh_history_wind_hint(self)
         if getattr(self, "_history_base_summary_var", None) is not None:
@@ -2427,14 +2521,16 @@ class BacktestApp(tk.Tk):
                 self, "_history_wind_auto_start_var", None)
             code = code_var.get().strip() if code_var is not None else "—"
             bar = BacktestApp._history_summary_bar_label(self)
+            # 自动模式也直接写推算出的起始日，而不是"自动覆盖最近 243 日连续
+            # 区间"这种规则描述。这一行讲的是"本次将冻结的取数区间"，规则描
+            # 述放在这里读者还得自己换算成日期；而起始日已经实时回填进旁边那
+            # 个输入框，两处显示同一个日期才对得上。周期没勾时才退回提示语。
+            start = start_var.get().strip() if start_var is not None else "—"
             if auto_start_var is not None and auto_start_var.get():
                 lookbacks = BacktestApp._history_lookbacks_from_controls(
                     self, require_one=False)
-                start = (
-                    f"自动覆盖最近{max(lookbacks.values())}日连续区间"
-                    if lookbacks else "未选择分析周期")
-            else:
-                start = start_var.get().strip() if start_var is not None else "—"
+                if not lookbacks:
+                    start = "未选择分析周期"
             end = end_var.get().strip() if end_var is not None else "—"
             source_text = (
                 f"Wind · {code or '—'} · {start or '—'} 至 {end or '—'}"
@@ -2562,6 +2658,18 @@ class BacktestApp(tk.Tk):
         self._param_frame.columnconfigure(1, weight=1)
         self._sync_snowball_margin_controls()
         self._bind_band_reference_inputs()
+        self._bind_wind_maturity_input()
+
+    def _bind_wind_maturity_input(self):
+        """重建期权参数后重新监听剩余期限：它决定倒推出来的建仓日。"""
+        if getattr(self, "_wind_start_var", None) is None:
+            return
+        entry = (self._param_entries.get("T_days")
+                 or self._param_entries.get("T"))
+        if entry is not None:
+            entry[0].trace_add(
+                "write", lambda *_args: self._sync_wind_entry_date())
+        self._sync_wind_entry_date()
 
     def _bind_band_reference_inputs(self):
         """重建期权参数后，重新监听带宽换算依赖的 S0 与年化 sigma。"""
@@ -2619,12 +2727,77 @@ class BacktestApp(tk.Tk):
             if label_widget is not None:
                 label_widget.configure(text="保证金比例(最大亏损):")
 
-    def _toggle_wind_auto_end(self):
-        entry = getattr(self, "_wind_end_entry", None)
-        variable = getattr(self, "_wind_auto_end_var", None)
-        if entry is None or variable is None:
+    def _toggle_wind_auto_start(self):
+        entry = getattr(self, "_wind_start_entry", None)
+        variable = getattr(self, "_wind_auto_start_var", None)
+        if entry is not None and variable is not None:
+            entry.configure(state="disabled" if variable.get() else "normal")
+        BacktestApp._sync_wind_entry_date(self)
+
+    def _maturity_days_from_controls(self):
+        """读取期权参数区的剩余期限；输入未完成时返回 None（只用于联动）。"""
+        entries = getattr(self, "_param_entries", {}) or {}
+        entry = entries.get("T_days") or entries.get("T")
+        if entry is None:
+            return None
+        try:
+            return BacktestApp._maturity_days_from_params(
+                {"T_days": entry[0].get().strip()})
+        except (AttributeError, TypeError, ValueError):
+            return None
+
+    def _sync_wind_entry_date(self):
+        """勾选倒推时把倒推结果回填到置灰的建仓日框。
+
+        建仓日就显示在它自己那一格里，界面不再单列"实际区间"——正因如此这
+        一格必须是倒推结果本身，留着上次手填的日期就成了假的建仓日。回填会
+        再次触发同一个 trace，用 ``_wind_date_syncing`` 挡住重入。
+
+        截止日或期限编辑到一半时保持上一个有效值：这里只负责显示，启动任务
+        时的 ``_resolve_single_wind_state`` 才是权威校验点。
+        """
+        start_var = getattr(self, "_wind_start_var", None)
+        if start_var is None or getattr(self, "_wind_date_syncing", False):
             return
-        entry.configure(state="disabled" if variable.get() else "normal")
+        auto_var = getattr(self, "_wind_auto_start_var", None)
+        if auto_var is not None and not auto_var.get():
+            return
+        maturity_days = BacktestApp._maturity_days_from_controls(self)
+        if maturity_days is None:
+            return
+        asof_var = getattr(self, "_wind_end_var", None)
+        try:
+            asof = BacktestApp._parse_wind_date(
+                asof_var.get().strip() if asof_var is not None else "",
+                "Wind 数据截止日")
+            start, _asof_anchor = BacktestApp._entry_date_from_asof(
+                asof, maturity_days)
+        except ValueError:
+            return
+        if start_var.get().strip() != start.isoformat():
+            self._wind_date_syncing = True
+            try:
+                start_var.set(start.isoformat())
+            finally:
+                self._wind_date_syncing = False
+
+    def _commit_wind_asof(self):
+        """编辑完成后把截止日落到倒推真正使用的交易日锚点。"""
+        auto_var = getattr(self, "_wind_auto_start_var", None)
+        if auto_var is not None and not auto_var.get():
+            return
+        asof_var = getattr(self, "_wind_end_var", None)
+        if asof_var is None:
+            return
+        try:
+            asof = BacktestApp._parse_wind_date(
+                asof_var.get().strip(), "Wind 数据截止日")
+        except ValueError:
+            return
+        anchor = BacktestApp._latest_trading_day(asof)
+        if anchor != asof:
+            # 触发 trace，建仓日随新锚点一起更新。
+            asof_var.set(anchor.isoformat())
 
     def _refresh_wind_frequency_hint(self):
         hint = getattr(self, "_wind_frequency_hint_var", None)
@@ -2668,6 +2841,9 @@ class BacktestApp(tk.Tk):
         if start_entry is not None:
             start_entry.configure(
                 state="normal" if is_wind and not auto_start else "disabled")
+        # 勾回自动时必须立刻重算：否则框里留着用户手动模式下填的旧日期，而
+        # 那已经不是本次真正会用的起始日了。
+        BacktestApp._refresh_history_auto_wind_start(self)
         BacktestApp._refresh_history_wind_hint(self)
         if getattr(self, "_history_base_summary_var", None) is not None:
             BacktestApp._refresh_history_base_summary(self)
@@ -2693,8 +2869,12 @@ class BacktestApp(tk.Tk):
         wind_code_var = getattr(self, "_wind_code_var", None)
         wind_code = (
             wind_code_var.get().strip() if wind_code_var is not None else "")
+        # 这里仍然要解析一次粒度，但**不是为了显示**：解析不出可用粒度时
+        # （例如固定时刻落在该代码的休市区间、任何一档都覆盖不了）会抛错，
+        # 而这条错误正是本行唯一的报告出口。别因为返回值没被用掉就删掉它。
+        # 实际采用的粒度本身不在这里说——顶部基准摘要已经写了一遍。
         try:
-            actual = BacktestApp._resolve_wind_bar_size(
+            BacktestApp._resolve_wind_bar_size(
                 WIND_AUTO_BAR_SIZE, fixed_times=fixed_times,
                 include_fixed_times=include_fixed,
                 include_band=include_band, wind_code=wind_code)
@@ -2709,14 +2889,16 @@ class BacktestApp(tk.Tk):
             if not lookbacks:
                 hint.set("请至少勾选一个历史分析周期")
                 return
-            range_text = (
-                f"自动覆盖最近 {max(lookbacks.values())} 日连续区间"
-                " + Day 0 锚点")
+            # 「Day 0 锚点」在这里展开成它到底是什么、为什么要多取：首日的
+            # 损益要和前一个交易日的收盘比，所以区间前面必须多一天收盘价。
+            # 这是本行唯一别处没有的信息。
+            hint.set(
+                f"起始日往前取满 {max(lookbacks.values())} 个交易日，"
+                "并多取前一个交易日的收盘价作为首日损益的比较起点")
         else:
-            range_text = "使用自定义历史起始日"
-        # 候选带宽的 σ 固定取左侧输入的波动率，不再需要 HV 预热区间。
-        # 全部候选共用同一份行情，粒度取各自所需里最细的一档，保证可比。
-        hint.set(f"统一采用 {actual}；{range_text}")
+            # 手动模式无需提示：勾选框未勾、输入框可编辑且已填着日期，本身
+            # 就说明了一切，再写一句"使用你填写的起始日"是同屏第三遍。
+            hint.set("")
 
     def _toggle_source(self):
         src = self._source_var.get()
@@ -2730,7 +2912,7 @@ class BacktestApp(tk.Tk):
         elif src == "wind":
             self._wind_frame.grid(row=1, column=0, columnspan=2, sticky="ew", pady=2)
         BacktestApp._toggle_strategy(self)
-        BacktestApp._toggle_wind_auto_end(self)
+        BacktestApp._toggle_wind_auto_start(self)
         BacktestApp._toggle_history_wind_controls(self)
         self._refresh_history_base_summary()
         BacktestApp._sync_history_button_state(self)
@@ -3070,8 +3252,9 @@ class BacktestApp(tk.Tk):
         mapping = get_main_contract_history(
             product_code, start_date.isoformat(), end_date.isoformat())
         # 严格区间只加载本次所选最长证据区间内真实出现的主力合约。
-        # 区间之前最多只为 Day 0 锚点和 realized-HV 预热留出必要历史，
-        # 不能再因代理期限 T 把行情扩到证据区间之外。
+        # 区间之前只为 Day 0 锚点留出必要历史，不能再因代理期限 T 把行情扩
+        # 到证据区间之外。下面仍加上 warmup_days 是留给引擎的 realized 通
+        # 路——本页 σ 恒取输入值，它恒为 0。
         history_lookbacks = BacktestApp._normalize_history_lookbacks(
             gs.get("history_lookbacks"))
         evidence_days = max(history_lookbacks.values())
@@ -3397,6 +3580,17 @@ class BacktestApp(tk.Tk):
         return days
 
     @staticmethod
+    def _history_auto_wind_start(asof, *, required_trade_days):
+        """自动模式下的历史行情起始日。
+
+        界面回填与真正发出的 Wind 请求共用这一份推算。分成两处各算一套的
+        话，置灰框里显示的日期和实际取数区间会各走各的，而那个框看上去正
+        是"本次从哪天开始取"。
+        """
+        span = BacktestApp._calendar_span_for_trading_days(required_trade_days)
+        return asof - datetime.timedelta(days=span)
+
+    @staticmethod
     def _calendar_span_for_trading_days(trading_days):
         """把交易日需求换成带节假日缓冲的自然日拉取跨度。"""
         try:
@@ -3406,6 +3600,60 @@ class BacktestApp(tk.Tk):
         if days <= 0:
             raise ValueError("Wind 交易日需求必须是正整数。")
         return int(np.ceil(days * 365.0 / ANNUAL_DAYS)) + _WIND_DATE_BUFFER_DAYS
+
+    _CALENDAR_FIX_HINT = (
+        "请更新 data/tradingday.csv，或取消勾选「按数据截止日倒推」"
+        "后手工指定建仓日。")
+
+    @staticmethod
+    def _trading_calendar_days(*, required=True):
+        """返回升序交易日列表；``required=False`` 时日历不可用只返回 None。"""
+        status, payload = _local_trading_calendar()
+        if status == "ok":
+            return payload
+        if required:
+            raise ValueError(
+                f"无法读取交易日历（{payload}），不能把数据截止日倒推成"
+                f"建仓日。{BacktestApp._CALENDAR_FIX_HINT}")
+        return None
+
+    @staticmethod
+    def _latest_trading_day(reference):
+        """返回不晚于 ``reference`` 的最近交易日。
+
+        只用于预填与提示：日历缺失或尚未覆盖到 ``reference`` 时原样返回，
+        不假装知道更近的交易日，也不为一个默认值去联网。
+        """
+        days = BacktestApp._trading_calendar_days(required=False)
+        if not days or reference < days[0] or reference > days[-1]:
+            return reference
+        return days[bisect.bisect_right(days, reference) - 1]
+
+    @staticmethod
+    def _entry_date_from_asof(asof, maturity_days):
+        """把数据截止日按交易日历倒推 ``maturity_days`` 个交易日。
+
+        单次回测把行情首日当作建仓日、之后严格 T 个交易日到期（见
+        ``HedgeBacktest`` 的评估窗口裁剪），因此这里不能沿用历史页那套
+        “自然日跨度 + 节假日缓冲”的取数区间估计：多取的缓冲会整体前移
+        建仓日，让期权在截止日之前就到期，界面上却仍写着截止日。
+
+        返回 ``(建仓日, 落到交易日的截止日)``：截止日本身可能是周末或节假日，
+        必须先落到不晚于它的最近交易日，倒推出来的两端才都是真实交易日。
+        """
+        days = BacktestApp._trading_calendar_days()
+        if asof < days[0] or asof > days[-1]:
+            raise ValueError(
+                f"交易日历未覆盖数据截止日 {asof.isoformat()}（可用区间 "
+                f"{days[0].isoformat()} ~ {days[-1].isoformat()}）。"
+                f"{BacktestApp._CALENDAR_FIX_HINT}")
+        end_index = bisect.bisect_right(days, asof) - 1
+        if end_index < maturity_days:
+            raise ValueError(
+                f"交易日历在 {days[end_index].isoformat()} 之前不足 "
+                f"{maturity_days} 个交易日，无法倒推建仓日。"
+                f"{BacktestApp._CALENDAR_FIX_HINT}")
+        return days[end_index - maturity_days], days[end_index]
 
     @staticmethod
     def _local_trading_sessions(wind_code):
@@ -3494,7 +3742,13 @@ class BacktestApp(tk.Tk):
 
     @staticmethod
     def _resolve_single_wind_state(state, *, today=None):
-        """解析单次回测的建仓日、自动结束日和实际行情粒度。"""
+        """解析单次回测的数据截止日、倒推建仓日和实际行情粒度。
+
+        日期主控是截止日（默认最新已收盘交易日），建仓日按期权期限往前倒推——与
+        策略优选一致：那边也是从分析截至日向前回放严格区间。往后推的旧口径
+        会把建仓日钉在过去某天、再拿期限去凑结束日，用户想问的“现在这套
+        参数在最近一个完整期限上表现如何”反而要自己反算日期。
+        """
         resolved = dict(state)
         if resolved.get("source") != "wind":
             return resolved
@@ -3504,25 +3758,25 @@ class BacktestApp(tk.Tk):
         today = today or datetime.date.today()
         if not isinstance(today, datetime.date):
             today = BacktestApp._parse_wind_date(today, "当前日期")
-        start = BacktestApp._parse_wind_date(
-            resolved.get("wind_start"), "Wind 建仓日")
-        if start > today:
-            raise ValueError("Wind 建仓日不能晚于当前日期。")
+        asof = BacktestApp._parse_wind_date(
+            resolved.get("wind_end"), "Wind 数据截止日")
+        if asof > today:
+            raise ValueError("Wind 数据截止日不能晚于当前日期。")
 
         maturity_days = BacktestApp._maturity_days_from_params(
             resolved.get("params", {}))
-        auto_end = bool(resolved.get("wind_auto_end", False))
-        if auto_end:
-            span = BacktestApp._calendar_span_for_trading_days(
-                maturity_days + 1)
-            end = min(start + datetime.timedelta(days=span), today)
+        # 缺少开关的调用方（旧 API / 测试替身）自带完整两端日期，保持显式区间。
+        auto_start = bool(resolved.get("wind_auto_start", False))
+        if auto_start:
+            start, asof = BacktestApp._entry_date_from_asof(
+                asof, maturity_days)
         else:
-            end = BacktestApp._parse_wind_date(
-                resolved.get("wind_end"), "Wind 数据结束日")
-            if end > today:
-                raise ValueError("Wind 数据结束日不能晚于当前日期。")
-        if end <= start:
-            raise ValueError("Wind 数据结束日必须晚于建仓日。")
+            start = BacktestApp._parse_wind_date(
+                resolved.get("wind_start"), "Wind 建仓日")
+            if start > today:
+                raise ValueError("Wind 建仓日不能晚于当前日期。")
+        if asof <= start:
+            raise ValueError("Wind 数据截止日必须晚于建仓日。")
 
         requested = resolved.get(
             "wind_bar_size_requested",
@@ -3536,11 +3790,12 @@ class BacktestApp(tk.Tk):
         )
         resolved.update({
             "wind_start": start.isoformat(),
-            "wind_end": end.isoformat(),
-            "wind_auto_end": auto_end,
+            "wind_end": asof.isoformat(),
+            "wind_auto_start": auto_start,
             "wind_bar_size_requested": str(requested),
             "wind_bar_size": actual_bar_size,
-            "wind_date_mode": "auto_maturity" if auto_end else "custom_range",
+            "wind_date_mode": (
+                "auto_entry_from_asof" if auto_start else "custom_entry_date"),
             "wind_required_trade_days": maturity_days + 1,
         })
         return resolved
@@ -3573,9 +3828,8 @@ class BacktestApp(tk.Tk):
         required_trade_days = max_lookback_days + warmup_days + 1
         auto_start = bool(resolved.get("history_wind_auto_start", True))
         if auto_start:
-            span = BacktestApp._calendar_span_for_trading_days(
-                required_trade_days)
-            start = asof - datetime.timedelta(days=span)
+            start = BacktestApp._history_auto_wind_start(
+                asof, required_trade_days=required_trade_days)
         else:
             start = BacktestApp._parse_wind_date(
                 resolved.get("history_wind_start", resolved.get("wind_start")),
@@ -3710,9 +3964,10 @@ class BacktestApp(tk.Tk):
             self, "_force_day_close_hedge_var", None)
         force_day_close_hedge = bool(
             force_close_var.get()) if force_close_var is not None else False
-        wind_auto_end_var = getattr(self, "_wind_auto_end_var", None)
-        wind_auto_end = bool(
-            wind_auto_end_var.get()) if wind_auto_end_var is not None else False
+        wind_auto_start_var = getattr(self, "_wind_auto_start_var", None)
+        wind_auto_start = bool(
+            wind_auto_start_var.get()
+        ) if wind_auto_start_var is not None else False
         # 粒度不再可选；解析阶段按当前策略推导实际值。
         wind_bar_size_requested = WIND_AUTO_BAR_SIZE
 
@@ -3737,7 +3992,7 @@ class BacktestApp(tk.Tk):
             "wind_code": self._wind_code_var.get().strip(),
             "wind_start": self._wind_start_var.get().strip(),
             "wind_end": self._wind_end_var.get().strip(),
-            "wind_auto_end": wind_auto_end,
+            "wind_auto_start": wind_auto_start,
             "wind_bar_size_requested": wind_bar_size_requested,
             # 未经过上下文 resolver 时暂存用户选择；单次/历史入口会在启动
             # 任务前把“自动（推荐）”替换为实际粒度。
@@ -3835,7 +4090,9 @@ class BacktestApp(tk.Tk):
                 history_start_var.get().strip()
                 if history_start_var is not None else state.get("wind_start", "")),
             # 旧测试替身 / API 调用没有历史控件时保留显式起始日；真实 GUI
-            # 默认自动覆盖最长已选严格区间、HV 预热与 Day 0 锚点。
+            # 默认自动覆盖最长已选严格区间与 Day 0 锚点。不含 HV 预热：本页
+            # 的 σ 恒取左侧输入值，预热日数恒为 0（见
+            # _history_realized_warmup_days）。
             "history_wind_auto_start": (
                 bool(history_auto_start_var.get())
                 if history_auto_start_var is not None else False),
@@ -6294,17 +6551,20 @@ class BacktestApp(tk.Tk):
             detail_box, orient="vertical", command=rank_tree.yview)
         rank_scrollbar.grid(row=2, column=1, sticky="ns")
         rank_tree.configure(yscrollcommand=rank_scrollbar.set)
-        rank_tree.tag_configure("leader", background=PALETTE["success_light"])
+        # 行底色只保留选中态（由 ttk 的 Treeview 样式提供），不再按角色/名
+        # 次/数据完整度给行上色。此前那三档底色各有毛病：
+        #   · 绿色标"第一行"——而第一行渲染后就被自动选中，选中蓝把它整个
+        #     盖住，实测三种排名形态下绿色一次都没显形；
+        #   · 判定用 row_no==0 而不是 rank==1，基准占了第 0 行时 elif 再也
+        #     不命中，真正最优的候选反而是纯白；
+        #   · "可比（仅参考）"这档降级完全没有颜色，与健康行同色，而结论卡
+        #     对同一行会显示"数据不足"——表格与卡片自相矛盾。
+        # 这些信息本来就各有归属：名次看 # 列的奖牌与排序，最优看结论卡，
+        # 数据完整度看「样本完整度」列。底色再说一遍只会互相打架。
+        # 基准行只保留等宽加粗：它是身份强调而非底色，且与正文同族同宽，
+        # 不会破坏数位对齐（换成比例字体会，见 _pad_history_row 一节）。
         rank_tree.tag_configure(
-            "baseline", background=PALETTE["reference"],
-            # 必须沿用表格正文的等宽族，只加粗。此前用的是 _UI_FONT_FAMILY
-            # ——那是比例字体，实测同一个数字在它下面宽 28~32px 而正文
-            # (Menlo 9) 恒为 35px，于是基准行的数位和上下各行全部错开，看
-            # 着就是"另一种数字格式"。等宽加粗的步进宽度与常规一致，既保住
-            # 强调又不破坏对齐。
-            font=(_MONO_FONT_FAMILY, 9, "bold"))
-        rank_tree.tag_configure(
-            "incomplete", background=PALETTE["warning_light"])
+            "baseline", font=(_MONO_FONT_FAMILY, 9, "bold"))
         rank_tree.bind("<Button-1>", self._toggle_history_chart_click)
         rank_tree.bind("<space>", self._toggle_focused_history_chart_candidate)
         rank_tree.bind(
@@ -7454,14 +7714,9 @@ class BacktestApp(tk.Tk):
                     ),
                     rank_tree["columns"],
                 )
-                if is_baseline:
-                    tag = "baseline"
-                elif row_no == 0 and comparison_eligible:
-                    tag = "leader"
-                elif not comparison_eligible:
-                    tag = "incomplete"
-                else:
-                    tag = ""
+                # 唯一的行标签：基准行加粗。其余一律不带标签——行底色只由
+                # 选中态表达。
+                tag = "baseline" if is_baseline else ""
                 image_val = ""
                 text_val = ""
                 if is_baseline:

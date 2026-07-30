@@ -442,7 +442,7 @@ def _single_wind_resolution_state(**overrides):
         "wind_code": "510050.SH",
         "wind_start": "2026-01-02",
         "wind_end": "2026-02-20",
-        "wind_auto_end": False,
+        "wind_auto_start": False,
         "wind_bar_size_requested": WIND_AUTO_BAR_SIZE,
         "strategy_name": "close_to_close",
         "fixed_times": "11:30,15:00",
@@ -452,13 +452,20 @@ def _single_wind_resolution_state(**overrides):
     return state
 
 
+def _trading_days_back(asof, trading_days):
+    """用与实现同一份交易日历取 asof 之前第 N 个交易日。"""
+    calendar = BacktestApp._trading_calendar_days()
+    end_index = calendar.index(asof)
+    return calendar[end_index - trading_days]
+
+
 @pytest.mark.parametrize(
     ("overrides", "message"),
     [
         ({"wind_start": "2026-03-02"}, "建仓日不能晚于当前日期"),
-        ({"wind_end": "2026-01-02"}, "结束日必须晚于建仓日"),
-        ({"wind_end": "2026-01-01"}, "结束日必须晚于建仓日"),
-        ({"wind_end": "2026-03-02"}, "结束日不能晚于当前日期"),
+        ({"wind_end": "2026-01-02"}, "截止日必须晚于建仓日"),
+        ({"wind_end": "2026-01-01"}, "截止日必须晚于建仓日"),
+        ({"wind_end": "2026-03-02"}, "截止日不能晚于当前日期"),
     ],
 )
 def test_single_wind_dates_reject_future_or_reversed_ranges(
@@ -469,42 +476,181 @@ def test_single_wind_dates_reject_future_or_reversed_ranges(
             state, today=datetime.date(2026, 3, 1))
 
 
-def test_single_wind_auto_end_uses_maturity_without_parsing_custom_end():
-    class _UnusedEnd:
+def test_single_wind_auto_start_backdates_entry_without_parsing_custom_start():
+    """建仓日由截止日倒推，落在真实交易日上，且不读自定义建仓日。"""
+    class _UnusedStart:
         def __str__(self):
-            raise AssertionError("自动结束模式不得解析自定义结束日")
+            raise AssertionError("自动倒推模式不得解析自定义建仓日")
 
     state = _single_wind_resolution_state(
-        wind_start="2025-01-02",
-        wind_end=_UnusedEnd(),
-        wind_auto_end=True,
+        wind_start=_UnusedStart(),
+        wind_end="2026-02-25",
+        wind_auto_start=True,
         params={"T_days": 30},
     )
     resolved = BacktestApp._resolve_single_wind_state(
         state, today=datetime.date(2026, 3, 1))
-    expected_span = BacktestApp._calendar_span_for_trading_days(31)
 
-    assert resolved["wind_end"] == (
-        datetime.date(2025, 1, 2)
-        + datetime.timedelta(days=expected_span)
-    ).isoformat()
+    assert resolved["wind_end"] == "2026-02-25"
+    assert resolved["wind_start"] == _trading_days_back(
+        datetime.date(2026, 2, 25), 30).isoformat()
     assert resolved["wind_required_trade_days"] == 31
-    assert resolved["wind_date_mode"] == "auto_maturity"
+    assert resolved["wind_date_mode"] == "auto_entry_from_asof"
 
 
-def test_single_wind_custom_end_is_preserved_exactly():
+def test_single_wind_auto_start_snaps_non_trading_asof_back_to_trading_day():
+    """截止日落在休市日时，两端都必须先落到真实交易日。
+
+    2026-02-20 是春节休市（前一个交易日 2026-02-13），因此这里同时验证
+    倒推不是简单的“跳过周末”自然日算术。
+    """
+    resolved = BacktestApp._resolve_single_wind_state(
+        _single_wind_resolution_state(
+            wind_end="2026-02-20",
+            wind_auto_start=True,
+            params={"T_days": 22},
+        ),
+        today=datetime.date(2026, 3, 1),
+    )
+    calendar = BacktestApp._trading_calendar_days()
+
+    assert resolved["wind_end"] == "2026-02-13"
+    assert datetime.date.fromisoformat(resolved["wind_start"]) in calendar
+    assert resolved["wind_start"] == _trading_days_back(
+        datetime.date(2026, 2, 13), 22).isoformat()
+
+
+def test_single_wind_auto_start_refuses_asof_beyond_trading_calendar():
+    """日历没覆盖到截止日时不能拿旧日历末尾当锚点，必须直接报错。"""
+    calendar = BacktestApp._trading_calendar_days()
+    beyond = calendar[-1] + datetime.timedelta(days=1)
+    state = _single_wind_resolution_state(
+        wind_end=beyond.isoformat(), wind_auto_start=True)
+
+    with pytest.raises(ValueError, match="交易日历未覆盖数据截止日"):
+        BacktestApp._resolve_single_wind_state(state, today=beyond)
+
+
+def test_single_wind_custom_entry_date_is_preserved_exactly():
     resolved = BacktestApp._resolve_single_wind_state(
         _single_wind_resolution_state(
             wind_start="2026-01-02",
             wind_end="2026-02-20",
-            wind_auto_end=False,
+            wind_auto_start=False,
         ),
         today=datetime.date(2026, 3, 1),
     )
 
     assert resolved["wind_start"] == "2026-01-02"
     assert resolved["wind_end"] == "2026-02-20"
-    assert resolved["wind_date_mode"] == "custom_range"
+    assert resolved["wind_date_mode"] == "custom_entry_date"
+
+
+def _fake_wind_date_form(*, auto_start=True, asof="2026-02-25",
+                         maturity="30", retrigger=False):
+    """模拟 Wind 日期控件组；``retrigger`` 复现真实 StringVar 的 write trace。"""
+    form = SimpleNamespace(
+        _wind_end_var=_Var(asof),
+        _wind_start_var=_Var("2025-01-02"),
+        _wind_auto_start_var=_BoolVar(auto_start),
+        _wind_start_entry=_Widget(),
+        _param_entries={"T_days": (_Var(maturity), int, None)},
+    )
+    if retrigger:
+        for var in (form._wind_start_var, form._wind_end_var):
+            original_set = var.set
+
+            def set_and_retrigger(value, _set=original_set):
+                _set(value)
+                BacktestApp._sync_wind_entry_date(form)
+
+            var.set = set_and_retrigger
+    return form
+
+
+def test_wind_auto_start_backfills_the_entry_box_with_the_backdated_date():
+    """界面不再单列实际区间，建仓日那一格必须就是倒推结果本身。"""
+    form = _fake_wind_date_form()
+
+    BacktestApp._sync_wind_entry_date(form)
+
+    expected_start = _trading_days_back(datetime.date(2026, 2, 25), 30)
+    assert form._wind_start_var.get() == expected_start.isoformat()
+
+
+def test_wind_entry_backfill_survives_its_own_write_trace():
+    """回填会再触发同一个 trace；重入必须被挡住而不是写出半成品。"""
+    form = _fake_wind_date_form(retrigger=True)
+
+    BacktestApp._sync_wind_entry_date(form)
+
+    expected_start = _trading_days_back(datetime.date(2026, 2, 25), 30)
+    assert form._wind_start_var.get() == expected_start.isoformat()
+
+
+@pytest.mark.parametrize(
+    ("asof", "maturity"),
+    [("2026-02-30", "30"), ("2026-02-2", "30"), ("2026-02-25", ""),
+     ("9999-01-05", "30")],
+)
+def test_wind_entry_backfill_keeps_last_value_on_half_edited_inputs(
+        asof, maturity):
+    """编辑到一半不得抛错、也不得把建仓日清空或写成半成品。"""
+    form = _fake_wind_date_form(asof=asof, maturity=maturity)
+
+    BacktestApp._sync_wind_entry_date(form)
+
+    assert form._wind_start_var.get() == "2025-01-02"
+
+
+def test_wind_asof_commit_snaps_to_the_trading_day_anchor_it_backdates_from():
+    """截止日填成休市日时，提交后落到真正的倒推锚点，建仓日随之更新。
+
+    2026-02-20 是春节休市，倒推锚点是 2026-02-13。两个日期框就是界面上唯一
+    的区间说明，锚点不落回框里就没有任何地方写着实际取到哪一天。
+    """
+    form = _fake_wind_date_form(asof="2026-02-20", retrigger=True)
+
+    BacktestApp._commit_wind_asof(form)
+
+    assert form._wind_end_var.get() == "2026-02-13"
+    assert form._wind_start_var.get() == _trading_days_back(
+        datetime.date(2026, 2, 13), 30).isoformat()
+
+
+@pytest.mark.parametrize("asof", ["2026-02-25", "2026-02-30", ""])
+def test_wind_asof_commit_leaves_trading_days_and_bad_input_untouched(asof):
+    form = _fake_wind_date_form(asof=asof, retrigger=True)
+
+    BacktestApp._commit_wind_asof(form)
+
+    assert form._wind_end_var.get() == asof
+
+
+def test_wind_asof_commit_is_inert_while_the_entry_date_is_manual():
+    """手工建仓日口径下截止日只是取数上限，不该被改写成交易日锚点。"""
+    form = _fake_wind_date_form(auto_start=False, asof="2026-02-20")
+
+    BacktestApp._commit_wind_asof(form)
+
+    assert form._wind_end_var.get() == "2026-02-20"
+
+
+def test_wind_auto_start_toggle_frees_manual_entry_without_overwriting_it():
+    form = _fake_wind_date_form(auto_start=False)
+
+    BacktestApp._toggle_wind_auto_start(form)
+
+    # 手工建仓日不被倒推覆盖。
+    assert form._wind_start_entry.state == "normal"
+    assert form._wind_start_var.get() == "2025-01-02"
+
+    form._wind_auto_start_var.set(True)
+    BacktestApp._toggle_wind_auto_start(form)
+
+    expected_start = _trading_days_back(datetime.date(2026, 2, 25), 30)
+    assert form._wind_start_entry.state == "disabled"
+    assert form._wind_start_var.get() == expected_start.isoformat()
 
 
 @pytest.mark.parametrize(
@@ -1103,16 +1249,16 @@ def test_history_collect_rejects_when_all_period_controls_are_cleared():
         BacktestApp._collect_history_state(fake)
 
 
-def test_single_wind_collection_uses_maturity_auto_end_and_ignores_history_ui():
+def test_single_wind_collection_backdates_entry_and_ignores_history_ui():
     class _ForbiddenVar:
         def get(self):
             raise AssertionError("单次回测不得读取历史择优 Wind 控件")
 
     fake = _fake_collect_state()
     fake._source_var.set("wind")
-    fake._wind_start_var.set("2025-01-02")
-    fake._wind_end_var.set("invalid-but-disabled")
-    fake._wind_auto_end_var = _BoolVar(True)
+    fake._wind_start_var.set("invalid-but-disabled")
+    fake._wind_end_var.set("2025-06-30")
+    fake._wind_auto_start_var = _BoolVar(True)
     fake._strategy_var.set(STRATEGY_DISPLAY["close_to_close"])
     fake._history_wind_asof_var = _ForbiddenVar()
     fake._history_wind_start_var = _ForbiddenVar()
@@ -1120,15 +1266,12 @@ def test_single_wind_collection_uses_maturity_auto_end_and_ignores_history_ui():
     fake._history_wind_bar_size_var = _ForbiddenVar()
 
     state = BacktestApp._collect_gui_state(fake)
-    required = state["params"]["T_days"] + 1
-    expected_end = (
-        datetime.date(2025, 1, 2) + datetime.timedelta(
-            days=BacktestApp._calendar_span_for_trading_days(required))
-    ).isoformat()
+    maturity_days = state["params"]["T_days"]
 
-    assert state["wind_start"] == "2025-01-02"
-    assert state["wind_end"] == expected_end
-    assert state["wind_required_trade_days"] == required
+    assert state["wind_end"] == "2025-06-30"
+    assert state["wind_start"] == _trading_days_back(
+        datetime.date(2025, 6, 30), maturity_days).isoformat()
+    assert state["wind_required_trade_days"] == maturity_days + 1
     assert state["wind_bar_size_requested"] == WIND_AUTO_BAR_SIZE
     assert state["wind_bar_size"] == "日频"
 
@@ -1186,7 +1329,7 @@ def test_history_state_always_requests_auto_bar_size():
 
 def test_new_wind_controls_are_optional_for_legacy_test_doubles():
     single = _fake_collect_state()
-    assert not hasattr(single, "_wind_auto_end_var")
+    assert not hasattr(single, "_wind_auto_start_var")
     collected_single = BacktestApp._collect_gui_state(single)
 
     history = _fake_history_collect_state()
@@ -1197,7 +1340,7 @@ def test_new_wind_controls_are_optional_for_legacy_test_doubles():
     assert not hasattr(history, "_history_period_vars")
     collected_history = BacktestApp._collect_history_state(history)
 
-    assert collected_single["wind_auto_end"] is False
+    assert collected_single["wind_auto_start"] is False
     assert collected_history["history_wind_auto_start"] is False
     assert collected_history["history_lookbacks"] == {
         key: gui_app.LOOKBACK_DAYS[key]
@@ -3644,7 +3787,7 @@ def test_resolved_wind_dates_and_bar_size_flow_to_build_meta_and_label(
     form._strategy_var.set(STRATEGY_DISPLAY["hedge_band"])
     form._wind_start_var.set("2025-01-02")
     form._wind_end_var.set("2025-02-28")
-    form._wind_auto_end_var = _BoolVar(False)
+    form._wind_auto_start_var = _BoolVar(False)
 
     state = BacktestApp._collect_gui_state(form)
     app = SimpleNamespace(
@@ -4444,6 +4587,47 @@ def test_source_hint_is_rendered_once_as_a_pill():
                  for w in app._history_header_summary_frame.winfo_children()]
         assert any("仅支持 CSV / Wind" in t for t in texts), texts
         assert str(app._history_btn.cget("state")) == "disabled"
+    finally:
+        app.destroy()
+
+
+def test_live_wind_date_controls_default_to_backdated_entry_from_latest_close():
+    """真实控件树上验证默认口径：截止日主控 + 建仓日倒推回填且不可手填。"""
+    import tkinter as tk
+    try:
+        probe = tk.Tk()
+    except tk.TclError:
+        pytest.skip("无可用显示环境")
+    probe.destroy()
+
+    import gui_app as module
+    app = module.BacktestApp()
+    try:
+        app.withdraw()
+        app._source_var.set("wind")
+        app._toggle_source()
+        app.update_idletasks()
+
+        calendar = BacktestApp._trading_calendar_days()
+        asof = datetime.date.fromisoformat(app._wind_end_var.get())
+        # 默认截止日是最近一个已收盘交易日：当天盘中的残段会让分钟粒度
+        # 策略直接被判死，因此不含当天。
+        assert asof in calendar
+        assert asof < datetime.date.today()
+        assert app._wind_auto_start_var.get() is True
+        assert str(app._wind_start_entry.cget("state")) == "disabled"
+
+        state = BacktestApp._collect_gui_state(app)
+        maturity_days = BacktestApp._maturity_days_from_params(state["params"])
+        expected_start = calendar[
+            calendar.index(asof) - maturity_days].isoformat()
+        assert state["wind_end"] == asof.isoformat()
+        assert state["wind_start"] == expected_start
+        assert state["wind_date_mode"] == "auto_entry_from_asof"
+        # 建仓日框必须显示倒推结果，而不是占位默认值——它是界面上唯一写着
+        # 建仓日的地方，已不再有单独的“实际区间”行兜底。
+        assert app._wind_start_var.get() == expected_start
+        assert not hasattr(app, "_wind_date_hint_var")
     finally:
         app.destroy()
 
@@ -5530,36 +5714,36 @@ def test_history_rank_headers_align_with_their_column_data():
         root.destroy()
 
 
-def test_baseline_row_is_not_tinted_like_the_table_header():
-    """基准行底色不得与表头同色。
+def test_rank_rows_carry_no_background_tint_at_all():
+    """排名表的行不得再有任何底色，选中态是唯一的行级底色。
 
-    两者都取 primary_light 时，紧挨在表头下面的基准行看着像是第二行表
-    头，而不是一条数据。
+    此前按角色/名次/完整度分了三档底色，每一档都有毛病：绿色标"第一行"
+    却总被自动选中的蓝底盖住（实测三种排名形态下一次都没显形）；判定用
+    ``row_no == 0`` 而不是 ``rank == 1``，基准占了第 0 行时真正最优的候选
+    反而是纯白；而"可比（仅参考）"这档降级完全没有颜色，与健康行同色，同
+    一行的结论卡却显示"数据不足"。
     """
-    import tkinter as tk
-    from tkinter import ttk
+    app = _render_history_result_page()
     try:
-        probe = tk.Tk()
-    except tk.TclError:
-        pytest.skip("无可用显示环境")
-    probe.destroy()
+        tree = app._history_rank_tree
+        tinted = {}
+        for iid in tree.get_children():
+            for tag in (tree.item(iid, "tags") or ()):
+                if not tag:
+                    continue
+                background = str(tree.tag_configure(tag, "background") or "")
+                if background:
+                    tinted[tag] = background
+        assert not tinted, f"仍有行标签带底色: {tinted}"
 
-    # 必须用真实 app：表头底色是 BacktestApp 启动时配进 ttk 样式的，裸
-    # Tk() 上 lookup 拿到的是系统默认值，断言会变成空转。
-    app = gui_app.BacktestApp()
-    try:
-        app.withdraw()
-        style = ttk.Style(app)
-        heading_bg = str(
-            style.lookup("Treeview.Heading", "background")).lower()
-        assert heading_bg == gui_app.PALETTE["primary_light"].lower(), (
-            f"表头底色不再是 primary_light（{heading_bg}），这条断言的前提变了")
+        # 分档底色的那几个标签必须彻底消失，而不是只把 background 留空。
+        for stale in ("leader", "incomplete"):
+            assert not tree.tag_configure(stale, "background"), stale
 
-        reference = gui_app.PALETTE["reference"].lower()
-        assert reference != heading_bg
-        # 也不能和普通行同色，否则基准行就完全看不出来了。
-        assert reference != str(
-            style.lookup("Treeview", "background")).lower()
+        # 基准行仍靠等宽加粗强调——那是字体不是底色。
+        baseline_font = tree.tag_configure("baseline", "font")
+        assert baseline_font, "基准行的加粗强调不应一起被删掉"
+        assert "bold" in str(baseline_font)
     finally:
         app.destroy()
 
@@ -5675,3 +5859,194 @@ def test_unplottable_candidate_is_skipped_without_reaching_deeper(monkeypatch):
 
     assert selected == ["候选1", "候选3"]
     assert "候选4" not in selected
+
+
+def _wind_history_app():
+    """建一个数据源为 Wind、历史区间控件已联动过的 app。"""
+    import tkinter as tk
+    try:
+        probe = tk.Tk()
+    except tk.TclError:
+        pytest.skip("无可用显示环境")
+    probe.destroy()
+
+    app = gui_app.BacktestApp()
+    app.withdraw()
+    app._source_var.set("wind")
+    BacktestApp._toggle_history_wind_controls(app)
+    app.update_idletasks()
+    return app
+
+
+def test_auto_start_date_is_backfilled_and_matches_the_real_request():
+    """自动模式下置灰框里的起始日必须等于真正会发出的请求起始日。
+
+    它此前显示的是构造界面时写死的「今天 − 420 自然日」，与实际取数区间毫
+    无关系。那个框看上去正是"本次从哪天开始取"，显示一个无关日期比措辞含糊
+    更能骗人。
+    """
+    app = _wind_history_app()
+    try:
+        shown = app._history_wind_start_var.get()
+        resolved = BacktestApp._collect_history_state(app)
+
+        assert shown == resolved["wind_start"], (
+            f"界面显示 {shown}，实际请求 {resolved['wind_start']}")
+        assert app._history_wind_asof_var.get() == resolved["wind_end"]
+        # 自动模式下该框只读。
+        assert str(app._history_wind_start_entry.cget("state")) == "disabled"
+    finally:
+        app.destroy()
+
+
+def test_auto_start_date_follows_period_and_asof_changes():
+    """周期或截至日一变，回填的起始日要跟着重算。"""
+    app = _wind_history_app()
+    try:
+        for key, var in app._history_period_vars.items():
+            var.set(key == "year")
+        BacktestApp._history_period_selection_changed(app)
+        app.update_idletasks()
+        long_start = app._history_wind_start_var.get()
+
+        for key, var in app._history_period_vars.items():
+            var.set(key == "week")
+        BacktestApp._history_period_selection_changed(app)
+        app.update_idletasks()
+        short_start = app._history_wind_start_var.get()
+
+        # 近周只需往前取 5 个交易日，起点必须比近年晚得多。
+        assert short_start > long_start, (long_start, short_start)
+
+        app._history_wind_asof_var.set("2026-03-31")
+        app.update_idletasks()
+        assert app._history_wind_start_var.get() != short_start
+        assert app._history_wind_start_var.get() < "2026-03-31"
+    finally:
+        app.destroy()
+
+
+def test_manual_start_date_is_never_overwritten():
+    """取消自动后，用户填的起始日不得被任何联动覆写。"""
+    app = _wind_history_app()
+    try:
+        app._history_wind_auto_start_var.set(False)
+        BacktestApp._toggle_history_wind_controls(app)
+        app._history_wind_start_var.set("2024-01-01")
+
+        # 改截至日、改周期都不该动它。
+        app._history_wind_asof_var.set("2026-06-30")
+        BacktestApp._history_period_selection_changed(app)
+        app.update_idletasks()
+        assert app._history_wind_start_var.get() == "2024-01-01"
+        assert str(app._history_wind_start_entry.cget("state")) == "normal"
+
+        # 勾回自动则必须重算，不能留着那个已经失效的手填值。
+        app._history_wind_auto_start_var.set(True)
+        BacktestApp._toggle_history_wind_controls(app)
+        app.update_idletasks()
+        assert app._history_wind_start_var.get() != "2024-01-01"
+        assert app._history_wind_start_var.get() == (
+            BacktestApp._collect_history_state(app)["wind_start"])
+    finally:
+        app.destroy()
+
+
+def test_auto_start_backfill_ignores_a_half_typed_asof():
+    """截至日还没输入完时不要乱猜，保留上一个有效结果。"""
+    app = _wind_history_app()
+    try:
+        app._history_wind_asof_var.set("2026-07-29")
+        app.update_idletasks()
+        valid = app._history_wind_start_var.get()
+
+        app._history_wind_asof_var.set("2026-0")
+        app.update_idletasks()
+
+        assert app._history_wind_start_var.get() == valid
+    finally:
+        app.destroy()
+
+
+def test_wind_hint_drops_what_the_top_summary_already_says():
+    """本行提示不再重复粒度，只留别处没有的那句。
+
+    实际采用的行情粒度在顶部基准摘要里已经写了一遍，同屏第二次出现是纯
+    重复；本行唯一独有的信息是"为什么要多取前一个交易日"。
+    """
+    app = _wind_history_app()
+    try:
+        for var in app._history_period_vars.values():
+            var.set(True)
+        BacktestApp._history_period_selection_changed(app)
+        app.update_idletasks()
+        hint = app._history_wind_hint_var.get()
+
+        assert "统一采用" not in hint and "行情" not in hint, hint
+        assert "多取前一个交易日的收盘价" in hint
+
+        # 手动模式无需提示：未勾的勾选框加可编辑的日期框本身就说明了一切。
+        app._history_wind_auto_start_var.set(False)
+        BacktestApp._toggle_history_wind_controls(app)
+        app.update_idletasks()
+        assert app._history_wind_hint_var.get() == ""
+    finally:
+        app.destroy()
+
+
+def test_wind_hint_still_reports_bar_size_resolution_errors():
+    """粒度解析失败时这一行仍是唯一的报错出口。
+
+    移除粒度显示后 `_resolve_wind_bar_size` 的返回值不再被用到，容易被当成
+    死代码删掉——但它抛的错正是从这里报给用户的。
+    """
+    app = _wind_history_app()
+    try:
+        app._history_include_fixed_times_var.set(True)
+        app._history_fixed_times_var.set("99:99")
+        BacktestApp._refresh_history_wind_hint(app)
+        app.update_idletasks()
+
+        assert "格式错误" in app._history_wind_hint_var.get()
+    finally:
+        app.destroy()
+
+
+def test_base_summary_shows_the_resolved_date_range_not_the_rule():
+    """顶部摘要写推算出的起始日，而不是「自动覆盖最近 N 日连续区间」。
+
+    这一行讲的是"本次将冻结的取数区间"；写规则描述读者还得自己换算成日
+    期，而起始日已经实时回填进旁边的输入框，两处必须显示同一个日期。
+    """
+    app = _wind_history_app()
+    try:
+        for var in app._history_period_vars.values():
+            var.set(True)
+        BacktestApp._history_period_selection_changed(app)
+        app.update_idletasks()
+
+        summary = app._history_base_summary_var.get()
+        shown_start = app._history_wind_start_var.get()
+        resolved = BacktestApp._collect_history_state(app)
+
+        assert "自动覆盖最近" not in summary, summary
+        assert f"{shown_start} 至 " in summary, summary
+        assert shown_start == resolved["wind_start"]
+    finally:
+        app.destroy()
+
+
+def test_auto_start_is_cleared_when_no_period_is_selected():
+    """推不出起始日时清空，不留一个看着像取数起点的旧日期。"""
+    app = _wind_history_app()
+    try:
+        app._history_wind_start_var.set("2024-03-01")
+        for var in app._history_period_vars.values():
+            var.set(False)
+        BacktestApp._history_period_selection_changed(app)
+        app.update_idletasks()
+
+        assert app._history_wind_start_var.get() == ""
+        assert "未选择分析周期" in app._history_base_summary_var.get()
+    finally:
+        app.destroy()
