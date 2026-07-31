@@ -1075,6 +1075,19 @@ class BacktestApp(tk.Tk):
 
         ttk.Separator(header, orient="horizontal").pack(fill="x", padx=0, pady=(6, 0))
 
+        # 底部状态栏
+        # 必须排在 body 之前 pack：pack 按调用顺序分配空间，body 带 expand=True
+        # 会先吃满自己的请求高度；一旦右侧图表 + 表格的请求高度超过窗口可用高度
+        # （最大化到较矮的屏幕、或策略优选页有图有表时），后 pack 的状态栏就会被
+        # 挤出窗口底部只露半行。先占位则状态栏恒为 24px，压缩的是可伸缩的 body。
+        status_bar = ttk.Frame(self, style="Surface.TFrame")
+        status_bar.pack(fill="x", side="bottom")
+        ttk.Separator(status_bar, orient="horizontal").pack(fill="x")
+        self._status_var = tk.StringVar(
+            value="就绪  |  选择期权类型、设置参数后点击『运行回测』")
+        ttk.Label(status_bar, textvariable=self._status_var,
+                  style="Status.TLabel", anchor="w").pack(fill="x", padx=10)
+
         # 主体：左侧参数 + 右侧结果
         body = ttk.PanedWindow(self, orient="horizontal")
         body.pack(fill="both", expand=True, padx=12, pady=(8, 4))
@@ -1599,15 +1612,6 @@ class BacktestApp(tk.Tk):
         self._build_history_workspace()
         self._nb.bind(
             "<<NotebookTabChanged>>", self._on_notebook_tab_changed, add="+")
-
-        # 底部状态栏
-        status_bar = ttk.Frame(self, style="Surface.TFrame")
-        status_bar.pack(fill="x", side="bottom")
-        ttk.Separator(status_bar, orient="horizontal").pack(fill="x")
-        self._status_var = tk.StringVar(
-            value="就绪  |  选择期权类型、设置参数后点击『运行回测』")
-        ttk.Label(status_bar, textvariable=self._status_var,
-                  style="Status.TLabel", anchor="w").pack(fill="x", padx=10)
 
         self._toggle_source()
 
