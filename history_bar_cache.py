@@ -1,0 +1,261 @@
+"""策略优选分段的 bar 级结果磁盘缓存（纯逻辑，不依赖 tkinter）。
+
+**为什么要有它。** 一轮近年全选是 161 次回测，bar 级数组合计约 153 MB，
+全留在内存代价太大，所以历史择优跑完就释放、只保留「重放配方」，想看某段
+明细时现跑一次（实测 620 ms）。把这些结果压缩落盘后，同一段再看只要 3 ms
+——快 200 倍，而整轮压缩后约 38 MB（数组重复度高，1052 KB 压到 239 KB）。
+
+**放在缓存目录，与结果包分开。** 这里的东西丢了能重跑，是真正的缓存；结果
+包不可重建（Wind 区间随分析截至日移动），所以在别处。
+
+**按内容哈希做 key。** 不用「第几次运行」这类外部标识：同一份输入无论来自
+刚跑完的结果还是载入的结果包，都命中同一条缓存；输入变了则必然 miss，不会
+读到过期数据。
+"""
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import sys
+import time
+
+import numpy as np
+import pandas as pd
+
+# 磁盘占用不在这里设上限——按产品决定，改由「最多保留 20 份优选记录」
+# 间接约束（见 history_store.MAX_RESULTS）。``prune`` 与 ``clear`` 仍然
+# 可用，只是不再自动调用；需要时一行就能接回去。
+DEFAULT_MAX_BYTES = 2 * 1024 ** 3
+_SUFFIX = ".npz"
+_META_SUFFIX = ".json"
+
+
+def cache_dir() -> str:
+    """与 Wind intraday 缓存同一个父目录，但另开一层。"""
+    if getattr(sys, "frozen", False):
+        base = os.path.join(os.path.expanduser("~"), ".deltalab", "cache")
+    else:
+        base = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "data", "cache")
+    return os.path.join(base, "history_bars")
+
+
+def _digest_option(option):
+    """期权身份：类型 + 所有影响定价的标量属性。"""
+    parts = [type(option).__name__]
+    for name in sorted(dir(option)):
+        if name.startswith("_"):
+            continue
+        try:
+            value = getattr(option, name)
+        except Exception:                              # noqa: BLE001
+            continue
+        if isinstance(value, (int, float, np.integer, np.floating)) and not (
+                isinstance(value, bool)):
+            parts.append(f"{name}={float(value):.12g}")
+        elif isinstance(value, str):
+            parts.append(f"{name}={value}")
+    return "|".join(parts)
+
+
+def _digest_strategy(strategy):
+    """策略身份：类名 + 决定触发行为的字段。"""
+    parts = [type(strategy).__name__, str(getattr(strategy, "name", ""))]
+    for field in ("threshold", "k", "band_type", "sigma_source",
+                  "window_days", "freq", "max_backfill_minutes"):
+        if hasattr(strategy, field):
+            parts.append(f"{field}={getattr(strategy, field)!r}")
+    times = getattr(strategy, "target_times", None) or getattr(
+        strategy, "fixed_times", None)
+    if times is not None:
+        parts.append(f"times={list(times)!r}")
+    sessions = getattr(strategy, "trading_sessions", None)
+    if sessions is not None:
+        parts.append(f"sessions={list(sessions)!r}")
+    return "|".join(parts)
+
+
+def _digest_path(path):
+    """行情切片身份：长度、首尾时间戳，加数值本身的哈希。
+
+    只取首尾会漏掉「区间相同但价格被改过」的情况——那正是复权口径变化会
+    造成的，而它必须导致 miss。
+    """
+    values = np.asarray(path, dtype=float)
+    index = getattr(path, "index", None)
+    head = str(index[0]) if index is not None and len(index) else ""
+    tail = str(index[-1]) if index is not None and len(index) else ""
+    body = hashlib.sha1(values.tobytes()).hexdigest()
+    return f"{len(values)}|{head}|{tail}|{body}"
+
+
+def key_for(spec, strategy_name):
+    """把一次重放的全部输入压成一个 key。
+
+    覆盖：期权、行情切片、评估天数、bar 粒度、策略身份、回测参数。任何一
+    项变化都会换 key——宁可 miss 再跑 620 ms，也不能读到不匹配的结果。
+    """
+    strategy = spec.strategies[str(strategy_name)]
+    material = "\n".join([
+        _digest_option(spec.option),
+        _digest_path(spec.external_path),
+        f"eval={int(spec.evaluation_days)}",
+        f"spd={int(spec.steps_per_day)}",
+        _digest_strategy(strategy),
+        json.dumps(
+            {str(k): repr(v) for k, v in dict(spec.backtest_kwargs).items()},
+            sort_keys=True, ensure_ascii=False),
+        json.dumps(
+            {str(k): repr(v)
+             for k, v in dict(spec.warmup_kwargs.get(strategy_name, {})).items()},
+            sort_keys=True, ensure_ascii=False),
+    ])
+    return hashlib.sha256(material.encode("utf-8")).hexdigest()[:32]
+
+
+def _paths(key, directory=None):
+    directory = directory or cache_dir()
+    stem = os.path.join(directory, key)
+    return stem + _SUFFIX, stem + _META_SUFFIX
+
+
+def store(spec, strategy_name, result, *, directory=None):
+    """把一段回测结果写进缓存，返回路径；写失败时返回 None。
+
+    缓存写失败绝不能让主流程出错——它只是省时间的东西，没有它一切照常。
+    """
+    directory = directory or cache_dir()
+    key = key_for(spec, strategy_name)
+    npz_path, meta_path = _paths(key, directory)
+    arrays, scalars = {}, {}
+    for name, value in dict(result).items():
+        if isinstance(value, np.ndarray):
+            arrays[str(name)] = value
+        elif isinstance(value, pd.Series):
+            arrays[str(name)] = value.to_numpy()
+        elif isinstance(value, (pd.DatetimeIndex, pd.Index)):
+            arrays[str(name)] = np.asarray(value)
+        else:
+            scalars[str(name)] = value
+    try:
+        os.makedirs(directory, exist_ok=True)
+        tmp = npz_path + ".part"
+        np.savez_compressed(tmp, **arrays)
+        # np.savez 会补 .npz 后缀，这里统一回目标名再原子替换。
+        produced = tmp if os.path.exists(tmp) else tmp + ".npz"
+        os.replace(produced, npz_path)
+        with open(meta_path, "w", encoding="utf-8") as handle:
+            json.dump(
+                {"scalars": _jsonable_scalars(scalars),
+                 "written_at": time.time()},
+                handle, ensure_ascii=False)
+    except Exception:                                  # noqa: BLE001
+        return None
+    return npz_path
+
+
+def _jsonable_scalars(scalars):
+    out = {}
+    for key, value in scalars.items():
+        if isinstance(value, (np.integer,)):
+            out[key] = int(value)
+        elif isinstance(value, (np.floating,)):
+            number = float(value)
+            out[key] = None if not np.isfinite(number) else number
+        elif isinstance(value, (np.bool_,)):
+            out[key] = bool(value)
+        elif isinstance(value, (str, int, float, bool)) or value is None:
+            out[key] = value
+        elif isinstance(value, (list, tuple)):
+            out[key] = [
+                v for v in (
+                    _jsonable_scalars({"x": item}).get("x") for item in value)
+            ]
+        elif isinstance(value, dict):
+            out[key] = _jsonable_scalars(value)
+        # 其它类型（策略对象、时间戳序列…）不进 meta：它们要么在 arrays
+        # 里，要么本来就能从配方重建。
+    return out
+
+
+def load(spec, strategy_name, *, directory=None):
+    """读回一段结果；未命中或文件损坏时返回 None（调用方重跑即可）。"""
+    key = key_for(spec, strategy_name)
+    npz_path, meta_path = _paths(key, directory)
+    if not os.path.isfile(npz_path):
+        return None
+    try:
+        result = {}
+        with np.load(npz_path, allow_pickle=False) as bundle:
+            for name in bundle.files:
+                result[name] = bundle[name]
+        if os.path.isfile(meta_path):
+            with open(meta_path, encoding="utf-8") as handle:
+                result.update(dict(json.load(handle).get("scalars", {})))
+        # 命中即刷新 mtime，LRU 才有意义。
+        os.utime(npz_path, None)
+    except Exception:                                  # noqa: BLE001
+        return None
+    return result
+
+
+def usage_bytes(directory=None):
+    directory = directory or cache_dir()
+    if not os.path.isdir(directory):
+        return 0
+    total = 0
+    for name in os.listdir(directory):
+        try:
+            total += os.path.getsize(os.path.join(directory, name))
+        except OSError:
+            continue
+    return total
+
+
+def prune(max_bytes=DEFAULT_MAX_BYTES, *, directory=None):
+    """按最近使用时间裁到容量上限内，返回删掉的字节数。"""
+    directory = directory or cache_dir()
+    if not os.path.isdir(directory):
+        return 0
+    entries = []
+    for name in os.listdir(directory):
+        if not name.endswith(_SUFFIX):
+            continue
+        path = os.path.join(directory, name)
+        try:
+            entries.append((os.path.getmtime(path), path,
+                            os.path.getsize(path)))
+        except OSError:
+            continue
+    total = usage_bytes(directory)
+    if total <= max_bytes:
+        return 0
+    freed = 0
+    for _mtime, path, size in sorted(entries):
+        if total - freed <= max_bytes:
+            break
+        meta = path[:-len(_SUFFIX)] + _META_SUFFIX
+        for target in (path, meta):
+            try:
+                freed += os.path.getsize(target)
+                os.remove(target)
+            except OSError:
+                continue
+    return freed
+
+
+def clear(directory=None):
+    """清空缓存；返回删掉的文件数。丢了只是下次要重跑，不丢数据。"""
+    directory = directory or cache_dir()
+    if not os.path.isdir(directory):
+        return 0
+    removed = 0
+    for name in os.listdir(directory):
+        if name.endswith((_SUFFIX, _META_SUFFIX, ".part")):
+            try:
+                os.remove(os.path.join(directory, name))
+                removed += 1
+            except OSError:
+                continue
+    return removed

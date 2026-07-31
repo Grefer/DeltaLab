@@ -3,9 +3,12 @@
 一次五周期全选要跑 23 个分段 × 7 个候选 = 161 次回测，实测 85 秒，而结果
 包 gzip 后只有约 137 KB。所以值得存：137 KB 换 85 秒。
 
-**不存 bar 级结果。** ``window_results`` 里每个回测的完整数组（Greeks、逐
-bar 价格、持仓）平均 971 KB，161 个约 153 MB。因此载入后「加载某段明细」
-不可用——调用方必须在界面上讲明这一点，而不是让按钮点了没反应。
+**存输入，不存输出。** ``window_results`` 里每个回测的完整数组（Greeks、逐
+bar 价格、持仓）平均 971 KB，161 个约 153 MB——那个存不了。但逐段下钻要的
+是**输入**：行情切片加构造参数。底层 1 分钟序列一年 gzip 后约 206 KB，各段
+都是它的切片，存一份即可。下钻时只重跑选中那一段（约 1 秒），不是 161 段。
+
+（早前把这两者搞混，据此误判成「载入后无法下钻」，这里记一笔免得再犯。）
 
 **不放在缓存目录。** intraday 缓存可丢弃，删了从 Wind 重拉即可；优选结果
 不可重建——Wind 区间是从「分析截至日」往回数的，下个月用同样参数跑出来的
@@ -31,6 +34,10 @@ SCHEMA_VERSION = 1
 
 _MANIFEST_NAME = "manifest.json"
 _SUFFIX = ".json.gz"
+
+# 最多保留多少份优选记录。超出后按保存时间淘汰最旧的——磁盘占用由此间接
+# 收敛（结果包本身几十到几百 KB，真正的大头是它带动的 bar 级缓存）。
+MAX_RESULTS = 20
 
 
 def results_dir() -> str:
@@ -189,7 +196,8 @@ def _safe_token(text, fallback="未命名"):
 
 
 def build_payload(*, ranking, window_summary, history_state, source_label,
-                  objective, notes=None, label=None, elapsed_seconds=None):
+                  objective, notes=None, label=None, elapsed_seconds=None,
+                  replay_index=None):
     """组装结果包。``history_state`` 是本次运行冻结的全部输入。"""
     # 回调、控件、期权对象这类不可序列化的东西不进包；它们也不是结果的一
     # 部分。真实状态里的 cfg["build"] 是嵌在字典里的回调，所以过滤必须靠
@@ -203,7 +211,9 @@ def build_payload(*, ranking, window_summary, history_state, source_label,
             state[str(key)] = converted
     return {
         "schema_version": SCHEMA_VERSION,
-        "saved_at": datetime.datetime.now().isoformat(timespec="seconds"),
+        # 精度到微秒：秒级精度下同一秒内连存几份会完全同时刻，「最旧的
+        # 是哪份」就没了定义，淘汰会变成随机删。
+        "saved_at": datetime.datetime.now().isoformat(timespec="microseconds"),
         "label": str(label or "").strip(),
         "source_label": str(source_label or ""),
         "objective": str(objective or ""),
@@ -213,18 +223,94 @@ def build_payload(*, ranking, window_summary, history_state, source_label,
         "history_state": state,
         "ranking": _frame_to_payload(ranking),
         "window_summary": _frame_to_payload(window_summary),
+        # 逐段下钻要的是回测**输入**（行情切片 + 构造参数），不是输出。
+        "replay": build_replay_payload(replay_index),
     }
 
 
-def default_label(state, existing=None):
-    """保存对话框的预填名：``品种 Buy/Sell 分析截至日``。
+def series_from_replay_index(replay_index):
+    """把逐分段行情切片并回一条底层序列。
 
-    第三段取分析截至日，因为它才是「同参数不同结果」的真实分界：隔周用
-    同样参数再跑一次，Wind 区间整体前移，那是另一份结果。候选空间试过但
-    不合适——参数相同时摘要也相同，防不了重名，而那正是要解决的问题。
+    各 lookback 的分段都是同一条已拉取序列的精确切片（实测 15/15 完全一
+    致），因此并集去重就还原出底层序列本身——不必把它单独从取数层一路传
+    到保存点。跨 lookback 会重叠（近周那 5 天也在近年里），所以必须按索引
+    去重，否则同一天会被存好几遍。
+    """
+    pieces = []
+    for windows in (replay_index or {}).values():
+        for spec in (windows or {}).values():
+            path = getattr(spec, "external_path", None)
+            if path is not None and len(path):
+                pieces.append(pd.Series(path))
+    if not pieces:
+        return None
+    merged = pd.concat(pieces)
+    merged = merged[~merged.index.duplicated(keep="first")].sort_index()
+    return merged
 
-    ``existing`` 传入已有的名字，完全同名时追加 ``#2``/``#3``。同参数同
-    截至日连存两次确实会撞，靠右边的保存时间列区分不够直观。
+
+def build_replay_payload(replay_index):
+    """把重放配方序列化。
+
+    存的是**输入**不是输出：底层价格序列一份，加上每段的起止时间戳与
+    ``evaluation_days`` / ``steps_per_day`` / 回测参数。实测一年 1 分钟序
+    列 gzip 后约 206 KB，而 bar 级**输出**是 153 MB——早前把这两者搞混，
+    才误判成「载入后无法下钻」。
+
+    分段的起止用时间戳而不是位置：位置依赖序列本身，时间戳则可以直接
+    ``series.loc[start:end]`` 切出来，与序列如何拼接无关。
+    """
+    series = series_from_replay_index(replay_index)
+    if series is None:
+        return None
+    specs = []
+    for lookback, windows in (replay_index or {}).items():
+        for window_id, spec in (windows or {}).items():
+            path = spec.external_path
+            specs.append({
+                "lookback": str(lookback),
+                "window_id": str(window_id),
+                "start_ts": pd.Timestamp(path.index[0]).isoformat(),
+                "end_ts": pd.Timestamp(path.index[-1]).isoformat(),
+                "evaluation_days": int(spec.evaluation_days),
+                "steps_per_day": int(spec.steps_per_day),
+                "option_s0": float(getattr(spec.option, "s0", float("nan"))),
+                "strategies": [str(name) for name in spec.strategies],
+                "backtest_kwargs": _jsonable(dict(spec.backtest_kwargs)),
+                "metadata": _jsonable(dict(spec.metadata)),
+            })
+    return {
+        "price_series": {
+            "index": [pd.Timestamp(ts).isoformat() for ts in series.index],
+            "values": [float(v) for v in series.to_numpy()],
+        },
+        "specs": specs,
+    }
+
+
+def restore_replay_payload(payload):
+    """还原成 ``(价格序列, 分段配方列表)``；没有重放数据时返回 ``(None, [])``。"""
+    block = (payload or {}).get("replay")
+    if not block:
+        return None, []
+    raw = block.get("price_series") or {}
+    index = pd.to_datetime(list(raw.get("index", ())))
+    values = np.asarray(list(raw.get("values", ())), dtype=float)
+    if not len(index) or len(index) != len(values):
+        return None, []
+    return pd.Series(values, index=index), list(block.get("specs", ()))
+
+
+def default_label(state, existing=None, now=None):
+    """保存对话框的预填名：``品种 Buy/Sell 保存时刻``。
+
+    第三段取保存时刻（``MM-DD HH:MM``）。它天生唯一，把「防重名」这件事
+    一次解决；分析截至日试过，但同一天连跑两次就撞，而且它已经单独成列。
+    不带年份是有意的：列表最多留 20 份，同月同日同分钟跨年重名不现实，
+    而少四个字符能让名称列容得下。
+
+    ``existing`` 传入已有的名字，完全同名时追加 ``#2``/``#3``——同一分钟
+    内连存两次仍会撞，这层兜底保留。
 
     ``position`` 是**买卖方向**：1=卖出、-1=买入（见 HedgeBacktest）。这里
     用 Buy/Sell 而不是 Long/Short——后者在期权语境里通常指 gamma 敞口，而
@@ -241,9 +327,8 @@ def default_label(state, existing=None):
     except (TypeError, ValueError):
         position = 1
     side = "Sell" if position == 1 else "Buy"
-    asof = str(state.get("history_wind_asof")
-               or state.get("wind_end") or "").strip()[:10]
-    base = " ".join(piece for piece in (code, side, asof) if piece)
+    stamp = (now or datetime.datetime.now()).strftime("%m-%d %H:%M")
+    base = " ".join(piece for piece in (code, side, stamp) if piece)
     if not base:
         base = side
     taken = {str(name).strip() for name in (existing or ()) if str(name).strip()}
@@ -268,8 +353,12 @@ def default_filename(payload):
     return f"{code}_{asof}_{periods}_{stamp}{_SUFFIX}"
 
 
-def save_result(payload, *, directory=None, filename=None):
-    """写入结果包，返回完整路径。"""
+def save_result(payload, *, directory=None, filename=None, enforce=True):
+    """写入结果包，返回完整路径。
+
+    ``enforce=False`` 时不在这里淘汰旧记录——调用方需要拿到被淘汰的清单
+    报给用户时，自己调 ``enforce_limit``。
+    """
     directory = directory or results_dir()
     os.makedirs(directory, exist_ok=True)
     filename = filename or default_filename(payload)
@@ -295,7 +384,25 @@ def save_result(payload, *, directory=None, filename=None):
     with gzip.open(tmp, "wt", encoding="utf-8", compresslevel=6) as handle:
         handle.write(text)
     os.replace(tmp, path)
+    if enforce:
+        enforce_limit(directory=directory)
     return path
+
+
+def enforce_limit(max_results=MAX_RESULTS, *, directory=None):
+    """只保留最近 ``max_results`` 份记录，返回被淘汰的路径列表。
+
+    删除是不可逆的，所以调用方应当把返回值报给用户——静默删掉别人 85 秒
+    跑出来的东西，即使是按规则删的，也必须说一声。
+    """
+    items = list_results(directory)
+    if max_results is None or max_results <= 0 or len(items) <= max_results:
+        return []
+    evicted = []
+    for item in items[max_results:]:          # list_results 已按时间倒序
+        if delete_result(item["path"]):
+            evicted.append(item)
+    return evicted
 
 
 class HistoryResultVersionError(ValueError):
@@ -401,6 +508,21 @@ def _option_summary(state):
     return " ".join(pieces) or "—"
 
 
+def _subtype_label(state, display_map=None):
+    """期权子类型的中文名。
+
+    ``display_map`` 由调用方注入（GUI 侧的 ``SUBTYPE_DISPLAY``），这里不
+    直接 import gui_app——本模块要保持纯逻辑、可独立测试。映射里没有的原
+    样返回，只去掉注册表统一的 ``Opt_`` 前缀（那四个字符不携带信息）。
+    """
+    subtype = str(state.get("subtype") or "").strip()
+    if not subtype:
+        return "—"
+    if display_map and subtype in display_map:
+        return str(display_map[subtype])
+    return subtype[4:] if subtype.startswith("Opt_") else subtype
+
+
 def _position_summary(state):
     """``Buy 费0.01%``，收盘保底被关掉时追加警示。
 
@@ -427,6 +549,11 @@ def _position_summary(state):
             "force_day_close_hedge"):
         pieces.append("⚠无保底")
     return " ".join(pieces)
+
+
+# 子类型中文名的来源。GUI 在 import 时注入自己的 SUBTYPE_DISPLAY——本模
+# 块不反向依赖 gui_app，未注入时退回原始标识，列表仍可用。
+SUBTYPE_DISPLAY = {}
 
 
 def _peek(path):
@@ -459,11 +586,13 @@ def _peek(path):
                  or state.get("wind_end") or ""),
         "lookbacks": list(lookbacks.keys()),
         "option_summary": _option_summary(state),
+        "subtype": _subtype_label(state, SUBTYPE_DISPLAY),
         "position_summary": _position_summary(state),
         "evidence_span": _evidence_span(records, lookbacks),
         "verdict": _verdict(records),
         "rows": len(records),
         "bytes": os.path.getsize(path),
+        "_mtime": os.path.getmtime(path),
     }
 
 
@@ -477,7 +606,10 @@ def list_results(directory=None):
         meta = _peek(path)
         if meta is not None:
             items.append(meta)
-    items.sort(key=lambda item: item["saved_at"], reverse=True)
+    # mtime 作次级键：旧包的 saved_at 只精确到秒，同秒的几份仍需确定顺序。
+    items.sort(
+        key=lambda item: (item["saved_at"], item.get("_mtime", 0.0)),
+        reverse=True)
     return items
 
 

@@ -364,6 +364,53 @@ def test_saving_twice_in_the_same_second_keeps_both(tmp_path):
     assert labels == {"第一份", "第二份", "第三份"}
 
 
+def test_saving_beyond_the_limit_evicts_the_oldest(tmp_path):
+    """最多保留 MAX_RESULTS 份，超出后淘汰最旧的。"""
+    import time
+
+    paths = []
+    for index in range(store.MAX_RESULTS + 3):
+        paths.append(_save(tmp_path, label=f"第{index}份"))
+        time.sleep(0.002)
+
+    items = store.list_results(str(tmp_path))
+
+    assert len(items) == store.MAX_RESULTS
+    labels = {item["label"] for item in items}
+    # 最早的三份出局，最新的都在。
+    assert {"第0份", "第1份", "第2份"}.isdisjoint(labels)
+    assert f"第{store.MAX_RESULTS + 2}份" in labels
+
+
+def test_enforce_limit_returns_what_it_deleted(tmp_path):
+    """删除不可逆。调用方要拿这个清单告诉用户——那是别人 85 秒跑出来的。"""
+    import time
+
+    for index in range(5):
+        _save(tmp_path, label=f"第{index}份")
+        time.sleep(0.002)
+
+    evicted = store.enforce_limit(max_results=3, directory=str(tmp_path))
+
+    assert [item["label"] for item in evicted] == ["第1份", "第0份"]
+    assert len(store.list_results(str(tmp_path))) == 3
+    # 再跑一次已经在限内，不该再删。
+    assert store.enforce_limit(max_results=3, directory=str(tmp_path)) == []
+
+
+def test_save_with_enforce_false_keeps_everything(tmp_path):
+    """调用方要自己收集淘汰清单时，写入不能顺手把旧的删了。"""
+    for index in range(store.MAX_RESULTS + 2):
+        payload = store.build_payload(
+            ranking=_ranking_frame(), window_summary=_summary_frame(),
+            history_state=_state(), source_label="t",
+            objective="incremental_pnl", label=f"第{index}份")
+        store.save_result(
+            payload, directory=str(tmp_path), enforce=False)
+
+    assert len(store.list_results(str(tmp_path))) == store.MAX_RESULTS + 2
+
+
 def test_delete_removes_the_package_and_tolerates_missing(tmp_path):
     path = _save(tmp_path)
 
@@ -383,46 +430,99 @@ def test_results_dir_is_separate_from_the_wind_cache():
     assert not results.startswith(cache + os.sep)
 
 
+_STAMP = datetime.datetime(2026, 7, 31, 14, 28)
+
+
 @pytest.mark.parametrize(("state", "expected"), [
-    ({"wind_code": "510050.SH", "position": 1,
-      "history_wind_asof": "2026-07-25"},
-     "510050.SH Sell 2026-07-25"),
-    ({"wind_code": "OI701.CZC", "position": -1,
-      "history_wind_asof": "2026-06-30"},
-     "OI701.CZC Buy 2026-06-30"),
-    # 没有 asof 时退回 wind_end
-    ({"wind_code": "510050.SH", "position": -1, "wind_end": "2026-05-20"},
-     "510050.SH Buy 2026-05-20"),
+    ({"wind_code": "510050.SH", "position": 1},
+     "510050.SH Sell 07-31 14:28"),
+    ({"wind_code": "OI701.CZC", "position": -1},
+     "OI701.CZC Buy 07-31 14:28"),
     # CSV 来源用文件名当品种
-    ({"csv_path": "/data/沪深300_2026.csv", "position": -1,
-      "history_wind_asof": "2026-07-25"},
-     "沪深300_2026 Buy 2026-07-25"),
+    ({"csv_path": "/data/沪深300_2026.csv", "position": -1},
+     "沪深300_2026 Buy 07-31 14:28"),
     # 空状态也要给出可用的名字，不能抛
-    ({}, "Sell"),
+    ({}, "Sell 07-31 14:28"),
 ])
-def test_default_label_is_code_side_and_asof(state, expected):
-    """预填名 = 品种 + 多空 + 分析截至日。
+def test_default_label_is_code_side_and_save_time(state, expected):
+    """预填名 = 品种 + 买卖方向 + 保存时刻。
 
-    第三段取截至日而不是候选摘要：参数相同时摘要也相同，防不了重名，而
-    「区分同参数的结果」正是这一段存在的理由。隔周同参数再跑，Wind 区间
-    整体前移，截至日就把两份分开了。
+    第三段取保存时刻而不是分析截至日：后者同一天连跑两次就撞，而且它已
+    经单独成列。不带年份是为了让名称列容得下——列表最多 20 份，同月同日
+    同分钟跨年重名不现实。
     """
-    assert store.default_label(state) == expected
+    assert store.default_label(state, now=_STAMP) == expected
 
 
-def test_default_label_appends_a_serial_when_the_name_is_taken(tmp_path):
-    """同参数同截至日连存两次确实会撞，靠保存时间列区分不够直观。"""
-    state = {"wind_code": "510050.SH", "position": -1,
-             "history_wind_asof": "2026-07-25"}
-    base = "510050.SH Buy 2026-07-25"
+def test_default_label_appends_a_serial_when_the_name_is_taken():
+    """同一分钟内连存两次仍会撞，序号是最后一层兜底。"""
+    state = {"wind_code": "510050.SH", "position": -1}
+    base = "510050.SH Buy 07-31 14:28"
 
-    assert store.default_label(state, existing=[]) == base
-    assert store.default_label(state, existing=[base]) == f"{base} #2"
+    assert store.default_label(state, existing=[], now=_STAMP) == base
     assert store.default_label(
-        state, existing=[base, f"{base} #2"]) == f"{base} #3"
+        state, existing=[base], now=_STAMP) == f"{base} #2"
+    assert store.default_label(
+        state, existing=[base, f"{base} #2"], now=_STAMP) == f"{base} #3"
     # 别的名字不影响；空白项不算占用。
     assert store.default_label(
-        state, existing=["换月前对照", "  ", ""]) == base
+        state, existing=["换月前对照", "  ", ""], now=_STAMP) == base
+
+
+@pytest.mark.parametrize(("subtype", "expected"), [
+    ("Eu", "欧式"),
+    ("Opt_EnDecumulator_Fix", "固定赔付增强累计"),
+    ("Opt_ASGQ_EFF", "熔断每日双固赔累计"),
+    ("Opt_Snowball", "雪球"),
+    ("EnhanceAsian", "增强亚式"),
+])
+def test_listing_reports_the_option_subtype_in_chinese(
+        tmp_path, monkeypatch, subtype, expected):
+    """同一大类下子型行为差别很大——累计期权就有 13 个子型。
+
+    中文名复用 GUI 已有的 SUBTYPE_DISPLAY（由 gui_app 注入），不另造一套
+    ——两套映射迟早会各自演化到对不上。
+    """
+    import gui_app                                    # 触发注入
+    monkeypatch.setattr(
+        store, "SUBTYPE_DISPLAY", gui_app.SUBTYPE_DISPLAY)
+    path = _save(tmp_path, history_state={**_state(), "subtype": subtype})
+
+    item = next(i for i in store.list_results(str(tmp_path))
+                if i["path"] == path)
+
+    assert item["subtype"] == expected
+
+
+def test_every_registered_subtype_has_a_chinese_name():
+    """注册表里每个子型都必须有中文名，否则列表会露出内部标识。"""
+    import gui_app
+
+    missing = [
+        subtype
+        for cfg in gui_app.OPTION_CLASSES.values()
+        for subtype in cfg["subtypes"]
+        if subtype not in gui_app.SUBTYPE_DISPLAY
+    ]
+
+    assert missing == [], missing
+
+
+@pytest.mark.parametrize(("subtype", "expected"), [
+    # 映射缺失时不能崩，也不该显示空白：去掉无信息的 Opt_ 前缀后原样给出
+    ("Opt_未知子型", "未知子型"),
+    ("SomethingNew", "SomethingNew"),
+    ("", "—"),
+])
+def test_unmapped_subtype_falls_back_to_the_raw_identifier(
+        tmp_path, monkeypatch, subtype, expected):
+    monkeypatch.setattr(store, "SUBTYPE_DISPLAY", {})
+    path = _save(tmp_path, history_state={**_state(), "subtype": subtype})
+
+    item = next(i for i in store.list_results(str(tmp_path))
+                if i["path"] == path)
+
+    assert item["subtype"] == expected
 
 
 def test_default_label_gets_the_position_sign_right():
@@ -431,7 +531,7 @@ def test_default_label_gets_the_position_sign_right():
     用 Buy/Sell 而不是 Long/Short：后者在期权语境里指 gamma 敞口，而同一
     买卖方向在不同产品上敞口相反，拿它当买卖方向的标签必然对一半错一半。
     """
-    base = {"wind_code": "510050.SH", "history_wind_asof": "2026-07-25"}
+    base = {"wind_code": "510050.SH"}
 
     assert store.default_label({**base, "position": 1}).split()[1] == "Sell"
     assert store.default_label({**base, "position": -1}).split()[1] == "Buy"

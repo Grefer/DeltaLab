@@ -24,6 +24,7 @@ from pricing import (
     ContractHistoryPool,
     FixedTimeStrategy,
     HedgeBandStrategy,
+    Option_Vanilla,
     StrategyCase,
 )
 from pricing.constants import ANNUAL_DAYS
@@ -4131,32 +4132,6 @@ def test_history_verify_entry_falls_back_to_the_selected_row():
     assert result == "single"
 
 
-def test_history_action_hint_states_the_scope_the_button_will_run():
-    fake = SimpleNamespace(
-        _history_action_hint_var=_Var(""),
-        _history_chart_candidates=lambda lookback=None: [
-            "固定间隔(1.5σ)", "固定时刻(10:30)"],
-    )
-
-    BacktestApp._refresh_history_action_hint(fake)
-    batch_hint = fake._history_action_hint_var.get()
-
-    fake._history_chart_candidates = lambda lookback=None: []
-    BacktestApp._refresh_history_action_hint(fake)
-    single_hint = fake._history_action_hint_var.get()
-
-    # 提示必须说清这次按钮实际会跑几个策略，措辞保持平实。
-    assert "勾选的 2 个策略" in batch_hint
-    assert "选中的那一个策略" in single_hint
-
-
-def test_history_action_hint_is_silent_before_the_result_page_exists():
-    # 结果页尚未渲染时提示控件还不存在；类级默认值保证这里不会抛异常。
-    fake = SimpleNamespace(_history_action_hint_var=None)
-
-    assert BacktestApp._refresh_history_action_hint(fake) is None
-
-
 def test_history_multi_chart_model_reuses_supplied_pairs_cache():
     summary = _history_multi_chart_summary()
     cache = {}
@@ -4833,13 +4808,16 @@ def test_saved_result_reloads_into_an_identical_ranking_table(
         app2.destroy()
 
 
-def test_loaded_result_is_labelled_and_blocks_segment_drilldown(
+def test_loaded_result_is_labelled_and_blocks_drilldown_without_replay(
         history_store_dir, monkeypatch):
-    """载入的结果必须自报身份，且下钻控件要禁掉而不是点了没反应。
+    """没有重放配方的包：载入后自报身份，且下钻控件禁掉并说明原因。
 
-    包里不含 bar 级数组（161 个回测约 153 MB），所以逐段下钻确实做不到；
-    而页面仍允许「只填参数 / 用当前行情回测」——那份结论是过去某天算的，
-    不标出来会被当成刚跑的结果用。
+    包里存的是回测**输入**（行情切片 + 构造参数），不是 bar 级输出——后者
+    161 个回测约 153 MB，存不了。带配方的包可以下钻（见下一条测试）；这条
+    覆盖旧包或配方缺失的情形，那时按钮必须禁掉而不是点了没反应。
+
+    页面仍允许「只填参数 / 用当前行情回测」——那份结论是过去某天算的，不
+    标出来会被当成刚跑的结果用。
     """
     monkeypatch.setattr(
         gui_app.simpledialog, "askstring", lambda *a, **k: "近季基线")
@@ -4851,7 +4829,7 @@ def test_loaded_result_is_labelled_and_blocks_segment_drilldown(
         assert getattr(app, "_history_loaded_meta", None) is None
         assert str(app._history_replay_button.cget("state")) == "normal"
         assert _replay_note(app) is not None
-        assert "载入的结果不含" not in _replay_note(app)
+        assert "不含重放配方" not in _replay_note(app)
         path = BacktestApp._save_history_result(app)
     finally:
         app.destroy()
@@ -4865,7 +4843,7 @@ def test_loaded_result_is_labelled_and_blocks_segment_drilldown(
             app2._history_replay_window_combo.cget("state")) == "disabled"
         assert str(app2._history_replay_button.cget("state")) == "disabled"
         # 必须讲清为什么不能下钻，而不是留一个点了没反应的按钮。
-        assert "载入的结果不含逐 bar 明细" in _replay_note(app2)
+        assert "不含重放配方" in _replay_note(app2)
 
         banners = []
 
@@ -4899,6 +4877,153 @@ def test_loaded_result_is_labelled_and_blocks_segment_drilldown(
         app2.destroy()
 
 
+def _replay_fixture():
+    """一段可重跑的最小配方：真实回测 + 真实价格切片，不依赖 Wind。"""
+    from pricing.hedge_analysis import HistoryReplaySpec
+
+    # 按真实分段的形状造：首个 bar 是 Day 0 锚点（前一日收盘），其后 4 个
+    # 交易日各 6 根。总点数必须是 evaluation_days*steps_per_day + 1。
+    stamps = [pd.Timestamp("2026-01-05 15:00")]
+    for day in range(6, 10):
+        stamps.extend(
+            pd.Timestamp(f"2026-01-{day:02d} 09:3{minute}")
+            for minute in range(6))
+    index = pd.DatetimeIndex(stamps)
+    path = pd.Series(
+        100.0 + np.sin(np.arange(len(index)) / 3.0), index=index)
+    option = Option_Vanilla(
+        "Vanilla", s0=float(path.iloc[0]), sr=[], K=float(path.iloc[0]),
+        T=4, sigma=0.18, cp=1, r=0.03, q=0.03)
+    spec = HistoryReplaySpec(
+        lookback="quarter", window_id="segment_1", option=option,
+        external_path=path, evaluation_days=4, steps_per_day=6,
+        strategies={"固定间隔(1σ)": HedgeBandStrategy(
+            band_type="sigma", threshold=1.0)},
+        backtest_kwargs={"tc_rate": 0.0, "quantity": 1, "multiplier": 0},
+        metadata={"segment_no": 1, "terminal_mode": "expiry"})
+    return {"quarter": {"segment_1": spec}}
+
+
+def test_saved_replay_recipe_makes_drilldown_work_after_reload(
+        history_store_dir, monkeypatch):
+    """带重放配方的包，载入后逐段下钻必须可用。
+
+    早前误以为做不到——量的是回测**输出**（161 个约 153 MB）。真正要存的
+    是**输入**：一年 1 分钟序列 gzip 后约 206 KB，各段都是它的切片。
+    """
+    monkeypatch.setattr(
+        gui_app.simpledialog, "askstring", lambda *a, **k: "带配方")
+    ranking = _store_ranking_frame()
+    # 排名行要带上重建策略所需的身份元数据。
+    ranking = ranking.assign(
+        meta_strategy_name=[
+            "hedge_band", "close_to_close", "fixed_times", "close_to_close"],
+        meta_candidate_sigma=[1.0, np.nan, np.nan, np.nan],
+        meta_fixed_times=[np.nan, np.nan, "10:30", np.nan])
+    ranking.loc[0, "strategy"] = "固定间隔(1σ)"
+
+    app = _fresh_app()
+    try:
+        BacktestApp._show_history_recommendation(
+            app, ranking[ranking["rank"].eq(1)].copy(), ranking, notes=None,
+            source_label="Wind · 510050.SH · 1分钟", window_results=None,
+            history_state={
+                "history_lookbacks": {"quarter": 61, "year": 243},
+                "wind_code": "510050.SH", "history_wind_asof": "2026-07-25",
+                "cls_name": "香草期权 (Vanilla)", "subtype": "Eu",
+                "params": {"s0": 100.0, "K": 100.0, "T_days": 4,
+                           "sigma": 0.18, "cp": 1, "r": 0.03, "q": 0.03},
+            })
+        app._history_replay_index = _replay_fixture()
+        app.update_idletasks()
+        path = BacktestApp._save_history_result(app)
+    finally:
+        app.destroy()
+
+    app2 = _fresh_app()
+    try:
+        assert BacktestApp._load_history_result(app2, path) is True
+        app2.update_idletasks()
+        # 配方重建成功 -> 下钻可用，且文案不再说「不含重放配方」。
+        assert app2._history_loaded_meta["replay_available"] is True
+        assert app2._history_replay_index
+        assert str(app2._history_replay_button.cget("state")) == "normal"
+        assert "不含重放配方" not in _replay_note(app2)
+
+        spec = app2._history_replay_index["quarter"]["segment_1"]
+        assert spec.evaluation_days == 4
+        assert spec.steps_per_day == 6
+        assert len(spec.external_path) == 25
+        assert spec.external_path.index.normalize().nunique() == 5
+        # 期权按段初价重定基——与原始运行同一个函数，否则重放会与排名不符。
+        assert spec.option.s0 == pytest.approx(100.0, abs=1e-9)
+        # 真能跑起来。
+        assert spec.replay("固定间隔(1σ)") is not None
+    finally:
+        app2.destroy()
+
+
+def test_loading_syncs_the_option_form_and_display_metadata(
+        history_store_dir, monkeypatch):
+    """载入后左侧表单必须跟着变，展示页摘要也要有来源。
+
+    不同步不只是「看不见」：「用当前行情回测」读的是左侧表单，表单没跟上
+    就会拿另一套期权参数去跑，而结论页仍挂着这份载入结果的名字——两者对
+    不上且不会报错。逐段下钻的展示页摘要同理，它从 _latest_history_state
+    取期权类型/子类型/数据来源，不设就全是 None。
+    """
+    monkeypatch.setattr(
+        gui_app.simpledialog, "askstring", lambda *a, **k: "同步校验")
+    frozen = {
+        "history_lookbacks": {"quarter": 61, "year": 243},
+        "wind_code": "510050.SH", "history_wind_asof": "2026-07-25",
+        "cls_name": "香草期权 (Vanilla)", "subtype": "Eu",
+        "params": {"s0": 100.0, "K": 100.0, "T_days": 30, "sigma": 0.23,
+                   "cp": -1, "r": 0.025, "q": 0.015},
+        "source": "wind", "position": -1, "quantity": 50.0,
+        "multiplier": 10.0, "tc_rate": 0.0003, "slippage_bps": 2.0,
+        "force_day_close_hedge": False,
+    }
+    app = _fresh_app()
+    try:
+        ranking = _store_ranking_frame()
+        BacktestApp._show_history_recommendation(
+            app, ranking[ranking["rank"].eq(1)].copy(), ranking, notes=None,
+            source_label="Wind · 510050.SH · 1分钟", window_results=None,
+            history_state=frozen)
+        app.update_idletasks()
+        path = BacktestApp._save_history_result(app)
+    finally:
+        app.destroy()
+
+    app2 = _fresh_app()
+    try:
+        # 先把左侧改成完全不同的配置，确认载入真的覆盖了它。
+        app2._class_var.set("雪球期权 (Snowball)")
+        BacktestApp._on_option_class_change(app2, None)
+        app2._qty_var.set("999")
+        app2.update_idletasks()
+
+        assert BacktestApp._load_history_result(app2, path) is True
+        app2.update_idletasks()
+
+        assert app2._class_var.get() == "香草期权 (Vanilla)"
+        assert app2._subtype_var.get() == gui_app.SUBTYPE_DISPLAY["Eu"]
+        assert app2._param_entries["sigma"][0].get() == "0.23"
+        assert app2._param_entries["T_days"][0].get() == "30"
+        assert app2._qty_var.get() == "50"
+        assert app2._mult_var.get() == "10"
+        # 成本率界面用百分数，状态里是小数
+        assert app2._tc_var.get() == "0.03"
+        assert bool(app2._force_day_close_hedge_var.get()) is False
+        # 展示页摘要的三项来源不能是 None
+        assert app2._latest_history_state
+        for key in ("cls_name", "subtype", "source"):
+            assert app2._latest_history_state.get(key), key
+    finally:
+        app2.destroy()
+
+
 def test_running_a_fresh_optimisation_clears_the_loaded_marker(
         history_store_dir, monkeypatch):
     """真跑一轮之后不能还挂着「载入结果」横幅、也不能继续禁用下钻。"""
@@ -4918,7 +5043,7 @@ def test_running_a_fresh_optimisation_clears_the_loaded_marker(
 
         assert getattr(app, "_history_loaded_meta", None) is None
         assert str(app._history_replay_button.cget("state")) == "normal"
-        assert "载入的结果不含" not in _replay_note(app)
+        assert "不含重放配方" not in _replay_note(app)
     finally:
         app.destroy()
 
@@ -5551,11 +5676,11 @@ def test_history_conclusion_card_tracks_the_selected_rank_row():
         app.destroy()
 
 
-def test_history_run_button_sits_in_the_page_header_with_its_own_progress():
-    """主行动与进度都必须留在本页。
+def test_history_run_button_stays_pinned_in_the_page_header():
+    """主行动固定在页首，折叠候选配置不会让它移位。
 
-    按钮此前跟在候选配置下方，折叠配置时会随之上跳；而进度条只有左侧参
-    数栏那一条，用户正看着本页时那边的动静完全看不到。
+    按钮此前跟在候选配置下方，折叠配置时会随之上跳，出结果后又被推到滚动
+    区上方，想改参数重跑得先往回滚。
     """
     import tkinter as tk
     try:
@@ -5581,16 +5706,6 @@ def test_history_run_button_sits_in_the_page_header_with_its_own_progress():
         BacktestApp._toggle_history_config_panel(app)
         app.update_idletasks()
         assert app._history_config_panel.winfo_manager() == "pack"
-
-        assert not app._history_progress.grid_info()
-        BacktestApp._set_history_progress(app, "正在优选（近一年）…")
-        app.update_idletasks()
-        assert app._history_progress.grid_info()
-        assert "近一年" in app._history_progress_var.get()
-        BacktestApp._set_history_progress(app, "")
-        app.update_idletasks()
-        assert not app._history_progress.grid_info()
-        assert app._history_progress_var.get() == ""
     finally:
         app.destroy()
 
@@ -6049,4 +6164,120 @@ def test_auto_start_is_cleared_when_no_period_is_selected():
         assert app._history_wind_start_var.get() == ""
         assert "未选择分析周期" in app._history_base_summary_var.get()
     finally:
+        app.destroy()
+
+
+def test_candidate_panel_inputs_share_one_size():
+    """候选空间里的输入框必须同宽同高。
+
+    此前时刻/带宽候选是 184px、两个日期是 107px，尾部说明跟着错开。
+    """
+    app = _wind_history_app()
+    try:
+        app._nb.select(app._history_tab)
+        app.update_idletasks()
+        entries = {
+            "时刻候选": app._history_fixed_times_entry,
+            "带宽候选": app._history_band_candidate_entry,
+            "自定义起始日": app._history_wind_start_entry,
+            "分析截至日": app._history_wind_asof_entry,
+        }
+        sizes = {
+            name: (w.winfo_width(), w.winfo_height())
+            for name, w in entries.items()
+        }
+        assert len(set(sizes.values())) == 1, sizes
+    finally:
+        app.destroy()
+
+
+def test_date_inputs_do_not_move_when_the_auto_checkbox_toggles():
+    """勾选/取消「根据周期自动推算起始日」不得让输入框左右位移。
+
+    提示行原本跨全部列，它的文案随模式变化（自动一长句、手动为空），列宽
+    跟着重算，两个日期框就被挤得左右跳。
+    """
+    app = _wind_history_app()
+    try:
+        app._nb.select(app._history_tab)
+        app.update_idletasks()
+
+        def x_positions():
+            # 用容器内相对坐标：窗口在测试里是 withdraw 的，绝对屏幕坐标要
+            # 等布局定型才稳定，而"是否位移"本来就该在父容器里衡量。
+            app.update_idletasks()
+            return (app._history_wind_start_entry.winfo_x(),
+                    app._history_wind_asof_entry.winfo_x())
+
+        baseline = x_positions()
+        for auto in (False, True, False, True):
+            app._history_wind_auto_start_var.set(auto)
+            BacktestApp._toggle_history_wind_controls(app)
+            assert x_positions() == baseline, f"auto={auto} 时发生位移"
+
+        # 周期变化会改写提示里的天数，同样不得挪动输入框。
+        for key, var in app._history_period_vars.items():
+            var.set(key == "week")
+        BacktestApp._history_period_selection_changed(app)
+        assert x_positions() == baseline
+
+        for var in app._history_period_vars.values():
+            var.set(False)
+        BacktestApp._history_period_selection_changed(app)
+        assert x_positions() == baseline
+    finally:
+        app.destroy()
+
+
+def test_candidate_rows_align_their_labels_and_hints():
+    """同组内各行的标签、输入框、尾部说明要各自成列。"""
+    app = _wind_history_app()
+    try:
+        app._nb.select(app._history_tab)
+        app.update_idletasks()
+
+        # 两个候选参数行同属一组。
+        assert (app._history_fixed_times_entry.winfo_rootx()
+                == app._history_band_candidate_entry.winfo_rootx())
+        # 两个日期行同属一组。
+        assert (app._history_wind_start_entry.winfo_rootx()
+                == app._history_wind_asof_entry.winfo_rootx())
+    finally:
+        app.destroy()
+
+
+def test_optimization_reuses_the_one_shared_progress_bar():
+    """优选任务复用全应用唯一那条进度条，不另建一条。
+
+    界面上只该有一个长任务指示器，任务名由底部状态栏给出。此前本页另建了
+    一条，运行时同屏两条一起转。
+    """
+    import threading
+
+    app = _wind_history_app()
+    original_thread = threading.Thread
+    try:
+        app._nb.select(app._history_tab)
+        app.update_idletasks()
+        assert not app._progress.winfo_ismapped()
+        # 本页不得再有自己的进度条部件。
+        assert not hasattr(app, "_history_progress")
+        assert not hasattr(BacktestApp, "_set_history_progress")
+
+        # 拦住真正的后台线程，只观察进度条状态。
+        threading.Thread = lambda *a, **k: SimpleNamespace(start=lambda: None)
+        assert BacktestApp._run_history_recommendation(app) is True
+        threading.Thread = original_thread
+        app.update_idletasks()
+
+        assert app._progress.winfo_ismapped(), "优选应当启动共用进度条"
+        assert "批量优选" in app._status_var.get()
+
+        BacktestApp._finish_job(
+            app, "history", success=True,
+            success_text="策略优选完成", failure_text="失败")
+        app.update_idletasks()
+        assert not app._progress.winfo_ismapped()
+    finally:
+        threading.Thread = original_thread
         app.destroy()

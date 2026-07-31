@@ -19,6 +19,7 @@ from dataclasses import dataclass, field
 from types import SimpleNamespace
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, simpledialog
+import tkinter.font as tkfont
 import numpy as np
 import matplotlib
 matplotlib.use("TkAgg")
@@ -95,6 +96,66 @@ PALETTE = {
     "tab_inactive": "#E2E8F0",   # 未选中 tab 底色
 }
 
+# ---- 左侧参数面板的统一度量 (像素) ----
+# 三个分组 (期权类型 / 期权参数 / 回测设置) 以及它们内部的子面板共用同一套
+# 列宽, 输入框的左右边缘才能跨分组对齐; 列宽由 grid 的 minsize 强制, 各控件
+# 自己的 width= 只是字符数下限, 因此统一改这里就能整体调节表单尺寸。
+FORM_LABEL_W     = 144   # 标签列宽 (含标签右侧留白; 容得下最长的雪球保证金标签)
+FORM_INPUT_W     = 168   # 输入列宽: 所有 Entry / Combobox 等宽
+FORM_LABEL_GAP   = 10    # 标签与输入框之间的留白
+FORM_HINT_GAP    = 8     # 输入框与右侧说明文字之间的留白
+FORM_ROW_PADY    = 4     # 每行上下留白 => 相邻控件间隔恒为 8
+FORM_SECTION_PAD = 12    # 分组内边距
+FORM_SECTION_GAP = 10    # 分组之间的间距
+FORM_ENTRY_CHARS = 8     # 字符宽度只作下限, 实际宽度取 FORM_INPUT_W
+
+
+def _form_grid(container):
+    """把容器配成统一的三列表单: 标签 | 等宽输入 | 说明文字。
+
+    只有第三列可伸缩, 面板拉宽时输入框不会跟着变形, 跨分组始终等宽对齐。
+    """
+    container.columnconfigure(0, minsize=FORM_LABEL_W, weight=0)
+    container.columnconfigure(1, minsize=FORM_INPUT_W, weight=0)
+    container.columnconfigure(2, weight=1)
+
+
+def _form_label(parent, text, row, column=0, columnspan=1,
+                style="Surface.TLabel"):
+    """表单标签: 统一右侧留白与行距。"""
+    widget = ttk.Label(parent, text=text, style=style)
+    widget.grid(row=row, column=column, columnspan=columnspan, sticky="w",
+                padx=(0, FORM_LABEL_GAP), pady=FORM_ROW_PADY)
+    return widget
+
+
+def _form_input(widget, row, column=1, columnspan=1, sticky="ew"):
+    """表单输入: 贴住输入列左边缘, 宽度由列宽统一。
+
+    多控件组合 (单选组、带勾选框的行) 传 columnspan=2 + sticky="w",
+    让它们向右溢出到说明列, 而不是把输入列撑宽。
+    """
+    widget.grid(row=row, column=column, columnspan=columnspan,
+                sticky=sticky, pady=FORM_ROW_PADY)
+    return widget
+
+
+def _form_hint(parent, row, text, column=2, columnspan=1):
+    """输入框右侧的浅色说明文字。"""
+    widget = ttk.Label(parent, text=text, style="SurfaceMuted.TLabel")
+    widget.grid(row=row, column=column, columnspan=columnspan, sticky="w",
+                padx=(FORM_HINT_GAP, 0), pady=FORM_ROW_PADY)
+    return widget
+
+
+def _form_separator(parent, row, columnspan=3):
+    """分组内的轻分割线: 上下留白一致。"""
+    widget = ttk.Separator(parent, orient="horizontal")
+    widget.grid(row=row, column=0, columnspan=columnspan, sticky="ew",
+                pady=(FORM_ROW_PADY + 4, FORM_ROW_PADY + 2))
+    return widget
+
+
 # matplotlib 整体风格配置 (与 Tk 主题协调)
 plt.rcParams['axes.facecolor']   = PALETTE["surface"]
 plt.rcParams['figure.facecolor'] = PALETTE["surface"]
@@ -126,10 +187,14 @@ from pricing.hedge_analysis import (
     LOOKBACK_DAYS,
     DEFAULT_SELECTION_OBJECTIVE,
     SELECTION_OBJECTIVES,
+    HistoryReplaySpec,
     rerank_history,
     recommend_by_contract_history_pool,
     recommend_by_rolling_history,
 )
+# 载入结果包时按冻结参数重建每段的期权：原始运行也是按段初价重定基的，
+# 用同一个函数才能保证重放与排名同源。
+from pricing.hedge_backtest import _rescale_option_to_real_s0
 from pricing.hedge_backtest import (
     _infer_intraday_steps,
     _rescale_strategy_to_real_s0,
@@ -144,6 +209,7 @@ from history_selection import (
     MAX_HISTORY_CHART_CANDIDATES,
 )
 import history_store
+import history_bar_cache
 
 # ============================================================
 #  期权类型注册表
@@ -343,6 +409,10 @@ SUBTYPE_DISPLAY = {
     "Opt_Snowball":          "雪球",
 }
 SUBTYPE_FROM_DISPLAY = {v: k for k, v in SUBTYPE_DISPLAY.items()}
+
+# 已保存结果列表要显示子类型的中文名。history_store 保持纯逻辑、不反
+# 向依赖 GUI，所以由这里把映射注入进去。
+history_store.SUBTYPE_DISPLAY = SUBTYPE_DISPLAY
 
 STRATEGY_DISPLAY = {
     "close_to_close": "每日收盘",
@@ -641,7 +711,6 @@ class BacktestApp(tk.Tk):
     # 结果页的实例用 getattr(..., None) 兜底会递归。策略优选结果页按需创建
     # 的状态统一在类级给出 None 默认值。
     _history_pairs_cache = None
-    _history_action_hint_var = None
 
     def __init__(self):
         super().__init__()
@@ -781,13 +850,15 @@ class BacktestApp(tk.Tk):
                         padding=(4, 0))
 
         # ---- 输入控件 ----
+        # Entry 与 Combobox 的纵向内边距取同一个值, 两者才等高;
+        # 横向留 6 让文字不贴边 (Combobox 右侧还要放下箭头, 少 2)。
         style.configure("TEntry",
                         fieldbackground=PALETTE["surface"],
                         foreground=PALETTE["text"],
                         bordercolor=PALETTE["border"],
                         lightcolor=PALETTE["border"],
                         darkcolor=PALETTE["border"],
-                        padding=4)
+                        padding=(6, 4))
         style.map("TEntry",
                   bordercolor=[("focus", PALETTE["primary"])],
                   lightcolor=[("focus", PALETTE["primary"])])
@@ -798,7 +869,7 @@ class BacktestApp(tk.Tk):
                         foreground=PALETTE["text"],
                         bordercolor=PALETTE["border"],
                         arrowcolor=PALETTE["text_muted"],
-                        padding=3)
+                        padding=(6, 4))
         style.map("TCombobox",
                   fieldbackground=[("readonly", PALETTE["surface"])],
                   bordercolor=[("focus", PALETTE["primary"])],
@@ -881,6 +952,9 @@ class BacktestApp(tk.Tk):
                   background=[("active", PALETTE["border_soft"]),
                               ("pressed", PALETTE["border"])],
                   bordercolor=[("active", PALETTE["primary"])])
+
+        # 行内小按钮 (如 CSV 的「浏览…」): 纵向内边距与输入框对齐, 同高
+        style.configure("Field.TButton", padding=(10, 4))
 
         # 主色按钮 (运行)
         style.configure("Run.TButton",
@@ -1010,10 +1084,12 @@ class BacktestApp(tk.Tk):
         body.add(left_outer, weight=1)
 
         # 外层 Canvas 横向充满, Scrollbar 靠右
-        # width 仅作为 PanedWindow 初始 sash 位置的参考, 不阻止后续缩放
+        # width 仅作为 PanedWindow 初始 sash 位置的参考, 不阻止后续缩放;
+        # 取表单三列 (标签 + 输入 + 说明) 的自然宽度, 初次打开时右侧说明
+        # 文字不会被 sash 截断
         self._left_canvas = tk.Canvas(
             left_outer, highlightthickness=0, bd=0,
-            bg=PALETTE["surface"], width=440,
+            bg=PALETTE["surface"], width=480,
         )
         self._left_scrollbar = ttk.Scrollbar(
             left_outer, orient="vertical", command=self._left_canvas.yview
@@ -1076,117 +1152,108 @@ class BacktestApp(tk.Tk):
         left = self._left_inner
 
         # 1) 期权大类
-        sec1 = ttk.LabelFrame(left, text=" 期权类型 ", padding=12)
-        sec1.pack(fill="x", pady=(0, 8))
+        sec1 = ttk.LabelFrame(left, text=" 期权类型 ", padding=FORM_SECTION_PAD)
+        sec1.pack(fill="x", pady=(0, FORM_SECTION_GAP))
+        _form_grid(sec1)
 
-        ttk.Label(sec1, text="大类:", style="Surface.TLabel").grid(
-            row=0, column=0, sticky="w", pady=4)
+        _form_label(sec1, "大类:", 0)
         self._class_var = tk.StringVar()
-        class_cb = ttk.Combobox(sec1, textvariable=self._class_var, width=25,
+        class_cb = ttk.Combobox(sec1, textvariable=self._class_var,
+                                width=FORM_ENTRY_CHARS,
                                 values=list(OPTION_CLASSES.keys()), state="readonly")
-        class_cb.grid(row=0, column=1, padx=(8, 0), pady=4, sticky="ew")
+        _form_input(class_cb, 0)
         class_cb.current(0)
         class_cb.bind("<<ComboboxSelected>>", self._on_option_class_change)
 
-        ttk.Label(sec1, text="子类型:", style="Surface.TLabel").grid(
-            row=1, column=0, sticky="w", pady=4)
+        _form_label(sec1, "子类型:", 1)
         self._subtype_var = tk.StringVar()
         self._subtype_cb = ttk.Combobox(sec1, textvariable=self._subtype_var,
-                                        width=25, state="readonly")
-        self._subtype_cb.grid(row=1, column=1, padx=(8, 0), pady=4, sticky="ew")
+                                        width=FORM_ENTRY_CHARS, state="readonly")
+        _form_input(self._subtype_cb, 1)
         self._subtype_cb.bind(
             "<<ComboboxSelected>>", lambda _event: self._schedule_band_reference_sync())
-        sec1.columnconfigure(1, weight=1)
 
         # 2) 期权参数
         # 说明: 外层左侧已经有整体 Canvas+Scrollbar, 这里不再嵌套独立滚动容器,
         # 让参数区按内容自然撑开高度, 整体滚动由外层统一处理.
-        sec2 = ttk.LabelFrame(left, text=" 期权参数 ", padding=12)
-        sec2.pack(fill="x", pady=(0, 8))
+        sec2 = ttk.LabelFrame(left, text=" 期权参数 ", padding=FORM_SECTION_PAD)
+        sec2.pack(fill="x", pady=(0, FORM_SECTION_GAP))
 
         self._param_frame = ttk.Frame(sec2, style="Surface.TFrame")
         self._param_frame.pack(fill="x", expand=True)
+        _form_grid(self._param_frame)
 
         # 3) 回测设置
-        sec3 = ttk.LabelFrame(left, text=" 回测设置 ", padding=12)
-        sec3.pack(fill="x", pady=(0, 8))
+        sec3 = ttk.LabelFrame(left, text=" 回测设置 ", padding=FORM_SECTION_PAD)
+        sec3.pack(fill="x", pady=(0, FORM_SECTION_GAP))
+        _form_grid(sec3)
 
-        ttk.Label(sec3, text="数据来源:", style="Surface.TLabel").grid(
-            row=0, column=0, sticky="w", pady=4)
+        _form_label(sec3, "数据来源:", 0)
         self._source_var = tk.StringVar(value="simulate")
         src_frame = ttk.Frame(sec3, style="Surface.TFrame")
-        src_frame.grid(row=0, column=1, sticky="w", padx=(8, 0))
+        # 单选组比输入列宽, 让它跨到说明列, 免得把输入列撑变形
+        _form_input(src_frame, 0, columnspan=2, sticky="w")
         ttk.Radiobutton(src_frame, text="模拟", variable=self._source_var,
-                        value="simulate", command=self._toggle_source).pack(side="left", padx=(0, 6))
+                        value="simulate", command=self._toggle_source).pack(side="left")
         ttk.Radiobutton(src_frame, text="CSV", variable=self._source_var,
-                        value="csv", command=self._toggle_source).pack(side="left", padx=6)
+                        value="csv", command=self._toggle_source).pack(side="left", padx=(12, 0))
         ttk.Radiobutton(src_frame, text="Wind", variable=self._source_var,
-                        value="wind", command=self._toggle_source).pack(side="left", padx=6)
+                        value="wind", command=self._toggle_source).pack(side="left", padx=(12, 0))
 
+        # 模拟 / CSV / Wind 三个子面板共用同一套列宽, 切换数据来源时
+        # 输入框不会左右跳动。
         # 模拟参数
         self._sim_frame = ttk.Frame(sec3, style="Surface.TFrame")
-        self._sim_frame.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(4, 2))
-        ttk.Label(self._sim_frame, text="种子:", style="Surface.TLabel").grid(
-            row=0, column=0, sticky="w", pady=2)
+        self._sim_frame.grid(row=1, column=0, columnspan=3, sticky="ew")
+        _form_grid(self._sim_frame)
+        _form_label(self._sim_frame, "种子:", 0)
         self._seed_var = tk.StringVar(value="42")
-        ttk.Entry(self._sim_frame, textvariable=self._seed_var, width=10).grid(
-            row=0, column=1, padx=(6, 0), pady=2, sticky="w")
-        ttk.Label(self._sim_frame, text="已实现波动率:", style="Surface.TLabel").grid(
-            row=1, column=0, sticky="w", pady=2)
+        _form_input(ttk.Entry(self._sim_frame, textvariable=self._seed_var,
+                              width=FORM_ENTRY_CHARS), 0)
+        _form_label(self._sim_frame, "已实现波动率:", 1)
         self._real_vol_var = tk.StringVar(value="")
-        rv_frame = ttk.Frame(self._sim_frame, style="Surface.TFrame")
-        rv_frame.grid(row=1, column=1, columnspan=3, sticky="w", padx=(6, 0), pady=2)
-        ttk.Entry(rv_frame, textvariable=self._real_vol_var, width=10).pack(side="left")
-        ttk.Label(rv_frame, text=" 空=同隐含", style="SurfaceMuted.TLabel").pack(side="left")
-        ttk.Label(self._sim_frame, text="回测路径数 (MC):", style="Surface.TLabel").grid(
-            row=2, column=0, sticky="w", pady=2)
+        _form_input(ttk.Entry(self._sim_frame, textvariable=self._real_vol_var,
+                              width=FORM_ENTRY_CHARS), 1)
+        _form_hint(self._sim_frame, 1, "空=同隐含")
+        _form_label(self._sim_frame, "回测路径数 (MC):", 2)
         self._npaths_var = tk.StringVar(value="10")
-        ttk.Entry(self._sim_frame, textvariable=self._npaths_var, width=10).grid(
-            row=2, column=1, padx=(6, 0), pady=2, sticky="w")
-        ttk.Label(self._sim_frame, text="每日模拟采样点数:",
-                  style="Surface.TLabel").grid(
-            row=3, column=0, sticky="w", pady=2)
-        sim_spd_frame = ttk.Frame(self._sim_frame, style="Surface.TFrame")
-        sim_spd_frame.grid(row=3, column=1, columnspan=3,
-                           sticky="w", padx=(6, 0), pady=2)
+        _form_input(ttk.Entry(self._sim_frame, textvariable=self._npaths_var,
+                              width=FORM_ENTRY_CHARS), 2)
+        _form_label(self._sim_frame, "每日模拟采样点数:", 3)
         self._spd_var = tk.StringVar(value="1")
         self._spd_combo = ttk.Combobox(
-            sim_spd_frame, textvariable=self._spd_var, width=6,
+            self._sim_frame, textvariable=self._spd_var, width=FORM_ENTRY_CHARS,
             values=("1", "4", "48", "240"), state="readonly")
-        self._spd_combo.pack(side="left")
-        ttk.Label(
-            sim_spd_frame,
-            text=" 每个交易日等分为 1 / 4 / 48 / 240 个采样点",
-            style="SurfaceMuted.TLabel",
-        ).pack(side="left", padx=(6, 0))
+        _form_input(self._spd_combo, 3)
+        _form_hint(self._sim_frame, 3, "每个交易日等分的采样点数")
 
         # CSV 参数
         self._csv_frame = ttk.Frame(sec3, style="Surface.TFrame")
-        ttk.Label(self._csv_frame, text="文件:", style="Surface.TLabel").grid(
-            row=0, column=0, sticky="w", pady=2)
+        _form_grid(self._csv_frame)
+        _form_label(self._csv_frame, "文件:", 0)
         self._csv_path_var = tk.StringVar()
-        ttk.Entry(self._csv_frame, textvariable=self._csv_path_var, width=22).grid(
-            row=0, column=1, padx=(6, 4), pady=2)
+        _form_input(ttk.Entry(self._csv_frame, textvariable=self._csv_path_var,
+                              width=FORM_ENTRY_CHARS), 0)
         ttk.Button(self._csv_frame, text="浏览…", width=6,
-                   command=self._browse_csv).grid(row=0, column=2, pady=2)
-        ttk.Label(self._csv_frame, text="价格列:", style="Surface.TLabel").grid(
-            row=1, column=0, sticky="w", pady=2)
+                   style="Field.TButton", command=self._browse_csv).grid(
+            row=0, column=2, sticky="w",
+            padx=(FORM_HINT_GAP, 0), pady=FORM_ROW_PADY)
+        _form_label(self._csv_frame, "价格列:", 1)
         self._csv_col_var = tk.StringVar(value="close")
-        ttk.Entry(self._csv_frame, textvariable=self._csv_col_var, width=12).grid(
-            row=1, column=1, padx=(6, 0), pady=2, sticky="w")
+        _form_input(ttk.Entry(self._csv_frame, textvariable=self._csv_col_var,
+                              width=FORM_ENTRY_CHARS), 1)
 
         # Wind 参数
         self._wind_frame = ttk.Frame(sec3, style="Surface.TFrame")
-        ttk.Label(self._wind_frame, text="代码:", style="Surface.TLabel").grid(
-            row=0, column=0, sticky="w", pady=2)
+        _form_grid(self._wind_frame)
+        _form_label(self._wind_frame, "代码:", 0)
         self._wind_code_var = tk.StringVar(value="510050.SH")
-        ttk.Entry(self._wind_frame, textvariable=self._wind_code_var, width=15).grid(
-            row=0, column=1, padx=(6, 0), pady=2)
+        _form_input(ttk.Entry(self._wind_frame, textvariable=self._wind_code_var,
+                              width=FORM_ENTRY_CHARS), 0)
         # 建仓日排在最上面：它才是读结果时关心的那一天。勾选倒推时这一格
         # 由「数据截止日」按期权期限沿交易日历往前算出来并回填（置灰只读），
         # 开关紧跟其后说明这格是谁算的；下一行才是作为主控的截止日。
-        ttk.Label(self._wind_frame, text="建仓日:", style="Surface.TLabel").grid(
-            row=1, column=0, sticky="w", pady=2)
+        _form_label(self._wind_frame, "建仓日:", 1)
         _today = datetime.date.today()
         # 截止日默认落在最近一个「已收盘」交易日：当天盘中拉行情，最后一个
         # 交易日组只有半天 bar，分钟粒度的策略会被判成盘中残段而直接拒绝。
@@ -1197,22 +1264,24 @@ class BacktestApp(tk.Tk):
         _wind_start_default = (_today - datetime.timedelta(days=90)).strftime("%Y-%m-%d")
         self._wind_start_var = tk.StringVar(value=_wind_start_default)
         self._wind_start_entry = ttk.Entry(
-            self._wind_frame, textvariable=self._wind_start_var, width=15)
-        self._wind_start_entry.grid(row=1, column=1, padx=(6, 8), pady=2)
+            self._wind_frame, textvariable=self._wind_start_var,
+            width=FORM_ENTRY_CHARS)
+        _form_input(self._wind_start_entry, 1)
         self._wind_auto_start_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(
             self._wind_frame, text="按数据截止日倒推",
             variable=self._wind_auto_start_var,
             command=self._toggle_wind_auto_start,
-        ).grid(row=1, column=2, columnspan=2, sticky="w", padx=(4, 0), pady=2)
+            style="Surface.TCheckbutton",
+        ).grid(row=1, column=2, sticky="w",
+               padx=(FORM_HINT_GAP, 0), pady=FORM_ROW_PADY)
 
-        ttk.Label(self._wind_frame, text="数据截止日:",
-                  style="Surface.TLabel").grid(
-            row=2, column=0, sticky="w", pady=2)
+        _form_label(self._wind_frame, "数据截止日:", 2)
         self._wind_end_var = tk.StringVar(value=_wind_asof_default)
         self._wind_end_entry = ttk.Entry(
-            self._wind_frame, textvariable=self._wind_end_var, width=15)
-        self._wind_end_entry.grid(row=2, column=1, padx=(6, 8), pady=2)
+            self._wind_frame, textvariable=self._wind_end_var,
+            width=FORM_ENTRY_CHARS)
+        _form_input(self._wind_end_entry, 2)
         # 界面上不再单列"实际区间"，两个日期框就是本次真实取数区间，因此
         # 截止日填成休市日时也要落到倒推真正用的那个锚点（不晚于它的最近
         # 交易日）。逐次击键就落值会打断输入，只在提交时对齐。
@@ -1224,14 +1293,13 @@ class BacktestApp(tk.Tk):
         # 行情采样粒度不再由用户选择：每种策略的正确粒度是唯一确定的
         # （收盘=日频、固定时刻=能覆盖目标时刻的最粗、价格波动=1 分钟），
         # 手动调粗只会静默让结论偏乐观。这里只展示本次将要使用的粒度。
-        ttk.Label(self._wind_frame, text="行情采样粒度:",
-                  style="Surface.TLabel").grid(
-            row=3, column=0, sticky="w", pady=2)
+        _form_label(self._wind_frame, "行情采样粒度:", 3)
         self._wind_frequency_hint_var = tk.StringVar()
+        # 这一格是只读结论, 不是输入框, 因此贴着输入列起点直接铺开
         ttk.Label(
             self._wind_frame, textvariable=self._wind_frequency_hint_var,
             style="SurfaceMuted.TLabel",
-        ).grid(row=3, column=1, columnspan=3, sticky="w", padx=(6, 0), pady=2)
+        ).grid(row=3, column=1, columnspan=2, sticky="w", pady=FORM_ROW_PADY)
         self._toggle_wind_auto_start()
         self._refresh_wind_frequency_hint()
         self._wind_code_var.trace_add(
@@ -1240,124 +1308,120 @@ class BacktestApp(tk.Tk):
             "write", lambda *_args: self._sync_wind_entry_date())
 
         # 轻分割线
-        ttk.Separator(sec3, orient="horizontal").grid(
-            row=2, column=0, columnspan=2, sticky="ew", pady=(8, 6))
+        _form_separator(sec3, 2)
 
         # 对冲参数
         row_h = 3
-        ttk.Label(sec3, text="交易成本率(%):", style="Surface.TLabel").grid(
-            row=row_h, column=0, sticky="w", pady=4)
+        _form_label(sec3, "交易成本率(%):", row_h)
         self._tc_var = tk.StringVar(value="0.01")
-        ttk.Entry(sec3, textvariable=self._tc_var, width=10).grid(
-            row=row_h, column=1, sticky="w", padx=(8, 0), pady=4)
+        _form_input(ttk.Entry(sec3, textvariable=self._tc_var,
+                              width=FORM_ENTRY_CHARS), row_h)
 
         row_h += 1
-        ttk.Label(sec3, text="头寸方向:", style="Surface.TLabel").grid(
-            row=row_h, column=0, sticky="w", pady=4)
+        _form_label(sec3, "头寸方向:", row_h)
         self._pos_var = tk.StringVar(value="1")
         pos_frame = ttk.Frame(sec3, style="Surface.TFrame")
-        pos_frame.grid(row=row_h, column=1, sticky="w", padx=(8, 0), pady=4)
+        _form_input(pos_frame, row_h, columnspan=2, sticky="w")
         ttk.Radiobutton(pos_frame, text="卖出 (Sell)", variable=self._pos_var,
-                        value="1").pack(side="left", padx=(0, 8))
+                        value="1").pack(side="left")
         ttk.Radiobutton(pos_frame, text="买入 (Buy)", variable=self._pos_var,
-                        value="-1").pack(side="left")
+                        value="-1").pack(side="left", padx=(12, 0))
 
         row_h += 1
-        ttk.Label(sec3, text="交易数量:", style="Surface.TLabel").grid(
-            row=row_h, column=0, sticky="w", pady=4)
+        _form_label(sec3, "交易数量:", row_h)
         self._qty_var = tk.StringVar(value="100")
-        ttk.Entry(sec3, textvariable=self._qty_var, width=12).grid(
-            row=row_h, column=1, sticky="w", padx=(8, 0), pady=4)
+        _form_input(ttk.Entry(sec3, textvariable=self._qty_var,
+                              width=FORM_ENTRY_CHARS), row_h)
 
         row_h += 1
-        ttk.Label(sec3, text="合约乘数:", style="Surface.TLabel").grid(
-            row=row_h, column=0, sticky="w", pady=4)
+        _form_label(sec3, "合约乘数:", row_h)
         self._mult_var = tk.StringVar(value="5")
-        mult_frame = ttk.Frame(sec3, style="Surface.TFrame")
-        mult_frame.grid(row=row_h, column=1, sticky="w", padx=(8, 0), pady=4)
-        ttk.Entry(mult_frame, textvariable=self._mult_var, width=10).pack(side="left")
-        ttk.Label(mult_frame, text=" 0=不取整", style="SurfaceMuted.TLabel").pack(side="left")
+        _form_input(ttk.Entry(sec3, textvariable=self._mult_var,
+                              width=FORM_ENTRY_CHARS), row_h)
+        _form_hint(sec3, row_h, "0=不取整")
 
         # 轻分割线：高级对冲参数（策略 / intraday / 滑点）
         row_h += 1
-        ttk.Separator(sec3, orient="horizontal").grid(
-            row=row_h, column=0, columnspan=2, sticky="ew", pady=(8, 4))
+        _form_separator(sec3, row_h)
 
         row_h += 1
-        ttk.Label(sec3, text="对冲策略:", style="Surface.TLabel").grid(
-            row=row_h, column=0, sticky="w", pady=4)
+        _form_label(sec3, "对冲策略:", row_h)
         self._strategy_var = tk.StringVar(
             value=STRATEGY_DISPLAY["close_to_close"])
-        strat_frame = ttk.Frame(sec3, style="Surface.TFrame")
-        strat_frame.grid(row=row_h, column=1, sticky="w", padx=(8, 0), pady=4)
         self._strategy_combo = ttk.Combobox(
-            strat_frame, textvariable=self._strategy_var, width=16,
+            sec3, textvariable=self._strategy_var, width=FORM_ENTRY_CHARS,
             values=tuple(STRATEGY_DISPLAY.values()), state="readonly",
         )
-        self._strategy_combo.pack(side="left")
+        _form_input(self._strategy_combo, row_h)
         self._strategy_combo.bind("<<ComboboxSelected>>", lambda e: self._toggle_strategy())
-        # 紧贴策略下拉：它只修饰所选策略的触发时点，不是第四种策略。原先排在
+
+        # 紧跟策略下拉：它只修饰所选策略的触发时点，不是第四种策略。原先排在
         # 固定时刻 / 带宽参数之后，会随策略切换在面板里上下跳。
         # 默认开启：日内触发策略若不在收盘补一次，隔夜会裸露一整晚的
         # Δ 敞口，而回测把这段风险记为零成本，结果偏乐观。
+        row_h += 1
         self._force_day_close_hedge_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(
-            strat_frame, text="每日收盘保底对冲（重复则跳过）",
+            sec3, text="每日收盘保底对冲（重复则跳过）",
             variable=self._force_day_close_hedge_var,
             command=self._refresh_history_base_summary,
-        ).pack(side="left", padx=(8, 0))
+            style="Surface.TCheckbutton",
+        ).grid(row=row_h, column=1, columnspan=2, sticky="w", pady=FORM_ROW_PADY)
 
         # sigma 单位下的波动率来源参数；带宽数值统一使用下方输入框。
         row_h += 1
         self._sigma_band_frame = ttk.Frame(sec3, style="Surface.TFrame")
-        self._sigma_band_frame.grid(row=row_h, column=0, columnspan=2, sticky="ew",
-                                    padx=(0, 0), pady=2)
+        self._sigma_band_frame.grid(row=row_h, column=0, columnspan=3, sticky="ew")
+        _form_grid(self._sigma_band_frame)
         self._k_var = tk.StringVar(value="1")  # 旧状态字段兼容，不再单独展示
-        ttk.Label(self._sigma_band_frame, text="波动率来源:",
-                  style="Surface.TLabel").grid(row=0, column=0, sticky="w", pady=2)
+        _form_label(self._sigma_band_frame, "波动率来源:", 0)
         self._sigma_src_var = tk.StringVar(value=SIGMA_SOURCE_DISPLAY["implied"])
-        ttk.Combobox(self._sigma_band_frame, textvariable=self._sigma_src_var, width=14,
-                     values=tuple(SIGMA_SOURCE_DISPLAY.values()), state="readonly").grid(
-            row=0, column=1, padx=(8, 0), pady=2, sticky="w")
-        ttk.Label(self._sigma_band_frame, text="历史波动率回看天数:",
-                  style="Surface.TLabel").grid(row=1, column=0, sticky="w", pady=2)
+        _form_input(ttk.Combobox(
+            self._sigma_band_frame, textvariable=self._sigma_src_var,
+            width=FORM_ENTRY_CHARS,
+            values=tuple(SIGMA_SOURCE_DISPLAY.values()), state="readonly"), 0)
+        _form_label(self._sigma_band_frame, "历史波动率回看天数:", 1)
         self._sigma_win_var = tk.StringVar(value="20")
-        ttk.Entry(self._sigma_band_frame, textvariable=self._sigma_win_var, width=6).grid(
-            row=1, column=1, padx=(8, 0), pady=2, sticky="w")
+        _form_input(ttk.Entry(self._sigma_band_frame,
+                              textvariable=self._sigma_win_var,
+                              width=FORM_ENTRY_CHARS), 1)
 
         row_h += 1
         self._fixed_time_frame = ttk.Frame(sec3, style="Surface.TFrame")
-        self._fixed_time_frame.grid(row=row_h, column=0, columnspan=2, sticky="ew", pady=2)
-        ttk.Label(self._fixed_time_frame, text="固定时刻(HH:MM,逗号分隔):",
-                  style="Surface.TLabel").grid(row=0, column=0, sticky="w")
+        self._fixed_time_frame.grid(row=row_h, column=0, columnspan=3, sticky="ew")
+        _form_grid(self._fixed_time_frame)
+        _form_label(self._fixed_time_frame, "固定时刻:", 0)
         self._fixed_times_var = tk.StringVar(value=DEFAULT_FIXED_TIMES)
         self._fixed_times_entry = ttk.Entry(
-            self._fixed_time_frame, textvariable=self._fixed_times_var, width=24)
-        self._fixed_times_entry.grid(row=0, column=1, padx=(8, 0), sticky="w")
+            self._fixed_time_frame, textvariable=self._fixed_times_var,
+            width=FORM_ENTRY_CHARS)
+        _form_input(self._fixed_times_entry, 0)
+        _form_hint(self._fixed_time_frame, 0, "HH:MM，逗号分隔")
 
+        # 三种带宽单位互为换算，逐行排布才能和上面的参数共用同一条对齐线。
         self._band_frame = ttk.Frame(sec3, style="Surface.TFrame")
-        self._band_frame.grid(row=row_h, column=0, columnspan=2, sticky="ew", pady=2)
-        ttk.Label(self._band_frame, text="绝对间隔:",
-                  style="Surface.TLabel").grid(row=0, column=0, sticky="w", pady=2)
+        self._band_frame.grid(row=row_h, column=0, columnspan=3, sticky="ew")
+        _form_grid(self._band_frame)
+        _form_label(self._band_frame, "绝对间隔:", 0)
         self._band_abs_var = tk.StringVar(value="1")
         self._band_abs_entry = ttk.Entry(
-            self._band_frame, textvariable=self._band_abs_var, width=12)
-        self._band_abs_entry.grid(row=0, column=1, padx=(8, 18), sticky="w")
-        ttk.Label(self._band_frame, text="相对间隔 (0.01=1%):",
-                  style="Surface.TLabel").grid(row=0, column=2, sticky="w", pady=2)
+            self._band_frame, textvariable=self._band_abs_var,
+            width=FORM_ENTRY_CHARS)
+        _form_input(self._band_abs_entry, 0)
+        _form_label(self._band_frame, "相对间隔:", 1)
         self._band_rel_var = tk.StringVar(value="0.01")
         self._band_rel_entry = ttk.Entry(
-            self._band_frame, textvariable=self._band_rel_var, width=12)
-        self._band_rel_entry.grid(row=0, column=3, padx=(8, 0), sticky="w")
-        ttk.Label(self._band_frame, text="日波动率倍数:",
-                  style="Surface.TLabel").grid(row=1, column=0, sticky="w", pady=2)
+            self._band_frame, textvariable=self._band_rel_var,
+            width=FORM_ENTRY_CHARS)
+        _form_input(self._band_rel_entry, 1)
+        _form_hint(self._band_frame, 1, "0.01 = 1%")
+        _form_label(self._band_frame, "日波动率倍数:", 2)
         self._band_sigma_var = tk.StringVar(value="0.779423")
         self._band_sigma_entry = ttk.Entry(
-            self._band_frame, textvariable=self._band_sigma_var, width=12)
-        self._band_sigma_entry.grid(row=1, column=1, padx=(8, 18), sticky="w")
-        ttk.Label(self._band_frame, text="编辑任一项后自动换算",
-                  style="SurfaceMuted.TLabel").grid(
-            row=1, column=2, columnspan=2, sticky="w", pady=2)
+            self._band_frame, textvariable=self._band_sigma_var,
+            width=FORM_ENTRY_CHARS)
+        _form_input(self._band_sigma_entry, 2)
+        _form_hint(self._band_frame, 2, "编辑任一项后自动换算")
 
         # 保留原状态字段供收集/兼容；其值由最后编辑的联动输入决定。
         self._price_interval_var = tk.StringVar(value="1")
@@ -1378,13 +1442,10 @@ class BacktestApp(tk.Tk):
             entry.bind("<Return>", lambda e, k=kind: self._commit_band_input(k, force=True))
 
         row_h += 1
-        ttk.Label(sec3, text="滑点 (基点):", style="Surface.TLabel").grid(
-            row=row_h, column=0, sticky="w", pady=4)
+        _form_label(sec3, "滑点 (基点):", row_h)
         self._slip_var = tk.StringVar(value="0")
-        ttk.Entry(sec3, textvariable=self._slip_var, width=10).grid(
-            row=row_h, column=1, sticky="w", padx=(8, 0), pady=4)
-
-        sec3.columnconfigure(1, weight=1)
+        _form_input(ttk.Entry(sec3, textvariable=self._slip_var,
+                              width=FORM_ENTRY_CHARS), row_h)
 
         # 依据默认策略（close_to_close）初始化专用参数可见性
         self._toggle_strategy()
@@ -1400,29 +1461,29 @@ class BacktestApp(tk.Tk):
             btn_frame, text="＋  保留当前结果到对比", style="Accent.TButton",
             command=self._retain_current_backtest, state="disabled",
         )
-        self._retain_btn.pack(fill="x", ipady=2, pady=(6, 0))
+        self._retain_btn.pack(fill="x", ipady=2, pady=(FORM_SECTION_GAP - 2, 0))
 
         self._compare_btn = ttk.Button(
             btn_frame, text="🆚  结果对比 (0)", style="Accent.TButton",
             command=self._open_saved_comparison,
         )
-        self._compare_btn.pack(fill="x", ipady=2, pady=(6, 0))
+        self._compare_btn.pack(fill="x", ipady=2, pady=(FORM_SECTION_GAP - 2, 0))
 
         self._struct_btn = ttk.Button(btn_frame, text="📊  绘制结构图",
                                       style="Accent.TButton",
                                       command=self._plot_structure)
-        self._struct_btn.pack(fill="x", ipady=2, pady=(6, 0))
+        self._struct_btn.pack(fill="x", ipady=2, pady=(FORM_SECTION_GAP - 2, 0))
 
         struct_ctrl = ttk.Frame(btn_frame)
-        struct_ctrl.pack(fill="x", pady=(6, 0))
+        struct_ctrl.pack(fill="x", pady=(FORM_SECTION_GAP - 2, 0))
         ttk.Label(struct_ctrl, text="扫描 ±%:", style="Muted.TLabel").pack(side="left")
         self._struct_range_var = tk.StringVar(value="30")
         ttk.Entry(struct_ctrl, textvariable=self._struct_range_var, width=6).pack(
-            side="left", padx=(4, 10))
+            side="left", padx=(6, 16))
         ttk.Label(struct_ctrl, text="点数:", style="Muted.TLabel").pack(side="left")
         self._struct_npts_var = tk.StringVar(value="31")
         ttk.Entry(struct_ctrl, textvariable=self._struct_npts_var, width=6).pack(
-            side="left", padx=(4, 0))
+            side="left", padx=(6, 0))
 
         self._progress = ttk.Progressbar(btn_frame, mode="indeterminate")
         self._progress_label = ttk.Label(btn_frame, text="", anchor="center",
@@ -1601,15 +1662,6 @@ class BacktestApp(tk.Tk):
         )
         self._history_btn.grid(row=0, column=4, sticky="e", ipadx=12, ipady=2)
 
-        # 优选跑在后台，而共享进度条在左侧参数栏里；用户此刻正盯着这一页，
-        # 那边的动静完全看不到，只能看见一个变灰的按钮。这里给本页一份。
-        self._history_progress = ttk.Progressbar(
-            header, mode="indeterminate")
-        self._history_progress_var = tk.StringVar(value="")
-        self._history_progress_label = ttk.Label(
-            header, textvariable=self._history_progress_var,
-            style="SurfaceMuted.TLabel", anchor="w")
-
         self._history_config_panel = ttk.Frame(
             container, style="Surface.TFrame")
         self._history_config_panel.pack(fill="x", padx=8, pady=(0, 6))
@@ -1632,6 +1684,20 @@ class BacktestApp(tk.Tk):
             self._history_config_panel,
             text=" 候选空间（仅属于策略优选） ", padding=14)
         settings.pack(fill="x")
+        # 面板统一度量。四个输入框此前宽度不一（时刻/带宽 184px，两个日期
+        # 107px），左边缘也各走各的，尾部说明跟着错开。这里用一套常量约束：
+        # 同宽输入框 + 同宽标签列 => 每一行的输入框和尾部说明各自成列。
+        # 标签列宽按字体实测最长标签算，不写死像素，换字体不会错位。
+        row_pady = 4
+        entry_width = 22
+        label_font = tkfont.nametofont("TkDefaultFont")
+        label_gap, hint_gap = 8, 12
+        param_label_w = max(
+            label_font.measure(text) for text in ("时刻候选:", "带宽候选:")
+        ) + label_gap
+        date_label_w = max(
+            label_font.measure(text) for text in ("自定义起始日:", "分析截至日:")
+        ) + label_gap
         # 左栏放勾选、右栏放该策略自己的参数：从属关系由「同一行」表达，
         # 比缩进符号更硬——置灰整行时右侧一起变灰，看得出是同一组。此前
         # σ 来源/回看天数单独占一行、看着像全局设置，而它们只在勾选了固定
@@ -1651,7 +1717,8 @@ class BacktestApp(tk.Tk):
             font=(_UI_FONT_FAMILY, 9, "bold"),
         ).grid(row=0, column=1, sticky="w", padx=(18, 0), pady=(0, 4))
         ttk.Separator(settings, orient="horizontal").grid(
-            row=1, column=0, columnspan=2, sticky="ew", pady=(0, 6))
+            row=1, column=0, columnspan=2, sticky="ew",
+            pady=(0, row_pady + 2))
 
         self._history_close_baseline_check = ttk.Checkbutton(
             settings, text="每日收盘",
@@ -1659,60 +1726,66 @@ class BacktestApp(tk.Tk):
             state="disabled", style="Surface.TCheckbutton",
         )
         self._history_close_baseline_check.grid(
-            row=2, column=0, sticky="w", pady=(2, 2))
+            row=2, column=0, sticky="w", pady=row_pady)
         ttk.Label(
             settings, text="固定基准，其余策略的增量指标都相对它计算，不可取消",
             style="SurfaceMuted.TLabel",
-        ).grid(row=2, column=1, sticky="w", padx=(18, 0), pady=(2, 2))
+        ).grid(row=2, column=1, sticky="w", padx=(18, 0), pady=row_pady)
 
         ttk.Checkbutton(
             settings, text="固定时刻",
             variable=self._history_include_fixed_times_var,
             command=self._toggle_history_candidate_controls,
             style="Surface.TCheckbutton",
-        ).grid(row=3, column=0, sticky="w", pady=(2, 2))
+        ).grid(row=3, column=0, sticky="w", pady=row_pady)
+        # 参数行改用 grid：pack 下每行各自紧排，输入框和尾部说明的左边缘由
+        # 前面标签的实际文字宽度决定，行与行对不齐。固定列宽后各成一列。
         fixed_row = ttk.Frame(settings, style="Surface.TFrame")
-        fixed_row.grid(row=3, column=1, sticky="w", padx=(18, 0), pady=(2, 2))
+        fixed_row.grid(row=3, column=1, sticky="w", padx=(18, 0), pady=row_pady)
+        fixed_row.columnconfigure(0, minsize=param_label_w)
         ttk.Label(
             fixed_row, text="时刻候选:", style="Surface.TLabel",
-        ).pack(side="left")
+        ).grid(row=0, column=0, sticky="w")
         self._history_fixed_times_var = tk.StringVar(value=DEFAULT_FIXED_TIMES)
         self._history_fixed_times_entry = ttk.Entry(
-            fixed_row, textvariable=self._history_fixed_times_var, width=24)
-        self._history_fixed_times_entry.pack(side="left", padx=(8, 10))
+            fixed_row, textvariable=self._history_fixed_times_var,
+            width=entry_width)
+        self._history_fixed_times_entry.grid(row=0, column=1, sticky="w")
         ttk.Label(
             fixed_row, text="每日在这些时刻各调仓一次",
             style="SurfaceMuted.TLabel",
-        ).pack(side="left")
+        ).grid(row=0, column=2, sticky="w", padx=(hint_gap, 0))
 
         ttk.Checkbutton(
             settings, text="固定间隔",
             variable=self._history_include_band_var,
             command=self._toggle_history_candidate_controls,
             style="Surface.TCheckbutton",
-        ).grid(row=4, column=0, sticky="nw", pady=(2, 2))
+        ).grid(row=4, column=0, sticky="nw", pady=row_pady)
         band_box = ttk.Frame(settings, style="Surface.TFrame")
-        band_box.grid(row=4, column=1, sticky="w", padx=(18, 0), pady=(2, 2))
+        band_box.grid(row=4, column=1, sticky="w", padx=(18, 0), pady=row_pady)
         band_row = ttk.Frame(band_box, style="Surface.TFrame")
-        band_row.pack(anchor="w")
+        band_row.pack(anchor="w", fill="x")
+        band_row.columnconfigure(0, minsize=param_label_w)
         ttk.Label(
             band_row, text="带宽候选:", style="Surface.TLabel",
-        ).pack(side="left")
+        ).grid(row=0, column=0, sticky="w")
         self._history_band_candidate_sigmas_var = tk.StringVar(
             value=",".join(
                 f"{value:g}" for value in DEFAULT_BAND_CANDIDATE_SIGMAS))
         self._history_band_candidate_entry = ttk.Entry(
             band_row, textvariable=self._history_band_candidate_sigmas_var,
-            width=24,
+            width=entry_width,
         )
-        self._history_band_candidate_entry.pack(side="left", padx=(8, 10))
+        self._history_band_candidate_entry.grid(row=0, column=1, sticky="w")
         ttk.Label(
             band_row, text="日波动 σ 的倍数，最多 10 档，英文逗号分隔",
             style="SurfaceMuted.TLabel",
-        ).pack(side="left")
+        ).grid(row=0, column=2, sticky="w", padx=(hint_gap, 0))
 
+        # 附加勾选与上面的输入框左对齐，不再顶到标签列。
         band_extra = ttk.Frame(band_box, style="Surface.TFrame")
-        band_extra.pack(anchor="w", pady=(4, 0))
+        band_extra.pack(anchor="w", pady=(row_pady + 2, 0))
         self._history_include_current_band_var = tk.BooleanVar(value=True)
         self._history_current_band_label_var = tk.StringVar(
             value="加入当前回测带宽")
@@ -1730,13 +1803,14 @@ class BacktestApp(tk.Tk):
         ).pack(side="left")
 
         ttk.Separator(settings, orient="horizontal").grid(
-            row=5, column=0, columnspan=2, sticky="ew", pady=(10, 6))
+            row=5, column=0, columnspan=2, sticky="ew",
+            pady=(row_pady + 6, row_pady + 2))
 
         # 分析周期不属于任何一个策略，放在分隔线下面单独一行，避免被误读
         # 成上面某个策略的参数。
         period_bar = ttk.Frame(settings, style="Surface.TFrame")
         period_bar.grid(
-            row=6, column=0, columnspan=2, sticky="ew", pady=(0, 2))
+            row=6, column=0, columnspan=2, sticky="ew", pady=row_pady)
         ttk.Label(
             period_bar, text="分析周期:", style="Surface.TLabel",
             font=(_UI_FONT_FAMILY, 9, "bold"),
@@ -1758,13 +1832,20 @@ class BacktestApp(tk.Tk):
         self._history_wind_frame = ttk.LabelFrame(
             settings, text=" Wind 严格历史区间（独立于单次回测） ", padding=(12, 8))
         self._history_wind_frame.grid(
-            row=7, column=0, columnspan=2, sticky="ew", pady=(8, 4))
+            row=7, column=0, columnspan=2, sticky="ew", pady=(row_pady + 4, 2))
+        # 钉死前两列的宽度，把所有富余给最后一列。否则跨列的提示行一换文案
+        # （自动模式一长句、手动模式为空）就会重算列宽，两个日期输入框跟着
+        # 左右跳——勾一下「自动推算」就位移，正是这个原因。
+        self._history_wind_frame.columnconfigure(0, minsize=date_label_w)
+        self._history_wind_frame.columnconfigure(
+            1, minsize=entry_width * label_font.measure("0"))
+        self._history_wind_frame.columnconfigure(2, weight=1)
         # 按区间的自然读法排：先起始日、后截止日。自动推算开关紧跟在它所
         # 控制的那个输入框后面，而不是另起一列。
         ttk.Label(
             self._history_wind_frame, text="自定义起始日:",
             style="Surface.TLabel",
-        ).grid(row=0, column=0, sticky="w", pady=3)
+        ).grid(row=0, column=0, sticky="w", pady=row_pady)
         history_start_default = (
             datetime.date.today() - datetime.timedelta(days=420)
         ).isoformat()
@@ -1772,10 +1853,10 @@ class BacktestApp(tk.Tk):
             value=history_start_default)
         self._history_wind_start_entry = ttk.Entry(
             self._history_wind_frame,
-            textvariable=self._history_wind_start_var, width=13,
+            textvariable=self._history_wind_start_var, width=entry_width,
         )
         self._history_wind_start_entry.grid(
-            row=0, column=1, sticky="w", padx=(8, 20), pady=3)
+            row=0, column=1, sticky="w", pady=row_pady)
 
         self._history_wind_auto_start_var = tk.BooleanVar(value=True)
         # 静态文案：往前取多少天、以及为什么多取一天，都在下方提示行里按当
@@ -1787,28 +1868,31 @@ class BacktestApp(tk.Tk):
             command=self._toggle_history_wind_controls,
         )
         self._history_wind_auto_start_check.grid(
-            row=0, column=2, columnspan=2, sticky="w", pady=3)
+            row=0, column=2, sticky="w", padx=(hint_gap, 0), pady=row_pady)
 
         ttk.Label(
             self._history_wind_frame, text="分析截至日:",
             style="Surface.TLabel",
-        ).grid(row=1, column=0, sticky="w", pady=3)
+        ).grid(row=1, column=0, sticky="w", pady=row_pady)
         history_asof_default = (datetime.date.today() - datetime.timedelta(
             days=1)).isoformat()
         self._history_wind_asof_var = tk.StringVar(
             value=history_asof_default)
         self._history_wind_asof_entry = ttk.Entry(
             self._history_wind_frame,
-            textvariable=self._history_wind_asof_var, width=13,
+            textvariable=self._history_wind_asof_var, width=entry_width,
         )
         self._history_wind_asof_entry.grid(
-            row=1, column=1, sticky="w", padx=(8, 20), pady=3)
+            row=1, column=1, sticky="w", pady=row_pady)
         self._history_wind_hint_var = tk.StringVar()
+        # 提示行只占最后一列：跨列会把它的文字宽度算进前两列的需求，文案一
+        # 变就挤动上面的输入框。
         ttk.Label(
             self._history_wind_frame,
             textvariable=self._history_wind_hint_var,
-            style="SurfaceMuted.TLabel",
-        ).grid(row=2, column=0, columnspan=4, sticky="w", pady=(3, 0))
+            style="SurfaceMuted.TLabel", wraplength=760, justify="left",
+        ).grid(row=2, column=0, columnspan=3, sticky="w",
+               pady=(row_pady, 0))
         # 截至日是自动起始日的推算基准，改一个字就要重算回填。
         self._history_wind_asof_var.trace_add(
             "write",
@@ -1972,14 +2056,26 @@ class BacktestApp(tk.Tk):
                 objective=getattr(self, "_history_result_objective", None),
                 notes=getattr(self, "_history_last_notes", None),
                 label=label,
+                replay_index=getattr(self, "_history_replay_index", None),
             )
-            path = history_store.save_result(payload)
+            # 先写入再淘汰，顺序不能反：反过来会在写失败时白删一份。
+            path = history_store.save_result(payload, enforce=False)
+            evicted = history_store.enforce_limit()
         except Exception as exc:                      # noqa: BLE001
             messagebox.showerror("保存失败", str(exc))
             return None
         size_kb = os.path.getsize(path) / 1024
-        self._set_status(
-            f"已保存优选结果（{size_kb:.0f} KB）: {os.path.basename(path)}")
+        message = f"已保存优选结果（{size_kb:.0f} KB）: {os.path.basename(path)}"
+        # 超出上限时最旧的记录会被删掉。删除不可逆，即使是按规则删的也必
+        # 须说一声——那是别人 85 秒跑出来的东西。
+        if evicted:
+            names = "、".join(
+                item["label"] or item["filename"] for item in evicted[:3])
+            more = f" 等 {len(evicted)} 份" if len(evicted) > 3 else ""
+            message += (
+                f"；已达上限 {history_store.MAX_RESULTS} 份，"
+                f"淘汰最旧的「{names}」{more}")
+        self._set_status(message)
         return path
 
     def _load_history_result(self, path):
@@ -2016,21 +2112,224 @@ class BacktestApp(tk.Tk):
             "asof": str(state.get("history_wind_asof")
                         or state.get("wind_end") or ""),
         }
+        replay_index = self._replay_index_from_payload(payload, ranking)
+        meta["replay_available"] = bool(replay_index)
         try:
             BacktestApp._show_history_recommendation(
                 self, recommendations, ranking,
                 notes=payload.get("notes") or None,
                 source_label=payload.get("source_label"),
                 window_results=None, history_state=state,
-                details=(payload.get("window_summary"), {}),
+                details=(payload.get("window_summary"), replay_index),
                 loaded_meta=meta,
             )
         except Exception as exc:                      # noqa: BLE001
             messagebox.showerror("载入失败", str(exc))
             return False
+        # 载入的这份结果就是当前上下文：把它的冻结状态装回去，逐段下钻的
+        # 展示页摘要（期权类型/子类型/数据来源）才有来源，「用当前行情回
+        # 测」也才不会拿另一套参数去跑。
+        self._latest_history_state = BacktestApp._copy_snapshot_gui_state(
+            state)
+        self._latest_history_source_label = payload.get("source_label")
+        applied = self._apply_state_to_option_form(state)
         stamp = meta["saved_at"][:16].replace("T", " ")
-        self._set_status(f"已载入优选结果（保存于 {stamp}）")
+        message = f"已载入优选结果（保存于 {stamp}）"
+        if applied:
+            message += "；已同步左侧 " + "、".join(applied)
+        self._set_status(message)
         return True
+
+    @staticmethod
+    def _strategy_from_ranking_row(row, *, wind_code=None):
+        """按排名行的元数据重建策略对象；无法识别时返回 None。
+
+        载入的结果包不带策略对象（它不可序列化），但排名行里存着重建它所
+        需的全部身份信息——这正是 _apply_history_recommendation 写回左侧表
+        单时用的同一批字段。
+
+        ``wind_code`` 用来还原固定时刻策略的交易时段。**这一步不能省**：
+        原始运行会用时段过滤掉标的没有的时刻（510050 没有夜盘，23:00 会被
+        剔除），不设时段的话重建出来的策略会因为「23:00 在全部交易日组中
+        都不存在」直接构造失败。
+        """
+        row = dict(row or {})
+        name = str(row.get("meta_strategy_name")
+                   or row.get("strategy_type") or "").strip()
+        if name == "close_to_close":
+            return CloseToCloseStrategy()
+        if name == "fixed_times":
+            times = str(row.get("meta_fixed_times") or "").strip()
+            if not times:
+                return None
+            fixed = FixedTimeStrategy(times)
+            code = str(wind_code or "").strip()
+            if code:
+                from pricing.wind_data import (
+                    get_trading_session_clock_ranges,
+                )
+                try:
+                    fixed.set_trading_sessions(
+                        get_trading_session_clock_ranges(code))
+                except Exception:                      # noqa: BLE001
+                    # 取不到时段时退回不过滤：仍能重放存在的时刻，
+                    # 缺失时刻会由回测自身的校验明确报错。
+                    pass
+            return fixed
+        if name == "hedge_band":
+            sigma = BacktestApp._comparison_finite(
+                row.get("meta_candidate_sigma"))
+            if sigma is None or sigma <= 0:
+                return None
+            return HedgeBandStrategy(
+                band_type="sigma", threshold=float(sigma),
+                sigma_source=str(row.get("meta_sigma_source") or "implied"),
+                window_days=int(row.get("meta_sigma_window") or 20))
+        return None
+
+    def _replay_index_from_payload(self, payload, ranking):
+        """用包里存的行情切片与构造参数重建逐段重放索引。
+
+        存的是回测**输入**，所以这里不是「读回结果」而是「重建可重跑的配
+        方」——下钻时只重跑选中那一段。重建路径与原始运行是两套代码，任何
+        一处对不上都会让下钻显示的数字与排名不符且**不会报错**，因此
+        _verify_replay_fidelity 会拿包里存的逐日损益核对。
+        """
+        import pandas as pd
+
+        series, specs = history_store.restore_replay_payload(payload)
+        if series is None or not specs:
+            return {}
+        state = dict(payload.get("history_state") or {})
+        try:
+            base_option = state["cfg"]["build"](
+                state.get("subtype"), state.get("params"))
+        except Exception:                              # noqa: BLE001
+            # cfg 带回调，不进包；改由注册表按冻结的类型与参数重建。
+            base_option = BacktestApp._option_from_state(state)
+        if base_option is None:
+            return {}
+        strategies = {}
+        for _index, row in ranking.iterrows():
+            item = row.to_dict()
+            built = BacktestApp._strategy_from_ranking_row(
+                item, wind_code=state.get("wind_code"))
+            if built is not None:
+                strategies[str(item.get("strategy", "")).strip()] = built
+        if not strategies:
+            return {}
+        index = {}
+        failures = []
+        for spec in specs:
+            # 这里刻意不吞异常：整段 try/except 一裹，重建失败就退化成「下
+            # 钻按钮点了没反应」，和功能没做一样却更难查。失败原因收集起来
+            # 报给用户。
+            try:
+                path = series.loc[
+                    pd.Timestamp(spec["start_ts"]):pd.Timestamp(spec["end_ts"])]
+                if not len(path):
+                    failures.append(
+                        f"{spec['lookback']}/{spec['window_id']}: 行情切片为空")
+                    continue
+                option, _info = _rescale_option_to_real_s0(
+                    base_option, float(path.iloc[0]))
+                index.setdefault(str(spec["lookback"]), {})[
+                    str(spec["window_id"])] = HistoryReplaySpec(
+                        lookback=str(spec["lookback"]),
+                        window_id=str(spec["window_id"]),
+                        option=option,
+                        external_path=path,
+                        evaluation_days=int(spec["evaluation_days"]),
+                        steps_per_day=int(spec["steps_per_day"]),
+                        strategies=dict(strategies),
+                        backtest_kwargs=dict(spec.get("backtest_kwargs") or {}),
+                        metadata=dict(spec.get("metadata") or {}),
+                    )
+            except Exception as exc:                   # noqa: BLE001
+                failures.append(
+                    f"{spec.get('lookback')}/{spec.get('window_id')}: "
+                    f"{type(exc).__name__} {exc}")
+        if failures and not index:
+            self._set_status(f"重放配方重建失败：{failures[0]}")
+        return index
+
+    @staticmethod
+    def _option_from_state(state):
+        """按冻结的期权类型与参数重建期权对象。"""
+        cls_name = str(state.get("cls_name") or "").strip()
+        cfg = OPTION_CLASSES.get(cls_name)
+        if cfg is None:
+            return None
+        try:
+            return cfg["build"](state.get("subtype"), dict(
+                state.get("params") or {}))
+        except Exception:                              # noqa: BLE001
+            return None
+
+    def _apply_state_to_option_form(self, state):
+        """把冻结状态里的期权与回测设置写回左侧表单。
+
+        载入结果后不同步是有实际危害的，不只是看不见：「用当前行情回测」
+        读的是左侧表单，表单没跟上就会拿另一套期权参数去回测，而结论页仍
+        挂着这份载入结果的名字——两者对不上且不会报错。
+
+        只写确实存在于状态里的字段；写不进去的静默跳过（旧包可能缺字段，
+        缺一项不该让整次载入失败）。
+        """
+        state = dict(state or {})
+        applied = []
+        cls_name = str(state.get("cls_name") or "").strip()
+        if cls_name in OPTION_CLASSES and hasattr(self, "_class_var"):
+            if self._class_var.get() != cls_name:
+                self._class_var.set(cls_name)
+                # 换大类要重建子类型下拉与参数控件，走界面原有的回调。
+                BacktestApp._on_option_class_change(self, None)
+            applied.append("期权大类")
+        subtype = str(state.get("subtype") or "").strip()
+        if subtype and hasattr(self, "_subtype_var"):
+            self._subtype_var.set(SUBTYPE_DISPLAY.get(subtype, subtype))
+            applied.append("子类型")
+        params = dict(state.get("params") or {})
+        entries = getattr(self, "_param_entries", {}) or {}
+        for key, value in params.items():
+            record = entries.get(key)
+            if not record:
+                continue
+            var, _dtype, choices = record
+            try:
+                if choices:
+                    # 下拉项存的是显示名，反查一次。
+                    label = next(
+                        (text for text, raw in choices.items() if raw == value),
+                        None)
+                    var.set(label if label is not None else str(value))
+                else:
+                    var.set(f"{value:g}" if isinstance(value, float)
+                            else str(value))
+            except (tk.TclError, TypeError, ValueError):
+                continue
+        if params:
+            applied.append(f"{len(params)} 个期权参数")
+        for key, attr, fmt in (
+                ("position", "_pos_var", str),
+                ("quantity", "_qty_var", lambda v: f"{float(v):g}"),
+                ("multiplier", "_mult_var", lambda v: f"{float(v):g}"),
+                ("tc_rate", "_tc_var", lambda v: f"{float(v) * 100:g}"),
+                ("slippage_bps", "_slip_var", lambda v: f"{float(v):g}"),
+                ("force_day_close_hedge", "_force_day_close_hedge_var", bool),
+        ):
+            if key not in state:
+                continue
+            var = getattr(self, attr, None)
+            if var is None:
+                continue
+            try:
+                var.set(fmt(state[key]))
+            except (tk.TclError, TypeError, ValueError):
+                continue
+        if applied:
+            self._refresh_history_base_summary()
+        return applied
 
     def _open_history_result_store(self):
         """已保存结果的列表窗口：载入 / 重命名 / 删除。"""
@@ -2041,7 +2340,7 @@ class BacktestApp(tk.Tk):
             return
         window = tk.Toplevel(self)
         window.title("已保存的优选结果")
-        window.geometry("1080x420")
+        window.geometry("1180x420")
         window.transient(self)
         body = ttk.Frame(window, style="Surface.TFrame", padding=12)
         body.pack(fill="both", expand=True)
@@ -2062,15 +2361,18 @@ class BacktestApp(tk.Tk):
         # 0.75σ 在 σ=0.12 与 0.24 下是两条不同的带）。数量与乘数不入列
         # ——实测只线性缩放金额、不改名次；行权价每段按段初价重定基；粒度
         # 现在是自动推导的因变量。这些都在选中后的细节行里。
-        columns = ("label", "code", "option", "position", "asof", "span",
-                   "verdict")
+        # 保存时刻已经写进名称，不再单独占列；腾出的位置给期权子类型
+        # ——同一大类下 Decumulator 有 13 个子型，行为差别很大。
+        columns = ("label", "code", "option", "subtype", "position", "asof",
+                   "span", "verdict")
         headings = {
             "label": "名称", "code": "标的", "option": "期权",
-            "position": "头寸", "asof": "分析截至日", "span": "证据跨度",
-            "verdict": "结论",
+            "subtype": "子类型", "position": "头寸", "asof": "分析截至日",
+            "span": "证据跨度", "verdict": "结论",
         }
-        widths = {"label": 190, "code": 100, "option": 105, "position": 150,
-                  "asof": 105, "span": 80, "verdict": 175}
+        # 子类型用中文名，最长「熔断每日双固赔累计」9 个汉字；列宽按它留。
+        widths = {"label": 170, "code": 92, "option": 92, "subtype": 150,
+                  "position": 138, "asof": 98, "span": 74, "verdict": 155}
         # 动作行先占位（见下方 actions 的 pack）：树带 expand=True 会吃掉
         # 剩余空腔，排在它后面的按钮行会被压成 0 高度直接消失，而 tkinter
         # 对此完全沉默。
@@ -2109,6 +2411,7 @@ class BacktestApp(tk.Tk):
                         item["label"] or item["filename"],
                         item["wind_code"] or "—",
                         item["option_summary"],
+                        item["subtype"],
                         item["position_summary"],
                         item["asof"] or "—",
                         item["evidence_span"],
@@ -2200,7 +2503,7 @@ class BacktestApp(tk.Tk):
             history_store._PERIOD_LABELS.get(key, key)
             for key in item.get("lookbacks", ())) or "—"
         parts = [
-            f"保存于 {str(item.get('saved_at', ''))[:16].replace('T', ' ')}",
+            f"保存于 {str(item.get('saved_at', ''))[:19].replace('T', ' ')}",
             f"周期 {periods}",
             f"{item.get('rows', 0)} 行 · {item.get('bytes', 0) / 1024:.0f} KB",
         ]
@@ -2229,33 +2532,6 @@ class BacktestApp(tk.Tk):
             load_btn.configure(
                 state="normal" if has and item["compatible"] else "disabled")
         except tk.TclError:
-            pass
-
-    def _set_history_progress(self, text):
-        """在本页主按钮下方显示/隐藏优选任务进度。
-
-        ``text`` 为空表示任务结束，收起进度条并让出版面。左侧那条共享
-        进度条仍照常工作，这里只补上本页看得见的一份。
-        """
-        bar = getattr(self, "_history_progress", None)
-        label = getattr(self, "_history_progress_label", None)
-        variable = getattr(self, "_history_progress_var", None)
-        if bar is None or label is None or variable is None:
-            return
-        try:
-            if text:
-                variable.set(text)
-                label.grid(row=1, column=0, sticky="w", pady=(6, 0))
-                bar.grid(row=1, column=1, columnspan=4, sticky="ew",
-                         padx=(12, 0), pady=(6, 0))
-                bar.start(15)
-            else:
-                bar.stop()
-                bar.grid_remove()
-                label.grid_remove()
-                variable.set("")
-        except tk.TclError:
-            # 容忍窗口销毁期间的收尾回调。
             pass
 
     @staticmethod
@@ -2625,10 +2901,7 @@ class BacktestApp(tk.Tk):
             choices = spec[4] if len(spec) > 4 else None
             meta = spec[5] if len(spec) > 5 else None
             editable = bool(meta and meta.get("editable"))  # 可编辑下拉=预设+手填
-            label_widget = ttk.Label(self._param_frame, text=f"{label}:",
-                                     style="Surface.TLabel")
-            label_widget.grid(
-                row=i, column=0, sticky="w", padx=(2, 8), pady=3)
+            label_widget = _form_label(self._param_frame, f"{label}:", i)
             if choices:
                 val_to_display = {v: k for k, v in choices.items()}
                 default_display = val_to_display.get(
@@ -2637,16 +2910,17 @@ class BacktestApp(tk.Tk):
                 cb = ttk.Combobox(self._param_frame, textvariable=var,
                                   values=list(choices.keys()),
                                   state="normal" if editable else "readonly",
-                                  width=14)
-                cb.grid(row=i, column=1, sticky="ew", pady=3, padx=(0, 2))
+                                  width=FORM_ENTRY_CHARS)
+                _form_input(cb, i)
                 input_widget = cb
                 if key == "margin_call":
                     cb.bind("<<ComboboxSelected>>",
                             lambda _event: self._sync_snowball_margin_controls())
             else:
                 var = tk.StringVar(value=str(default))
-                entry = ttk.Entry(self._param_frame, textvariable=var, width=16)
-                entry.grid(row=i, column=1, sticky="ew", pady=3, padx=(0, 2))
+                entry = ttk.Entry(self._param_frame, textvariable=var,
+                                  width=FORM_ENTRY_CHARS)
+                _form_input(entry, i)
                 input_widget = entry
             self._param_entries[key] = (var, dtype, choices)
             self._param_widgets[key] = {
@@ -2655,7 +2929,7 @@ class BacktestApp(tk.Tk):
                 "base_label": label,
                 "choices": choices,
             }
-        self._param_frame.columnconfigure(1, weight=1)
+        _form_grid(self._param_frame)
         self._sync_snowball_margin_controls()
         self._bind_band_reference_inputs()
         self._bind_wind_maturity_input()
@@ -2906,11 +3180,11 @@ class BacktestApp(tk.Tk):
         self._csv_frame.grid_remove()
         self._wind_frame.grid_remove()
         if src == "simulate":
-            self._sim_frame.grid(row=1, column=0, columnspan=2, sticky="ew", pady=2)
+            self._sim_frame.grid(row=1, column=0, columnspan=3, sticky="ew")
         elif src == "csv":
-            self._csv_frame.grid(row=1, column=0, columnspan=2, sticky="ew", pady=2)
+            self._csv_frame.grid(row=1, column=0, columnspan=3, sticky="ew")
         elif src == "wind":
-            self._wind_frame.grid(row=1, column=0, columnspan=2, sticky="ew", pady=2)
+            self._wind_frame.grid(row=1, column=0, columnspan=3, sticky="ew")
         BacktestApp._toggle_strategy(self)
         BacktestApp._toggle_wind_auto_start(self)
         BacktestApp._toggle_history_wind_controls(self)
@@ -3133,7 +3407,6 @@ class BacktestApp(tk.Tk):
         self._progress.pack_forget()
         self._progress_label.pack_forget()
         self._progress_label.configure(text="")
-        BacktestApp._set_history_progress(self, "")
         self._active_job = None
         for button in BacktestApp._job_guarded_buttons(self):
             button.configure(state="normal")
@@ -3189,7 +3462,8 @@ class BacktestApp(tk.Tk):
                 "history",
                 f"正在使用真实历史行情执行批量优选（{selected_text}）…"):
             return False
-        self._set_history_progress(f"正在优选（{selected_text}）…")
+        # 与单次回测、结构扫描、分段重放共用同一条进度条：全应用只有一个
+        # 长任务指示器，任务名由底部状态栏给出。
         self._progress.configure(mode="indeterminate")
         self._progress.pack(fill="x", pady=(6, 0))
         self._progress.start(15)
@@ -3478,6 +3752,10 @@ class BacktestApp(tk.Tk):
                 )
             BacktestApp._validate_history_recommendation_payload(
                 recommendations, ranking, window_results)
+            # 趁 bar 级结果还在手里落盘：渲染之后它们就被释放了，之后想看
+            # 某段明细只能重跑（620 ms/段）。现在写一次约 10 ms/段，读回
+            # 只要 3 ms。仍在 worker 线程里，不挡界面。
+            BacktestApp._cache_history_bars(window_results)
             source_label = BacktestApp._history_recommendation_source_label(
                 gs, history)
 
@@ -5676,7 +5954,6 @@ class BacktestApp(tk.Tk):
             "_history_chart_metric_combo", "_history_chart_hint_var",
             "_history_chart_selected_by_period", "_history_pairs_cache",
             "_history_chart_color_map", "_history_chart_marker_map",
-            "_history_action_hint_var",
             "_history_conclusion_card", "_history_conclusion_accent",
             "_history_conclusion_badge_var", "_history_conclusion_name_var",
             "_history_conclusion_stats", "_history_splitter",
@@ -6697,12 +6974,6 @@ class BacktestApp(tk.Tk):
             command=self._apply_history_recommendation,
         ).pack(fill="x", pady=(5, 0))
 
-        self._history_action_hint_var = tk.StringVar(value="")
-        ttk.Label(
-            body, textvariable=self._history_action_hint_var,
-            style="SurfaceMuted.TLabel", justify="left", wraplength=1080,
-        ).grid(row=3, column=0, columnspan=2, sticky="ew", pady=(8, 0))
-
         self._history_batch_outcome_bar = tk.Frame(
             body, bg=PALETTE["surface_alt"],
             highlightbackground=PALETTE["border_soft"], highlightthickness=1,
@@ -6727,7 +6998,6 @@ class BacktestApp(tk.Tk):
         self._history_batch_outcome_open_btn.pack(side="right", padx=(6, 0))
         self._history_batch_failure_details = []
         self._history_batch_last_result_ids = []
-        self._refresh_history_action_hint()
 
     def _history_conclusion_stat_specs(self, row):
         """结论卡上的数字：优先给增量口径，缺失时退回损益波动原值。
@@ -6912,25 +7182,6 @@ class BacktestApp(tk.Tk):
             self._saved_comparison_selection.add(baseline_id)
         self._show_saved_comparison_page()
 
-    def _refresh_history_action_hint(self):
-        """让动作说明始终反映“当前路径验证”这一刻的真实执行范围。"""
-        hint_var = self._history_action_hint_var
-        if hint_var is None:
-            return
-        try:
-            checked = self._history_chart_candidates()
-        except (AttributeError, tk.TclError):
-            checked = []
-        if checked:
-            scope = (
-                f"将用当前行情依次回测勾选的 {len(checked)} 个策略，"
-                "结果自动加入结果对比。")
-        else:
-            scope = (
-                "将用当前行情回测选中的那一个策略；"
-                "勾选首列可改为一次跑多个。")
-        hint_var.set(scope)
-
     def _build_history_chart_box(self, parent):
         """渲染整段接续的损益图表、口径切换与逐段下钻入口。
 
@@ -7026,10 +7277,14 @@ class BacktestApp(tk.Tk):
         # 逐段下钻因此不可用。必须把原因说出来并把控件禁掉——留一个点了没
         # 反应的按钮比没有按钮更糟。
         loaded = getattr(self, "_history_loaded_meta", None)
-        if loaded:
-            note = "载入的结果不含逐 bar 明细；重新运行一次优选即可下钻"
+        if loaded and not loaded.get("replay_available"):
+            # 旧版本的包不含重放配方（只存了结果表）。禁掉并说明原因，而
+            # 不是留一个点了没反应的按钮。
+            note = "这份结果不含重放配方；重新运行一次优选即可下钻"
             self._history_replay_window_combo.configure(state="disabled")
             self._history_replay_button.configure(state="disabled")
+        elif loaded:
+            note = "载入的结果：按包内行情重跑这一段，得到 Greeks 与逐 bar 明细"
         else:
             note = "把选中策略的这一段单独跑出 Greeks 与逐 bar 明细"
         tk.Label(
@@ -7131,8 +7386,6 @@ class BacktestApp(tk.Tk):
                 tree.item(iid, image=self._cb_sf_checked if strategy in selected else self._cb_sf_unchecked, text="")
             else:
                 tree.item(iid, image="", text="—")
-        # 勾选集合同时决定图表曲线与批量验证范围，标记刷新处一并同步说明。
-        self._refresh_history_action_hint()
 
     def _toggle_history_chart_click(self, event):
         tree = self._history_rank_tree
@@ -7415,9 +7668,53 @@ class BacktestApp(tk.Tk):
         ).start()
         return True
 
+    @staticmethod
+    def _replay_with_cache(spec, strategy_name):
+        """重放一段：先查磁盘缓存，未命中才真跑并写回。
+
+        ``run()`` 只设置 ``_results``（见 hedge_backtest），所以命中时用
+        ``build()`` 造出未运行的对象再把结果塞进去，与真跑出来的等价。
+        """
+        backtest = spec.build(strategy_name)
+        cached = history_bar_cache.load(spec, strategy_name)
+        if cached is not None:
+            backtest._results = cached
+            return backtest
+        backtest.run()
+        history_bar_cache.store(spec, strategy_name, backtest._results)
+        return backtest
+
+    @staticmethod
+    def _cache_history_bars(window_results):
+        """把一轮优选的全部分段结果写进磁盘缓存。
+
+        缓存写失败绝不能影响主流程——它只省时间，没有它一切照常，所以整
+        体兜底并在结束时按 LRU 裁到容量上限内。
+        """
+        try:
+            index = history_replay_index(window_results or {})
+        except Exception:                              # noqa: BLE001
+            return 0
+        written = 0
+        for _lookback, windows in index.items():
+            for _window_id, spec in windows.items():
+                per_case = None
+                for name in spec.strategy_names():
+                    try:
+                        per_case = window_results[spec.lookback][
+                            spec.window_id]
+                        result = per_case.get(name)
+                    except Exception:                  # noqa: BLE001
+                        continue
+                    if not isinstance(result, Mapping):
+                        continue
+                    if history_bar_cache.store(spec, name, result):
+                        written += 1
+        return written
+
     def _history_replay_worker(self, spec, strategy_name):
         try:
-            bt = spec.replay(strategy_name)
+            bt = BacktestApp._replay_with_cache(spec, strategy_name)
             self.after(
                 0,
                 lambda: self._deliver_history_replay(
