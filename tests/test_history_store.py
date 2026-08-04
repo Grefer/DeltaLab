@@ -310,6 +310,86 @@ def test_listing_flags_position_cost_and_a_disabled_close_fallback(
     assert item["position_summary"] == expected
 
 
+def test_listing_survives_a_package_that_is_gzip_but_not_utf8(tmp_path):
+    """gzip 流完好、内容不是合法 utf-8 时抛 UnicodeDecodeError。
+
+    漏捕它会让整个 list_results 崩掉，而不是跳过这一个坏包——列表页直接
+    打不开。
+    """
+    good = _save(tmp_path)
+    broken = os.path.join(str(tmp_path), "非utf8.json.gz")
+    with gzip.open(broken, "wb") as handle:
+        handle.write(b"\xff\xfe\x00\x01 not utf-8")
+
+    items = store.list_results(str(tmp_path))
+
+    assert [item["path"] for item in items] == [good]
+
+
+def test_listing_sweeps_crash_leftover_part_files(tmp_path):
+    """``.part`` 不在 *.json.gz 的 glob 里，没有别的清理点，只会一直占盘。"""
+    _save(tmp_path)
+    leftover = os.path.join(str(tmp_path), "崩溃残留.json.gz.part")
+    with open(leftover, "wb") as handle:
+        handle.write(b"half written")
+
+    store.list_results(str(tmp_path))
+
+    assert not os.path.exists(leftover)
+
+
+def test_tuple_column_normalises_missing_to_nan_like_scalars(tmp_path):
+    """元组列的缺失也要还原成 np.nan，与 scalar 分支一致。"""
+    frame = pd.DataFrame([
+        {"lookback": "quarter", "segment_lengths": (17, 22)},
+        {"lookback": "year", "segment_lengths": None},
+    ])
+    path = _save(tmp_path, ranking=frame)
+
+    back = store.load_result(path)["ranking"]
+
+    assert back["segment_lengths"].iloc[0] == (17, 22)
+    assert pd.isna(back["segment_lengths"].iloc[1])
+    assert back["segment_lengths"].iloc[1] is not None
+
+
+def test_replay_payload_carries_warmup_kwargs(tmp_path):
+    """预热参数必须入包。
+
+    实跑路径按候选记录它，HistoryReplaySpec.build 会取；缺了它，realized
+    σ 的候选会在没有预热种子的情况下跑完，而实跑路径本来会因
+    strict_sigma_warmup=True 直接报错。
+    """
+    from pricing.hedge_analysis import HistoryReplaySpec
+    from pricing import CloseToCloseStrategy, Option_Vanilla
+
+    index = pd.DatetimeIndex([
+        pd.Timestamp(f"2026-01-{day:02d} 15:00") for day in (5, 6, 7, 8, 9)])
+    path = pd.Series([100.0, 101.0, 99.0, 102.0, 100.5], index=index)
+    spec = HistoryReplaySpec(
+        lookback="quarter", window_id="segment_1",
+        option=Option_Vanilla("Vanilla", s0=100.0, sr=[], K=100.0, T=4,
+                              sigma=0.18, cp=1, r=0.03, q=0.03),
+        external_path=path, evaluation_days=4, steps_per_day=1,
+        strategies={"每日收盘": CloseToCloseStrategy()},
+        backtest_kwargs={"tc_rate": 0.0},
+        warmup_kwargs={"每日收盘": {"sigma_warmup_log_returns": [0.01, -0.02],
+                                   "strict_sigma_warmup": True}},
+        metadata={})
+
+    payload = store.build_payload(
+        ranking=_ranking_frame(), window_summary=_summary_frame(),
+        history_state=_state(), source_label="t",
+        objective="incremental_pnl",
+        replay_index={"quarter": {"segment_1": spec}})
+    stored = store.save_result(payload, directory=str(tmp_path))
+    _series, specs = store.restore_replay_payload(store.load_result(stored))
+
+    warmup = specs[0]["warmup_kwargs"]["每日收盘"]
+    assert warmup["strict_sigma_warmup"] is True
+    assert warmup["sigma_warmup_log_returns"] == [0.01, -0.02]
+
+
 def test_listing_skips_corrupt_packages(tmp_path):
     good = _save(tmp_path)
     broken = os.path.join(str(tmp_path), "坏包.json.gz")

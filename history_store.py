@@ -174,8 +174,12 @@ def _payload_to_frame(payload):
         elif kind == "timestamp":
             frame[name] = pd.to_datetime(frame[name], errors="coerce")
         elif kind == "tuple":
+            # 缺失同样归一成 np.nan，与下面 scalar 分支保持一致——那里的
+            # 注释解释了为什么必须统一。
             frame[name] = [
-                tuple(v) if isinstance(v, list) else v for v in frame[name]
+                tuple(v) if isinstance(v, list)
+                else (np.nan if v is None else v)
+                for v in frame[name]
             ]
         else:
             # JSON 的 null 读回来是 None，而 pandas 原生的缺失是 np.nan。
@@ -277,6 +281,12 @@ def build_replay_payload(replay_index):
                 "option_s0": float(getattr(spec.option, "s0", float("nan"))),
                 "strategies": [str(name) for name in spec.strategies],
                 "backtest_kwargs": _jsonable(dict(spec.backtest_kwargs)),
+                # 预热参数必须入包：实跑路径按候选记录它，重放时
+                # HistoryReplaySpec.build 会取。缺了它，realized σ 的候选
+                # 会在没有预热种子的情况下跑完，而实跑路径本来会因
+                # strict_sigma_warmup=True 直接报错。
+                "warmup_kwargs": _jsonable(
+                    {str(k): v for k, v in dict(spec.warmup_kwargs).items()}),
                 "metadata": _jsonable(dict(spec.metadata)),
             })
     return {
@@ -566,7 +576,10 @@ def _peek(path):
     try:
         with gzip.open(path, "rt", encoding="utf-8") as handle:
             payload = json.load(handle)
-    except (OSError, EOFError, json.JSONDecodeError, gzip.BadGzipFile):
+    # ValueError 一并覆盖 JSONDecodeError 与 UnicodeDecodeError——gzip 流
+    # 完好但内容不是合法 utf-8 时抛后者，漏掉会让整个 list_results 崩掉，
+    # 而不是跳过这一个坏包。BadGzipFile 是 OSError 子类，无需单列。
+    except (OSError, EOFError, ValueError):
         return None
     state = dict(payload.get("history_state") or {})
     ranking = payload.get("ranking") or {}
@@ -596,11 +609,27 @@ def _peek(path):
     }
 
 
+def _sweep_partials(directory):
+    """清掉进程崩溃残留的 ``.part``。
+
+    它们不会出现在 ``*.json.gz`` 的 glob 里，也就没有别的清理点，只会一直
+    占着盘。列目录时顺手扫一次即可。
+    """
+    for name in os.listdir(directory):
+        if not name.endswith(".part"):
+            continue
+        try:
+            os.remove(os.path.join(directory, name))
+        except OSError:
+            continue
+
+
 def list_results(directory=None):
     """按保存时间倒序列出结果包；坏包与非法文件跳过。"""
     directory = directory or results_dir()
     if not os.path.isdir(directory):
         return []
+    _sweep_partials(directory)
     items = []
     for path in glob.glob(os.path.join(directory, "*" + _SUFFIX)):
         meta = _peek(path)

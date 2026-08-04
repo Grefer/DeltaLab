@@ -185,6 +185,7 @@ from pricing import (
 from pricing.constants import ANNUAL_DAYS
 from pricing.hedge_analysis import (
     LOOKBACK_DAYS,
+    _aggregate_result_by_day,
     DEFAULT_SELECTION_OBJECTIVE,
     SELECTION_OBJECTIVES,
     HistoryReplaySpec,
@@ -2191,19 +2192,45 @@ class BacktestApp(tk.Tk):
                 window_days=int(row.get("meta_sigma_window") or 20))
         return None
 
+    @staticmethod
+    def _segment_strategies(strategies, summary, lookback, window_id):
+        """只保留在该分段**确实成功**的候选。
+
+        实跑路径的 replay_strategies 是在候选于该段成功之后才写入的，所以
+        失败的段本来就不会出现在下拉里。载入时若给每段都塞上全部候选，原
+        本失败的段也会进下拉，点下去要么撞引擎报错、要么跑出一个从未参与
+        排名的数字。包里的 window_summary 带 success 列，据此过滤。
+        """
+        if summary is None or getattr(summary, "empty", True):
+            return dict(strategies)
+        try:
+            rows = summary[
+                (summary["lookback"].astype(str) == str(lookback))
+                & (summary["window_id"].astype(str) == str(window_id))
+                & summary["success"].astype(bool)
+            ]
+            ok = {str(name) for name in rows["strategy"]}
+        except (KeyError, TypeError):
+            return dict(strategies)
+        kept = {name: obj for name, obj in strategies.items() if name in ok}
+        # 摘要里一个都对不上时不做过滤：宁可多给几项，也别把下拉清空。
+        return kept or dict(strategies)
+
     def _replay_index_from_payload(self, payload, ranking):
         """用包里存的行情切片与构造参数重建逐段重放索引。
 
         存的是回测**输入**，所以这里不是「读回结果」而是「重建可重跑的配
         方」——下钻时只重跑选中那一段。重建路径与原始运行是两套代码，任何
-        一处对不上都会让下钻显示的数字与排名不符且**不会报错**，因此
-        _verify_replay_fidelity 会拿包里存的逐日损益核对。
+        一处对不上都会让下钻显示的数字与排名不符且**不会报错**，因此每次
+        重放都由 ``_replay_fidelity_error`` 拿包里存的逐日损益核对，不符
+        时弹窗说明。
         """
         import pandas as pd
 
         series, specs = history_store.restore_replay_payload(payload)
         if series is None or not specs:
             return {}
+        summary = payload.get("window_summary")
         state = dict(payload.get("history_state") or {})
         try:
             base_option = state["cfg"]["build"](
@@ -2245,8 +2272,14 @@ class BacktestApp(tk.Tk):
                         external_path=path,
                         evaluation_days=int(spec["evaluation_days"]),
                         steps_per_day=int(spec["steps_per_day"]),
-                        strategies=dict(strategies),
+                        strategies=BacktestApp._segment_strategies(
+                            strategies, summary,
+                            spec["lookback"], spec["window_id"]),
                         backtest_kwargs=dict(spec.get("backtest_kwargs") or {}),
+                        warmup_kwargs={
+                            str(k): dict(v or {})
+                            for k, v in dict(
+                                spec.get("warmup_kwargs") or {}).items()},
                         metadata=dict(spec.get("metadata") or {}),
                     )
             except Exception as exc:                   # noqa: BLE001
@@ -6965,18 +6998,46 @@ class BacktestApp(tk.Tk):
         self._build_history_action_bar(body)
         BacktestApp._refresh_history_conclusion_card(self)
 
+    def _refresh_history_action_buttons(self):
+        """把「会跑几个」写进按钮标题。
+
+        这个按钮按首列勾选集合分派：勾了就逐个批量跑，没勾就跑选中那一
+        条——而标题原先完全不变，模式切换是隐藏的。把数量放进标题，不占
+        额外版面就能让它可见。
+        """
+        button = getattr(self, "_history_verify_btn", None)
+        if button is None:
+            return
+        try:
+            checked = len(self._history_chart_candidates())
+        except (AttributeError, tk.TclError):
+            checked = 0
+        text = "应用策略并用当前行情回测"
+        if checked:
+            # 用 ×N 而不是「（N 个）」：后者渲染 167px，撑破 20 字宽的按钮
+            # 会被静默截断——而按钮被截断是看不出来的。
+            text += f" ×{checked}"
+        try:
+            button.configure(text=text)
+        except tk.TclError:
+            pass
+
     def _build_history_action_bar(self, body):
         """把结论用到当下的动作栏；逐段下钻另在图表下方，两者对象不同。"""
         actions = tk.Frame(body, bg=PALETTE["surface_alt"])
         actions.grid(row=0, column=1, rowspan=3, sticky="ne", padx=(18, 0))
-        ttk.Button(
-            actions, text="用当前行情回测", width=14,
+        # 名字要说清「应用什么」和「应用到哪」：原来的「只填参数」没说填到
+        # 哪去，用户看不到左侧表单变了，会以为什么都没发生。
+        self._history_verify_btn = ttk.Button(
+            actions, text="应用策略并用当前行情回测", width=20,
             command=self._verify_history_on_current_path,
-        ).pack(fill="x")
+        )
+        self._history_verify_btn.pack(fill="x")
         ttk.Button(
-            actions, text="只填参数", width=14,
+            actions, text="应用策略到左侧参数", width=20,
             command=self._apply_history_recommendation,
         ).pack(fill="x", pady=(5, 0))
+        BacktestApp._refresh_history_action_buttons(self)
 
         self._history_batch_outcome_bar = tk.Frame(
             body, bg=PALETTE["surface_alt"],
@@ -7390,6 +7451,8 @@ class BacktestApp(tk.Tk):
                 tree.item(iid, image=self._cb_sf_checked if strategy in selected else self._cb_sf_unchecked, text="")
             else:
                 tree.item(iid, image="", text="—")
+        # 勾选集合决定「用当前行情回测」跑几个，标题要跟着变。
+        BacktestApp._refresh_history_action_buttons(self)
 
     def _toggle_history_chart_click(self, event):
         tree = self._history_rank_tree
@@ -7716,13 +7779,53 @@ class BacktestApp(tk.Tk):
                         written += 1
         return written
 
+    @staticmethod
+    def _replay_fidelity_error(result, spec, strategy_name, summary):
+        """重放结果与包内逐日损益不符时返回一句描述，一致或无从比对返回 None。
+
+        重建路径与原始运行是两套代码，任何一处对不上都会让下钻显示的数字
+        与排名不符**且不会报错**。这个函数就是那道关——早前只在注释里写了
+        它的名字却没实现，而它本该拦住的正是缓存 key 漏项、分段策略集合不
+        对、预热参数丢失这几类问题。
+        """
+        if summary is None or getattr(summary, "empty", True):
+            return None
+        try:
+            rows = summary[
+                (summary["lookback"].astype(str) == str(spec.lookback))
+                & (summary["window_id"].astype(str) == str(spec.window_id))
+                & (summary["strategy"].astype(str) == str(strategy_name))
+            ]
+        except (KeyError, TypeError):
+            return None
+        if rows.empty or not bool(rows["success"].iloc[0]):
+            return None
+        expected = np.asarray(rows["daily_net_pnl"].iloc[0], dtype=float)
+        try:
+            actual = _aggregate_result_by_day(
+                result, int(spec.steps_per_day))["net_pnl"].to_numpy()
+        except Exception as exc:                       # noqa: BLE001
+            return f"无法聚合重放结果：{type(exc).__name__} {exc}"
+        if len(expected) != len(actual):
+            return (f"重放天数 {len(actual)} 与记录的 {len(expected)} 不符")
+        if not np.allclose(expected, actual, rtol=1e-9, atol=1e-12,
+                           equal_nan=True):
+            worst = float(np.max(np.abs(expected - actual)))
+            return f"重放逐日损益与记录不符（最大差 {worst:.3e}）"
+        return None
+
     def _history_replay_worker(self, spec, strategy_name):
         try:
             bt = BacktestApp._replay_with_cache(spec, strategy_name)
+            # 与包内逐日损益核对。不一致时照常展示（数据本身可能仍有诊断
+            # 价值），但必须明说——静默显示对不上的数字才是最坏的结果。
+            mismatch = BacktestApp._replay_fidelity_error(
+                bt._results, spec, strategy_name,
+                getattr(self, "_history_window_summary", None))
             self.after(
                 0,
                 lambda: self._deliver_history_replay(
-                    bt, spec, strategy_name),
+                    bt, spec, strategy_name, mismatch=mismatch),
             )
         except Exception:
             import traceback
@@ -7751,7 +7854,8 @@ class BacktestApp(tk.Tk):
         state["history_replay_window_id"] = spec.window_id
         return state
 
-    def _deliver_history_replay(self, bt, spec, strategy_name):
+    def _deliver_history_replay(self, bt, spec, strategy_name,
+                                mismatch=None):
         """在主线程渲染重放结果；成功后它也是可保留的当前回测。"""
         success = False
         try:
@@ -7783,6 +7887,15 @@ class BacktestApp(tk.Tk):
         finally:
             self._finish_history_replay(
                 success, spec, strategy_name)
+            if success and mismatch:
+                # 数字对不上必须说出来。照常展示是因为它仍有诊断价值，但
+                # 不说的话用户会把它当成排名的依据来读。
+                messagebox.showwarning(
+                    "重放结果与记录不一致",
+                    f"{spec.lookback}/{spec.window_id}/{strategy_name}：\n"
+                    f"{mismatch}\n\n"
+                    "展示页的数字可能与排名表不同源，请重新运行一次策略优选。")
+                self._set_status(f"⚠ 重放与记录不一致：{mismatch}")
 
     def _fail_history_replay(self, message):
         messagebox.showerror("历史分段回测失败", message)

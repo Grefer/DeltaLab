@@ -11,6 +11,8 @@ import pytest
 
 import gui_app
 import history_selection
+from pricing.hedge_analysis import (
+    _aggregate_result_by_day as _agg_daily_frame)
 from gui_app import (
     BacktestApp,
     DEFAULT_BAND_CANDIDATE_SIGMAS,
@@ -5022,6 +5024,157 @@ def test_loading_syncs_the_option_form_and_display_metadata(
             assert app2._latest_history_state.get(key), key
     finally:
         app2.destroy()
+
+
+def test_verify_button_title_shows_how_many_it_will_run():
+    """「用当前行情回测」按勾选集合分派批量/单条，标题必须说明会跑几个。
+
+    此前标题恒定不变，模式切换完全隐藏——勾了 3 个就跑 3 次，用户点下去
+    才知道。数量进标题不占额外版面就能让它可见。
+    """
+    class _Btn:
+        def __init__(self):
+            self.text = ""
+
+        def configure(self, text):
+            self.text = text
+
+    def title_for(checked):
+        button = _Btn()
+        fake = SimpleNamespace(
+            _history_verify_btn=button,
+            _history_chart_candidates=lambda: list(checked))
+        BacktestApp._refresh_history_action_buttons(fake)
+        return button.text
+
+    assert title_for([]) == "应用策略并用当前行情回测"
+    assert title_for(["a"]) == "应用策略并用当前行情回测 ×1"
+    assert title_for(["a", "b", "c"]) == "应用策略并用当前行情回测 ×3"
+
+
+def test_action_button_titles_say_what_gets_applied_and_where():
+    """按钮名要说清「应用什么」和「应用到哪」。
+
+    原来的「只填参数」没说填到哪去——用户看不到左侧表单变了，会以为什么
+    都没发生；「用当前行情回测」也没体现它会先应用策略。
+    """
+    import tkinter as tk
+    import gui_app as module
+    try:
+        probe = tk.Tk()
+    except tk.TclError:
+        pytest.skip("无可用显示环境")
+    probe.destroy()
+
+    app = module.BacktestApp()
+    try:
+        app.withdraw()
+        ranking = _store_ranking_frame()
+        BacktestApp._show_history_recommendation(
+            app, ranking[ranking["rank"].eq(1)].copy(), ranking, notes=None,
+            source_label="测试", window_results=None,
+            history_state={"history_lookbacks": {"quarter": 61}})
+        app.update_idletasks()
+
+        titles = []
+
+        def walk(widget):
+            from tkinter import ttk
+            for child in widget.winfo_children():
+                if isinstance(child, ttk.Button):
+                    titles.append(str(child.cget("text")))
+                walk(child)
+
+        walk(app)
+        assert "应用策略到左侧参数" in titles, titles
+        assert any(t.startswith("应用策略并用当前行情回测") for t in titles), titles
+        # 旧名字不该再出现
+        assert "只填参数" not in titles
+        assert "用当前行情回测" not in titles
+    finally:
+        app.destroy()
+
+
+def test_replay_fidelity_error_catches_a_mismatch(history_store_dir):
+    """重放与包内逐日损益不符时必须报出来，一致时不得误报。
+
+    这道关早前只在注释里写了名字却没实现——而它本该拦住的正是缓存 key 漏
+    项、分段策略集合不对、预热参数丢失这几类「静默错数」。
+    """
+    from pricing.hedge_analysis import HistoryReplaySpec
+
+    # 每天一根 bar、共 5 个交易日：首根是 Day 0 锚点，其后 4 天参与评估。
+    index = pd.DatetimeIndex([
+        pd.Timestamp(f"2026-01-{day:02d} 15:00") for day in (5, 6, 7, 8, 9)])
+    path = pd.Series([100.0, 101.0, 99.0, 102.0, 100.5], index=index)
+    spec = HistoryReplaySpec(
+        lookback="quarter", window_id="segment_1",
+        option=Option_Vanilla("Vanilla", s0=100.0, sr=[], K=100.0, T=4,
+                              sigma=0.18, cp=1, r=0.03, q=0.03),
+        external_path=path, evaluation_days=4, steps_per_day=1,
+        strategies={"每日收盘": CloseToCloseStrategy()},
+        backtest_kwargs={"tc_rate": 0.0, "quantity": 1, "multiplier": 0},
+        metadata={})
+    result = spec.replay("每日收盘")._results
+    actual = _agg_daily_frame(result, 1)["net_pnl"].to_numpy()
+
+    faithful = pd.DataFrame([{
+        "lookback": "quarter", "window_id": "segment_1",
+        "strategy": "每日收盘", "success": True, "daily_net_pnl": actual,
+    }])
+    assert BacktestApp._replay_fidelity_error(
+        result, spec, "每日收盘", faithful) is None
+
+    # 数值被动过一点点就必须抓出来
+    tampered = faithful.copy()
+    bad = actual.copy()
+    bad[0] += 1e-6
+    tampered.at[0, "daily_net_pnl"] = bad
+    message = BacktestApp._replay_fidelity_error(
+        result, spec, "每日收盘", tampered)
+    assert message and "不符" in message
+
+    # 天数对不上也要抓
+    shorter = faithful.copy()
+    shorter.at[0, "daily_net_pnl"] = actual[:-1]
+    assert "不符" in BacktestApp._replay_fidelity_error(
+        result, spec, "每日收盘", shorter)
+
+    # 失败段或无摘要时不比对，也不该误报
+    failed = faithful.copy()
+    failed.at[0, "success"] = False
+    assert BacktestApp._replay_fidelity_error(
+        result, spec, "每日收盘", failed) is None
+    assert BacktestApp._replay_fidelity_error(
+        result, spec, "每日收盘", None) is None
+
+
+def test_segment_strategies_drops_candidates_that_failed_in_that_segment():
+    """实跑路径只记录该段成功的候选；载入不该给每段塞上全部候选。
+
+    否则原本失败的段也会进下拉，点下去要么撞引擎报错、要么跑出一个从未
+    参与排名的数字。
+    """
+    strategies = {"每日收盘": object(), "固定时刻(10:30)": object(),
+                  "固定间隔(1σ)": object()}
+    summary = pd.DataFrame([
+        {"lookback": "quarter", "window_id": "segment_1",
+         "strategy": "每日收盘", "success": True},
+        {"lookback": "quarter", "window_id": "segment_1",
+         "strategy": "固定时刻(10:30)", "success": False},
+        {"lookback": "quarter", "window_id": "segment_1",
+         "strategy": "固定间隔(1σ)", "success": True},
+    ])
+
+    kept = BacktestApp._segment_strategies(
+        strategies, summary, "quarter", "segment_1")
+
+    assert set(kept) == {"每日收盘", "固定间隔(1σ)"}
+    # 摘要缺失或一个都对不上时不过滤——宁可多给几项，也别把下拉清空。
+    assert set(BacktestApp._segment_strategies(
+        strategies, None, "quarter", "segment_1")) == set(strategies)
+    assert set(BacktestApp._segment_strategies(
+        strategies, summary, "year", "segment_9")) == set(strategies)
 
 
 def test_running_a_fresh_optimisation_clears_the_loaded_marker(

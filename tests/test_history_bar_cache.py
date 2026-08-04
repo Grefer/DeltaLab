@@ -5,6 +5,7 @@
 """
 from __future__ import annotations
 
+import copy
 import os
 from dataclasses import replace
 
@@ -13,7 +14,8 @@ import pandas as pd
 import pytest
 
 import history_bar_cache as cache
-from pricing import (CloseToCloseStrategy, HedgeBandStrategy, Option_Vanilla)
+from pricing import (CloseToCloseStrategy, FixedTimeStrategy,
+                     HedgeBandStrategy, Option_Vanilla)
 from pricing.hedge_analysis import HistoryReplaySpec
 
 
@@ -44,6 +46,13 @@ def _spec(**overrides):
 
 
 NAME = "固定间隔(1σ)"
+
+
+def _with_changed_option_list_attr(spec):
+    """只改期权的列表属性（``sr``）——digest 曾经整类丢弃列表。"""
+    option = copy.deepcopy(spec.option)
+    option.sr = [0.9, 0.8]
+    return replace(spec, option=option)
 
 
 def test_cached_result_is_bit_identical_to_a_fresh_run(tmp_path):
@@ -98,6 +107,11 @@ def test_scalar_fields_survive_alongside_the_arrays(tmp_path):
         "Vanilla", s0=float(s.external_path.iloc[0]), sr=[],
         K=float(s.external_path.iloc[0]), T=4, sigma=0.25, cp=1,
         r=0.03, q=0.03)), id="波动率"),
+    # 补的：原先 5 项恰好没碰到 digest 丢列表属性这个洞——期权那项换的是
+    # 整个类，掩盖了「只改一个列表字段」的情形。时刻表那个洞由下面的
+    # test_changing_only_the_fixed_time_schedule_misses 单独钉（key 是按
+    # 候选算的，改 dict 里另一个策略本就不该影响本候选）。
+    pytest.param(_with_changed_option_list_attr, id="期权的列表属性"),
 ])
 def test_any_input_change_misses_the_cache(tmp_path, mutate):
     """key 必须覆盖所有影响结果的输入。
@@ -111,6 +125,39 @@ def test_any_input_change_misses_the_cache(tmp_path, mutate):
 
     assert cache.load(spec, NAME, directory=str(tmp_path)) is not None
     assert cache.load(mutate(spec), NAME, directory=str(tmp_path)) is None
+
+
+def test_changing_only_the_fixed_time_schedule_misses(tmp_path):
+    """时刻表整张不进 key 的话，改时刻重跑后下钻会显示上一次的明细。
+
+    实测过：``_digest_strategy`` 曾去找 ``target_times``/``fixed_times``，
+    而 FixedTimeStrategy 的属性叫 ``requested_times``/``effective_times``/
+    ``times``，两个名字都不存在，时刻表整个不进 key。
+    """
+    name = "固定时刻"
+    base = _spec(strategies={name: FixedTimeStrategy(["09:31"])})
+    other = _spec(strategies={name: FixedTimeStrategy(["09:33"])})
+
+    assert cache.key_for(base, name) != cache.key_for(other, name)
+
+
+def test_unsummarisable_input_disables_the_cache_instead_of_colliding(
+        tmp_path):
+    """摘要不了的属性必须让整次缓存放弃，而不是被悄悄丢掉。
+
+    悄悄丢掉的后果是两次不同的运行共用一条缓存、下钻显示别次的数据且不报
+    错；放弃缓存的代价只是白跑 620 ms。
+    """
+    spec = _spec()
+    option = copy.deepcopy(spec.option)
+    option.某个无法摘要的字段 = object()
+    blind = replace(spec, option=option)
+
+    assert cache.key_for(blind, NAME) is None
+    # 既不写也不读。
+    assert cache.store(blind, NAME, spec.replay(NAME)._results,
+                       directory=str(tmp_path)) is None
+    assert cache.load(blind, NAME, directory=str(tmp_path)) is None
 
 
 def test_a_different_strategy_in_the_same_segment_misses(tmp_path):

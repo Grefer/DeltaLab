@@ -14,6 +14,7 @@
 """
 from __future__ import annotations
 
+import datetime
 import hashlib
 import json
 import os
@@ -41,38 +42,82 @@ def cache_dir() -> str:
     return os.path.join(base, "history_bars")
 
 
-def _digest_option(option):
-    """期权身份：类型 + 所有影响定价的标量属性。"""
-    parts = [type(option).__name__]
-    for name in sorted(dir(option)):
-        if name.startswith("_"):
+# 摘要不了的值用它标记。**默认方向必须是「放弃缓存」而不是「悄悄丢
+# 掉」**：漏掉一个决定行为的属性，就会让两次不同的运行共用一条缓存，下钻
+# 页显示的是别次的逐 bar 明细，而且不报错。代价只是偶尔多跑 620 ms。
+_GIVE_UP = object()
+
+# 只有确实不影响回测结果的属性才允许跳过。名单要短，且每一项都要能说出
+# 为什么无关。
+_IGNORED_ATTRS = frozenset({
+    "name",            # 策略类型名，已由类名覆盖
+    "optiontype",      # 期权的展示标签，行为由 exe_mode 等字段决定
+})
+
+
+def _digest_value(value, depth=0):
+    """把任意值压成可比较的字符串；压不了就返回 ``_GIVE_UP``。"""
+    if depth > 6:
+        return _GIVE_UP
+    if value is None:
+        return "None"
+    if isinstance(value, (bool, np.bool_)):
+        return f"b{bool(value)}"
+    if isinstance(value, (int, np.integer)):
+        return f"i{int(value)}"
+    if isinstance(value, (float, np.floating)):
+        number = float(value)
+        return "fnan" if not np.isfinite(number) else f"f{number:.17g}"
+    if isinstance(value, str):
+        return f"s{value}"
+    if isinstance(value, (datetime.time, datetime.date, datetime.datetime)):
+        return f"t{value.isoformat()}"
+    if isinstance(value, pd.Timestamp):
+        return "T" + ("NaT" if pd.isna(value) else value.isoformat())
+    if isinstance(value, np.ndarray):
+        if value.dtype == object:
+            return _digest_value(value.tolist(), depth + 1)
+        return f"a{value.shape}{hashlib.sha1(value.tobytes()).hexdigest()}"
+    if isinstance(value, (list, tuple, set, frozenset)):
+        items = sorted(value, key=repr) if isinstance(
+            value, (set, frozenset)) else value
+        parts = [_digest_value(item, depth + 1) for item in items]
+        if any(part is _GIVE_UP for part in parts):
+            return _GIVE_UP
+        return "[" + ",".join(parts) + "]"
+    if isinstance(value, dict):
+        parts = []
+        for key in sorted(value, key=repr):
+            sub = _digest_value(value[key], depth + 1)
+            if sub is _GIVE_UP:
+                return _GIVE_UP
+            parts.append(f"{key!r}:{sub}")
+        return "{" + ",".join(parts) + "}"
+    return _GIVE_UP
+
+
+def _digest_object(obj):
+    """枚举对象的全部公开非可调用属性；有一项摘要不了就整体放弃。
+
+    此前这里按类型白名单挑（只收 int/float/str，还显式排除 bool），认不出
+    的静默丢弃。实测漏掉的是 ``sr``（逐期敲出线）、``ko_observ``（观察
+    日）、``margin_call``，以及固定时刻策略的整张时刻表——两个完全不同的
+    配置会算出同一个 key。现在改成全枚举 + 遇到不认识的就放弃缓存。
+    """
+    parts = [type(obj).__name__]
+    for name in sorted(dir(obj)):
+        if name.startswith("_") or name in _IGNORED_ATTRS:
             continue
         try:
-            value = getattr(option, name)
+            value = getattr(obj, name)
         except Exception:                              # noqa: BLE001
+            return None
+        if callable(value):
             continue
-        if isinstance(value, (int, float, np.integer, np.floating)) and not (
-                isinstance(value, bool)):
-            parts.append(f"{name}={float(value):.12g}")
-        elif isinstance(value, str):
-            parts.append(f"{name}={value}")
-    return "|".join(parts)
-
-
-def _digest_strategy(strategy):
-    """策略身份：类名 + 决定触发行为的字段。"""
-    parts = [type(strategy).__name__, str(getattr(strategy, "name", ""))]
-    for field in ("threshold", "k", "band_type", "sigma_source",
-                  "window_days", "freq", "max_backfill_minutes"):
-        if hasattr(strategy, field):
-            parts.append(f"{field}={getattr(strategy, field)!r}")
-    times = getattr(strategy, "target_times", None) or getattr(
-        strategy, "fixed_times", None)
-    if times is not None:
-        parts.append(f"times={list(times)!r}")
-    sessions = getattr(strategy, "trading_sessions", None)
-    if sessions is not None:
-        parts.append(f"sessions={list(sessions)!r}")
+        digested = _digest_value(value)
+        if digested is _GIVE_UP:
+            return None
+        parts.append(f"{name}={digested}")
     return "|".join(parts)
 
 
@@ -91,25 +136,33 @@ def _digest_path(path):
 
 
 def key_for(spec, strategy_name):
-    """把一次重放的全部输入压成一个 key。
+    """把一次重放的全部输入压成一个 key；无法完整刻画时返回 ``None``。
 
-    覆盖：期权、行情切片、评估天数、bar 粒度、策略身份、回测参数。任何一
-    项变化都会换 key——宁可 miss 再跑 620 ms，也不能读到不匹配的结果。
+    返回 None 表示这次不缓存（既不读也不写）。覆盖：期权、行情切片、评估
+    天数、bar 粒度、策略身份、回测参数、预热参数。任何一项变化都会换
+    key，任何一项摘要不了就整体放弃——宁可白跑 620 ms，也不能读到不匹配
+    的结果。
     """
-    strategy = spec.strategies[str(strategy_name)]
+    strategy = spec.strategies.get(str(strategy_name))
+    if strategy is None:
+        return None
+    option_digest = _digest_object(spec.option)
+    strategy_digest = _digest_object(strategy)
+    if option_digest is None or strategy_digest is None:
+        return None
+    kwargs_digest = _digest_value(dict(spec.backtest_kwargs))
+    warmup_digest = _digest_value(
+        dict(spec.warmup_kwargs.get(strategy_name, {}) or {}))
+    if kwargs_digest is _GIVE_UP or warmup_digest is _GIVE_UP:
+        return None
     material = "\n".join([
-        _digest_option(spec.option),
+        option_digest,
         _digest_path(spec.external_path),
         f"eval={int(spec.evaluation_days)}",
         f"spd={int(spec.steps_per_day)}",
-        _digest_strategy(strategy),
-        json.dumps(
-            {str(k): repr(v) for k, v in dict(spec.backtest_kwargs).items()},
-            sort_keys=True, ensure_ascii=False),
-        json.dumps(
-            {str(k): repr(v)
-             for k, v in dict(spec.warmup_kwargs.get(strategy_name, {})).items()},
-            sort_keys=True, ensure_ascii=False),
+        strategy_digest,
+        kwargs_digest,
+        warmup_digest,
     ])
     return hashlib.sha256(material.encode("utf-8")).hexdigest()[:32]
 
@@ -127,6 +180,8 @@ def store(spec, strategy_name, result, *, directory=None):
     """
     directory = directory or cache_dir()
     key = key_for(spec, strategy_name)
+    if key is None:
+        return None
     npz_path, meta_path = _paths(key, directory)
     arrays, scalars = {}, {}
     for name, value in dict(result).items():
@@ -182,6 +237,8 @@ def _jsonable_scalars(scalars):
 def load(spec, strategy_name, *, directory=None):
     """读回一段结果；未命中或文件损坏时返回 None（调用方重跑即可）。"""
     key = key_for(spec, strategy_name)
+    if key is None:
+        return None
     npz_path, meta_path = _paths(key, directory)
     if not os.path.isfile(npz_path):
         return None
