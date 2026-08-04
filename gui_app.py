@@ -985,6 +985,32 @@ class BacktestApp(tk.Tk):
                               ("disabled", "#9CA3AF")],
                   foreground=[("disabled", "#E5E7EB")])
 
+        # 幽灵按钮：导航与视图开关这类"不产生结果"的操作。它们和真正的动作
+        # 用同一种带边框实心按钮时，一排四个同权重，主行动就被稀释了。去掉
+        # 边框、文字转为次要色，悬停才浮出主色底。
+        style.configure("Ghost.TButton",
+                        font=btn_font,
+                        background=PALETTE["surface"],
+                        foreground=PALETTE["text_muted"],
+                        bordercolor=PALETTE["surface"],
+                        lightcolor=PALETTE["surface"],
+                        darkcolor=PALETTE["surface"],
+                        focusthickness=0,
+                        padding=(10, 6),
+                        relief="flat")
+        style.map("Ghost.TButton",
+                  background=[("active", PALETTE["primary_light"]),
+                              ("pressed", PALETTE["selected"]),
+                              ("disabled", PALETTE["surface"])],
+                  foreground=[("active", PALETTE["primary"]),
+                              ("disabled", PALETTE["text_light"])],
+                  bordercolor=[("active", PALETTE["primary_light"]),
+                               ("pressed", PALETTE["selected"])],
+                  lightcolor=[("active", PALETTE["primary_light"]),
+                              ("pressed", PALETTE["selected"])],
+                  darkcolor=[("active", PALETTE["primary_light"]),
+                             ("pressed", PALETTE["selected"])])
+
         # ---- Notebook (现代卡片式 Tab) ----
         style.configure("TNotebook",
                         background=PALETTE["bg"],
@@ -1636,8 +1662,10 @@ class BacktestApp(tk.Tk):
         # 一次五周期全选要跑八十多秒，跑完只能截图——所以给它一个落盘的去
         # 处。「已保存结果」任何时候都可用（要去翻旧结果）；「保存结果」只
         # 在页面上确实有结果时可用。
+        # 「已保存结果」是去翻旧结果的入口，「收起/展开候选配置」只是视图
+        # 开关——都用幽灵样式，把实心按钮的分量留给「保存结果」和主行动。
         self._history_open_store_btn = ttk.Button(
-            header, text="已保存结果", width=11,
+            header, text="已保存结果", width=11, style="Ghost.TButton",
             command=self._open_history_result_store,
         )
         self._history_open_store_btn.grid(
@@ -1650,7 +1678,7 @@ class BacktestApp(tk.Tk):
 
         self._history_config_visible = True
         self._history_config_toggle_btn = ttk.Button(
-            header, text="收起候选配置", width=13,
+            header, text="收起候选配置", width=13, style="Ghost.TButton",
             command=self._toggle_history_config_panel,
         )
         self._history_config_toggle_btn.grid(
@@ -7028,13 +7056,21 @@ class BacktestApp(tk.Tk):
         actions.grid(row=0, column=1, rowspan=3, sticky="ne", padx=(18, 0))
         # 名字要说清「应用什么」和「应用到哪」：原来的「只填参数」没说填到
         # 哪去，用户看不到左侧表单变了，会以为什么都没发生。
+        # 两个动作的分量不同：一个真的跑回测并把结果入池，一个只写左侧表
+        # 单。此前同为描边按钮，看不出哪个有副作用。用次级实心与描边区分，
+        # 页首的主色仍专属「开始策略优选」，避免同屏两个主行动。
+        # width 要按**加上 ×N 之后**的最长文案定：勾选上限是 8，
+        # 「应用策略并用当前行情回测 ×8」实测 146px，含内边距需 166px，而
+        # width=20 只有 164px——会被静默截断，而按钮截断是看不出来的。
+        # 22 留出余量，且两个按钮同宽，勾选数变化时也不会改变卡片列宽。
         self._history_verify_btn = ttk.Button(
-            actions, text="应用策略并用当前行情回测", width=20,
+            actions, text="应用策略并用当前行情回测", width=22,
+            style="Accent.TButton",
             command=self._verify_history_on_current_path,
         )
         self._history_verify_btn.pack(fill="x")
         ttk.Button(
-            actions, text="应用策略到左侧参数", width=20,
+            actions, text="应用策略到左侧参数", width=22,
             command=self._apply_history_recommendation,
         ).pack(fill="x", pady=(5, 0))
         BacktestApp._refresh_history_action_buttons(self)

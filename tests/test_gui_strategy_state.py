@@ -6434,3 +6434,56 @@ def test_optimization_reuses_the_one_shared_progress_bar():
     finally:
         threading.Thread = original_thread
         app.destroy()
+
+
+def test_history_buttons_carry_a_visual_hierarchy():
+    """页首与结论卡的按钮要分出主次，不能一排同权重。
+
+    真正有副作用的动作（跑回测、落盘）用实心，导航与视图开关用幽灵样式；
+    主色只留给页面主行动，避免同屏两个"主按钮"。
+    """
+    app = _wind_history_app()
+    try:
+        assert str(app._history_btn.cget("style")) == "Run.TButton"
+        # 去翻旧结果 / 折叠配置都只是导航，不产生结果。
+        for button in (app._history_open_store_btn,
+                       app._history_config_toggle_btn):
+            assert str(button.cget("style")) == "Ghost.TButton"
+        # 保存结果确实产出文件，保持实心描边。
+        assert str(app._history_save_btn.cget("style") or "") in ("", "TButton")
+    finally:
+        app.destroy()
+
+
+def test_verify_button_fits_its_longest_label():
+    """勾满 8 个候选时按钮文案也不能被截断。
+
+    ttk 按钮截断是静默的——看不出少了字。`width` 必须按加上 ×N 之后的最长
+    文案定，而不是按不带后缀的基础文案。
+    """
+    import tkinter.font as tkfont
+    from tkinter import ttk
+
+    # 必须量应用里真实的那个按钮：另建一个探针再给它设宽度，测的是探针。
+    app = _render_history_result_page()
+    try:
+        app.update_idletasks()
+        button = app._history_verify_btn
+        style = ttk.Style(app)
+        font = tkfont.Font(
+            font=style.lookup(str(button.cget("style")), "font")
+            or "TkDefaultFont")
+        longest = (
+            "应用策略并用当前行情回测 ×"
+            + str(history_selection.MAX_HISTORY_CHART_CANDIDATES))
+        needed = font.measure(longest) + 20      # padding=(10, 6)
+
+        assert button.winfo_reqwidth() >= needed, (
+            f"按钮 {button.winfo_reqwidth()}px 放不下最长文案 {needed}px")
+        # 同栏的另一个按钮必须同宽，否则勾选数一变两个按钮就不齐。
+        siblings = [w for w in button.master.winfo_children() if w is not button]
+        assert siblings
+        assert all(w.winfo_reqwidth() == button.winfo_reqwidth()
+                   for w in siblings)
+    finally:
+        app.destroy()
