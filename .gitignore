@@ -8,6 +8,11 @@ dist/
 build/
 *.egg
 
+# Local secrets (keep the placeholder template tracked)
+.env
+.env.*
+!.env.example
+
 # Jupyter Notebook
 .ipynb_checkpoints/
 
