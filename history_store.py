@@ -6,7 +6,10 @@
 **存输入，不存输出。** ``window_results`` 里每个回测的完整数组（Greeks、逐
 bar 价格、持仓）平均 971 KB，161 个约 153 MB——那个存不了。但逐段下钻要的
 是**输入**：行情切片加构造参数。底层 1 分钟序列一年 gzip 后约 206 KB，各段
-都是它的切片，存一份即可。下钻时只重跑选中那一段（约 1 秒），不是 161 段。
+都是它的切片，存一份即可。这份输入是**兜底**：正常下钻读的是 history_bar_cache
+里那份可丢弃的 bar 级缓存（3 ms），缓存不在时才用这里的配方重算选中那一段（约
+620 ms），而不是 161 段。两层缺一不可——缓存能重建所以不进包，包不可重建（Wind
+前复权会让重取拿到另一串数）所以必须自带输入。
 
 （早前把这两者搞混，据此误判成「载入后无法下钻」，这里记一笔免得再犯。）
 
@@ -30,7 +33,7 @@ import pandas as pd
 # 包格式版本。列名与口径这些东西是会变的（增量性价比→增量信噪比、分段
 # 方向从正推改成倒推），旧包用新代码渲染会静默显示错误口径——那样这个功
 # 能就是在制造错误结论。载入时必须校验。
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 _MANIFEST_NAME = "manifest.json"
 _SUFFIX = ".json.gz"
@@ -232,25 +235,78 @@ def build_payload(*, ranking, window_summary, history_state, source_label,
     }
 
 
-def series_from_replay_index(replay_index):
-    """把逐分段行情切片并回一条底层序列。
+DEFAULT_SERIES_KEY = "__all__"
 
-    各 lookback 的分段都是同一条已拉取序列的精确切片（实测 15/15 完全一
-    致），因此并集去重就还原出底层序列本身——不必把它单独从取数层一路传
-    到保存点。跨 lookback 会重叠（近周那 5 天也在近年里），所以必须按索引
-    去重，否则同一天会被存好几遍。
+
+def _series_bucket_key(spec):
+    """这一段属于哪条底层序列。
+
+    单标的时各段都是同一条已拉取序列的精确切片（实测 15/15 完全一致），并
+    成一条存最省。品种池不成立：各段来自**不同合约**，换月处同一天有两个
+    价，因此按合约分桶。
     """
-    pieces = []
+    meta = dict(getattr(spec, "metadata", None) or {})
+    code = str(meta.get("contract_code") or "").strip()
+    return code or DEFAULT_SERIES_KEY
+
+
+def _slice_round_trips(merged, piece):
+    """``piece`` 能否按首尾时间戳从 ``merged`` 原样切回来。"""
+    got = merged.loc[piece.index[0]:piece.index[-1]]
+    return (len(got) == len(piece)
+            and np.array_equal(got.to_numpy(), piece.to_numpy()))
+
+
+def replay_series_buckets(replay_index):
+    """把逐分段行情切片按底层序列分桶合并。
+
+    返回 ``(series_by_key, key_by_window)``，后者是 ``{(lookback, window_id):
+    series_key}``。跨 lookback 会重叠（近周那 5 天也在近年里），所以桶内必
+    须按索引去重，否则同一天会被存好几遍。
+
+    **合并只有在每段都能原样切回来时才成立。** 早前无条件并成一条并
+    ``keep="first"``，前提写的是「各段都是同一条序列的切片」——那只对单标
+    的成立。品种池实测：P2605 段原本 ``[105,106,107,108]``，载回来变成
+    ``[203,204,107,108]``，头两根是 P2601 的价；串掉的第一根还是 Day 0 锚
+    点，``_rescale_option_to_real_s0`` 会拿它给整段期权重定基，错的不止那两
+    根 bar。所以这里逐段校验，一旦切不回来就退化成按段各存各的：多占些空
+    间，但绝不能让某段读到别段的价格。
+    """
+    buckets = {}
     for windows in (replay_index or {}).values():
         for spec in (windows or {}).values():
             path = getattr(spec, "external_path", None)
-            if path is not None and len(path):
-                pieces.append(pd.Series(path))
-    if not pieces:
+            if path is None or not len(path):
+                continue
+            buckets.setdefault(_series_bucket_key(spec), []).append(
+                (spec, pd.Series(path)))
+    series_by_key, key_by_window = {}, {}
+    for key, entries in buckets.items():
+        merged = pd.concat([piece for _spec, piece in entries])
+        merged = merged[~merged.index.duplicated(keep="first")].sort_index()
+        if all(_slice_round_trips(merged, piece) for _spec, piece in entries):
+            series_by_key[key] = merged
+            for spec, _piece in entries:
+                key_by_window[(str(spec.lookback), str(spec.window_id))] = key
+            continue
+        for spec, piece in entries:
+            window = (str(spec.lookback), str(spec.window_id))
+            per_key = f"{spec.lookback}|{spec.window_id}"
+            series_by_key[per_key] = piece
+            key_by_window[window] = per_key
+    return series_by_key, key_by_window
+
+
+def series_from_replay_index(replay_index):
+    """把逐分段行情切片并回一条底层序列；分桶不止一条时返回 None。
+
+    只保留给「确实只有一条底层序列」的调用方（单标的）。多合约请改用
+    ``replay_series_buckets``——并成一条会串价。
+    """
+    series_by_key, _keys = replay_series_buckets(replay_index)
+    if len(series_by_key) != 1:
         return None
-    merged = pd.concat(pieces)
-    merged = merged[~merged.index.duplicated(keep="first")].sort_index()
-    return merged
+    return next(iter(series_by_key.values()))
 
 
 def build_replay_payload(replay_index):
@@ -264,8 +320,8 @@ def build_replay_payload(replay_index):
     分段的起止用时间戳而不是位置：位置依赖序列本身，时间戳则可以直接
     ``series.loc[start:end]`` 切出来，与序列如何拼接无关。
     """
-    series = series_from_replay_index(replay_index)
-    if series is None:
+    series_by_key, key_by_window = replay_series_buckets(replay_index)
+    if not series_by_key:
         return None
     specs = []
     for lookback, windows in (replay_index or {}).items():
@@ -288,27 +344,65 @@ def build_replay_payload(replay_index):
                 "warmup_kwargs": _jsonable(
                     {str(k): v for k, v in dict(spec.warmup_kwargs).items()}),
                 "metadata": _jsonable(dict(spec.metadata)),
+                # 这一段该从哪条序列上切。单标的只有一条（DEFAULT_SERIES_KEY），
+                # 品种池按合约一条——不记这个字段就没法知道该切哪条。
+                "series_key": key_by_window.get(
+                    (str(lookback), str(window_id)), DEFAULT_SERIES_KEY),
             })
     return {
-        "price_series": {
-            "index": [pd.Timestamp(ts).isoformat() for ts in series.index],
-            "values": [float(v) for v in series.to_numpy()],
+        "price_series_by_key": {
+            str(key): {
+                "index": [pd.Timestamp(ts).isoformat() for ts in series.index],
+                "values": [float(v) for v in series.to_numpy()],
+            }
+            for key, series in series_by_key.items()
         },
         "specs": specs,
     }
 
 
+def _series_from_block(raw):
+    index = pd.to_datetime(list((raw or {}).get("index", ())))
+    values = np.asarray(list((raw or {}).get("values", ())), dtype=float)
+    if not len(index) or len(index) != len(values):
+        return None
+    return pd.Series(values, index=index)
+
+
 def restore_replay_payload(payload):
-    """还原成 ``(价格序列, 分段配方列表)``；没有重放数据时返回 ``(None, [])``。"""
+    """还原成 ``({序列键: 价格序列}, 分段配方列表)``；没有重放数据时 ``({}, [])``。
+
+    兼容旧包：本修复之前写的包只有一条扁平的 ``price_series``，那时的合并
+    方式对**单标的**是对的，直接挂到 ``DEFAULT_SERIES_KEY`` 上照常用。
+
+    但旧的**品种池**包不可救：多合约当初就已经被并成一条、换月处的价被顶
+    掉了，包里存的就是错数。这种情况直接判定不可重放，而不是拿错价格画一
+    条看起来正常的曲线——后者不会报错，还能被保留进结果对比。
+    """
     block = (payload or {}).get("replay")
     if not block:
-        return None, []
-    raw = block.get("price_series") or {}
-    index = pd.to_datetime(list(raw.get("index", ())))
-    values = np.asarray(list(raw.get("values", ())), dtype=float)
-    if not len(index) or len(index) != len(values):
-        return None, []
-    return pd.Series(values, index=index), list(block.get("specs", ()))
+        return {}, []
+    specs = list(block.get("specs", ()))
+    keyed = block.get("price_series_by_key")
+    if keyed:
+        out = {}
+        for key, raw in dict(keyed).items():
+            series = _series_from_block(raw)
+            if series is not None:
+                out[str(key)] = series
+        return (out, specs) if out else ({}, [])
+
+    series = _series_from_block(block.get("price_series"))
+    if series is None:
+        return {}, []
+    contracts = {
+        str((dict(spec.get("metadata") or {})).get("contract_code") or "")
+        for spec in specs
+    }
+    contracts.discard("")
+    if len(contracts) > 1:
+        return {}, []
+    return {DEFAULT_SERIES_KEY: series}, specs
 
 
 def default_label(state, existing=None, now=None):

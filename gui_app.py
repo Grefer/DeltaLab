@@ -195,11 +195,16 @@ from pricing.hedge_analysis import (
 )
 # 载入结果包时按冻结参数重建每段的期权：原始运行也是按段初价重定基的，
 # 用同一个函数才能保证重放与排名同源。
-from pricing.hedge_backtest import _rescale_option_to_real_s0
+from pricing.hedge_backtest import (
+    _PRICE_FIELDS_BY_CLS,
+    _rescale_option_to_real_s0,
+)
 from pricing.hedge_backtest import (
     _infer_intraday_steps,
     _rescale_strategy_to_real_s0,
     _validate_fixed_time_data,
+    histogram_bin_edges,
+    padded_histogram_range,
 )
 import history_selection
 from history_selection import (
@@ -211,6 +216,7 @@ from history_selection import (
 )
 import history_store
 import history_bar_cache
+import backtest_pool_store
 
 # ============================================================
 #  期权类型注册表
@@ -517,18 +523,22 @@ BASELINE_STRATEGY_STYLE_KEY = "close_to_close"
 # 快照来源：只有 origin 是结构化字段，可供结果池分组与回跳使用；此前来源
 # 只体现在用户可改的结果名前缀里，改名即丢失。
 SNAPSHOT_ORIGIN_MANUAL = "manual"
-SNAPSHOT_ORIGIN_HISTORY_VERIFY = "history_verify"
 SNAPSHOT_ORIGIN_HISTORY_REPLAY = "history_replay"
 SNAPSHOT_ORIGIN_DISPLAY = {
     SNAPSHOT_ORIGIN_MANUAL: "手工回测",
-    SNAPSHOT_ORIGIN_HISTORY_VERIFY: "优选验证",
     SNAPSHOT_ORIGIN_HISTORY_REPLAY: "分段重放",
 }
 
 
 @dataclass
 class SavedBacktestResult:
-    """会话内保留的轻量回测快照，只保存实时对比所需字段。"""
+    """回测结果池里的轻量快照：只保存对比所需字段，外加一份重放配方。
+
+    展示层（``summary_row`` / ``daily_frame`` / 四个签名 key / ``form_state``）
+    恒可用，重开程序后画曲线、算差异、应用策略都只读它。``replay`` 是可选
+    的第二层，存的是**输入**（行情切片 + 冻结的运行参数），供「加载明细」
+    重跑出 bar 级结果——bar 级**输出**平均 971 KB，那个不存。
+    """
 
     result_id: str
     name: str
@@ -540,6 +550,9 @@ class SavedBacktestResult:
     source_label: str
     option_label: str
     path_key: tuple
+    # 四组可比属性的签名，都保留键名，因此能逐字段 diff 出"差在哪一项"。
+    # path_key 是价格数组的哈希，只能判"数据变没变"，定位不了原因。
+    market_key: tuple
     contract_key: tuple
     economics_key: tuple
     position: int
@@ -548,6 +561,16 @@ class SavedBacktestResult:
     # 结构化来源，不随重命名丢失；origin_meta 记录优选周期、批次与当时排名。
     origin: str = SNAPSHOT_ORIGIN_MANUAL
     origin_meta: dict = field(default_factory=dict)
+    # 本次运行的对冲策略输入，按原始单位保存，供回填左侧表单继续调参。
+    # parameter_summary 是给人看的一句话，回不了表单。
+    form_state: dict = field(default_factory=dict)
+    # 保存顺序的权威来源。对比表原先按 result_id 字典序排，等于把「顺序」
+    # 焊死在 ID 格式上：改 ID 方案会静默乱序，第 10000 条也会排到 9999 前。
+    sequence: int = 0
+    # 重放配方；缺失（旧包、或行情拿不到）时「加载明细」置灰而不是假装成功。
+    replay: dict = field(default_factory=dict)
+    # 该快照在磁盘上的位置，载入时回填；重命名原地覆盖、删除据此删文件。
+    store_path: str = ""
 
 SIGMA_SOURCE_DISPLAY = {
     "implied":  "隐含波动率",
@@ -724,31 +747,20 @@ class BacktestApp(tk.Tk):
         self._active_job = None
         self._saved_backtests = {}
         self._saved_comparison_selection = set()
-        # 会话内第一个 close-to-close 快照固定为回测对比基准；只有删除它后
-        # 才会按保留顺序接替下一条 close-to-close，避免基准随勾选结果漂移。
-        self._saved_comparison_baseline_id = None
         self._saved_backtest_sequence = 0
         self._latest_backtest = None
         self._latest_backtest_state = None
         self._latest_retained_result_id = None
         self._latest_history_state = None
         self._latest_history_source_label = None
-        self._pending_history_retain_name = None
-        self._pending_history_retain_origin = None
         # 策略配色登记表：结果对比与策略优选共用，使同一策略跨页同色。
+        # 仍是会话级——跨会话的配色稳定性从没承诺过，结果池持久化后同一批
+        # 结果重开可能换色，这一点写在 GUI_USAGE 的 6.7 里。
         self._strategy_style_registry = None
-        # 策略优选批量联动：把勾选候选逐条在当前单次回测路径上验证，
-        # 完成后送入结果池，使优选结论可直接在其它展示页面对照。
-        self._history_batch_queue = []
-        self._history_batch_total = 0
-        self._history_batch_done = 0
-        self._history_batch_failures = []
-        self._history_batch_position = None
-        self._history_batch_result_ids = []
-        self._history_batch_id = None
-        # 上一批验证的收尾结论，供优选页结果条按需展开与回跳。
-        self._history_batch_failure_details = []
-        self._history_batch_last_result_ids = []
+        # 载入本机已保存的结果池。放在 _build_ui 之前：计数行与占位符在构建
+        # 时就要拿到真实条数，否则要么显示 0、要么得再刷一次。
+        self._saved_pool_load_error = ""
+        self._load_saved_pool()
         self._apply_window_icon()
         self._setup_styles()
         self._build_ui()
@@ -1351,10 +1363,19 @@ class BacktestApp(tk.Tk):
         _form_separator(sec3, 2)
 
         # 对冲参数
+        # 顺序：成本（成本率 + 滑点）→ 仓位（方向 / 数量 / 乘数）→ 策略。
+        # 滑点与成本率是同一类按成交量计的执行成本，排在一起；也因此不能留在
+        # 策略块之后——那里的专属参数随策略显隐，会带着滑点上下跳一百多像素。
         row_h = 3
         _form_label(sec3, "交易成本率(%):", row_h)
         self._tc_var = tk.StringVar(value="0.01")
         _form_input(ttk.Entry(sec3, textvariable=self._tc_var,
+                              width=FORM_ENTRY_CHARS), row_h)
+
+        row_h += 1
+        _form_label(sec3, "滑点 (基点):", row_h)
+        self._slip_var = tk.StringVar(value="0")
+        _form_input(ttk.Entry(sec3, textvariable=self._slip_var,
                               width=FORM_ENTRY_CHARS), row_h)
 
         row_h += 1
@@ -1462,6 +1483,7 @@ class BacktestApp(tk.Tk):
             width=FORM_ENTRY_CHARS)
         _form_input(self._band_sigma_entry, 2)
         _form_hint(self._band_frame, 2, "编辑任一项后自动换算")
+        # 策略专属参数是本组最后一行：它随策略显隐，后面不能再排别的控件。
 
         # 保留原状态字段供收集/兼容；其值由最后编辑的联动输入决定。
         self._price_interval_var = tk.StringVar(value="1")
@@ -1481,12 +1503,6 @@ class BacktestApp(tk.Tk):
             entry.bind("<FocusOut>", lambda e, k=kind: self._commit_band_input(k))
             entry.bind("<Return>", lambda e, k=kind: self._commit_band_input(k, force=True))
 
-        row_h += 1
-        _form_label(sec3, "滑点 (基点):", row_h)
-        self._slip_var = tk.StringVar(value="0")
-        _form_input(ttk.Entry(sec3, textvariable=self._slip_var,
-                              width=FORM_ENTRY_CHARS), row_h)
-
         # 依据默认策略（close_to_close）初始化专用参数可见性
         self._toggle_strategy()
 
@@ -1503,12 +1519,9 @@ class BacktestApp(tk.Tk):
         )
         self._retain_btn.pack(fill="x", ipady=2, pady=(FORM_SECTION_GAP - 2, 0))
 
-        self._compare_btn = ttk.Button(
-            btn_frame, text="🆚  结果对比 (0)", style="Accent.TButton",
-            command=self._open_saved_comparison,
-        )
-        self._compare_btn.pack(fill="x", ipady=2, pady=(FORM_SECTION_GAP - 2, 0))
-
+        # 左侧不再有「结果对比」按钮：同名标签页是等效入口，切过去时
+        # _on_notebook_tab_changed 会补建页面。已保留条数改挂到标签页标题上，
+        # 从任何页面都看得见。
         self._struct_btn = ttk.Button(btn_frame, text="📊  绘制结构图",
                                       style="Accent.TButton",
                                       command=self._plot_structure)
@@ -1552,7 +1565,7 @@ class BacktestApp(tk.Tk):
              "波动率分析", "运行回测后此处将展示隐含波动率与已实现波动率的对比分析"),
             ("dist",    " 🎲 盈亏分布 ",
              "盈亏分布", "在模拟模式下运行多路径回测后，此处将展示蒙特卡洛盈亏分布"),
-            ("compare", " 🆚 结果对比 ",
+            ("compare", BacktestApp._COMPARE_TAB_TITLE,
              "已保存回测结果对比",
              "回测完成后点击『保留当前结果到对比』；换策略或参数继续回测，再到此页勾选结果"),
             ("history", " 🎯 策略优选 ",
@@ -1669,12 +1682,12 @@ class BacktestApp(tk.Tk):
             command=self._open_history_result_store,
         )
         self._history_open_store_btn.grid(
-            row=0, column=1, sticky="e", padx=(8, 4))
+            row=0, column=1, sticky="e", padx=(12, 0))
         self._history_save_btn = ttk.Button(
             header, text="保存结果", width=10, state="disabled",
             command=self._save_history_result,
         )
-        self._history_save_btn.grid(row=0, column=2, sticky="e", padx=(0, 4))
+        self._history_save_btn.grid(row=0, column=2, sticky="e", padx=(6, 0))
 
         self._history_config_visible = True
         self._history_config_toggle_btn = ttk.Button(
@@ -1682,7 +1695,7 @@ class BacktestApp(tk.Tk):
             command=self._toggle_history_config_panel,
         )
         self._history_config_toggle_btn.grid(
-            row=0, column=3, sticky="e", padx=(4, 6))
+            row=0, column=3, sticky="e", padx=(6, 0))
 
         # 变量保留：顶部摘要里的警示 pill 从它取文案。这里不再重复渲染
         # 同一句话——同屏出现两遍只会让人以为是两条不同的提示。
@@ -1693,7 +1706,8 @@ class BacktestApp(tk.Tk):
             header, text="开始策略优选", style="Run.TButton",
             command=self._run_history_recommendation,
         )
-        self._history_btn.grid(row=0, column=4, sticky="e", ipadx=12, ipady=2)
+        self._history_btn.grid(
+            row=0, column=4, sticky="e", padx=(6, 0), ipadx=12, ipady=2)
 
         self._history_config_panel = ttk.Frame(
             container, style="Surface.TFrame")
@@ -1706,12 +1720,12 @@ class BacktestApp(tk.Tk):
             highlightbackground=PALETTE["border_soft"], highlightthickness=1,
             padx=14, pady=8)
         base_box.pack(fill="x", pady=(0, 8))
-        tk.Label(
+        base_summary = tk.Label(
             base_box, textvariable=self._history_base_summary_var,
             bg=PALETTE["primary_light"], fg=PALETTE["primary"],
-            font=(_UI_FONT_FAMILY, 9), anchor="w", justify="left",
-            wraplength=980,
-        ).pack(fill="x")
+            font=(_UI_FONT_FAMILY, 9), anchor="w", justify="left")
+        base_summary.pack(fill="x")
+        BacktestApp._track_wraplength(base_summary)
 
         settings = ttk.LabelFrame(
             self._history_config_panel,
@@ -1785,7 +1799,7 @@ class BacktestApp(tk.Tk):
             width=entry_width)
         self._history_fixed_times_entry.grid(row=0, column=1, sticky="w")
         ttk.Label(
-            fixed_row, text="每日在这些时刻各调仓一次",
+            fixed_row, text="每日在这些时刻各调仓一次，HH:MM 英文逗号分隔",
             style="SurfaceMuted.TLabel",
         ).grid(row=0, column=2, sticky="w", padx=(hint_gap, 0))
 
@@ -1826,14 +1840,18 @@ class BacktestApp(tk.Tk):
             band_extra, textvariable=self._history_current_band_label_var,
             variable=self._history_include_current_band_var,
         )
-        self._history_current_band_check.pack(side="left", padx=(0, 18))
+        self._history_current_band_check.pack(anchor="w")
         # σ 恒取左侧输入的波动率，界面上不再给选项：选「历史波动率」会让
         # 带宽随行情伸缩，那是另一条策略维度，而这里的排名只比带宽倍数，
         # 全部候选共用同一个 σ 才可比。引擎侧仍支持 realized。
+        #
+        # 这句话另起一行而不是跟在勾选框右边：勾选框的文案是变量，勾上时会
+        # 带上换算出的 σ 值（「加入当前回测带宽: 0.866025σ（绝对输入换算）」），
+        # 实测把右边这句推走 144px——同一句说明在两次渲染间左右横跳。
         ttk.Label(
             band_extra, text="σ 统一取左侧输入的波动率",
             style="SurfaceMuted.TLabel",
-        ).pack(side="left")
+        ).pack(anchor="w")
 
         ttk.Separator(settings, orient="horizontal").grid(
             row=5, column=0, columnspan=2, sticky="ew",
@@ -1870,8 +1888,13 @@ class BacktestApp(tk.Tk):
         # （自动模式一长句、手动模式为空）就会重算列宽，两个日期输入框跟着
         # 左右跳——勾一下「自动推算」就位移，正是这个原因。
         self._history_wind_frame.columnconfigure(0, minsize=date_label_w)
-        self._history_wind_frame.columnconfigure(
-            1, minsize=entry_width * label_font.measure("0"))
+        # 列宽取输入框的实际请求宽度，而不是「字符数 × 字宽」估算——后者
+        # 实测比真实渲染宽 28px（198 vs 170），右侧凭空多出一块死区，把后面
+        # 的勾选框整体推远。量完即销毁，不给框里留下一个孤儿控件。
+        _probe = ttk.Entry(self._history_wind_frame, width=entry_width)
+        entry_px = _probe.winfo_reqwidth()
+        _probe.destroy()
+        self._history_wind_frame.columnconfigure(1, minsize=entry_px)
         self._history_wind_frame.columnconfigure(2, weight=1)
         # 按区间的自然读法排：先起始日、后截止日。自动推算开关紧跟在它所
         # 控制的那个输入框后面，而不是另起一列。
@@ -1998,11 +2021,19 @@ class BacktestApp(tk.Tk):
 
         source_label = getattr(self, "_history_last_source_label", None)
         if not source_label and hasattr(self, "_source_var"):
-            src_type = self._source_var.get().upper()
-            code_var = getattr(self, "_wind_code_var", None)
-            code = code_var.get().strip() if code_var is not None else ""
-            if src_type in ("CSV", "WIND"):
-                source_label = f"{src_type} 行情" + (f" · {code}" if code else "")
+            source = self._source_var.get()
+            # 标的必须按来源取：此前一律读 _wind_code_var，于是 CSV 模式下
+            # 这枚 pill 会显示 Wind 代码框里的内容（实测「CSV 行情 ·
+            # 510050.SH」），而本次根本不会去碰那个代码。
+            if source == "wind":
+                code_var = getattr(self, "_wind_code_var", None)
+                subject = code_var.get().strip() if code_var is not None else ""
+                source_label = "WIND 行情" + (f" · {subject}" if subject else "")
+            elif source == "csv":
+                path_var = getattr(self, "_csv_path_var", None)
+                path = path_var.get().strip() if path_var is not None else ""
+                subject = os.path.basename(path) if path else ""
+                source_label = "CSV 行情" + (f" · {subject}" if subject else "")
 
         if source_label:
             src_pill = tk.Label(
@@ -2248,15 +2279,15 @@ class BacktestApp(tk.Tk):
         """用包里存的行情切片与构造参数重建逐段重放索引。
 
         存的是回测**输入**，所以这里不是「读回结果」而是「重建可重跑的配
-        方」——下钻时只重跑选中那一段。重建路径与原始运行是两套代码，任何
+        方」——缓存不在时据此重算选中那一段。重建路径与原始运行是两套代码，任何
         一处对不上都会让下钻显示的数字与排名不符且**不会报错**，因此每次
         重放都由 ``_replay_fidelity_error`` 拿包里存的逐日损益核对，不符
         时弹窗说明。
         """
         import pandas as pd
 
-        series, specs = history_store.restore_replay_payload(payload)
-        if series is None or not specs:
+        series_by_key, specs = history_store.restore_replay_payload(payload)
+        if not series_by_key or not specs:
             return {}
         summary = payload.get("window_summary")
         state = dict(payload.get("history_state") or {})
@@ -2284,6 +2315,16 @@ class BacktestApp(tk.Tk):
             # 钻按钮点了没反应」，和功能没做一样却更难查。失败原因收集起来
             # 报给用户。
             try:
+                # 按段各切各的序列。单标的只有一条，品种池按合约分桶——拿
+                # 错序列就会切到别的合约的价，而且不报错。
+                key = str(spec.get("series_key")
+                          or history_store.DEFAULT_SERIES_KEY)
+                series = series_by_key.get(key)
+                if series is None:
+                    failures.append(
+                        f"{spec['lookback']}/{spec['window_id']}: "
+                        f"包内缺少序列 {key}")
+                    continue
                 path = series.loc[
                     pd.Timestamp(spec["start_ts"]):pd.Timestamp(spec["end_ts"])]
                 if not len(path):
@@ -2600,6 +2641,32 @@ class BacktestApp(tk.Tk):
             pass
 
     @staticmethod
+    def _track_wraplength(label, slack=0):
+        """让 wraplength 跟随控件实际宽度，而不是写死一个数。
+
+        写死的值必然与真实槽位对不上：基准摘要写的是 980，而它的槽位实测
+        1242——文本只要多十来个字就在还剩 262px 的情况下提前折成两行。
+
+        防自激：只有宽度真的变了才重设。设 wraplength 会改变**高度**（一行
+        变两行），高度变化会让父容器重排并再次派发 <Configure>；不比宽度就
+        会形成「设值→重排→再设值」的闭环。
+        """
+        last = {"width": None}
+
+        def _apply(event=None):
+            width = label.winfo_width()
+            if width <= 1 or width == last["width"]:
+                return
+            last["width"] = width
+            try:
+                label.configure(wraplength=max(80, width - slack))
+            except tk.TclError:
+                pass
+
+        label.bind("<Configure>", _apply, add="+")
+        label.after_idle(_apply)
+
+    @staticmethod
     def _attach_tooltip(widget, text):
         """给控件挂一个轻量悬浮提示。
 
@@ -2796,6 +2863,8 @@ class BacktestApp(tk.Tk):
             BacktestApp._refresh_history_wind_hint(self)
         if getattr(self, "_history_base_summary_var", None) is not None:
             BacktestApp._refresh_history_base_summary(self)
+        # 勾选数为 0 时主按钮要禁用，所以每次改动都得重算按钮状态。
+        BacktestApp._sync_history_button_state(self)
 
     def _toggle_history_candidate_controls(self):
         """只联动历史页自己的候选输入，不影响单次回测控件。"""
@@ -2936,15 +3005,41 @@ class BacktestApp(tk.Tk):
 
     # ---- 事件回调 ----
     def _on_notebook_tab_changed(self, _event=None):
-        """进入历史页时刷新将被冻结的公共环境与当前带宽摘要。"""
+        """按落地页刷新它依赖的会话状态。
+
+        历史页要刷新将被冻结的公共环境与当前带宽摘要；结果对比页此前只由
+        左侧按钮构建，从标签直接进来的用户会看到「先保留结果」占位符——哪
+        怕按钮上已经写着结果数。
+        """
         try:
-            if self._nb.select() != str(self._history_tab):
-                return
+            current = self._nb.select()
         except (AttributeError, tk.TclError):
             return
-        BacktestApp._toggle_history_wind_controls(self)
-        self._refresh_history_base_summary()
-        self._refresh_history_current_band_label()
+        if current == str(self._history_tab):
+            BacktestApp._toggle_history_wind_controls(self)
+            self._refresh_history_base_summary()
+            self._refresh_history_current_band_label()
+            return
+        if current == str(getattr(self, "_compare_tab", None)):
+            BacktestApp._ensure_saved_comparison_page(self)
+
+    def _ensure_saved_comparison_page(self):
+        """结果池非空却还没构建过页面时补建一次，不改变任何勾选状态。
+
+        只在页面缺失时动手：已经构建过的页面由结果池自己的刷新链路维护，
+        重建会丢掉用户当前的聚焦行。池子为空时保持占位符——那句提示正是
+        此时该说的话。
+        """
+        tree = getattr(self, "_saved_pool_tree", None)
+        try:
+            if tree is not None and tree.winfo_exists():
+                return
+        except tk.TclError:
+            # widget 已随旧渲染销毁，按未构建处理。
+            pass
+        if not getattr(self, "_saved_backtests", None):
+            return
+        self._show_saved_comparison_page(navigate=False)
 
     def _on_option_class_change(self, event):
         cls_name = self._class_var.get()
@@ -3039,6 +3134,24 @@ class BacktestApp(tk.Tk):
             return
         # 参数编辑到一半时不弹窗；运行前会执行 strict 校验并阻止错误输入。
         self._sync_band_inputs(self._band_last_edited, quiet=True)
+
+    def destroy(self):
+        """先撤掉挂起的带宽换算定时器，再销毁窗口。
+
+        Tk 的 destroy 清 widget、也清本实例注册的 Tcl 命令，唯独不动 after
+        队列。带宽输入的防抖定时器几乎总是挂着一个，窗口关掉后它仍排在事件
+        队列里，指向一个已经被删掉的命令名。同一个进程里随后再开一个窗口
+        时，那次事件循环就会执行到这条失效的 after 脚本 —— 报
+        ``invalid command name``，并且不再返回。
+        """
+        pending = getattr(self, "_band_reference_after_id", None)
+        if pending is not None:
+            try:
+                self.after_cancel(pending)
+            except (tk.TclError, ValueError):
+                pass
+            self._band_reference_after_id = None
+        super().destroy()
 
     def _sync_snowball_margin_controls(self):
         """雪球保证金模式联动：追保时保证金比例不参与封顶，置灰避免误读。"""
@@ -3401,9 +3514,18 @@ class BacktestApp(tk.Tk):
         source_var = getattr(self, "_source_var", None)
         if source_var is None:
             return
+        # 一个周期都没勾时也要禁用：此前按钮照常可点，点下去才弹
+        # 「请至少选择一个历史分析周期。」的模态框——用模态错误代替禁用态，
+        # 等于让用户先撞一次才知道不能按。
+        try:
+            has_period = bool(BacktestApp._history_lookbacks_from_controls(
+                self, require_one=False))
+        except (AttributeError, tk.TclError):
+            has_period = True      # 控件还没建好时不误禁
         enabled = (
             getattr(self, "_active_job", None) is None
             and source_var.get() in ("csv", "wind")
+            and has_period
         )
         state = "normal" if enabled else "disabled"
         for attr in ("_history_btn",):
@@ -3421,11 +3543,14 @@ class BacktestApp(tk.Tk):
                 setattr(self, attr, None)
         hint = getattr(self, "_history_source_hint_var", None)
         if hint is not None:
-            if source_var.get() in ("csv", "wind"):
+            if source_var.get() not in ("csv", "wind"):
+                hint.set("策略优选仅支持 CSV / Wind，模拟行情下不可运行")
+            elif not has_period:
+                # 禁用必须有就近可循的理由：这条 pill 紧挨着主按钮。
+                hint.set("请至少勾选一个分析周期")
+            else:
                 # 一切正常时不占版面；能不能跑由按钮自身的可用状态表达。
                 hint.set("")
-            else:
-                hint.set("策略优选仅支持 CSV / Wind，模拟行情下不可运行")
         BacktestApp._update_history_header_summary(self)
 
     def _begin_job(self, job_name, status_text):
@@ -3445,8 +3570,7 @@ class BacktestApp(tk.Tk):
         """返回会重建结果视图或改变快照状态的入口按钮。"""
         buttons = []
         for attr in (
-                "_run_btn", "_retain_btn", "_compare_btn", "_history_btn",
-                "_struct_btn"):
+                "_run_btn", "_retain_btn", "_history_btn", "_struct_btn"):
             button = getattr(self, attr, None)
             if button is not None:
                 buttons.append(button)
@@ -3868,7 +3992,7 @@ class BacktestApp(tk.Tk):
     def _finish_history_recommendation(self, success=True):
         self._finish_job(
             "history", success=success,
-            success_text="策略优选完成  |  可应用该策略或用当前行情回测",
+            success_text="策略优选完成  |  可在排名表选中策略后应用到左侧参数",
             failure_text="历史择优失败  |  请查看错误信息",
         )
 
@@ -3932,6 +4056,27 @@ class BacktestApp(tk.Tk):
         """
         span = BacktestApp._calendar_span_for_trading_days(required_trade_days)
         return asof - datetime.timedelta(days=span)
+
+    @staticmethod
+    def _validate_sigma_input(value, label):
+        """波动率必须是大于 0 的有限数值。
+
+        σ=0 不是"没有波动"这么无害：Black-Scholes 的 d1/d2 要除以
+        ``σ√T``，σ=0 时直接除零，Greeks 全部退化成 NaN 或 0；模拟路径也塌
+        成一条确定性曲线，多路径统计的每条路径完全相同。回测照样跑完、界面
+        照样出数，只是那些数字没有任何意义——所以必须在启动前就拦掉，而不是
+        让用户对着一屏 0.0000 猜哪里不对。
+        """
+        if value is None:
+            return
+        try:
+            sigma = float(value)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError(f"{label}必须是大于 0 的数值。") from exc
+        if sigma == 0:
+            raise ValueError(f"{label}不能为 0，必须是大于 0 的数值。")
+        if not np.isfinite(sigma) or sigma < 0:
+            raise ValueError(f"{label}必须是大于 0 的有限数值。")
 
     @staticmethod
     def _calendar_span_for_trading_days(trading_days):
@@ -4271,6 +4416,9 @@ class BacktestApp(tk.Tk):
             else:
                 params[key] = val_str
 
+        BacktestApp._validate_sigma_input(
+            params.get("sigma"), param_labels.get("sigma", "波动率"))
+
         if cls_name == "雪球期权 (Snowball)":
             margin = float(params.get("margin", 0.0))
             if margin < 0:
@@ -4300,6 +4448,12 @@ class BacktestApp(tk.Tk):
         fixed_times = (self._fixed_times_var.get().strip()
                        if strategy_name == "fixed_times" else "")
         source = self._source_var.get()
+        real_vol = self._real_vol_var.get().strip()
+        # 留空是有意义的默认（同隐含），0 或负数不是：那会让所有模拟路径
+        # 退化成同一条确定性曲线。只在模拟来源校验——CSV / Wind 根本不读
+        # 这个框，不该被里面的历史残值挡住。
+        if source == "simulate" and real_vol:
+            BacktestApp._validate_sigma_input(real_vol, "已实现波动率")
         # 真实 CSV/Wind 的 bar 数由后端按时间索引和交易时段自动推导；
         # 只有模拟路径需要用户选择离散粒度。
         steps_per_day = self._gui_steps_per_day(source, self._spd_var.get())
@@ -4328,7 +4482,7 @@ class BacktestApp(tk.Tk):
             "multiplier": float(self._mult_var.get()),
             "s0": str(params.get("s0", "")),
             "seed": self._seed_var.get().strip(),
-            "real_vol": self._real_vol_var.get().strip(),
+            "real_vol": real_vol,
             "n_paths": self._npaths_var.get().strip(),
             "csv_path": self._csv_path_var.get().strip(),
             "csv_col": self._csv_col_var.get().strip() or "close",
@@ -4511,10 +4665,6 @@ class BacktestApp(tk.Tk):
     def _deliver_backtest_result(self, bt, multi_stats, gui_state):
         """在主线程原子地渲染并登记最新结果，避免假成功状态。"""
         success = False
-        pending_history_name = getattr(
-            self, "_pending_history_retain_name", None)
-        pending_history_origin = copy.deepcopy(dict(getattr(
-            self, "_pending_history_retain_origin", None) or {}))
         try:
             state_copy = BacktestApp._copy_snapshot_gui_state(gui_state)
             self._show_results(bt, multi_stats)
@@ -4529,35 +4679,10 @@ class BacktestApp(tk.Tk):
             messagebox.showerror("回测结果展示失败", err_msg)
         finally:
             self._finish_run(success)
-        self._pending_history_retain_name = None
-        self._pending_history_retain_origin = None
-        if success and pending_history_name:
-            next_sequence = self._saved_backtest_sequence + 1
-            auto_name = f"{pending_history_name} #{next_sequence:02d}"
-            suffix = 2
-            while any(
-                    snapshot.name == auto_name
-                    for snapshot in self._saved_backtests.values()):
-                auto_name = f"{pending_history_name} ({suffix})"
-                suffix += 1
-            try:
-                self._store_current_backtest(
-                    auto_name,
-                    origin=SNAPSHOT_ORIGIN_HISTORY_VERIFY,
-                    origin_meta=pending_history_origin)
-            except Exception as exc:
-                success = False
-                messagebox.showerror("历史验证结果保留失败", str(exc))
-        if getattr(self, "_history_batch_queue", None):
-            self._history_batch_advance(success)
 
     def _fail_backtest(self, message):
-        self._pending_history_retain_name = None
-        self._pending_history_retain_origin = None
         messagebox.showerror("回测失败", message)
         self._finish_run(False)
-        if getattr(self, "_history_batch_queue", None):
-            self._history_batch_advance(False)
 
     def _set_status(self, text):
         """更新底部状态栏文字 (线程安全: 调用方需保证在主线程或通过 after)。"""
@@ -4825,6 +4950,181 @@ class BacktestApp(tk.Tk):
         return copy.deepcopy(summary_row), daily_frame
 
     @staticmethod
+    def _snapshot_replay_recipe(bt, gui_state):
+        """把重跑这次回测所需的**输入**摘成配方。
+
+        存价格序列本身，而不是「来源标识 + 重新取数」：
+        - 模拟的路径由 ``real_vol`` 参与生成，而 ``real_vol`` 从来没进过快照；
+        - CSV 文件可能被移动或删除；
+        - Wind 非期货走前复权，复权因子随时间变，同一区间换个日期取回来的
+          **不是同一串数**。
+        存下来就都不依赖了，离线也能精确重现。
+
+        固定时刻存的是 ``effective_times``（已按交易时段剔掉休市目标）而不是
+        用户填的原值：重放时拿不到品种 session 元数据，用原值会触发逐日严格
+        校验而失败——原始运行明明是成功的。
+        """
+        import pandas as pd
+        results = getattr(bt, "_results", None) or {}
+        prices = np.asarray(results.get("prices", ()), dtype=float)
+        if prices.size < 2:
+            return {}
+        timestamps = results.get("timestamps")
+        index = None
+        if timestamps is not None:
+            try:
+                index = [pd.Timestamp(ts).isoformat()
+                         for ts in pd.DatetimeIndex(timestamps)]
+            except (TypeError, ValueError):
+                index = None
+        if index is not None and len(index) != prices.size:
+            index = None
+        recipe = {
+            "prices": prices.tolist(),
+            "index": index,
+            "steps_per_day": int(results.get("steps_per_day", 1) or 1),
+            "source": gui_state.get("source"),
+            "cls_name": gui_state.get("cls_name"),
+            "subtype": gui_state.get("subtype"),
+            "params": copy.deepcopy(dict(gui_state.get("params", {}))),
+            "position": BacktestApp._normalize_position(
+                gui_state.get("position")),
+            "quantity": gui_state.get("quantity"),
+            "multiplier": gui_state.get("multiplier"),
+            "tc_rate": gui_state.get("tc_rate"),
+            "slippage_bps": gui_state.get("slippage_bps", 0.0),
+            "force_day_close_hedge": bool(
+                gui_state.get("force_day_close_hedge", False)),
+            "evaluation_days": results.get("evaluation_days"),
+            "form_state": BacktestApp._snapshot_form_state(gui_state),
+            "fixed_times_effective": list(
+                results.get("fixed_time_effective_times", ()) or ()),
+            # 摘要页直接读 bt._gui_meta，重放出来的对象也得有一份。
+            "gui_meta": copy.deepcopy(dict(getattr(bt, "_gui_meta", {}) or {})),
+        }
+        return recipe
+
+    @staticmethod
+    def _strategy_from_form_state(form_state, *, fixed_times_effective=None):
+        """按冻结的表单输入重建策略对象。
+
+        固定时刻优先用 ``effective_times``：重放时没有品种交易时段元数据，
+        用用户填的原值会让休市目标重新参与逐日严格校验而失败——而原始运行
+        是成功的，那一步已经把它们剔掉了。
+        """
+        name = str(form_state.get("strategy_name", "close_to_close"))
+        if name == "close_to_close":
+            return CloseToCloseStrategy()
+        if name == "fixed_times":
+            times = fixed_times_effective or form_state.get(
+                "fixed_times", DEFAULT_FIXED_TIMES)
+            return FixedTimeStrategy(times)
+        if name == "hedge_band":
+            return HedgeBandStrategy(
+                band_type=form_state.get("interval_type", "absolute"),
+                threshold=form_state.get("price_interval", 1.0),
+                sigma_source=form_state.get("sigma_source", "implied"),
+                window_days=form_state.get("sigma_window", 20),
+            )
+        raise ValueError(f"未知对冲策略: {name}")
+
+    def _replay_saved_snapshot(self, snapshot):
+        """取这条快照的逐 bar 明细，返回 ``(回测对象, 是否重算过)``。
+
+        **正常路径是读已保存的数据，不是重跑。** 保留结果的那一刻 bar 级
+        结果就已落盘（见 ``_make_saved_backtest_result``），这里按同一份配
+        方算出的 key 读回来，实测 3 ms；真跑一次要几百毫秒。
+
+        只有缓存确实不在时才回退重算——缓存被清过、换了机器、或本功能上线
+        前保留的旧快照。回退与「保留结果」时那次运行同源：价格序列是存下来
+        的原始切片，期权与策略按同一个 ``_rescale_option_to_real_s0`` 重定
+        基，因此逐 bar 明细与当时一致，不依赖 CSV 文件是否还在、也不依赖
+        Wind 能否联网。调用方要把「重算过」说出来：用户按的是「加载」。
+        """
+        import pandas as pd
+        recipe = dict(getattr(snapshot, "replay", None) or {})
+        if not recipe:
+            raise ValueError(
+                "这条结果没有重放配方（可能保存于本功能上线之前），"
+                "无法加载明细；重新跑一次并保留即可。")
+        prices = np.asarray(recipe.get("prices", ()), dtype=float)
+        if prices.size < 2:
+            raise ValueError("重放配方里的行情序列不完整。")
+        index = recipe.get("index")
+        series = (pd.Series(prices, index=pd.to_datetime(index))
+                  if index else pd.Series(prices))
+
+        cls_name = recipe.get("cls_name")
+        cfg = OPTION_CLASSES.get(cls_name)
+        if cfg is None:
+            raise ValueError(f"未知期权大类：{cls_name}")
+        option = cfg["build"](recipe.get("subtype"), dict(recipe.get("params", {})))
+        strategy = BacktestApp._strategy_from_form_state(
+            dict(recipe.get("form_state", {})),
+            fixed_times_effective=recipe.get("fixed_times_effective") or None)
+
+        # 真实行情当时按首价整体缩放过期权与绝对带宽，重放必须走同一步，
+        # 否则行权价与带宽会停在参考价口径上，明细和当时对不上。
+        if str(recipe.get("source")) in ("csv", "wind"):
+            option, info = _rescale_option_to_real_s0(
+                option, float(series.iloc[0]))
+            strategy = _rescale_strategy_to_real_s0(strategy, info["ratio"])
+
+        bt = HedgeBacktest(
+            option, series,
+            tc_rate=recipe.get("tc_rate", 0.0),
+            position=recipe.get("position", 1),
+            quantity=recipe.get("quantity", 1.0),
+            multiplier=recipe.get("multiplier", 5),
+            strategy=strategy,
+            steps_per_day=int(recipe.get("steps_per_day", 1) or 1),
+            slippage_bps=recipe.get("slippage_bps", 0.0),
+            force_day_close_hedge=bool(
+                recipe.get("force_day_close_hedge", False)),
+            evaluation_days=recipe.get("evaluation_days"),
+        )
+        bt._gui_meta = dict(recipe.get("gui_meta", {})) or {
+            "cls_name": cls_name,
+            "subtype": recipe.get("subtype"),
+            "source": recipe.get("source"),
+        }
+        cached = history_bar_cache.load_recipe(recipe)
+        if cached is not None:
+            # run() 只设置 _results（hedge_backtest 里唯一一处赋值），所以
+            # 把结果塞进未运行的对象与真跑出来的等价。
+            bt._results = cached
+            return bt, False
+        bt.run()
+        history_bar_cache.store_recipe(recipe, dict(bt._results or {}))
+        return bt, True
+
+    def _load_saved_snapshot_detail(self):
+        """右键菜单「加载明细」：重跑选中快照并渲染到结果页。"""
+        if not BacktestApp._saved_pool_actions_allowed(self):
+            return
+        result_id = self._focused_saved_backtest_id()
+        if result_id not in self._saved_backtests:
+            messagebox.showinfo("请选择结果", "请先在结果池中点击一条结果。")
+            return
+        snapshot = self._saved_backtests[result_id]
+        try:
+            bt, recomputed = self._replay_saved_snapshot(snapshot)
+        except Exception as exc:                              # noqa: BLE001
+            messagebox.showerror("加载明细失败", str(exc))
+            return
+        self._latest_backtest = bt
+        self._show_results(bt)
+        if recomputed:
+            # 菜单项叫「加载明细」，正常就该是秒开的读盘。走到重算说明保存
+            # 的明细不在了，得说一声，否则用户只感觉「怎么卡了一下」。
+            self._set_status(
+                f"已保存的明细不存在，已按配方重新计算并补存：{snapshot.name}")
+        else:
+            self._set_status(
+                f"已加载『{snapshot.name}』的明细  |  "
+                "回测摘要 / 对冲图表 / 每日明细 / 波动率分析均为该次结果")
+
+    @staticmethod
     def _saved_snapshot_strategy_type(snapshot):
         """读取不可被用户重命名影响的快照策略类型。"""
         summary_row = getattr(snapshot, "summary_row", {}) or {}
@@ -4837,62 +5137,38 @@ class BacktestApp(tk.Tk):
 
     @staticmethod
     def _saved_snapshot_origin_label(snapshot):
-        """产生方式列文案；优选验证额外标出来自哪一档周期。
+        """产生方式列文案。
 
         来源读结构化的 origin 字段，用户重命名结果不会让它丢失。
         """
         origin = str(getattr(snapshot, "origin", "") or
                      SNAPSHOT_ORIGIN_MANUAL)
-        label = SNAPSHOT_ORIGIN_DISPLAY.get(origin, origin)
+        return SNAPSHOT_ORIGIN_DISPLAY.get(origin, origin)
+
+    @staticmethod
+    def _snapshot_origin_detail(snapshot):
+        """把快照的结构化来源摊成一句可读的溯源说明。
+
+        分段重放会记下它回放的是哪个周期、哪个候选、哪一段。溯源不参与任何
+        排名，它只回答"这条结果是怎么来的"。
+        """
         meta = getattr(snapshot, "origin_meta", None) or {}
+        parts = []
         period = str(meta.get("period_label", "") or "").strip()
-        if origin == SNAPSHOT_ORIGIN_HISTORY_VERIFY and period:
-            return f"{label}·{period}"
-        return label
-
-    def _resolve_saved_comparison_baseline_id(self, position=None):
-        """返回当前方向最早的 close-to-close 基准，禁止跨方向复用。"""
-        saved = getattr(self, "_saved_backtests", {})
-        target_position = (
-            BacktestApp._normalize_position(position)
-            if position is not None else None)
-        if target_position is None:
-            selected_ids = getattr(
-                self, "_saved_comparison_selection", set())
-            selected_positions = {
-                BacktestApp._saved_snapshot_position(saved[result_id])
-                for result_id in selected_ids if result_id in saved
-            }
-            if len(selected_positions) == 1:
-                target_position = next(iter(selected_positions))
-            elif len(selected_positions) > 1:
-                # 防御旧状态或外部调用制造的混选；调用方随后会给出明确提示。
-                self._saved_comparison_baseline_id = None
-                return None
-
-        preferred = getattr(self, "_saved_comparison_baseline_id", None)
-        if (preferred in saved and BacktestApp._saved_snapshot_strategy_type(
-                saved[preferred]) == "close_to_close"
-                and (target_position is None
-                     or BacktestApp._saved_snapshot_position(
-                         saved[preferred]) == target_position)):
-            return preferred
-
-        baseline_id = next((
-            result_id for result_id, snapshot in saved.items()
-            if BacktestApp._saved_snapshot_strategy_type(snapshot)
-            == "close_to_close"
-            and (target_position is None
-                 or BacktestApp._saved_snapshot_position(snapshot)
-                 == target_position)
-        ), None)
-        self._saved_comparison_baseline_id = baseline_id
-        return baseline_id
+        if period:
+            parts.append(f"周期 {period}")
+        strategy = str(meta.get("history_strategy", "") or "").strip()
+        if strategy:
+            parts.append(f"候选『{strategy}』")
+        window_id = str(meta.get("window_id", "") or "").strip()
+        if window_id:
+            parts.append(f"分段 {window_id}")
+        return "  ·  ".join(parts)
 
     @staticmethod
     def _make_saved_backtest_result(
             bt, gui_state, result_id, name, saved_at=None, *,
-            origin=SNAPSHOT_ORIGIN_MANUAL, origin_meta=None):
+            origin=SNAPSHOT_ORIGIN_MANUAL, origin_meta=None, sequence=0):
         snapshot_position = BacktestApp._normalize_position(
             gui_state.get("position"))
         result_position = (getattr(bt, "_results", {}) or {}).get("position")
@@ -4906,13 +5182,28 @@ class BacktestApp(tk.Tk):
         strategy_label, parameter_summary = (
             BacktestApp._strategy_snapshot_labels(gui_state))
         params = gui_state.get("params", {})
+        path_key = BacktestApp._backtest_path_key(bt, gui_state)
+        market_key = BacktestApp._freeze_snapshot_value({
+            "source": gui_state.get("source"),
+            # 价格序列本身的摘要。可读字段（标的、区间、粒度）说不清的差异
+            # 由它兜底：日内滚动的两段、同一区间取到了不同数据，都能认出来。
+            # 反过来，跨周期取到同一段末尾时数据逐字节相同，它也不会造出假
+            # 差异——用分段编号就会，那三段编号不同而数据一模一样。
+            "data_digest": path_key[2],
+            "seed": gui_state.get("seed"),
+            "csv_path": gui_state.get("csv_path"),
+            "csv_col": gui_state.get("csv_col"),
+            "wind_code": gui_state.get("wind_code"),
+            "wind_start": gui_state.get("wind_start"),
+            "wind_end": gui_state.get("wind_end"),
+            "wind_bar_size": gui_state.get("wind_bar_size"),
+        })
         contract_key = BacktestApp._freeze_snapshot_value({
             "cls_name": gui_state.get("cls_name"),
             "subtype": gui_state.get("subtype"),
             "params": params,
         })
         economics_key = BacktestApp._freeze_snapshot_value({
-            "position": snapshot_position,
             "quantity": gui_state.get("quantity"),
             "multiplier": gui_state.get("multiplier"),
             "tc_rate": gui_state.get("tc_rate"),
@@ -4920,6 +5211,12 @@ class BacktestApp(tk.Tk):
             "steps_per_day": bt._results.get("steps_per_day"),
         })
         subtype = gui_state.get("subtype", "—")
+        replay_recipe = BacktestApp._snapshot_replay_recipe(bt, gui_state)
+        # 保留的这一刻 bar 级结果还在手里，顺手落盘：之后点「加载明细」就
+        # 不必按配方重跑（实测 3 ms vs 620 ms）。与策略优选共用同一套内容
+        # 寻址缓存，写失败只是白跑一次，不影响保留本身。
+        history_bar_cache.store_recipe(
+            replay_recipe, dict(getattr(bt, "_results", None) or {}))
         return SavedBacktestResult(
             result_id=result_id,
             name=name,
@@ -4930,14 +5227,45 @@ class BacktestApp(tk.Tk):
             parameter_summary=parameter_summary,
             source_label=BacktestApp._snapshot_source_label(gui_state),
             option_label=SUBTYPE_DISPLAY.get(subtype, str(subtype)),
-            path_key=BacktestApp._backtest_path_key(bt, gui_state),
+            path_key=path_key,
+            market_key=market_key,
             contract_key=contract_key,
             economics_key=economics_key,
             position=snapshot_position,
             style_key=BacktestApp._snapshot_style_key(gui_state),
             origin=str(origin or SNAPSHOT_ORIGIN_MANUAL),
             origin_meta=copy.deepcopy(dict(origin_meta or {})),
+            form_state=BacktestApp._snapshot_form_state(gui_state),
+            sequence=int(sequence or 0),
+            replay=replay_recipe,
         )
+
+    @staticmethod
+    def _snapshot_form_state(gui_state):
+        """摘出可回填左侧表单的对冲策略输入，保持运行时的原始单位。
+
+        只取对冲策略这一组：期权结构、方向、成本和行情来源改动面太大，回填
+        它们等于把整张表单换掉，而用户点这个按钮想做的是接着这条结果继续调
+        对冲参数。
+        """
+        gui_state = dict(gui_state or {})
+        return {
+            "strategy_name": str(gui_state.get("strategy_name", "") or ""),
+            "fixed_times": str(gui_state.get("fixed_times", "") or ""),
+            "interval_type": str(
+                gui_state.get("interval_type", "") or "absolute"),
+            "price_interval": BacktestApp._comparison_finite(
+                gui_state.get("price_interval")),
+            "force_day_close_hedge": bool(
+                gui_state.get("force_day_close_hedge", False)),
+            # 波动率口径决定带宽怎么换算，实际改变回测结果（它直接传给
+            # HedgeBandStrategy）。此前它不在快照的任何一处：两条只差这个
+            # 口径的结果，逐字段比下来会是"完全一致"，而数字明明不同。
+            "sigma_source": str(
+                gui_state.get("sigma_source", "") or "implied"),
+            "sigma_window": BacktestApp._comparison_safe_int(
+                gui_state.get("sigma_window"), 20),
+        }
 
     @staticmethod
     def _validate_saved_result_name(saved_results, name, exclude_id=None):
@@ -4950,11 +5278,123 @@ class BacktestApp(tk.Tk):
             raise ValueError(f"结果名称已存在：{cleaned}")
         return cleaned
 
+    _COMPARE_TAB_TITLE = " 🆚 结果对比 "
+
     def _update_saved_result_count(self):
-        button = getattr(self, "_compare_btn", None)
-        if button is not None:
-            button.configure(
-                text=f"🆚  结果对比 ({len(self._saved_backtests)})")
+        """把结果池条数写进标签页标题。
+
+        空池不写 `(0)`：那时标签页里的占位符已经在说"先保留结果"，标题再挂
+        一个 0 只是噪声。非空时数字要一直可见——它是"有没有东西可对比"的
+        唯一常驻提示，此前挂在左侧按钮上。
+        """
+        notebook = getattr(self, "_nb", None)
+        tab = getattr(self, "_compare_tab", None)
+        if notebook is None or tab is None:
+            return
+        count = len(getattr(self, "_saved_backtests", None) or {})
+        title = BacktestApp._COMPARE_TAB_TITLE
+        if count:
+            title = f"{title.rstrip()} ({count}) "
+        try:
+            notebook.tab(tab, text=title)
+        except tk.TclError:
+            # 标签页已随窗口销毁：计数只是展示，不该反过来打断清理流程。
+            pass
+
+    # ---- 结果池落盘 ----
+    _POOL_FIELDS = (
+        "result_id", "name", "saved_at", "summary_row", "daily_frame",
+        "strategy_label", "parameter_summary", "source_label", "option_label",
+        "path_key", "market_key", "contract_key", "economics_key", "position",
+        "style_key", "origin", "origin_meta", "form_state", "sequence",
+        "replay",
+    )
+
+    @staticmethod
+    def _snapshot_to_payload(snapshot):
+        """快照 → 可写盘的 payload。``store_path`` 不入包（它就是包的位置）。"""
+        body = {
+            key: backtest_pool_store.encode(getattr(snapshot, key))
+            for key in BacktestApp._POOL_FIELDS
+        }
+        return {
+            "schema_version": backtest_pool_store.POOL_SCHEMA_VERSION,
+            "sequence": int(getattr(snapshot, "sequence", 0) or 0),
+            "result_id": str(snapshot.result_id),
+            "saved_at": snapshot.saved_at.isoformat(),
+            "snapshot": body,
+        }
+
+    @staticmethod
+    def _payload_to_snapshot(payload):
+        """payload → 快照。缺字段用 dataclass 默认值补，不让旧包整条报废。"""
+        body = dict(payload.get("snapshot") or {})
+        values = {
+            key: backtest_pool_store.decode(body[key])
+            for key in BacktestApp._POOL_FIELDS if key in body
+        }
+        saved_at = values.get("saved_at")
+        if not isinstance(saved_at, datetime.datetime):
+            values["saved_at"] = datetime.datetime.fromisoformat(
+                str(payload.get("saved_at")))
+        else:
+            values["saved_at"] = saved_at.to_pydatetime() if hasattr(
+                saved_at, "to_pydatetime") else saved_at
+        snapshot = SavedBacktestResult(**values)
+        snapshot.store_path = str(payload.get("_path", "") or "")
+        return snapshot
+
+    def _persist_saved_snapshot(self, snapshot):
+        """写盘并返回一句状态栏后缀。
+
+        失败不回滚内存池——这一条结果是真跑出来的，扔掉它比留着更糟。但
+        「已保留」四个字必须诚实：写不进去就当场说清楚，否则用户下次开机
+        才发现，而那时已经无从追查。
+        """
+        try:
+            path = backtest_pool_store.write_snapshot(
+                BacktestApp._snapshot_to_payload(snapshot))
+        except Exception as exc:                              # noqa: BLE001
+            snapshot.store_path = ""
+            return f"（未能写入本机：{exc}）"
+        snapshot.store_path = path
+        return "并已保存到本机"
+
+    def _load_saved_pool(self):
+        """启动时载入结果池，并把序号推到已有最大值之后。
+
+        序号不推的话，载入 20 条旧结果后第一次「保留」仍会生成
+        ``result-0001``，而入池是按 key 直接赋值——盘里那条会被静默顶掉。
+        """
+        try:
+            payloads, skipped = backtest_pool_store.read_all()
+        except Exception as exc:                              # noqa: BLE001
+            self._saved_pool_load_error = f"载入已保存结果失败：{exc}"
+            return
+        self._saved_pool_load_error = ""
+        max_sequence = 0
+        for payload in payloads:
+            try:
+                snapshot = BacktestApp._payload_to_snapshot(payload)
+            except Exception as exc:                          # noqa: BLE001
+                skipped.append(
+                    (os.path.basename(str(payload.get("_path", ""))),
+                     f"字段无法还原：{exc}"))
+                continue
+            self._saved_backtests[snapshot.result_id] = snapshot
+            max_sequence = max(max_sequence, int(snapshot.sequence or 0))
+        self._saved_backtest_sequence = max_sequence
+        # 恢复上次显示的那几条。与结果本身分开存：它坏了最多回到「全部隐
+        # 藏」，而空状态会写明 N 条都还在池里。默认不全选——重开就把二十条
+        # 曲线一起铺上去，比让用户点一下更糟。
+        restored = backtest_pool_store.read_view_state() & set(
+            self._saved_backtests)
+        self._saved_comparison_selection = restored
+        if skipped:
+            self._saved_pool_load_error = (
+                f"有 {len(skipped)} 条已保存结果未能载入："
+                + "；".join(f"{name}（{why}）" for name, why in skipped[:3])
+                + ("…" if len(skipped) > 3 else ""))
 
     def _store_current_backtest(self, name, *,
                                 origin=SNAPSHOT_ORIGIN_MANUAL,
@@ -4971,31 +5411,23 @@ class BacktestApp(tk.Tk):
             self._saved_backtests, name)
         next_sequence = self._saved_backtest_sequence + 1
         result_id = f"result-{next_sequence:04d}"
+        # 序号在载入结果池时已经推到已有最大值之后（见 _load_saved_pool），
+        # 所以这里不会撞上盘里那些旧 ID。
         snapshot = self._make_saved_backtest_result(
             bt, gui_state, result_id, cleaned_name,
-            origin=origin, origin_meta=origin_meta)
+            origin=origin, origin_meta=origin_meta, sequence=next_sequence)
         self._saved_backtest_sequence = next_sequence
         self._saved_backtests[result_id] = snapshot
-        position = BacktestApp._saved_snapshot_position(snapshot)
-        # 结果池可同时保存买卖两组，但当前视图始终只激活一个方向。
-        self._saved_comparison_selection.intersection_update({
-            saved_id for saved_id, saved_snapshot
-            in self._saved_backtests.items()
-            if BacktestApp._saved_snapshot_position(saved_snapshot)
-            == position
-        })
         self._saved_comparison_selection.add(result_id)
-        baseline_id = BacktestApp._resolve_saved_comparison_baseline_id(
-            self, position)
-        if baseline_id is not None:
-            self._saved_comparison_selection.add(baseline_id)
         self._latest_retained_result_id = result_id
+        write_note = self._persist_saved_snapshot(snapshot)
+        BacktestApp._persist_pool_view(self)
         self._update_saved_result_count()
         self._sync_retain_button_state()
         self._refresh_saved_comparison_if_visible()
         self._set_status(
-            f"已保留『{cleaned_name}』  |  可修改策略或参数继续回测（共 "
-            f"{len(self._saved_backtests)} 条）")
+            f"已保留『{cleaned_name}』{write_note}  |  可修改策略或参数继续回测"
+            f"（共 {len(self._saved_backtests)} 条）")
         return snapshot
 
     def _retain_current_backtest(self):
@@ -5041,30 +5473,14 @@ class BacktestApp(tk.Tk):
             return
 
     @staticmethod
-    def _saved_comparison_payload(snapshots, baseline_result_id=None):
-        """只读取已完成快照生成排名与曲线数据，绝不重新运行回测。"""
+    def _saved_comparison_payload(snapshots):
+        """只读取已完成快照生成对比数据，绝不重新运行回测。
+
+        本页展示的是每条结果自己的绝对指标，不设固定基准、不算相对改善：
+        谁跟谁比、比哪一项，交给排序和并列的曲线去回答。
+        """
         import pandas as pd
         snapshots = list(snapshots)
-        positions = {
-            BacktestApp._saved_snapshot_position(snapshot)
-            for snapshot in snapshots
-        }
-        if len(positions) > 1:
-            raise ValueError(
-                "买入与卖出结果不能混选；"
-                "请一次只比较同一头寸方向。")
-        close_snapshots = [
-            snapshot for snapshot in snapshots
-            if BacktestApp._saved_snapshot_strategy_type(snapshot)
-            == "close_to_close"
-        ]
-        close_ids = {snapshot.result_id for snapshot in close_snapshots}
-        if baseline_result_id not in close_ids:
-            baseline_result_id = (
-                min(close_snapshots, key=lambda snapshot: (
-                    snapshot.result_id, snapshot.saved_at)).result_id
-                if close_snapshots else None
-            )
         rows = []
         daily_curves = {}
         for snapshot in snapshots:
@@ -5079,92 +5495,296 @@ class BacktestApp(tk.Tk):
                 "strategy": snapshot.name,
                 "meta_description": description,
                 "meta_result_id": snapshot.result_id,
-                "meta_is_comparison_baseline": (
-                    snapshot.result_id == baseline_result_id),
+                # 保存顺序的权威来源。别退回按 result_id 字典序排：那把顺序
+                # 焊死在 ID 格式上，第 10000 条会排到 9999 前面，跨会话载入
+                # 后若换了 ID 方案更会静默乱序——而乱序不会有任何断言挂掉。
+                "meta_sequence": int(getattr(snapshot, "sequence", 0) or 0),
                 # 曲线名可被用户改写，配色必须走稳定的策略身份键。
                 "meta_style_key": getattr(
                     snapshot, "style_key", BASELINE_STRATEGY_STYLE_KEY),
                 "meta_origin": getattr(
                     snapshot, "origin", SNAPSHOT_ORIGIN_MANUAL),
+                "meta_origin_detail": (
+                    BacktestApp._snapshot_origin_detail(snapshot)),
             })
             rows.append(row)
             daily_curves[snapshot.name] = snapshot.daily_frame
         summary = pd.DataFrame(rows)
         if not summary.empty:
+            # 默认按保存顺序，与结果池上下对照着看最省事；想看谁高谁低，
+            # 点一下列头即可。按某个指标排序会隐含"这一列越高/越低越好"的
+            # 暗示，而本页不替用户下这个判断。
             summary = summary.sort_values(
-                ["score", "total_tc", "meta_result_id"], kind="stable"
-            ).reset_index(drop=True)
-            summary.insert(0, "rank", np.arange(1, len(summary) + 1))
+                ["meta_sequence", "meta_result_id"],
+                kind="stable").reset_index(drop=True)
         return summary, daily_curves
 
+    # 一次对比里可以变化的五组属性。控制变量的道理：只有一组不同，差异才
+    # 归得到那一组头上；同时变两组以上，看到的差就说不清是谁造成的。
+    # (属性键, 中文名, 取值函数)
+    _COMPARISON_ASPECTS = (
+        ("market", "行情", lambda s: getattr(s, "market_key", ())),
+        ("contract", "期权", lambda s: getattr(s, "contract_key", ())),
+        ("position", "头寸方向", lambda s: (
+            ("position", BacktestApp._saved_snapshot_position(s)),)),
+        ("economics", "规模与成本", lambda s: getattr(s, "economics_key", ())),
+        ("strategy", "对冲策略", lambda s: BacktestApp._freeze_snapshot_value(
+            dict(getattr(s, "form_state", None) or {}))),
+    )
+
+    # 字段级差异的中文名。签名保留了键名，所以能说到具体是哪一项不同，
+    # 而不只是"期权不同"。期权合约参数的标签直接取自 OPTION_CLASSES 的
+    # 定义，新增期权类型时不必在这里补一遍。
+    _COMPARISON_FIELD_LABELS = {
+        "source": "行情来源", "seed": "随机种子", "csv_path": "CSV 文件",
+        "csv_col": "CSV 列", "wind_code": "标的代码",
+        "wind_start": "起始日", "wind_end": "截止日",
+        "wind_bar_size": "bar 粒度", "data_digest": "行情数据",
+        "cls_name": "期权大类", "subtype": "期权子类",
+        "quantity": "交易数量", "multiplier": "合约乘数",
+        "tc_rate": "成本率", "slippage_bps": "滑点", "steps_per_day": "日内采样",
+        "position": "头寸方向",
+        "strategy_name": "策略类型", "fixed_times": "固定时刻",
+        "interval_type": "带宽单位", "price_interval": "带宽阈值",
+        "force_day_close_hedge": "收盘兜底",
+        "sigma_source": "波动率口径", "sigma_window": "波动率窗口",
+    }
+
     @staticmethod
-    def _saved_comparison_warnings(snapshots, baseline_result_id=None):
-        snapshots = list(snapshots)
-        if not snapshots:
+    def _option_param_labels():
+        """期权合约参数的键 → 中文名，以及取值的中文回译。
+
+        标签就写在 OPTION_CLASSES 的参数定义里（第二项），带 choices 的参数
+        （如方向 1/-1）还能把数值译回"看涨/看跌"。
+        """
+        labels, choices = {}, {}
+        for config in OPTION_CLASSES.values():
+            for spec in config.get("params", ()):
+                key = str(spec[0])
+                labels.setdefault(key, str(spec[1]))
+                if len(spec) > 4 and isinstance(spec[4], dict):
+                    choices.setdefault(key, {
+                        value: text for text, value in spec[4].items()})
+        return labels, choices
+
+    @staticmethod
+    def _flatten_signature(value, prefix=()):
+        """把嵌套签名摊平成 {键路径: 取值}。
+
+        ``contract_key`` 里的 params 本身又是一组键值对，只比顶层就只能说
+        到"合约参数不同"——而真正要说的是"波动率 0.18 vs 0.15"。
+        """
+        flat = {}
+        for key, item in value:
+            path = prefix + (str(key),)
+            nested = (
+                isinstance(item, tuple) and item
+                and all(isinstance(entry, tuple) and len(entry) == 2
+                        for entry in item))
+            if nested:
+                flat.update(BacktestApp._flatten_signature(item, path))
+            else:
+                flat[path] = item
+        return flat
+
+    # 取值的中文回译：差异串里写 "close_to_close vs hedge_band" 没人看得舒服。
+    _COMPARISON_VALUE_LABELS = {
+        "position": {-1: "买入", 1: "卖出"},
+        "strategy_name": STRATEGY_DISPLAY,
+        "sigma_source": SIGMA_SOURCE_DISPLAY,
+        "subtype": SUBTYPE_DISPLAY,
+        "interval_type": {
+            "absolute": "绝对", "relative": "相对", "sigma": "σ 倍数"},
+        "force_day_close_hedge": {True: "开启", False: "关闭"},
+        "source": {"simulate": "模拟", "csv": "CSV", "wind": "Wind"},
+    }
+
+    @staticmethod
+    def _format_signature_value(key, value):
+        """把签名里的取值渲染成人看的字符串。"""
+        mapping = BacktestApp._COMPARISON_VALUE_LABELS.get(key)
+        if mapping and value in mapping:
+            return str(mapping[value])
+        _labels, choices = BacktestApp._option_param_labels()
+        mapping = choices.get(key)
+        if mapping and value in mapping:
+            return str(mapping[value])
+        if value is None or value == "":
+            return "—"
+        if isinstance(value, bool):
+            return "开启" if value else "关闭"
+        if isinstance(value, float):
+            return f"{value:g}"
+        return str(value)
+
+    @staticmethod
+    def _differing_field_names(values):
+        """逐字段比出差异，返回 ["波动率：0.18 vs 0.15", ...]。
+
+        键集合本身不同时（换期权大类会整体换掉参数集）说不出具体字段，返回
+        空表示"整组不同"，由调用方按属性级报告。
+        """
+        flats = [BacktestApp._flatten_signature(value) for value in values]
+        paths = {frozenset(flat) for flat in flats}
+        if len(paths) != 1:
             return []
-        if len({
-                BacktestApp._saved_snapshot_position(snapshot)
-                for snapshot in snapshots
-        }) > 1:
-            return [
-                "买入与卖出结果不能混选；"
-                "请清空后选择同一头寸方向。"
+        param_labels, _choices = BacktestApp._option_param_labels()
+        order = list(BacktestApp._COMPARISON_FIELD_LABELS) + list(param_labels)
+        changed = []
+        opaque = {"data_digest"}
+        for path in next(iter(paths)):
+            taken = [flat[path] for flat in flats]
+            if len({BacktestApp._freeze_snapshot_value(v) for v in taken}) <= 1:
+                continue
+            key = path[-1]
+            label = BacktestApp._COMPARISON_FIELD_LABELS.get(
+                key, param_labels.get(key, key))
+            rank = order.index(key) if key in order else len(order)
+            if key in opaque:
+                # 摘要是一串哈希，摊出来没人看得懂；它只负责"确实不一样"。
+                changed.append((rank, label, True))
+                continue
+            shown = " vs ".join(
+                BacktestApp._format_signature_value(key, value)
+                for value in taken)
+            changed.append((rank, f"{label}：{shown}", False))
+        # 可读字段已经说清了差异时，就不必再补一句"行情数据不同"——那是
+        # 同一件事的两种说法。只有摘要单独不同才值得说：输入看着一样，跑出
+        # 来的价格序列却不是同一条。
+        if any(not is_opaque for _rank, _text, is_opaque in changed):
+            changed = [item for item in changed if not item[2]]
+        # 按定义顺序输出，而不是签名的字典序——"策略类型、带宽阈值"读着顺。
+        # 次级键是文本本身：路径集合是 frozenset，迭代序不确定，只按 rank
+        # 排的话未列入定义表的字段每次出来的顺序都可能不同。
+        return [text for _rank, text, _opaque in sorted(changed)]
+
+    @staticmethod
+    def _comparison_aspect_diff(snapshots):
+        """逐属性比对，返回 [(中文名, 是否相同, 差异字段列表), ...]。
+
+        少于两条时没有"异同"可言，返回空表。
+        """
+        snapshots = list(snapshots)
+        if len(snapshots) < 2:
+            return []
+        report = []
+        for _key, label, getter in BacktestApp._COMPARISON_ASPECTS:
+            values = [tuple(getter(snapshot)) for snapshot in snapshots]
+            same = len(set(values)) == 1
+            fields = [] if same else BacktestApp._differing_field_names(values)
+            report.append((label, same, fields))
+        return report
+
+    @staticmethod
+    def _comparison_variable_summary(snapshots):
+        """把属性异同压成一句话：这次的变量是谁，还是有好几个。"""
+        report = BacktestApp._comparison_aspect_diff(snapshots)
+        if not report:
+            return None
+        changed = [(label, fields) for label, same, fields in report if not same]
+        same_labels = [label for label, same, _f in report if same]
+
+        def _detail(label, fields):
+            if not fields:
+                return label
+            # 字段名与属性名重合时省掉前缀：头寸方向这个属性就只有这一个
+            # 同名字段，写成「头寸方向（头寸方向：买入 vs 卖出）」是废话。
+            fields = [
+                field[len(label) + 1:]
+                if field.startswith(f"{label}：") else field
+                for field in fields
             ]
+            if len(fields) > 3:
+                # "等 N 项"直接跟在第三项后面会读成"带宽阈值等 5 项"，
+                # 用分隔符断开。
+                shown = "；".join(fields[:3]) + f"；……共 {len(fields)} 项不同"
+            else:
+                shown = "；".join(fields)
+            return f"{label}（{shown}）"
+
+        if not changed:
+            return {
+                "state": "identical",
+                "headline": "所选结果的输入完全相同",
+                "rest": ("行情、期权、头寸方向、规模与成本、对冲策略逐项一致；"
+                         "若数字仍有差异，只可能来自未记录的输入。"),
+            }
+        if len(changed) == 1:
+            label, fields = changed[0]
+            return {
+                "state": "single",
+                "headline": f"本次对比的变量：{_detail(*changed[0])}",
+                "rest": (f"其余一致：{'、'.join(same_labels)}"
+                         if same_labels else ""),
+            }
+        return {
+            "state": "multiple",
+            "headline": (
+                f"同时有 {len(changed)} 项不同："
+                + "、".join(_detail(label, fields)
+                            for label, fields in changed)),
+            "rest": ("差异无法归因到其中任何一项；"
+                     + (f"一致的是：{'、'.join(same_labels)}"
+                        if same_labels else "没有任何一项是一致的")),
+        }
+
+    @staticmethod
+    def _saved_comparison_warnings(snapshots):
+        """属性异同之外，还需要单独说明的看数限制。
+
+        不报"行情路径不同"：模拟行情下价格序列由期权参数派生（改 σ 就会重
+        新生成路径），Wind/CSV 下换区间也必然换数据——路径差异是上游输入
+        变化的必然结果，单独说一句"行情数据本身不同"会和"其余一致：行情"
+        直接打架。真正需要提醒的是**长度不同**：那时曲线按序号对齐才有误
+        导性，累计类指标也不在同一个跨度上。
+        """
+        snapshots = list(snapshots)
+        if len(snapshots) < 2:
+            return []
         warnings = []
-        close_snapshots = [
-            snapshot for snapshot in snapshots
-            if BacktestApp._saved_snapshot_strategy_type(snapshot)
-            == "close_to_close"
-        ]
-        if not close_snapshots:
+        lengths = {
+            BacktestApp._comparison_safe_int(
+                (snapshot.summary_row or {}).get("n_trade_days"), 0)
+            for snapshot in snapshots
+        }
+        if len(lengths) > 1:
             warnings.append(
-                "未包含 close-to-close 基准；请先保留或勾选每日收盘结果，"
-                "相对基准指标暂不计算。")
-        elif len(close_snapshots) > 1:
-            close_ids = {snapshot.result_id for snapshot in close_snapshots}
-            chosen_id = (
-                baseline_result_id if baseline_result_id in close_ids else
-                min(close_snapshots, key=lambda snapshot: (
-                    snapshot.result_id, snapshot.saved_at)).result_id
-            )
-            chosen = next(
-                snapshot for snapshot in close_snapshots
-                if snapshot.result_id == chosen_id)
+                "各条的交易日数不同：曲线按序号对齐，"
+                "期末净损益与总成本不在同一个跨度上。")
+        positions = {
+            BacktestApp._saved_snapshot_position(snapshot)
+            for snapshot in snapshots
+        }
+        if len(positions) > 1:
             warnings.append(
-                f"包含多条 close-to-close 结果；固定使用最早设定的"
-                f"『{chosen.name}』作为基准，其余作为普通对比项。")
-        if len(snapshots) == 1:
-            warnings.append(
-                "当前只选择了 1 个结果；再勾选至少一个结果即可查看相对差异。")
-            return warnings
-        if len({snapshot.path_key for snapshot in snapshots}) > 1:
-            warnings.append(
-                "行情路径或时间索引不同：曲线可并列查看，但领先排名仅供场景对照。")
-        if len({snapshot.contract_key for snapshot in snapshots}) > 1:
-            warnings.append(
-                "期权结构参数不同：结果同时包含产品参数差异，不应只归因于对冲策略。")
-        if len({snapshot.economics_key for snapshot in snapshots}) > 1:
-            warnings.append(
-                "头寸、合约乘数、成本、滑点或交易日聚合口径不同：金额差异需谨慎解读。")
+                "同时包含买入与卖出：期末净损益与最大回撤的正负来自方向本身，"
+                "横向看应比总成本、再触发与换手额。")
         return warnings
 
     def _rename_saved_backtest(self, result_id, new_name):
         snapshot = self._saved_backtests[result_id]
         snapshot.name = BacktestApp._validate_saved_result_name(
             self._saved_backtests, new_name, exclude_id=result_id)
+        # 原地覆盖同一个文件：文件名带序号，是载入顺序的依据，不能因为改
+        # 展示名就换名字。
+        if snapshot.store_path:
+            try:
+                backtest_pool_store.write_snapshot(
+                    BacktestApp._snapshot_to_payload(snapshot),
+                    path=snapshot.store_path, enforce=False)
+            except Exception:                                 # noqa: BLE001
+                # 改名失败只影响下次启动看到的名字，不该打断本次会话。
+                pass
         return snapshot
 
     def _delete_saved_backtest(self, result_id):
         snapshot = self._saved_backtests.pop(result_id)
         self._saved_comparison_selection.discard(result_id)
-        if getattr(self, "_saved_comparison_baseline_id", None) == result_id:
-            self._saved_comparison_baseline_id = None
-        replacement_id = BacktestApp._resolve_saved_comparison_baseline_id(
-            self)
-        if self._saved_comparison_selection and replacement_id is not None:
-            self._saved_comparison_selection.add(replacement_id)
         if getattr(self, "_latest_retained_result_id", None) == result_id:
             self._latest_retained_result_id = None
+        if snapshot.store_path:
+            backtest_pool_store.delete_snapshot(snapshot.store_path)
+        BacktestApp._persist_pool_view(self)
         BacktestApp._update_saved_result_count(self)
         BacktestApp._sync_retain_button_state(self)
         return snapshot
@@ -5381,21 +6001,6 @@ class BacktestApp(tk.Tk):
 
     # ---- 结果展示 ----
     @staticmethod
-    def _comparison_rows_match(left, right):
-        """用稳定快照 ID 判断同一结果，缺少 ID 时才回退到策略身份。"""
-        if not left or not right:
-            return False
-        left_id = left.get("meta_result_id")
-        right_id = right.get("meta_result_id")
-        if (isinstance(left_id, str) and left_id
-                and isinstance(right_id, str) and right_id):
-            return left_id == right_id
-        return (
-            left.get("strategy_type") == right.get("strategy_type")
-            and left.get("strategy") == right.get("strategy")
-        )
-
-    @staticmethod
     def _format_comparison_value(value, digits=2, *, signed=False,
                                  percent=False):
         """稳健格式化对比指标；缺失值统一显示为破折号。"""
@@ -5410,192 +6015,161 @@ class BacktestApp(tk.Tk):
         suffix = "%" if percent else ""
         return f"{sign}{number:,.{digits}f}{suffix}"
 
-    @staticmethod
-    def _comparison_headline(summary):
-        """返回当前路径冠军、次优及改善幅度，独立于 DataFrame 行顺序。"""
-        candidates = []
-        if summary is not None and not getattr(summary, "empty", True):
-            for _index, row in summary.iterrows():
-                item = row.to_dict()
-                score = BacktestApp._comparison_finite(item.get("score"))
-                if score is None:
-                    continue
-                cost = BacktestApp._comparison_finite(item.get("total_tc"))
-                rank = BacktestApp._comparison_finite(item.get("rank"))
-                stable_tie_breaker = (
-                    (0, rank) if rank is not None else
-                    (1, str(item.get("meta_result_id",
-                                     item.get("strategy", ""))))
-                )
-                candidates.append((
-                    score,
-                    np.inf if cost is None else cost,
-                    stable_tie_breaker,
-                    item,
-                ))
-        candidates.sort(key=lambda item: item[:3])
-        if not candidates:
-            return {
-                "best": None, "runner_up": None,
-                "improvement_ratio": None, "strategy_count": 0,
-            }
-        best = candidates[0][3]
-        runner = candidates[1][3] if len(candidates) > 1 else None
-        improvement = None
-        if runner is not None:
-            best_score = BacktestApp._comparison_finite(best.get("score"))
-            runner_score = BacktestApp._comparison_finite(runner.get("score"))
-            if (best_score is not None and runner_score is not None
-                    and runner_score > 0):
-                improvement = (runner_score - best_score) / runner_score
-        return {
-            "best": best,
-            "runner_up": runner,
-            "improvement_ratio": improvement,
-            "strategy_count": len(candidates),
-        }
+    # 导出用的列与表头。排名表给的是格式化过的展示串，这里导原始数值，
+    # 落到表格软件里才能继续算。
+    _COMPARISON_EXPORT_COLUMNS = (
+        ("strategy", "结果名称"),
+        ("meta_description", "策略 / 参数 / 期权 / 行情来源"),
+        ("total_net_pnl", "期末净损益"),
+        ("total_tc", "总成本"),
+        ("max_drawdown", "最大回撤"),
+        ("rehedge_count", "再触发次数"),
+        ("actual_trade_count", "实际成交次数"),
+        ("turnover", "换手额"),
+        ("n_trade_days", "交易日数"),
+        ("meta_origin", "产生方式"),
+        ("meta_origin_detail", "来源溯源"),
+    )
 
-    @staticmethod
-    def _comparison_improvement_vs_baseline(score, baseline_score):
-        """结果对比页“较每日收盘改善”的唯一定义：正值表示 RMS 低于基准。
+    def _comparison_export_frames(self):
+        """把当前对比整理成两张可导出的表：指标与曲线。
 
-        方向与策略优选页的同名指标以及本页顶部统计卡一致。此前排名列用的是
-        (本行-基准)/|基准|，负值才代表更好，与相邻页面读法相反，容易被反着
-        解读。分母仍是 |基准 RMS|，因此它与优选页那个以 max(基准, 候选) 为
-        分母的有界改善不是同一个统计量，只是方向相同。
+        导的是原始数值而不是表里那串格式化文本，落到表格软件里才能继续算。
         """
-        score = BacktestApp._comparison_finite(score)
-        baseline_score = BacktestApp._comparison_finite(baseline_score)
-        if score is None or baseline_score is None or baseline_score == 0:
-            return None
-        return (baseline_score - score) / abs(baseline_score)
+        import pandas as pd
+        summary = getattr(self, "_comparison_summary", None)
+        if summary is None or getattr(summary, "empty", True):
+            raise ValueError("当前没有可导出的对比结果。")
+        ranking = pd.DataFrame([
+            {
+                heading: row.to_dict().get(key)
+                for key, heading in BacktestApp._COMPARISON_EXPORT_COLUMNS
+            }
+            for _index, row in summary.iterrows()
+        ])
+        curves = pd.DataFrame({
+            name: np.asarray(
+                daily.get("cumulative_net_pnl", []), dtype=float)
+            for name, daily in getattr(
+                self, "_comparison_daily_curves", {}).items()
+        })
+        curves.index = np.arange(1, len(curves) + 1)
+        curves.index.name = "交易日序号"
+        return ranking, curves
 
-    @staticmethod
-    def _comparison_relative_delta(selected, baseline, key):
-        selected_value = BacktestApp._comparison_finite(selected.get(key))
-        baseline_value = BacktestApp._comparison_finite(baseline.get(key))
-        if selected_value is None or baseline_value is None:
-            return {"value": selected_value, "delta": None, "ratio": None}
-        delta = selected_value - baseline_value
-        ratio = delta / abs(baseline_value) if baseline_value != 0 else None
-        return {"value": selected_value, "delta": delta, "ratio": ratio}
-
-    @staticmethod
-    def _comparison_delta_display(selected, baseline, key, *, digits=2,
-                                  percent=True):
-        metric = BacktestApp._comparison_relative_delta(
-            selected, baseline, key)
-        value_text = BacktestApp._format_comparison_value(
-            metric["value"], digits)
-        delta = metric["delta"]
-        if delta is None:
-            return value_text
-        is_baseline = BacktestApp._comparison_rows_match(selected, baseline)
-        if is_baseline:
-            return f"{value_text}（基准）"
-        if abs(delta) < 0.5 * 10 ** (-digits):
-            return f"{value_text}（与基准相同）"
-        delta_text = BacktestApp._format_comparison_value(
-            delta, digits, signed=True)
-        ratio_text = BacktestApp._format_comparison_value(
-            metric["ratio"], 1, signed=True, percent=True)
-        return (f"{value_text}  |  {delta_text}"
-                + (f" ({ratio_text})" if percent and ratio_text != "—" else ""))
-
-    @staticmethod
-    def _make_comparison_stat_card(parent, column, title, value, subtitle="",
-                                   *, highlight=False, baseline=False):
-        if baseline:
-            bg, border = PALETTE["primary_light"], PALETTE["primary"]
-        elif highlight:
-            bg, border = PALETTE["success_light"], PALETTE["success"]
-        else:
-            bg, border = PALETTE["surface_alt"], PALETTE["border_soft"]
-        card = tk.Frame(
-            parent, bg=bg, highlightbackground=border, highlightthickness=1,
-            padx=9, pady=5,
-        )
-        card.grid(row=0, column=column, sticky="nsew", padx=(0 if column == 0 else 4, 0))
-        tk.Label(
-            card, text=title, bg=bg, fg=PALETTE["text_muted"],
-            font=(_UI_FONT_FAMILY, 8), anchor="w",
-        ).pack(fill="x")
-        tk.Label(
-            card, text=value, bg=bg, fg=PALETTE["text"],
-            font=(_UI_FONT_FAMILY, 11, "bold"), anchor="w",
-            justify="left", wraplength=165,
-        ).pack(fill="x")
-        if subtitle:
-            tk.Label(
-                card, text=subtitle, bg=bg, fg=PALETTE["text_muted"],
-                font=(_UI_FONT_FAMILY, 8), anchor="w",
-                justify="left", wraplength=165,
-            ).pack(fill="x")
-
-    def _build_comparison_stat_strip(
-            self, parent, summary, *, lead_title="固定基准",
-            count_label="可比策略"):
-        headline = self._comparison_headline(summary)
-        best = headline["best"] or {}
-        baseline = self._comparison_baseline(summary) or {}
-        self._comparison_best_row = best
-        self._comparison_baseline_row = baseline
-
-        stat_strip = ttk.Frame(parent, style="Surface.TFrame")
-        stat_strip.pack(fill="x", padx=8, pady=(8, 4))
-        for column in range(4):
-            stat_strip.columnconfigure(column, weight=1, uniform="comparison_stats")
-        baseline_name = str(baseline.get(
-            "strategy", "缺少 close-to-close 结果"))
-        self._make_comparison_stat_card(
-            stat_strip, 0, lead_title, baseline_name,
-            (f"close-to-close · 共 {headline['strategy_count']} 个{count_label}"
-             if baseline else "请先运行并保留每日收盘回测"),
-            baseline=True)
-        self._make_comparison_stat_card(
-            stat_strip, 1, "基准日净损益 RMS（已含成本）",
-            self._format_comparison_value(baseline.get("score"), 2),
-            "金额口径 · 越低越好")
-        improvement = BacktestApp._comparison_improvement_vs_baseline(
-            best.get("score"), baseline.get("score"))
-        best_name = str(best.get("strategy", "无可比较结果"))
-        if not baseline:
-            improvement_note = "缺少基准，无法计算改善"
-        elif self._comparison_rows_match(best, baseline):
-            improvement_note = "基准即当前最优"
-        else:
-            improvement_note = (
-                "较基准改善 "
-                + self._format_comparison_value(
-                    improvement, 1, signed=True, percent=True)
-            )
-        self._make_comparison_stat_card(
-            stat_strip, 2, "当前最优", best_name, improvement_note,
-            highlight=True)
-        baseline_cost = self._format_comparison_value(
-            baseline.get("total_tc"), 2)
-        baseline_rehedges = self._comparison_safe_int(
-            baseline.get("rehedge_count"), 0)
-        baseline_actual_trades = self._comparison_safe_int(
-            baseline.get("actual_trade_count"), 0)
-        self._make_comparison_stat_card(
-            stat_strip, 3, "基准总成本 / 再触发",
-            f"{baseline_cost} / {baseline_rehedges}",
-            f"实际成交 {baseline_actual_trades} 次")
-        return headline
-
-    def _open_saved_comparison(self):
-        """打开会话结果池；勾选只读取快照，不触发任何回测。"""
-        if getattr(self, "_active_job", None) is not None:
-            messagebox.showinfo("任务运行中", "请等待当前任务完成后再打开结果对比。")
+    def _export_saved_comparison(self):
+        """导出当前对比：排名一张表，累计净损益曲线另一张。"""
+        try:
+            ranking, curves = BacktestApp._comparison_export_frames(self)
+        except Exception as exc:
+            messagebox.showinfo("没有可导出的结果", str(exc))
             return
-        self._show_saved_comparison_page()
+        path = filedialog.asksaveasfilename(
+            title="导出结果对比", defaultextension=".csv",
+            initialfile="结果对比.csv",
+            filetypes=[("CSV files", "*.csv")])
+        if not path:
+            return
+        base, extension = os.path.splitext(path)
+        curves_path = f"{base}_曲线{extension or '.csv'}"
+        try:
+            ranking.to_csv(path, index=False, encoding="utf-8-sig")
+            curves.to_csv(curves_path, encoding="utf-8-sig")
+        except Exception as exc:
+            messagebox.showerror("导出失败", str(exc))
+            return
+        self._set_status(
+            f"已导出 {len(ranking)} 条排名与曲线  |  "
+            f"{os.path.basename(path)} / {os.path.basename(curves_path)}")
+        messagebox.showinfo(
+            "导出成功",
+            f"排名已保存至:\n{path}\n\n累计净损益曲线已保存至:\n{curves_path}")
 
-    def _show_saved_comparison_page(self):
+    def _apply_snapshot_strategy_to_form(self, snapshot):
+        """把快照的对冲策略输入写回左侧表单，不动其它任何一组参数。"""
+        form_state = dict(getattr(snapshot, "form_state", None) or {})
+        strategy_name = str(form_state.get("strategy_name", "") or "").strip()
+        if strategy_name not in STRATEGY_DISPLAY:
+            raise ValueError(
+                "这条快照保存于本功能之前，没有可回填的策略参数；"
+                "重新运行一次回测并保留即可。")
+        if strategy_name == "fixed_times":
+            fixed_times = str(form_state.get("fixed_times", "") or "").strip()
+            if not fixed_times:
+                raise ValueError("快照缺少固定时刻参数。")
+            FixedTimeStrategy(fixed_times)
+            self._fixed_times_var.set(fixed_times)
+        elif strategy_name == "hedge_band":
+            band_type = str(
+                form_state.get("interval_type", "") or "absolute").strip()
+            threshold = BacktestApp._comparison_finite(
+                form_state.get("price_interval"))
+            if band_type not in ("absolute", "relative", "sigma"):
+                raise ValueError(f"快照的带宽单位无法识别：{band_type}")
+            if threshold is None or threshold <= 0:
+                raise ValueError("快照缺少有效的固定间隔带宽。")
+            # 波动率口径要先写回：带宽的三口径换算依赖它，顺序反了会按旧
+            # 口径换算出另外两种表示。
+            sigma_source = str(
+                form_state.get("sigma_source", "") or "implied")
+            if sigma_source in SIGMA_SOURCE_DISPLAY:
+                self._sigma_src_var.set(SIGMA_SOURCE_DISPLAY[sigma_source])
+            sigma_window = BacktestApp._comparison_safe_int(
+                form_state.get("sigma_window"), 20)
+            self._sigma_win_var.set(str(max(2, sigma_window)))
+            # 按保存时的那一种输入单位写回，另外两种由既有换算链路补齐；
+            # 换算过一手再写回去，显示值会和当初跑的那次差一个舍入。
+            {
+                "absolute": self._band_abs_var,
+                "relative": self._band_rel_var,
+                "sigma": self._band_sigma_var,
+            }[band_type].set(f"{threshold:.10g}")
+            self._mark_band_edited(band_type)
+            self._sync_band_inputs(band_type, strict=True)
+        self._strategy_var.set(STRATEGY_DISPLAY[strategy_name])
+        fallback_var = getattr(self, "_force_day_close_hedge_var", None)
+        if fallback_var is not None:
+            fallback_var.set(
+                bool(form_state.get("force_day_close_hedge", False)))
+        self._toggle_strategy()
+        return strategy_name
+
+    def _apply_selected_snapshot_to_form(self):
+        """把结果池里聚焦那条快照的对冲参数送回左侧继续调。
+
+        与同排的重命名、删除同一个作用对象：结果池里点中的那一行。
+        """
+        if not BacktestApp._saved_pool_actions_allowed(self):
+            return
+        result_id = self._focused_saved_backtest_id()
+        if result_id not in self._saved_backtests:
+            messagebox.showinfo("请选择结果", "请先在结果池中点击一条结果。")
+            return
+        snapshot = self._saved_backtests[result_id]
+        try:
+            self._apply_snapshot_strategy_to_form(snapshot)
+        except Exception as exc:
+            messagebox.showerror("无法应用策略", str(exc))
+            return
+        self._set_status(
+            f"已把『{snapshot.name}』的对冲策略应用到左侧参数  |  "
+            "期权结构、方向与行情来源保持不变")
+
+    # 结果池表的列：(列键, 表头, 初始宽度, 对齐)。初始宽度按表头与内容实际
+    # 需要分配，总和接近容器宽度，配合全列 stretch 使窗口缩放不改变列比例。
+    _SAVED_POOL_COLUMNS = (
+        ("name", "结果名称", 190, "w"),
+        ("origin", "产生方式", 96, "center"),
+        ("strategy", "策略", 110, "center"),
+        ("parameters", "策略参数", 250, "w"),
+        ("source", "行情来源", 175, "w"),
+        ("saved_at", "保留时间", 110, "center"),
+    )
+
+    def _show_saved_comparison_page(self, *, navigate=True):
+        """构建并渲染结果对比页；``navigate`` 为假时只构建不抢占当前页。"""
         self._hide_placeholder("compare")
-        old_figure = getattr(self, "_comparison_chart_figure", None)
-        if old_figure is not None:
-            plt.close(old_figure)
+        BacktestApp._discard_comparison_frame(self)
         container = self._compare_container
         for widget in container.winfo_children():
             widget.destroy()
@@ -5611,63 +6185,55 @@ class BacktestApp(tk.Tk):
         ).grid(row=0, column=0, sticky="w")
         ttk.Label(
             header,
-            text=("仅保存在当前应用会话；同方向最早保留的 close-to-close "
-                  "结果固定为基准，勾选结果不会重新回测"),
+            text=(f"自动保存在本机，重开程序后仍在（最多 "
+                  f"{backtest_pool_store.MAX_RESULTS} 条，超出淘汰最旧的）；"
+                  "显示 / 隐藏只换视图，不会重新回测"),
             style="SurfaceMuted.TLabel",
         ).grid(row=1, column=0, sticky="w", pady=(2, 0))
         pool = ttk.LabelFrame(container, text=" 已保留结果 ", padding=12)
         pool.pack(fill="x", padx=8, pady=(4, 8))
         toolbar = ttk.Frame(pool, style="Surface.TFrame")
         toolbar.pack(fill="x", pady=(0, 4))
+        # 工具栏只留作用于「整池」的动作；作用于单条快照的（显示、应用策
+        # 略、重命名、删除）改走行右键菜单——它们本来就需要先点中一行，做
+        # 成常驻按钮等于让用户先读一句「点击其它列聚焦后…」才知道怎么用。
+        # 「全部显示 / 全部隐藏」原名「全选 / 清空」：选的是什么、清的是什
+        # 么都没说，而「清空」紧挨着「删除」，很像是要把结果池倒掉。
         ttk.Label(
             toolbar,
-            text=("选择其它结果时会自动带入同方向固定基准；买卖方向分组"
-                  "展示，点击其它列聚焦后可重命名或删除"),
+            text="右键结果行可显示、加载明细、应用策略、重命名或删除",
             style="SurfaceMuted.TLabel",
         ).pack(side="left", fill="x", expand=True)
         ttk.Button(
-            toolbar, text="全选", width=6,
+            toolbar, text="全部显示", width=9,
             command=self._select_all_saved_backtests,
         ).pack(side="left", padx=(4, 0))
         ttk.Button(
-            toolbar, text="清空", width=6,
+            toolbar, text="全部隐藏", width=9,
             command=self._clear_saved_backtest_selection,
         ).pack(side="left", padx=(4, 0))
         ttk.Button(
-            toolbar, text="重命名", width=7,
-            command=self._prompt_rename_saved_backtest,
+            toolbar, text="导出 CSV", width=9,
+            command=self._export_saved_comparison,
         ).pack(side="left", padx=(8, 0))
-        ttk.Button(
-            toolbar, text="删除", width=6,
-            command=self._prompt_delete_saved_backtest,
-        ).pack(side="left", padx=(4, 0))
 
-        columns = ("name", "origin", "strategy", "parameters",
-                   "source", "saved_at")
-        headings = {
-            "name": "结果名称", "origin": "产生方式",
-            "strategy": "策略", "parameters": "策略参数",
-            "source": "行情来源", "saved_at": "保留时间",
-        }
-        widths = {
-            "name": 138, "origin": 74, "strategy": 104,
-            "parameters": 212, "source": 132, "saved_at": 104,
-        }
+        pool_columns = BacktestApp._SAVED_POOL_COLUMNS
         tree_frame = ttk.Frame(pool, style="Surface.TFrame")
         tree_frame.pack(fill="x")
         tree = ttk.Treeview(
-            tree_frame, columns=columns, show="tree headings", height=5,
-            selectmode="browse",
+            tree_frame,
+            columns=[key for key, _text, _width, _anchor in pool_columns],
+            show="tree headings", height=5, selectmode="browse",
         )
         tree.heading("#0", text="显示")
         tree.column("#0", width=46, minwidth=44, stretch=False, anchor="center")
-        for column in columns:
-            tree.heading(column, text=headings[column])
+        for key, text, width, anchor in pool_columns:
+            # 与指标表同一套规则：表头跟本列数据同向对齐，且所有列一起
+            # stretch——只让其中一两列可拉伸时，余量会全灌进那几列。
+            tree.heading(key, text=text, anchor=anchor)
             tree.column(
-                column, width=widths[column], minwidth=44,
-                anchor="center" if column in (
-                    "origin", "strategy", "saved_at") else "w",
-                stretch=column in ("name", "parameters"),
+                key, width=width, minwidth=max(44, width - 30),
+                anchor=anchor, stretch=True,
             )
         scrollbar = ttk.Scrollbar(tree_frame, orient="vertical", command=tree.yview)
         tree.configure(yscrollcommand=scrollbar.set)
@@ -5675,19 +6241,13 @@ class BacktestApp(tk.Tk):
         scrollbar.pack(side="right", fill="y")
         tree.bind("<Button-1>", self._toggle_saved_backtest_click)
         tree.bind("<space>", self._toggle_focused_saved_backtest)
+        # 单条快照的动作全部收进右键菜单。三个序列都绑：macOS 的 Tk 在不同
+        # 小版本里把右键映射成 Button-2 或 Button-3，Control+左键又是系统级
+        # 的右键等价操作；Windows / Linux 只认 Button-3。
+        for sequence in ("<Button-3>", "<Button-2>", "<Control-Button-1>"):
+            tree.bind(sequence, self._popup_saved_pool_menu)
         self._saved_pool_tree = tree
-
-        self._saved_comparison_notice = tk.Frame(
-            container, bg=PALETTE["primary_light"],
-            highlightbackground=PALETTE["border_soft"], highlightthickness=1,
-            padx=12, pady=6)
-        self._saved_comparison_notice.pack(fill="x", padx=8, pady=(0, 6))
-        self._saved_comparison_notice_label = tk.Label(
-            self._saved_comparison_notice, text="", anchor="w", justify="left",
-            bg=PALETTE["primary_light"], fg=PALETTE["primary"],
-            font=(_UI_FONT_FAMILY, 10), wraplength=850,
-        )
-        self._saved_comparison_notice_label.pack(fill="x")
+        self._saved_pool_menu = BacktestApp._build_saved_pool_menu(self)
 
         self._saved_comparison_content = ttk.Frame(
             container, style="Surface.TFrame")
@@ -5695,7 +6255,8 @@ class BacktestApp(tk.Tk):
             fill="both", expand=True, padx=2, pady=(0, 6))
         self._refresh_saved_pool_tree()
         self._refresh_saved_comparison_view()
-        self._nb.select(self._compare_tab)
+        if navigate:
+            self._nb.select(self._compare_tab)
 
     def _refresh_saved_comparison_if_visible(self):
         tree = getattr(self, "_saved_pool_tree", None)
@@ -5711,7 +6272,6 @@ class BacktestApp(tk.Tk):
         tree = getattr(self, "_saved_pool_tree", None)
         if tree is None:
             return
-        baseline_id = BacktestApp._resolve_saved_comparison_baseline_id(self)
         focus = tree.focus()
         for item in tree.get_children():
             tree.delete(item)
@@ -5720,14 +6280,16 @@ class BacktestApp(tk.Tk):
             tree.insert(
                 "", "end", iid=snapshot.result_id,
                 image=self._cb_sf_checked if is_selected else self._cb_sf_unchecked,
-                values=(
-                    snapshot.name,
-                    BacktestApp._saved_snapshot_origin_label(snapshot),
-                    (f"{snapshot.strategy_label} · 基准"
-                     if snapshot.result_id == baseline_id
-                     else snapshot.strategy_label),
-                    snapshot.parameter_summary, snapshot.source_label,
-                    snapshot.saved_at.strftime("%m-%d %H:%M:%S"),
+                values=BacktestApp._pad_tree_cells(
+                    (
+                        snapshot.name,
+                        BacktestApp._saved_snapshot_origin_label(snapshot),
+                        snapshot.strategy_label,
+                        snapshot.parameter_summary, snapshot.source_label,
+                        snapshot.saved_at.strftime("%m-%d %H:%M:%S"),
+                    ),
+                    [anchor for _key, _text, _width, anchor
+                     in BacktestApp._SAVED_POOL_COLUMNS],
                 ),
             )
         children = tree.get_children()
@@ -5742,6 +6304,62 @@ class BacktestApp(tk.Tk):
             count_var.set(
                 f"回测结果池 · 已保存 {len(self._saved_backtests)} 条 · "
                 f"当前显示 {len(self._saved_comparison_selection)} 条")
+
+    def _build_saved_pool_menu(self):
+        """结果池的行右键菜单：只放作用于「点中那一条」的动作。
+
+        第一项的文案在弹出时按当前勾选状态改写，所以它固定占索引 0。
+        """
+        menu = tk.Menu(self, tearoff=0)
+        menu.add_command(label="显示",
+                         command=self._toggle_focused_saved_backtest)
+        menu.add_separator()
+        menu.add_command(label="加载明细",
+                         command=self._load_saved_snapshot_detail)
+        menu.add_command(label="应用策略",
+                         command=self._apply_selected_snapshot_to_form)
+        menu.add_command(label="重命名…",
+                         command=self._prompt_rename_saved_backtest)
+        menu.add_separator()
+        menu.add_command(label="删除",
+                         command=self._prompt_delete_saved_backtest)
+        return menu
+
+    _POOL_MENU_DETAIL_INDEX = 2
+
+    def _popup_saved_pool_menu(self, event):
+        """右键先把光标下那行设成作用对象，再弹菜单。
+
+        空白处右键没有作用对象，直接不弹——弹一份点了只会跳「请选择结果」
+        的菜单，比不弹更费解。
+        """
+        if not BacktestApp._saved_pool_actions_allowed(self):
+            return "break"
+        tree = getattr(self, "_saved_pool_tree", None)
+        menu = getattr(self, "_saved_pool_menu", None)
+        if tree is None or menu is None:
+            return None
+        result_id = tree.identify_row(event.y)
+        if not result_id:
+            return None
+        tree.selection_set(result_id)
+        tree.focus(result_id)
+        menu.entryconfigure(
+            0,
+            label=("取消显示" if result_id in self._saved_comparison_selection
+                   else "显示"))
+        # 没有重放配方就置灰：本功能上线前保留的快照只有汇总层，点了只能
+        # 弹一句"没有配方"，不如直接让它点不动。
+        snapshot = self._saved_backtests.get(result_id)
+        menu.entryconfigure(
+            BacktestApp._POOL_MENU_DETAIL_INDEX,
+            state=("normal" if getattr(snapshot, "replay", None)
+                   else "disabled"))
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+        return "break"
 
     def _saved_pool_actions_allowed(self):
         if getattr(self, "_active_job", None) is None:
@@ -5770,79 +6388,28 @@ class BacktestApp(tk.Tk):
             self._toggle_saved_backtest_selection(result_id)
         return "break"
 
+    def _persist_pool_view(self):
+        """记下当前显示了哪几条，供下次启动恢复。
+
+        显式调用而不是塞进刷新链路：刷新每次勾选都会走好几遍，写盘该只发生
+        在「选择真的变了」的那几个点上。
+        """
+        backtest_pool_store.write_view_state(self._saved_comparison_selection)
+
     def _toggle_saved_backtest_selection(self, result_id):
-        baseline_id = BacktestApp._resolve_saved_comparison_baseline_id(self)
         if result_id in self._saved_comparison_selection:
-            other_selected = self._saved_comparison_selection - {result_id}
-            if result_id == baseline_id and other_selected:
-                self._set_status(
-                    "close-to-close 是固定基准；请先取消其它对比项，或点击清空。")
-            else:
-                self._saved_comparison_selection.remove(result_id)
+            self._saved_comparison_selection.remove(result_id)
         elif result_id in self._saved_backtests:
-            target_position = BacktestApp._saved_snapshot_position(
-                self._saved_backtests[result_id])
-            selected_positions = {
-                BacktestApp._saved_snapshot_position(
-                    self._saved_backtests[selected_id])
-                for selected_id in self._saved_comparison_selection
-                if selected_id in self._saved_backtests
-            }
-            if selected_positions and selected_positions != {target_position}:
-                # 点击另一方向时切换整个视图分组，绝不沿用上一组的 每日收盘。
-                self._saved_comparison_selection.clear()
-                direction = (
-                    "卖出" if target_position == 1
-                    else "买入")
-                self._set_status(
-                    f"已切换到{direction}结果组；买卖方向不混合比较。")
             self._saved_comparison_selection.add(result_id)
-            baseline_id = BacktestApp._resolve_saved_comparison_baseline_id(
-                self, target_position)
-            if baseline_id is not None:
-                self._saved_comparison_selection.add(baseline_id)
+        BacktestApp._persist_pool_view(self)
         self._refresh_saved_pool_tree()
         self._refresh_saved_comparison_view()
 
     def _select_all_saved_backtests(self):
         if not BacktestApp._saved_pool_actions_allowed(self):
             return
-        if not self._saved_backtests:
-            self._saved_comparison_selection.clear()
-            self._refresh_saved_pool_tree()
-            self._refresh_saved_comparison_view()
-            return
-        focused_id = BacktestApp._focused_saved_backtest_id(self)
-        if focused_id in self._saved_backtests:
-            target_position = BacktestApp._saved_snapshot_position(
-                self._saved_backtests[focused_id])
-        else:
-            selected_positions = {
-                BacktestApp._saved_snapshot_position(
-                    self._saved_backtests[result_id])
-                for result_id in self._saved_comparison_selection
-                if result_id in self._saved_backtests
-            }
-            target_position = (
-                next(iter(selected_positions))
-                if len(selected_positions) == 1 else
-                BacktestApp._saved_snapshot_position(
-                    next(iter(self._saved_backtests.values())))
-            )
-        same_direction = {
-            result_id for result_id, snapshot in self._saved_backtests.items()
-            if BacktestApp._saved_snapshot_position(snapshot)
-            == target_position
-        }
-        skipped = len(self._saved_backtests) - len(same_direction)
-        self._saved_comparison_selection = same_direction
-        BacktestApp._resolve_saved_comparison_baseline_id(
-            self, target_position)
-        if skipped:
-            direction = (
-                "卖出" if target_position == 1 else "买入")
-            self._set_status(
-                f"已全选{direction}结果；另 {skipped} 条相反方向结果未混入。")
+        self._saved_comparison_selection = set(self._saved_backtests)
+        BacktestApp._persist_pool_view(self)
         self._refresh_saved_pool_tree()
         self._refresh_saved_comparison_view()
 
@@ -5850,6 +6417,7 @@ class BacktestApp(tk.Tk):
         if not BacktestApp._saved_pool_actions_allowed(self):
             return
         self._saved_comparison_selection.clear()
+        BacktestApp._persist_pool_view(self)
         self._refresh_saved_pool_tree()
         self._refresh_saved_comparison_view()
 
@@ -5893,7 +6461,11 @@ class BacktestApp(tk.Tk):
             return
         snapshot = self._saved_backtests[result_id]
         if not messagebox.askyesno(
-                "删除回测结果", f"确定从当前会话删除『{snapshot.name}』吗？"):
+                # 结果池已落盘，这是真删文件。措辞必须比「从当前会话删除」
+                # 重——那句的轻描淡写建立在「反正关程序也会没」之上。
+                "删除回测结果",
+                f"删除『{snapshot.name}』？将同时删掉本机上的结果文件，"
+                "此操作不可撤销。"):
             return
         self._delete_saved_backtest(result_id)
         self._refresh_saved_pool_tree()
@@ -5902,98 +6474,186 @@ class BacktestApp(tk.Tk):
             f"已删除『{snapshot.name}』  |  剩余 {len(self._saved_backtests)} 条")
 
     def _selected_saved_backtests(self):
-        selected_positions = {
-            BacktestApp._saved_snapshot_position(
-                self._saved_backtests[result_id])
-            for result_id in self._saved_comparison_selection
-            if result_id in self._saved_backtests
-        }
-        if len(selected_positions) > 1:
-            raise ValueError(
-                "买入与卖出结果不能混选；"
-                "请清空后选择同一头寸方向。")
-        selected_position = (
-            next(iter(selected_positions)) if selected_positions else None)
-        baseline_id = BacktestApp._resolve_saved_comparison_baseline_id(
-            self, selected_position)
-        if self._saved_comparison_selection and baseline_id is not None:
-            self._saved_comparison_selection.add(baseline_id)
+        """纯查询：按结果池顺序返回已勾选的快照。"""
         return [
             snapshot for result_id, snapshot in self._saved_backtests.items()
             if result_id in self._saved_comparison_selection
         ]
 
-    def _refresh_saved_comparison_notice(self, snapshots):
-        baseline_id = BacktestApp._resolve_saved_comparison_baseline_id(self)
-        warnings = self._saved_comparison_warnings(
-            snapshots, baseline_result_id=baseline_id)
-        if warnings:
-            text = "⚠ " + "  ".join(warnings)
-            mismatch = len(snapshots) > 1
-            bg = PALETTE["warning_light"] if mismatch else PALETTE["primary_light"]
-            fg = PALETTE["warning"] if mismatch else PALETTE["primary"]
-        elif len(snapshots) >= 2:
-            text = "✓ 所选结果的行情路径、期权参数及金额/成本口径一致。"
-            bg, fg = PALETTE["success_light"], PALETTE["success"]
-        else:
-            text = "点击结果池“显示”列的复选框，选择要放入图表和排名的回测结果。"
-            bg, fg = PALETTE["primary_light"], PALETTE["primary"]
-        notice = self._saved_comparison_notice
-        label = self._saved_comparison_notice_label
-        notice.configure(bg=bg)
-        label.configure(text=text, bg=bg, fg=fg)
+    def _discard_comparison_frame(self):
+        """丢掉结果区骨架与图表引用，让下一次刷新重新建。
+
+        这里不调用 ``plt.close``：图表是直接构造的 ``Figure``，从未登记进
+        pyplot 的 figure manager，对它调用 close 是空操作。真正生效的是销毁
+        canvas widget 之后由 GC 回收，clear 只是先松开轴上引用的数据。
+        """
+        figure = getattr(self, "_comparison_chart_figure", None)
+        if figure is not None:
+            figure.clear()
+        self._comparison_frame = None
+        self._comparison_chart_figure = None
+        self._comparison_chart_ax = None
+        self._comparison_chart_canvas = None
+        self._comparison_tree = None
+        self._comparison_rows = {}
+        self._comparison_summary = None
+        self._comparison_variable_var = None
+        self._comparison_variable_accent = None
+
+    def _render_saved_comparison_empty(self, title, detail):
+        """把内容区换成居中的空状态说明，并释放上一张图表。"""
+        content = self._saved_comparison_content
+        BacktestApp._discard_comparison_frame(self)
+        for widget in content.winfo_children():
+            widget.destroy()
+        empty = ttk.Frame(content, style="Surface.TFrame")
+        empty.place(relx=0.5, rely=0.42, anchor="center")
+        ttk.Label(
+            empty, text=title, style="Surface.TLabel",
+            font=(_UI_FONT_FAMILY, 14, "bold"),
+        ).pack(pady=(0, 5))
+        ttk.Label(
+            empty, text=detail, style="SurfaceMuted.TLabel", justify="center",
+            # 这里也会显示异常原文，长度不可控，必须折行。
+            wraplength=420,
+        ).pack()
 
     def _refresh_saved_comparison_view(self):
+        # 出错不弹模态框：这条链路每次勾选都会走，弹窗会把人挡在页面外。
+        # 直接把原因写进空状态区，它本来就是说明"为什么现在没东西看"的地方。
         try:
             snapshots = self._selected_saved_backtests()
+            if not snapshots:
+                # 「空」现在有三种含义，必须分清：本机从没存过 / 存过但载入
+                # 失败 / 存着但全被隐藏了。第三种最容易被误读成数据没了——
+                # 用户刚点完「全部隐藏」，页面回一句「尚未选择」就像清空了。
+                pooled = len(self._saved_backtests)
+                load_error = getattr(self, "_saved_pool_load_error", "")
+                if pooled:
+                    self._render_saved_comparison_empty(
+                        "当前没有显示任何结果",
+                        f"已保留的 {pooled} 条都在上方结果池里，"
+                        "点「显示」列或按「全部显示」即可放上来。")
+                elif load_error:
+                    self._render_saved_comparison_empty(
+                        "没有可显示的结果", load_error)
+                else:
+                    self._render_saved_comparison_empty(
+                        "尚未保留任何结果",
+                        "先运行回测，再点『＋ 保留当前结果到对比』。"
+                        "保留的结果会自动存在本机，重开程序后仍在。")
+                return
+            content = self._saved_comparison_content
+            summary, daily_curves = self._saved_comparison_payload(snapshots)
         except Exception as exc:
-            messagebox.showerror("选择已保存结果失败", str(exc))
+            self._render_saved_comparison_empty("无法生成对比", str(exc))
             return
-        self._refresh_saved_comparison_notice(snapshots)
-        content = self._saved_comparison_content
-        if not snapshots:
-            old_figure = getattr(self, "_comparison_chart_figure", None)
-            if old_figure is not None:
-                plt.close(old_figure)
-            for widget in content.winfo_children():
-                widget.destroy()
-            empty = ttk.Frame(content, style="Surface.TFrame")
-            empty.place(relx=0.5, rely=0.42, anchor="center")
-            ttk.Label(
-                empty, text="尚未选择对比结果", style="Surface.TLabel",
-                font=(_UI_FONT_FAMILY, 14, "bold"),
-            ).pack(pady=(0, 5))
-            ttk.Label(
-                empty,
-                text=("先运行回测并保留结果，或在上方结果池勾选已有结果。\n"
-                      "修改策略或参数后的下一次回测不会覆盖已保留快照。"),
-                style="SurfaceMuted.TLabel", justify="center",
-            ).pack()
-            return
+        BacktestApp._ensure_comparison_frame(self, content)
+        BacktestApp._refresh_comparison_variable_card(self, snapshots)
+        self._populate_comparison_view(summary, daily_curves)
 
+    def _ensure_comparison_frame(self, content):
+        """结果区骨架只建一次；已经建好就直接复用。"""
+        existing = getattr(self, "_comparison_frame", None)
         try:
-            baseline_id = BacktestApp._resolve_saved_comparison_baseline_id(
-                self)
-            summary, daily_curves = self._saved_comparison_payload(
-                snapshots, baseline_result_id=baseline_id)
-        except Exception as exc:
-            messagebox.showerror("读取已保存结果失败", str(exc))
-            return
-        old_figure = getattr(self, "_comparison_chart_figure", None)
-        if old_figure is not None:
-            plt.close(old_figure)
+            if existing is not None and existing.winfo_exists():
+                return
+        except tk.TclError:
+            pass
         for widget in content.winfo_children():
             widget.destroy()
         self._comparison_results = {}
         self._comparison_ranking = None
-        self._build_comparison_stat_strip(
-            content, summary, lead_title="固定基准", count_label="已选结果")
-        current = ttk.Frame(content, style="Surface.TFrame")
-        current.pack(fill="both", expand=True, padx=8, pady=(1, 0))
+        self._build_comparison_variable_card(content)
+        frame = ttk.Frame(content, style="Surface.TFrame")
+        frame.pack(fill="both", expand=True, padx=8, pady=(1, 0))
         self._build_current_comparison_view(
-            current, summary, {}, show_curve_controls=False,
-            ranking_title="已选结果排名（口径不一致时仅作场景对照）",
-            daily_curves=daily_curves)
+            frame, show_curve_controls=False,
+            ranking_title="已选结果指标（点列头换排序）")
+        self._comparison_frame = frame
+
+    def _build_comparison_variable_card(self, parent):
+        """对比说明卡：这次比的变量是哪一项，以及看数时要留意什么。
+
+        这个位置原先是一张"选中结果明细卡"，摆的是名称、五个指标和参数串
+        ——而那些数字指标表里全有，参数与来源结果池表里全有，独有的只剩一
+        个交易日数（已并入指标表）。真正该占这块版面的是本页唯一的结论性
+        信息：这两条结果之间到底差在哪。
+        """
+        card = tk.Frame(
+            parent, bg=PALETTE["surface_alt"],
+            highlightbackground=PALETTE["border_soft"], highlightthickness=1)
+        card.pack(fill="x", padx=8, pady=(8, 4))
+
+        self._comparison_variable_accent = tk.Frame(
+            card, bg=PALETTE["border_soft"], width=4)
+        self._comparison_variable_accent.pack(side="left", fill="y")
+
+        body = tk.Frame(card, bg=PALETTE["surface_alt"], padx=14, pady=10)
+        body.pack(side="left", fill="both", expand=True)
+        body.columnconfigure(0, weight=1)
+
+        self._comparison_variable_var = tk.StringVar(value="")
+        self._comparison_variable_label = tk.Label(
+            body, textvariable=self._comparison_variable_var,
+            bg=PALETTE["surface_alt"], fg=PALETTE["text"],
+            font=(_UI_FONT_FAMILY, 14, "bold"), anchor="w", justify="left",
+            wraplength=980,
+        )
+        self._comparison_variable_label.grid(row=0, column=0, sticky="w")
+
+        self._comparison_same_var = tk.StringVar(value="")
+        tk.Label(
+            body, textvariable=self._comparison_same_var,
+            bg=PALETTE["surface_alt"], fg=PALETTE["text_muted"],
+            font=(_UI_FONT_FAMILY, 9), anchor="w", justify="left",
+            wraplength=980,
+        ).grid(row=1, column=0, sticky="w", pady=(4, 0))
+
+        self._comparison_caveat_var = tk.StringVar(value="")
+        self._comparison_caveat_label = tk.Label(
+            body, textvariable=self._comparison_caveat_var,
+            bg=PALETTE["surface_alt"], fg=PALETTE["text_muted"],
+            font=(_UI_FONT_FAMILY, 9), anchor="w", justify="left",
+            wraplength=980,
+        )
+        self._comparison_caveat_label.grid(row=2, column=0, sticky="w")
+
+    def _refresh_comparison_variable_card(self, snapshots):
+        """把变量结论与看数提醒写进说明卡。"""
+        variable_var = getattr(self, "_comparison_variable_var", None)
+        accent = getattr(self, "_comparison_variable_accent", None)
+        if variable_var is None or accent is None:
+            return
+        same_var = self._comparison_same_var
+        caveat_var = self._comparison_caveat_var
+        try:
+            if not accent.winfo_exists():
+                return
+        except tk.TclError:
+            return
+
+        if len(snapshots) < 2:
+            variable_var.set(
+                "再勾选一条即可比对" if snapshots else "尚未选择对比结果")
+            same_var.set(
+                "页面会说明所选结果之间差在哪一项，数值判断留给你。")
+            caveat_var.set("")
+            accent.configure(bg=PALETTE["border_soft"])
+            return
+
+        summary = BacktestApp._comparison_variable_summary(snapshots)
+        state = summary["state"]
+        variable_var.set(summary["headline"])
+        same_var.set(summary["rest"])
+        accent.configure(bg={
+            "single": PALETTE["success"],
+            "identical": PALETTE["primary"],
+            "multiple": PALETTE["warning"],
+        }[state])
+        caveats = self._saved_comparison_warnings(snapshots)
+        caveat_var.set(
+            "\n".join(f"· {caveat}" for caveat in caveats) if caveats else "")
 
     def _show_history_recommendation(
             self, recommendations, ranking, notes=None, source_label=None,
@@ -6022,12 +6682,6 @@ class BacktestApp(tk.Tk):
             "_history_conclusion_card", "_history_conclusion_accent",
             "_history_conclusion_badge_var", "_history_conclusion_name_var",
             "_history_conclusion_stats", "_history_splitter",
-            "_history_batch_outcome_bar", "_history_batch_outcome_var",
-            "_history_batch_outcome_label",
-            "_history_batch_outcome_detail_btn",
-            "_history_batch_outcome_open_btn",
-            "_history_batch_failure_details",
-            "_history_batch_last_result_ids",
             "_history_lookbacks", "_history_uses_strict_metric",
             "_history_uses_window_equal_metric",
         )
@@ -6104,10 +6758,140 @@ class BacktestApp(tk.Tk):
             BacktestApp._toggle_history_config_panel(self)
         self._nb.select(self._history_tab)
 
+    # 排名表结构与数据无关，骨架建一次就够。展示的全是每条结果自己的绝对
+    # 指标；谁跟谁比、比哪一项，交给排序和并列的曲线回答。
+    # 各列的初始宽度按表头与内容实际需要分配，总和接近容器宽度——配合下面
+    # 的全列 stretch，窗口缩放时平均摊到每列的增量很小，比例不会走样。
+    _COMPARISON_RANKING_COLUMNS = (
+        ("rank", "#", 46),
+        ("strategy", "结果名称", 260),
+        ("total_net_pnl", "期末净损益", 110),
+        ("total_tc", "总成本", 100),
+        ("max_drawdown", "最大回撤", 110),
+        ("rehedge_count", "再触发/成交", 115),
+        ("turnover", "换手额", 125),
+        ("n_trade_days", "交易日数", 90),
+    )
+
+    # 各列的对齐方向。未列出的都是数字列，一律右对齐——与优选页同一套规则。
+    _COMPARISON_COLUMN_ANCHORS = {"rank": "center", "strategy": "w"}
+
+    @staticmethod
+    def _comparison_column_anchor(key):
+        return BacktestApp._COMPARISON_COLUMN_ANCHORS.get(key, "e")
+
+    @staticmethod
+    def _pad_tree_cells(values, anchors):
+        """按对齐方向给单元格补一个空格，等价于给每格加内边距。
+
+        ttk.Treeview 没有单元格内边距这回事：文本严格贴着 anchor 那一侧的
+        列边界。列宽又随窗口伸缩，靠调宽某一列治不了根。表格值不参与任何
+        解析（行数据另存），补空格不影响逻辑。
+        """
+        padded = []
+        for value, anchor in zip(values, anchors):
+            text = str(value)
+            if not text:
+                padded.append(text)
+            elif anchor == "e":
+                padded.append(f"{text} ")
+            elif anchor == "w":
+                padded.append(f" {text}")
+            else:
+                padded.append(text)
+        return tuple(padded)
+
+    @staticmethod
+    def _pad_comparison_row(values):
+        """指标表的单元格内边距。"""
+        return BacktestApp._pad_tree_cells(values, [
+            BacktestApp._comparison_column_anchor(key)
+            for key, _text, _width in
+            BacktestApp._COMPARISON_RANKING_COLUMNS
+        ])
+
+    # 点列头换排序时，各列第一次点下去该往哪边排。收益是越高越好，先给降序；
+    # 成本、回撤、换手、触发次数先给升序——第一次点就看到自己想找的那一头。
+    _COMPARISON_SORT_DESCENDING_FIRST = frozenset({"total_net_pnl"})
+    # 排序取的是原始数值，不是表里那串格式化文本。
+    _COMPARISON_SORT_KEYS = {
+        "strategy": "strategy", "total_net_pnl": "total_net_pnl",
+        "total_tc": "total_tc", "max_drawdown": "max_drawdown",
+        "rehedge_count": "rehedge_count", "turnover": "turnover",
+        "n_trade_days": "n_trade_days",
+    }
+
+    @staticmethod
+    def _comparison_sorted_rows(summary, sort_key, descending):
+        """按指定列排出显示顺序；未指定时保持保存顺序。
+
+        ``rank`` 不是数据里的字段，它就是当前显示顺序的行号——本页没有唯一
+        的权威排序，按哪一列看是用户自己选的。
+        """
+        rows = []
+        if summary is not None and not getattr(summary, "empty", True):
+            rows = [row.to_dict() for _index, row in summary.iterrows()]
+        if not sort_key or sort_key == "rank":
+            return rows
+
+        def key_of(item):
+            if sort_key == "strategy":
+                # 名称按字典序；缺失当空串，不与数值列共用缺失规则。
+                return (0, str(item.get("strategy", "")))
+            value = BacktestApp._comparison_finite(
+                item.get(BacktestApp._COMPARISON_SORT_KEYS.get(
+                    sort_key, sort_key)))
+            # 缺失值恒排在末尾，无论升降序——它们不是"最好"也不是"最差"。
+            if value is None:
+                return (1, 0.0)
+            return (0, -value if descending else value)
+
+        rows.sort(key=key_of)
+        return rows
+
+    def _sort_comparison_by(self, column):
+        """点列头换排序：同一列再点一次反向，换列则用该列的默认方向。"""
+        if getattr(self, "_comparison_sort_column", None) == column:
+            self._comparison_sort_descending = not getattr(
+                self, "_comparison_sort_descending", False)
+        else:
+            self._comparison_sort_column = column
+            self._comparison_sort_descending = (
+                column in BacktestApp._COMPARISON_SORT_DESCENDING_FIRST)
+        summary = getattr(self, "_comparison_summary", None)
+        if summary is None:
+            return
+        self._populate_comparison_view(
+            summary, getattr(self, "_comparison_daily_curves", {}))
+
+    def _refresh_comparison_sort_markers(self):
+        """当前排序列打实心箭头，其余列用 ⇅ 表示可点。"""
+        tree = getattr(self, "_comparison_tree", None)
+        if tree is None:
+            return
+        active = getattr(self, "_comparison_sort_column", None)
+        descending = getattr(self, "_comparison_sort_descending", False)
+        for key, text, _width in BacktestApp._COMPARISON_RANKING_COLUMNS:
+            if key == active:
+                marker = " ▼" if descending else " ▲"
+            else:
+                marker = " ⇅"
+            try:
+                tree.heading(
+                    key, text=f"{text}{marker}",
+                    anchor=BacktestApp._comparison_column_anchor(key))
+            except tk.TclError:
+                return
+
     def _build_current_comparison_view(
-            self, parent, summary, results, *, show_curve_controls=True,
-            ranking_title="当前路径排名（金额与持仓口径一致）",
-            daily_curves=None):
+            self, parent, *, show_curve_controls=True,
+            ranking_title="当前路径排名（金额与持仓口径一致）"):
+        """建结果区骨架：图表画布、排名表、详情格。
+
+        这里一个数据字段都不读。勾选一次就把整块 destroy 重建，代价是每次
+        新造一个 matplotlib Figure 和整张表——批量验证十条候选，就是主线程
+        上十次这样的重建。骨架与数据分开之后，刷新只剩下改值。
+        """
         parent.columnconfigure(0, weight=1)
         parent.rowconfigure(0, weight=3)
         parent.rowconfigure(1, weight=2)
@@ -6117,59 +6901,22 @@ class BacktestApp(tk.Tk):
         chart_box.grid(row=0, column=0, sticky="nsew", pady=(4, 3))
         controls = ttk.Frame(chart_box, style="Surface.TFrame")
         controls.pack(fill="x", pady=(0, 2))
+        self._comparison_curve_hint_var = tk.StringVar(
+            value="显示曲线:" if show_curve_controls else "")
+        # 不显示曲线勾选框时这一行没有内容可放；条数顶部已经写了。
         ttk.Label(
-            controls,
-            text=("显示曲线:" if show_curve_controls else
-                  f"已选择 {len(daily_curves or {})} 条保存结果："),
+            controls, textvariable=self._comparison_curve_hint_var,
             style="SurfaceMuted.TLabel",
         ).pack(side="left", padx=(2, 5))
-        curve_choices = None
+        self._comparison_show_curve_controls = bool(show_curve_controls)
+        self._comparison_curve_choices = None
         if show_curve_controls:
             curve_choices = ttk.Frame(chart_box, style="Surface.TFrame")
             curve_choices.pack(fill="x", padx=2, pady=(0, 2))
             for column in range(2):
                 curve_choices.columnconfigure(column, weight=1, uniform="curve_choices")
+            self._comparison_curve_choices = curve_choices
 
-        if daily_curves is None:
-            self._comparison_daily_curves = {
-                name: result_daily_frame(result)
-                for name, result in (results or {}).items()
-            }
-        else:
-            self._comparison_daily_curves = dict(daily_curves)
-        # 曲线配色走与策略优选页共用的登记表，使同一策略跨页同色；summary 未
-        # 携带策略身份键时退回按曲线名登记，只保证本页内部不撞色。
-        style_keys = {}
-        if summary is not None and not getattr(summary, "empty", True):
-            for _index, row in summary.iterrows():
-                item = row.to_dict()
-                name = str(item.get("strategy", ""))
-                if name and name not in style_keys:
-                    style_keys[name] = str(
-                        item.get("meta_style_key") or f"result_name:{name}")
-        self._comparison_color_map = {
-            name: self._strategy_style(
-                style_keys.get(name, f"result_name:{name}"))[0]
-            for name in self._comparison_daily_curves
-        }
-        self._comparison_curve_vars = {}
-        for index, name in enumerate(self._comparison_daily_curves):
-            variable = tk.BooleanVar(value=True)
-            self._comparison_curve_vars[name] = variable
-            if show_curve_controls:
-                tk.Checkbutton(
-                    curve_choices, text=name, variable=variable,
-                    command=self._draw_comparison_cumulative_chart,
-                    bg=PALETTE["surface"], fg=self._comparison_color_map[name],
-                    activebackground=PALETTE["surface"],
-                    activeforeground=self._comparison_color_map[name],
-                    selectcolor=PALETTE["surface"],
-                    font=(_UI_FONT_FAMILY, 8), padx=2,
-                    anchor="w",
-                ).grid(
-                    row=index // 2, column=index % 2,
-                    sticky="w", padx=(0, 8), pady=(0, 1),
-                )
         from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
         from matplotlib.figure import Figure
         self._comparison_chart_figure = Figure(
@@ -6190,113 +6937,140 @@ class BacktestApp(tk.Tk):
         result_box = ttk.LabelFrame(
             lower, text=f" {ranking_title} ", padding=12)
         result_box.grid(row=0, column=0, sticky="nsew")
-        columns = (
-            "rank", "strategy", "score", "gap", "total_net_pnl",
-            "total_tc", "rehedge_count", "max_drawdown",
-        )
-        headings = {
-            "rank": "#", "strategy": "策略 / 参数",
-            "score": "日净损益 RMS↓", "gap": "较每日收盘改善↑",
-            "total_net_pnl": "期末净损益", "total_tc": "总成本↓",
-            "rehedge_count": "再触发/成交", "max_drawdown": "最大回撤↓",
-        }
-        widths = {
-            "rank": 36, "strategy": 145, "score": 78, "gap": 92,
-            "total_net_pnl": 78, "total_tc": 62,
-            "rehedge_count": 68, "max_drawdown": 70,
-        }
+        # 批量验证一次能送十条进来，而窗口高度未必够。给排名表配滚动条，
+        # 高度只作初始请求值——没有它的时候，超出可见区的行既看不到也滚不动。
+        tree_frame = ttk.Frame(result_box, style="Surface.TFrame")
+        tree_frame.pack(fill="both", expand=True)
         tree = ttk.Treeview(
-            result_box, columns=columns, show="headings",
-            height=max(3, min(5, len(summary))), selectmode="browse",
+            tree_frame,
+            columns=[key for key, _text, _width in
+                     BacktestApp._COMPARISON_RANKING_COLUMNS],
+            show="headings", height=3, selectmode="browse",
         )
-        for col in columns:
-            tree.heading(col, text=headings[col])
+        for key, text, width in BacktestApp._COMPARISON_RANKING_COLUMNS:
+            # 表头与本列数据同向对齐。表头一律居中而数字右对齐时，一列里没
+            # 有任何一条共同的竖边，眼睛就找不到列的界限。
+            anchor = BacktestApp._comparison_column_anchor(key)
+            tree.heading(
+                key, text=text, anchor=anchor,
+                command=lambda k=key: self._sort_comparison_by(k))
+            # 所有列一起 stretch：只让某一列可拉伸时它会独吞全部剩余空间
+            # ——本页的容器约 986px 而列宽总和 642px，那 329px 此前全灌给
+            # 了结果名列，把它撑到内容宽度的三倍多，数字列却全挤在左边。
             tree.column(
-                col, width=widths[col], minwidth=35,
-                anchor="w" if col == "strategy" else "e",
-                stretch=(col == "strategy"),
+                key, width=width, minwidth=max(40, width - 30),
+                anchor=anchor, stretch=True,
             )
-        tree.pack(fill="both", expand=True)
-        tree.tag_configure("best", background=PALETTE["success_light"])
-        tree.tag_configure("baseline", background=PALETTE["primary_light"])
-        tree.tag_configure("baseline_best", background=PALETTE["success_light"])
+        ranking_scroll = ttk.Scrollbar(
+            tree_frame, orient="vertical", command=tree.yview)
+        tree.configure(yscrollcommand=ranking_scroll.set)
+        tree.pack(side="left", fill="both", expand=True)
+        ranking_scroll.pack(side="right", fill="y")
+        # 行底色只由奇偶决定，与优选页同一条规则。极值不进表格：一行可能
+        # 在多列最优、多行也可能各占一项，而 Treeview 的 tag 是行级的，
+        # 底色说不出"哪一列最优"，只会把整张表染花。这件事交给结论卡——
+        # 徽章列出是哪几项，对应的数字瓦片染绿。
         tree.tag_configure("even", background=PALETTE["surface_alt"])
-
-        self._comparison_rows = {}
-        baseline = getattr(self, "_comparison_baseline_row", {}) or {}
-        baseline_score = self._comparison_finite(baseline.get("score"))
-        baseline_iid = None
-        for row_no, (_idx, row) in enumerate(summary.iterrows()):
-            item = row.to_dict()
-            iid = f"strategy_{row_no}"
-            score = self._comparison_finite(item.get("score"))
-            gap = BacktestApp._comparison_improvement_vs_baseline(
-                score, baseline_score)
-            is_baseline = self._comparison_rows_match(item, baseline)
-            is_best = self._comparison_rows_match(
-                item, self._comparison_best_row)
-            gap_text = (
-                "基准" if is_baseline
-                else self._format_comparison_value(
-                    gap, 1, signed=True, percent=True))
-            values = (
-                self._comparison_safe_int(
-                    item.get("rank"), row_no + 1), item.get("strategy", ""),
-                self._format_comparison_value(item.get("score"), 2), gap_text,
-                self._format_comparison_value(item.get("total_net_pnl"), 2),
-                self._format_comparison_value(item.get("total_tc"), 2),
-                (f"{self._comparison_safe_int(item.get('rehedge_count'), 0)}/"
-                 f"{self._comparison_safe_int(item.get('actual_trade_count'), 0)}"),
-                self._format_comparison_value(item.get("max_drawdown"), 2),
-            )
-            tag = (
-                "baseline_best" if is_baseline and is_best else
-                "baseline" if is_baseline else
-                "best" if is_best else
-                "even" if row_no % 2 == 0 else ""
-            )
-            tree.insert("", "end", iid=iid, values=values,
-                        tags=(tag,) if tag else ())
-            self._comparison_rows[iid] = item
-            if is_baseline:
-                baseline_iid = iid
         self._comparison_tree = tree
+        self._comparison_rows = {}
         tree.bind("<<TreeviewSelect>>", self._update_comparison_selection)
 
-        detail_box = ttk.LabelFrame(
-            lower, text=" 所选策略相对 close-to-close 基准 ", padding=12)
-        detail_box.grid(row=1, column=0, sticky="ew", pady=(4, 0))
-        self._comparison_detail_header_var = tk.StringVar(value="请选择策略")
-        ttk.Label(
-            detail_box, textvariable=self._comparison_detail_header_var,
-            style="Surface.TLabel",
-        ).grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 3))
-        detail_specs = (
-            ("score", "日净损益 RMS"), ("total_net_pnl", "期末净损益"),
-            ("total_tc", "总成本"), ("max_drawdown", "最大回撤"),
-            ("rehedge_count", "再触发 / 成交"), ("turnover", "换手额"),
-        )
-        self._comparison_detail_vars = {}
-        for index, (key, label) in enumerate(detail_specs):
-            column = index % 3
-            row_no = 1 + index // 3
-            detail_box.columnconfigure(column, weight=1, uniform="comparison_detail")
-            cell = ttk.Frame(detail_box, style="Surface.TFrame")
-            cell.grid(
-                row=row_no, column=column, sticky="ew",
-                padx=(0 if column == 0 else 8, 0), pady=(0, 3),
-            )
-            ttk.Label(cell, text=label, style="SurfaceMuted.TLabel").pack(anchor="w")
-            variable = tk.StringVar(value="—")
-            self._comparison_detail_vars[key] = variable
-            ttk.Label(cell, textvariable=variable, style="Surface.TLabel").pack(anchor="w")
+    def _populate_comparison_view(self, summary, daily_curves):
+        """把本次数据灌进已建好的骨架：曲线、配色、排名行、详情。"""
+        self._comparison_summary = summary
+        self._comparison_daily_curves = dict(daily_curves or {})
+        # 曲线配色走与策略优选页共用的登记表，使同一策略跨页同色；summary 未
+        # 携带策略身份键时退回按曲线名登记，只保证本页内部不撞色。
+        style_keys = {}
+        if summary is not None and not getattr(summary, "empty", True):
+            for _index, row in summary.iterrows():
+                item = row.to_dict()
+                name = str(item.get("strategy", ""))
+                if name and name not in style_keys:
+                    style_keys[name] = str(
+                        item.get("meta_style_key") or f"result_name:{name}")
+        self._comparison_color_map = {
+            name: self._strategy_style(
+                style_keys.get(name, f"result_name:{name}"))[0]
+            for name in self._comparison_daily_curves
+        }
+        self._rebuild_comparison_curve_toggles()
 
-        children = tree.get_children()
-        if children:
-            initial_iid = baseline_iid or children[0]
-            tree.selection_set(initial_iid)
-            tree.focus(initial_iid)
+        tree = self._comparison_tree
+        rows = {}
+        # 重填后把用户原来盯着的那一行选回来。行号会随排序和勾选变化，只有
+        # 快照 ID 是稳的；不记住它的话，换个列排序选中行就跳到第一行去了。
+        previous_id = ""
+        if tree.selection():
+            previous_id = str(getattr(self, "_comparison_rows", {}).get(
+                tree.selection()[0], {}).get("meta_result_id", "") or "")
+        ordered = BacktestApp._comparison_sorted_rows(
+            summary, getattr(self, "_comparison_sort_column", None),
+            getattr(self, "_comparison_sort_descending", False))
+        # 清表会让选中行消失并发出 TreeviewSelect；重填期间抑制回调，填完再
+        # 主动刷新一次，避免拿着半张表去画图。
+        self._comparison_populating = True
+        try:
+            tree.delete(*tree.get_children())
+            for row_no, item in enumerate(ordered):
+                iid = f"strategy_{row_no}"
+                values = BacktestApp._pad_comparison_row((
+                    row_no + 1,
+                    item.get("strategy", ""),
+                    self._format_comparison_value(item.get("total_net_pnl"), 2),
+                    self._format_comparison_value(item.get("total_tc"), 2),
+                    self._format_comparison_value(item.get("max_drawdown"), 2),
+                    (f"{self._comparison_safe_int(item.get('rehedge_count'), 0)}/"
+                     f"{self._comparison_safe_int(item.get('actual_trade_count'), 0)}"),
+                    self._format_comparison_value(item.get("turnover"), 2),
+                    self._comparison_safe_int(item.get("n_trade_days"), 0),
+                ))
+                tree.insert(
+                    "", "end", iid=iid, values=values,
+                    tags=("even",) if row_no % 2 == 0 else ())
+                rows[iid] = item
+            self._comparison_rows = rows
+            tree.configure(height=max(3, min(8, len(rows))))
+            BacktestApp._refresh_comparison_sort_markers(self)
+            children = tree.get_children()
+            if children:
+                kept_iid = next((
+                    iid for iid, item in rows.items()
+                    if previous_id
+                    and str(item.get("meta_result_id", "")) == previous_id
+                ), None)
+                initial_iid = kept_iid or children[0]
+                tree.selection_set(initial_iid)
+                tree.focus(initial_iid)
+        finally:
+            self._comparison_populating = False
         self._update_comparison_selection()
+
+    def _rebuild_comparison_curve_toggles(self):
+        """重建曲线勾选框；本页不显示它们时只登记全选状态。"""
+        self._comparison_curve_vars = {
+            name: tk.BooleanVar(value=True)
+            for name in self._comparison_daily_curves
+        }
+        container = getattr(self, "_comparison_curve_choices", None)
+        if container is None:
+            return
+        for widget in container.winfo_children():
+            widget.destroy()
+        for index, name in enumerate(self._comparison_daily_curves):
+            color = self._comparison_color_map[name]
+            tk.Checkbutton(
+                container, text=name,
+                variable=self._comparison_curve_vars[name],
+                command=self._draw_comparison_cumulative_chart,
+                bg=PALETTE["surface"], fg=color,
+                activebackground=PALETTE["surface"], activeforeground=color,
+                selectcolor=PALETTE["surface"],
+                font=(_UI_FONT_FAMILY, 8), padx=2, anchor="w",
+            ).grid(
+                row=index // 2, column=index % 2,
+                sticky="w", padx=(0, 8), pady=(0, 1),
+            )
 
     def _draw_comparison_cumulative_chart(self):
         ax = getattr(self, "_comparison_chart_ax", None)
@@ -6309,9 +7083,6 @@ class BacktestApp(tk.Tk):
         if tree is not None and tree.selection():
             row = self._comparison_rows.get(tree.selection()[0], {})
             focused_name = row.get("strategy")
-        baseline_name = (getattr(
-            self, "_comparison_baseline_row", {}) or {}).get("strategy")
-
         plotted = 0
         for name, daily in self._comparison_daily_curves.items():
             variable = self._comparison_curve_vars.get(name)
@@ -6322,12 +7093,10 @@ class BacktestApp(tk.Tk):
                 continue
             x = np.arange(1, len(y) + 1)
             focused = name == focused_name
-            is_baseline = name == baseline_name
             ax.plot(
                 x, y, label=name, color=self._comparison_color_map[name],
-                linewidth=2.8 if focused else (2.2 if is_baseline else 1.7),
+                linewidth=2.8 if focused else 1.7,
                 alpha=1.0 if focused or focused_name is None else 0.58,
-                linestyle="--" if is_baseline else "-",
                 marker="o", markersize=3.5 if focused else 2.5,
             )
             plotted += 1
@@ -6349,46 +7118,14 @@ class BacktestApp(tk.Tk):
         canvas.draw_idle()
 
     def _update_comparison_selection(self, _event=None):
-        tree = getattr(self, "_comparison_tree", None)
-        if tree is None or not tree.selection():
-            self._draw_comparison_cumulative_chart()
+        """选中一行只做一件事：在图上把它的曲线突出。
+
+        它的身份与数字，指标表和结果池表里都有，不必再另起一处复述。
+        """
+        # 重填排名表期间 Tk 会发选择事件，此时表只有半张，画出来的图是过渡
+        # 态；填完由 _populate_comparison_view 主动刷新一次。
+        if getattr(self, "_comparison_populating", False):
             return
-        selected = self._comparison_rows.get(tree.selection()[0], {})
-        baseline = getattr(self, "_comparison_baseline_row", {}) or {}
-        description = selected.get("meta_description", "")
-        header = (
-            f"{selected.get('strategy', '—')}  ·  排名 "
-            f"{self._comparison_safe_int(selected.get('rank'), 0)}")
-        if description:
-            header += f"  ·  {description}"
-        self._comparison_detail_header_var.set(header)
-        for key in (
-                "score", "total_net_pnl", "total_tc", "max_drawdown",
-                "turnover"):
-            self._comparison_detail_vars[key].set(
-                self._comparison_delta_display(selected, baseline, key))
-        selected_rehedges = self._comparison_safe_int(
-            selected.get("rehedge_count"), 0)
-        baseline_rehedges = self._comparison_safe_int(
-            baseline.get("rehedge_count"), 0)
-        selected_actual = self._comparison_safe_int(
-            selected.get("actual_trade_count"), 0)
-        baseline_actual = self._comparison_safe_int(
-            baseline.get("actual_trade_count"), 0)
-        rehedge_delta = selected_rehedges - baseline_rehedges
-        actual_delta = selected_actual - baseline_actual
-        is_baseline = self._comparison_rows_match(selected, baseline)
-        if not baseline:
-            rehedge_text = f"{selected_rehedges}/{selected_actual}"
-        elif is_baseline:
-            rehedge_text = f"{selected_rehedges}/{selected_actual}（基准）"
-        elif rehedge_delta == 0 and actual_delta == 0:
-            rehedge_text = f"{selected_rehedges}/{selected_actual}（与基准相同）"
-        else:
-            rehedge_text = (
-                f"{selected_rehedges}/{selected_actual}  |  "
-                f"{rehedge_delta:+d}/{actual_delta:+d}")
-        self._comparison_detail_vars["rehedge_count"].set(rehedge_text)
         self._draw_comparison_cumulative_chart()
 
     # 排名表的指标列。表头文案写死在这里，改口径时只有这一处要动。
@@ -6572,9 +7309,9 @@ class BacktestApp(tk.Tk):
         else:
             self._history_window_summary = history_window_summary(
                 window_results or {})
-        # 重放配方只保存构造回测所需的行情切片、期权与策略对象，据此可以
-        # 按需重跑任一分段并把逐 bar 明细送进普通展示页，而不必长期驻留
-        # 每个候选每段的完整结果数组。
+        # 重放配方只保存构造回测所需的行情切片、期权与策略对象，不驻留每个
+        # 候选每段的完整结果数组。逐段明细正常从 history_bar_cache 读（3 ms），
+        # 配方是缓存不在时的兜底，据此重算任一分段（620 ms）。
             self._history_replay_index = history_replay_index(
                 window_results or {})
         self._history_chart_selected_by_period = {}
@@ -6764,6 +7501,32 @@ class BacktestApp(tk.Tk):
         return (f"各周期结论不一致（{detail}）；"
                 "短周期样本少更易受噪声影响，建议以长周期为准"), "disagree"
 
+    @staticmethod
+    def _default_history_period(period_rows):
+        """默认展示哪个周期：有可比结论的周期里样本最多的那个。
+
+        此前取 ``next(iter(...))``，也就是 ``HISTORY_PERIOD_DEFS`` 的头一个
+        「近周」——五档里样本最少、最容易被噪声主导的那个。而同一行右端的
+        一致性提示写的是「短周期样本少更易受噪声影响，建议以长周期为准」：
+        页面一边这么建议，一边默认把最不该单独采信的结论摆在读者面前。
+
+        按可比样本段数排而不是按周期长短：某个长周期可能因历史不足而没有
+        可比结论，那时它反而不该被选中。全都没有结论就退回第一个，保持
+        「总有一个 chip 是选中的」。
+        """
+        rows = dict(period_rows or {})
+        if not rows:
+            return ""
+
+        def sample_size(item):
+            item = item or {}
+            if not str(item.get("strategy", "") or "").strip("—").strip():
+                return -1          # 没有可比结论的周期排到最后
+            return BacktestApp._comparison_safe_int(item.get("paired", 0), 0)
+
+        best = max(rows, key=lambda key: sample_size(rows[key]))
+        return best if sample_size(rows[best]) >= 0 else next(iter(rows))
+
     def _build_history_period_box(
             self, parent, recommendations, ranking):
         """渲染周期切换条与一枚跨周期一致性 pill。
@@ -6813,7 +7576,7 @@ class BacktestApp(tk.Tk):
             self._history_period_chips[key] = chip
         if self._history_period_rows:
             self._history_selected_period_var.set(
-                next(iter(self._history_period_rows)))
+                BacktestApp._default_history_period(self._history_period_rows))
             BacktestApp._refresh_history_period_chips(self)
 
         pill_bg = {
@@ -6844,10 +7607,11 @@ class BacktestApp(tk.Tk):
         # 周期本身的取样口径（合约期限、回放天数、分段构成…）另起一行：
         # 它常长到七八项，挤在周期按钮同一行会把 pill 顶出可视区。
         self._history_period_context_var = tk.StringVar(value="")
-        ttk.Label(
+        period_context = ttk.Label(
             box, textvariable=self._history_period_context_var,
-            style="SurfaceMuted.TLabel", justify="left", wraplength=1080,
-        ).pack(fill="x", pady=(0, 2))
+            style="SurfaceMuted.TLabel", justify="left")
+        period_context.pack(fill="x", pady=(0, 2))
+        BacktestApp._track_wraplength(period_context)
 
     def _build_history_detail_box(self, parent):
         """渲染选中周期的候选排名与图表勾选栏，返回待挂载的区块。
@@ -7026,79 +7790,23 @@ class BacktestApp(tk.Tk):
         self._build_history_action_bar(body)
         BacktestApp._refresh_history_conclusion_card(self)
 
-    def _refresh_history_action_buttons(self):
-        """把「会跑几个」写进按钮标题。
-
-        这个按钮按首列勾选集合分派：勾了就逐个批量跑，没勾就跑选中那一
-        条——而标题原先完全不变，模式切换是隐藏的。把数量放进标题，不占
-        额外版面就能让它可见。
-        """
-        button = getattr(self, "_history_verify_btn", None)
-        if button is None:
-            return
-        try:
-            checked = len(self._history_chart_candidates())
-        except (AttributeError, tk.TclError):
-            checked = 0
-        text = "应用策略并用当前行情回测"
-        if checked:
-            # 用 ×N 而不是「（N 个）」：后者渲染 167px，撑破 20 字宽的按钮
-            # 会被静默截断——而按钮被截断是看不出来的。
-            text += f" ×{checked}"
-        try:
-            button.configure(text=text)
-        except tk.TclError:
-            pass
-
     def _build_history_action_bar(self, body):
         """把结论用到当下的动作栏；逐段下钻另在图表下方，两者对象不同。"""
         actions = tk.Frame(body, bg=PALETTE["surface_alt"])
         actions.grid(row=0, column=1, rowspan=3, sticky="ne", padx=(18, 0))
-        # 名字要说清「应用什么」和「应用到哪」：原来的「只填参数」没说填到
-        # 哪去，用户看不到左侧表单变了，会以为什么都没发生。
-        # 两个动作的分量不同：一个真的跑回测并把结果入池，一个只写左侧表
-        # 单。此前同为描边按钮，看不出哪个有副作用。用次级实心与描边区分，
-        # 页首的主色仍专属「开始策略优选」，避免同屏两个主行动。
-        # width 要按**加上 ×N 之后**的最长文案定：勾选上限是 8，
-        # 「应用策略并用当前行情回测 ×8」实测 146px，含内边距需 166px，而
-        # width=20 只有 164px——会被静默截断，而按钮截断是看不出来的。
-        # 22 留出余量，且两个按钮同宽，勾选数变化时也不会改变卡片列宽。
-        self._history_verify_btn = ttk.Button(
-            actions, text="应用策略并用当前行情回测", width=22,
-            style="Accent.TButton",
-            command=self._verify_history_on_current_path,
-        )
-        self._history_verify_btn.pack(fill="x")
+        # 只留一个动作。原先并排的「应用并用当前行情回测」等于本按钮 + 左
+        # 侧「运行回测」，两条路做同一件事，先要分辨点哪个本身就是负担。
+        #
+        # navigate=False 是关键：此前它会跳到回测摘要页，而那页显示的是上
+        # 次留下的内容（多半是刚才下钻的那个分段）。刚点完「应用参数」就落
+        # 在一页别人的数字上，会被当成本策略的结果读——这正是「感觉它把明
+        # 细也加载了」的来源，其实它什么都没加载，只是跳了页。
         ttk.Button(
-            actions, text="应用策略到左侧参数", width=22,
-            command=self._apply_history_recommendation,
-        ).pack(fill="x", pady=(5, 0))
-        BacktestApp._refresh_history_action_buttons(self)
-
-        self._history_batch_outcome_bar = tk.Frame(
-            body, bg=PALETTE["surface_alt"],
-            highlightbackground=PALETTE["border_soft"], highlightthickness=1,
-            padx=10, pady=5)
-        self._history_batch_outcome_var = tk.StringVar(value="")
-        self._history_batch_outcome_label = tk.Label(
-            self._history_batch_outcome_bar,
-            textvariable=self._history_batch_outcome_var,
-            bg=PALETTE["surface_alt"], fg=PALETTE["text"], anchor="w",
-            justify="left", font=(_UI_FONT_FAMILY, 9), wraplength=760,
-        )
-        self._history_batch_outcome_label.pack(
-            side="left", fill="x", expand=True)
-        self._history_batch_outcome_detail_btn = ttk.Button(
-            self._history_batch_outcome_bar, text="失败详情", width=9,
-            command=self._show_history_batch_failures,
-        )
-        self._history_batch_outcome_open_btn = ttk.Button(
-            self._history_batch_outcome_bar, text="查看结果对比", width=12,
-            command=self._open_history_batch_results,
-        )
-        self._history_batch_outcome_open_btn.pack(side="right", padx=(6, 0))
-        self._history_batch_failure_details = []
-        self._history_batch_last_result_ids = []
+            actions, text="应用策略", width=16,
+            style="Accent.TButton",
+            command=lambda: self._apply_history_recommendation(
+                navigate=False),
+        ).pack(fill="x")
 
     def _history_conclusion_stat_specs(self, row):
         """结论卡上的数字：优先给增量口径，缺失时退回损益波动原值。
@@ -7130,9 +7838,9 @@ class BacktestApp(tk.Tk):
             ) + tail
         return (
             ("损益波动", BacktestApp._format_comparison_value(
-                row.get("score"), 2), None),
+                row.get("daily_net_pnl_rms"), 2), None),
             ("每日收盘", BacktestApp._format_comparison_value(
-                row.get("baseline_score"), 2), None),
+                row.get("baseline_daily_net_pnl_rms"), 2), None),
         ) + tail
 
     def _refresh_history_conclusion_card(self):
@@ -7220,69 +7928,6 @@ class BacktestApp(tk.Tk):
         except tk.TclError:
             pass
 
-    def _publish_history_batch_outcome(self, done, total, failures,
-                                       result_ids):
-        """把批量验证结论写进优选页结果条，替代跳页与模态弹窗。"""
-        self._history_batch_failure_details = list(failures)
-        self._history_batch_last_result_ids = list(result_ids)
-        bar = getattr(self, "_history_batch_outcome_bar", None)
-        var = getattr(self, "_history_batch_outcome_var", None)
-        if bar is None or var is None:
-            return
-        if failures:
-            text = f"⚠ 批量验证已完成 {done}/{total} 条，{len(failures)} 条未完成。"
-            bg, fg = PALETTE["warning_light"], PALETTE["warning"]
-        elif done:
-            text = f"✓ 批量验证完成：{done}/{total} 条已送入结果对比。"
-            bg, fg = PALETTE["success_light"], PALETTE["success"]
-        else:
-            text = "批量验证未产生任何可保留结果。"
-            bg, fg = PALETTE["surface_alt"], PALETTE["text"]
-        var.set(text)
-        try:
-            bar.configure(bg=bg)
-            self._history_batch_outcome_label.configure(bg=bg, fg=fg)
-            detail_btn = self._history_batch_outcome_detail_btn
-            if failures:
-                detail_btn.pack(side="right", padx=(6, 0))
-            else:
-                detail_btn.pack_forget()
-            self._history_batch_outcome_open_btn.configure(
-                state="normal" if done else "disabled")
-            bar.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(8, 0))
-        except tk.TclError:
-            pass
-
-    def _show_history_batch_failures(self):
-        """按需展开上一次批量验证的失败原因，默认不打断操作。"""
-        failures = list(
-            getattr(self, "_history_batch_failure_details", ()) or ())
-        if not failures:
-            return
-        messagebox.showinfo(
-            "批量验证未完成的候选", "\n".join(failures))
-
-    def _open_history_batch_results(self):
-        """跳到结果对比页，并只勾选上一次批量验证产生的快照。"""
-        result_ids = [
-            result_id
-            for result_id in getattr(
-                self, "_history_batch_last_result_ids", ()) or ()
-            if result_id in self._saved_backtests
-        ]
-        if not result_ids:
-            messagebox.showinfo(
-                "没有可查看的结果", "上一次批量验证没有留下仍在结果池中的快照。")
-            return
-        position = BacktestApp._saved_snapshot_position(
-            self._saved_backtests[result_ids[0]])
-        self._saved_comparison_selection = set(result_ids)
-        baseline_id = BacktestApp._resolve_saved_comparison_baseline_id(
-            self, position)
-        if baseline_id is not None:
-            self._saved_comparison_selection.add(baseline_id)
-        self._show_saved_comparison_page()
-
     def _build_history_chart_box(self, parent):
         """渲染整段接续的损益图表、口径切换与逐段下钻入口。
 
@@ -7319,9 +7964,12 @@ class BacktestApp(tk.Tk):
         self._history_chart_metric_combo.bind(
             "<<ComboboxSelected>>", self._update_history_chart_controls)
         self._history_chart_hint_var = tk.StringVar(value="")
+        # 显式 9pt：不写就继承全局默认 10pt，比同一条里 9pt 加粗的「指标:」
+        # 还大——整个结果区最长、最不重要的一句反而字号最大。
         tk.Label(
             controls, textvariable=self._history_chart_hint_var,
             bg=PALETTE["surface_alt"], fg=PALETTE["text_muted"],
+            font=(_UI_FONT_FAMILY, 9),
         ).pack(side="left", fill="x", expand=True, padx=(4, 0))
 
         from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
@@ -7369,8 +8017,12 @@ class BacktestApp(tk.Tk):
             values=(), width=40, state="readonly",
         )
         self._history_replay_window_combo.pack(side="left", padx=(6, 8))
+        # 名字必须说「加载」而不是「回测」：优选跑完时全部分段的 bar 级
+        # 明细就已落盘，这里是把它读回来（约 27 ms），不是重跑（620 ms）。
+        # 叫「回测」会让人以为点一下要再算一遍，也和旁边的说明自相矛盾。
+        # 只有保存的明细确实不在时才回退重算，那时状态栏会说明。
         self._history_replay_button = ttk.Button(
-            replay, text="加载到展示页",
+            replay, text="加载明细",
             command=self._load_history_window_backtest,
         )
         self._history_replay_button.pack(side="left")
@@ -7381,17 +8033,27 @@ class BacktestApp(tk.Tk):
         if loaded and not loaded.get("replay_available"):
             # 旧版本的包不含重放配方（只存了结果表）。禁掉并说明原因，而
             # 不是留一个点了没反应的按钮。
-            note = "这份结果不含重放配方；重新运行一次优选即可下钻"
+            note = "这份结果不含逐 bar 明细，无法加载；重新运行一次优选即可"
             self._history_replay_window_combo.configure(state="disabled")
             self._history_replay_button.configure(state="disabled")
         elif loaded:
-            note = "载入的结果：按包内行情重跑这一段，得到 Greeks 与逐 bar 明细"
+            note = ("加载这一段已保存的逐 bar 明细，"
+                    "送进回测摘要 / 对冲图表 / 每日明细并跳转")
         else:
-            note = "把选中策略的这一段单独跑出 Greeks 与逐 bar 明细"
+            # 说清去向与副作用：点了会切走标签页，而且这一段会成为「当前
+            # 回测」——两者都是点击前看不出来的。正常是读盘（约 27 ms），
+            # 只有保存的明细不在时才回退到重算，那时状态栏会说明。
+            # 「跳转」必须写：点完整页会切走，这是点击前完全看不出的。放在
+            # 句首是因为这条说明在窄窗口会从句尾开始丢字。
+            note = ("加载这一段已保存的逐 bar 明细并跳转到回测摘要 /"
+                    " 对冲图表 / 每日明细，同时成为当前回测")
+        # anchor="w" + fill/expand：这条说明在最小窗口下放不下，居中截断会
+        # 把句首也吃掉；左对齐后丢的是句尾的次要信息。字号同样显式 9pt。
         tk.Label(
-            replay, text=note,
+            replay, text=note, anchor="w",
             bg=PALETTE["surface_alt"], fg=PALETTE["text_muted"],
-        ).pack(side="left", padx=(12, 0))
+            font=(_UI_FONT_FAMILY, 9),
+        ).pack(side="left", fill="x", expand=True, padx=(12, 0))
 
     def _history_chart_candidates(self, lookback=None):
         """按排名顺序返回当前周期勾选的图表候选，不包含固定 每日收盘。"""
@@ -7487,8 +8149,6 @@ class BacktestApp(tk.Tk):
                 tree.item(iid, image=self._cb_sf_checked if strategy in selected else self._cb_sf_unchecked, text="")
             else:
                 tree.item(iid, image="", text="—")
-        # 勾选集合决定「用当前行情回测」跑几个，标题要跟着变。
-        BacktestApp._refresh_history_action_buttons(self)
 
     def _toggle_history_chart_click(self, event):
         tree = self._history_rank_tree
@@ -7614,10 +8274,10 @@ class BacktestApp(tk.Tk):
                 strategy = str(row.get("strategy", "—"))
                 is_baseline = str(
                     row.get("strategy_type", "")) == "close_to_close"
-                score_text = self._format_comparison_value(
-                    row.get("score"), 2)
+                rms_text = self._format_comparison_value(
+                    row.get("daily_net_pnl_rms"), 2)
                 baseline_text = self._format_comparison_value(
-                    row.get("baseline_score"), 2)
+                    row.get("baseline_daily_net_pnl_rms"), 2)
                 # 详情行只补表格没有的原始损益波动值。表格现在的四列是
                 # 增量收益/增量信噪比/增量成本/最大回撤，改善率与胜率都
                 # 不在其中——它们是刻意收敛掉的旧口径，不再单独渲染。
@@ -7630,7 +8290,7 @@ class BacktestApp(tk.Tk):
                     else "损益波动" if uses_strict_metric
                     else "损益波动(旧版)")
                 selected_detail = (
-                    f"{rms_label} {score_text}，"
+                    f"{rms_label} {rms_text}，"
                     f"每日收盘 {baseline_text}")
                 if not uses_strict_metric:
                     improvement_text = (
@@ -7754,13 +8414,13 @@ class BacktestApp(tk.Tk):
             messagebox.showinfo(
                 "没有可加载的分段",
                 "请先在周期排名表选中一个成功配对的候选；"
-                "失败或未参与的候选没有可重放的回测分段。"
+                "失败或未参与的候选没有保存下明细。"
                 if strategy_name else "请先在周期排名表中选择一条策略。")
             return False
         label = BacktestApp._history_replay_label(spec)
         if not self._begin_job(
                 "history_replay",
-                f"正在加载『{strategy_name}』的 {label} 历史回测…"):
+                f"正在加载『{strategy_name}』{label} 的明细…"):
             return False
         self._progress.configure(mode="indeterminate")
         self._progress.pack(fill="x", pady=(6, 0))
@@ -7773,7 +8433,15 @@ class BacktestApp(tk.Tk):
 
     @staticmethod
     def _replay_with_cache(spec, strategy_name):
-        """重放一段：先查磁盘缓存，未命中才真跑并写回。
+        """取一段的 bar 级明细，返回 ``(回测对象, 是否重算过)``。
+
+        **正常路径是「读已保存的数据」，不是重跑。** 一轮优选跑完时全部分
+        段的 bar 级结果就已落盘（见 ``_cache_history_bars``），这里直接读
+        回来，实测 27 ms；真跑一段要 620 ms。
+
+        只有缓存确实不在时才回退到重算——缓存被清过、旧结果包、或者当初
+        写盘失败。回退会算出同样的数字，但调用方要把这件事说出来：用户按
+        的是「加载」，多等半秒总得有个交代。
 
         ``run()`` 只设置 ``_results``（见 hedge_backtest），所以命中时用
         ``build()`` 造出未运行的对象再把结果塞进去，与真跑出来的等价。
@@ -7782,10 +8450,10 @@ class BacktestApp(tk.Tk):
         cached = history_bar_cache.load(spec, strategy_name)
         if cached is not None:
             backtest._results = cached
-            return backtest
+            return backtest, False
         backtest.run()
         history_bar_cache.store(spec, strategy_name, backtest._results)
-        return backtest
+        return backtest, True
 
     @staticmethod
     def _cache_history_bars(window_results):
@@ -7852,7 +8520,8 @@ class BacktestApp(tk.Tk):
 
     def _history_replay_worker(self, spec, strategy_name):
         try:
-            bt = BacktestApp._replay_with_cache(spec, strategy_name)
+            bt, recomputed = BacktestApp._replay_with_cache(
+                spec, strategy_name)
             # 与包内逐日损益核对。不一致时照常展示（数据本身可能仍有诊断
             # 价值），但必须明说——静默显示对不上的数字才是最坏的结果。
             mismatch = BacktestApp._replay_fidelity_error(
@@ -7861,7 +8530,8 @@ class BacktestApp(tk.Tk):
             self.after(
                 0,
                 lambda: self._deliver_history_replay(
-                    bt, spec, strategy_name, mismatch=mismatch),
+                    bt, spec, strategy_name, mismatch=mismatch,
+                    recomputed=recomputed),
             )
         except Exception:
             import traceback
@@ -7871,6 +8541,27 @@ class BacktestApp(tk.Tk):
                 0,
                 lambda message=err_msg: self._fail_history_replay(message))
 
+    @staticmethod
+    def _replay_scaled_params(params, option):
+        """把分段实际使用的价格量纲参数写回，其余参数原样保留。
+
+        缩放只动价格量纲那几项（各期权类自己声明在
+        ``_PRICE_FIELDS_BY_CLS``），波动率、期限这些不受影响。
+        """
+        params = dict(params or {})
+        if option is None:
+            return params
+        fields = ("s0",) + tuple(_PRICE_FIELDS_BY_CLS.get(
+            type(option).__name__, ()))
+        for field in fields:
+            value = getattr(option, field, None)
+            if value is None:
+                continue
+            number = BacktestApp._comparison_finite(value)
+            if number is not None and field in params:
+                params[field] = number
+        return params
+
     def _history_replay_gui_state(self, spec, strategy_name):
         """把历史任务快照收敛成展示与快照保留都能消费的单次回测状态。"""
         history_state = getattr(self, "_latest_history_state", None) or {}
@@ -7878,20 +8569,47 @@ class BacktestApp(tk.Tk):
         metadata = dict(getattr(spec, "metadata", {}) or {})
         index = getattr(spec.external_path, "index", None)
         if index is not None and len(index):
-            state["wind_start"] = BacktestApp._format_detail_index(index[0])
-            state["wind_end"] = BacktestApp._format_detail_index(index[-1])
+            # 保留时分：日内滚动的相邻两段起止日相同，只到天的话两条快照
+            # 的行情签名会一模一样，页面就会说"输入完全相同"。
+            state["wind_start"] = BacktestApp._format_detail_index(
+                index[0], include_time=True)
+            state["wind_end"] = BacktestApp._format_detail_index(
+                index[-1], include_time=True)
         contract_code = str(metadata.get("contract_code") or "").strip()
         if contract_code:
             state["wind_code"] = contract_code
+        # 每段实际用的期权是按该段首价整体缩放过的（_rescale_option_to_real_s0），
+        # 而 params 原样留着用户填的参考价——于是两段行权价实际差了 50%，
+        # 快照里的期权签名却一模一样，对比页恒报"期权：相同"。
+        state["params"] = BacktestApp._replay_scaled_params(
+            state.get("params"), getattr(spec, "option", None))
         strategy = spec.strategies.get(strategy_name)
         state["strategy_name"] = getattr(strategy, "name", "unknown")
+        # 策略的实际参数要从这一条候选的策略对象上取。原先只设了策略类型
+        # 名，带宽阈值与波动率口径仍沿用整个优选任务的配置——于是同一段
+        # 里重放两个不同候选（1σ 与 2σ），两条快照的策略签名一模一样。
+        if isinstance(strategy, HedgeBandStrategy):
+            state["interval_type"] = str(
+                getattr(strategy, "band_type", "sigma"))
+            state["price_interval"] = float(
+                getattr(strategy, "threshold", 0.0))
+            state["sigma_source"] = str(
+                getattr(strategy, "sigma_source", "implied"))
+            window_days = BacktestApp._comparison_safe_int(
+                getattr(strategy, "window_days", None), 20)
+            state["sigma_window"] = max(2, window_days)
+        elif isinstance(strategy, FixedTimeStrategy):
+            times = getattr(strategy, "requested_times", ())
+            state["fixed_times"] = ",".join(
+                value.strftime("%H:%M") if hasattr(value, "strftime")
+                else str(value) for value in times)
         state["history_replay_strategy"] = strategy_name
         state["history_replay_lookback"] = spec.lookback
         state["history_replay_window_id"] = spec.window_id
         return state
 
     def _deliver_history_replay(self, bt, spec, strategy_name,
-                                mismatch=None):
+                                mismatch=None, recomputed=False):
         """在主线程渲染重放结果；成功后它也是可保留的当前回测。"""
         success = False
         try:
@@ -7923,6 +8641,12 @@ class BacktestApp(tk.Tk):
         finally:
             self._finish_history_replay(
                 success, spec, strategy_name)
+            if success and recomputed:
+                # 按钮叫「加载」，正常就该是秒开的读盘。走到重算说明保存
+                # 的明细不在了，得说一声，否则用户只感觉「怎么卡了一下」。
+                self._set_status(
+                    f"已保存的明细不存在，已重新计算并补存："
+                    f"{spec.lookback}/{spec.window_id}/{strategy_name}")
             if success and mismatch:
                 # 数字对不上必须说出来。照常展示是因为它仍有诊断价值，但
                 # 不说的话用户会把它当成排名的依据来读。
@@ -8106,7 +8830,8 @@ class BacktestApp(tk.Tk):
             selected = ranking[
                 ranking["lookback"] == period_item.get("lookback")]
             if not selected.empty:
-                group = selected.sort_values(["rank", "score", "strategy"], kind="stable")
+                group = selected.sort_values(
+                    ["rank", "daily_net_pnl_rms", "strategy"], kind="stable")
         if group is not None:
             baseline = BacktestApp._comparison_baseline(group)
             for row_no, (_idx, row) in enumerate(group.iterrows()):
@@ -8167,12 +8892,11 @@ class BacktestApp(tk.Tk):
                 # 唯一的行标签：基准行加粗。其余一律不带标签——行底色只由
                 # 选中态表达。
                 tag = "baseline" if is_baseline else ""
-                image_val = ""
+                # 基线没有可勾选状态，这格留空；身份由策略列的「（基准）」
+                # 标明。此前这里写「基准」，但 _refresh_history_chart_marks
+                # 紧接着就把它无条件清成空串，写了也从不显示。
+                image_val = "" if is_baseline else self._cb_sf_unchecked
                 text_val = ""
-                if is_baseline:
-                    text_val = "基准"
-                else:
-                    image_val = self._cb_sf_unchecked
 
                 iid = f"history_rank_{row_no}"
                 rank_tree.insert(
@@ -8428,258 +9152,6 @@ class BacktestApp(tk.Tk):
         if navigate:
             self._nb.select(self._summary_tab)
         return applied
-
-    @staticmethod
-    def _history_verify_origin_meta(row, *, batch, batch_id=None):
-        """记录该快照来自哪一次优选的哪个周期、当时排第几、改善多少。
-
-        这些字段只作来源溯源，不参与结果对比页的任何排名计算；结果对比页
-        的指标始终由快照自身的单路径结果算出。
-        """
-        row = dict(row or {})
-        lookback = str(row.get("lookback", "") or "")
-        meta = {
-            "lookback": lookback,
-            "period_label": dict(HISTORY_PERIOD_DEFS).get(lookback, lookback),
-            "history_strategy": str(row.get("strategy", "") or ""),
-            "history_rank": BacktestApp._comparison_safe_int(
-                row.get("rank"), 0),
-            "history_improvement": BacktestApp._comparison_finite(
-                row.get("selection_improvement_vs_c2c",
-                        row.get("improvement_vs_c2c"))),
-            "batch": bool(batch),
-        }
-        if batch_id:
-            meta["batch_id"] = str(batch_id)
-        return meta
-
-    def _verify_history_on_current_path(self):
-        """“当前路径验证”的唯一入口：有勾选走批量，没有则验证选中的一条。
-
-        单条与批量此前是两个并列按钮，用户必须自己判断哪一个对应当前的
-        勾选状态。这里按勾选集合分派，两条既有路径的口径与命名不变。
-        """
-        if self._history_chart_candidates():
-            return self._run_history_batch_on_current_path()
-        return self._run_history_selection_on_current_path()
-
-    def _run_history_selection_on_current_path(self):
-        """应用选中候选，运行普通回测并在成功后自动保留快照。"""
-        if getattr(self, "_active_job", None) is not None:
-            messagebox.showinfo("任务运行中", "请等待当前任务完成后再验证。")
-            return False
-        if getattr(self, "_history_batch_queue", None):
-            messagebox.showinfo("批量验证进行中", "请等待当前批量验证完成。")
-            return False
-        row = self._selected_history_rank_row()
-        if not row:
-            messagebox.showinfo("请选择策略", "请先在周期排名表中选择一条策略。")
-            return False
-        position_var = getattr(self, "_pos_var", None)
-        launch_position = (
-            BacktestApp._normalize_position(position_var.get())
-            if position_var is not None else None)
-        try:
-            self._apply_history_recommendation(row, navigate=False)
-            # 历史行只携带策略参数；当前路径验证始终沿用点击启动时的
-            # 左侧方向，不能被历史任务快照或未来新增回填字段覆盖。
-            if position_var is not None:
-                position_var.set(launch_position)
-        except Exception as exc:
-            messagebox.showerror("无法应用历史策略", str(exc))
-            return False
-        self._pending_history_retain_name = (
-            f"历史验证 · {str(row.get('strategy', '策略')).strip()}")
-        self._pending_history_retain_origin = (
-            BacktestApp._history_verify_origin_meta(row, batch=False))
-        started = bool(self._run_backtest())
-        if not started:
-            self._pending_history_retain_name = None
-            self._pending_history_retain_origin = None
-        return started
-
-    def _history_batch_targets(self):
-        """按排名顺序返回当前周期勾选的候选，并在缺基准时补齐 每日收盘。"""
-        tree = getattr(self, "_history_rank_tree", None)
-        rows = getattr(self, "_history_rank_rows", {})
-        if tree is None:
-            return []
-        lookback, _row = self._history_chart_selection()
-        selected = set(self._history_chart_candidates(lookback))
-        period_label = dict(HISTORY_PERIOD_DEFS).get(
-            str(lookback or ""), str(lookback or ""))
-        baseline_row = None
-        targets = []
-        for iid in tree.get_children():
-            row = rows.get(iid, {})
-            strategy = str(row.get("strategy", "")).strip()
-            if not strategy:
-                continue
-            if str(row.get("strategy_type", "")) == "close_to_close":
-                if baseline_row is None:
-                    baseline_row = copy.deepcopy(row)
-                continue
-            if strategy in selected:
-                targets.append({
-                    "row": copy.deepcopy(row),
-                    "label": strategy,
-                    "name": f"优选{period_label} · {strategy}",
-                    "origin_meta": BacktestApp._history_verify_origin_meta(
-                        row, batch=True),
-                })
-        if not targets:
-            return []
-        # 结果对比页的相对指标依赖同方向 每日收盘 快照；结果池里没有时
-        # 一并验证基准，避免联动过去只能看到绝对排名。
-        position_var = getattr(self, "_pos_var", None)
-        position = (
-            BacktestApp._normalize_position(position_var.get())
-            if position_var is not None else None)
-        has_baseline = BacktestApp._resolve_saved_comparison_baseline_id(
-            self, position) is not None
-        if baseline_row is not None and not has_baseline:
-            targets.insert(0, {
-                "row": baseline_row,
-                "label": str(baseline_row.get("strategy", "每日收盘")),
-                "name": f"优选{period_label} · 每日收盘基准",
-                "origin_meta": BacktestApp._history_verify_origin_meta(
-                    baseline_row, batch=True),
-            })
-        return targets
-
-    def _run_history_batch_on_current_path(self):
-        """把勾选的优选候选逐条在当前路径验证，并统一送入结果对比。"""
-        if getattr(self, "_active_job", None) is not None:
-            messagebox.showinfo("任务运行中", "请等待当前任务完成后再批量验证。")
-            return False
-        if getattr(self, "_history_batch_queue", None):
-            messagebox.showinfo("批量验证进行中", "请等待当前批量验证完成。")
-            return False
-        targets = self._history_batch_targets()
-        if not targets:
-            messagebox.showinfo(
-                "请勾选候选",
-                "请先在周期排名表首列勾选至少一个候选策略，再批量验证。")
-            return False
-        position_var = getattr(self, "_pos_var", None)
-        self._history_batch_position = (
-            BacktestApp._normalize_position(position_var.get())
-            if position_var is not None else None)
-        self._history_batch_queue = list(targets)
-        self._history_batch_total = len(targets)
-        self._history_batch_done = 0
-        self._history_batch_failures = []
-        self._history_batch_result_ids = []
-        self._history_batch_id = datetime.datetime.now().strftime(
-            "batch-%Y%m%d-%H%M%S")
-        started = self._history_batch_step()
-        if not started:
-            self._reset_history_batch()
-        return started
-
-    def _reset_history_batch(self):
-        self._history_batch_queue = []
-        self._history_batch_total = 0
-        self._history_batch_done = 0
-        self._history_batch_failures = []
-        self._history_batch_position = None
-        self._history_batch_result_ids = []
-        self._history_batch_id = None
-
-    def _history_batch_skip_rest(self):
-        """中止剩余候选并记录，避免静默丢弃用户勾选的验证项。"""
-        queue = getattr(self, "_history_batch_queue", None) or []
-        if not queue:
-            return
-        skipped = [str(pending["label"]) for pending in queue]
-        queue.clear()
-        self._history_batch_failures.append(
-            "已中止未验证候选：" + "、".join(skipped))
-
-    def _history_batch_step(self):
-        """启动队首候选；单行参数无法回填时跳过它继续下一个候选。
-
-        元数据残缺的候选原先靠递归跳到下一条；勾选上限虽然不高，但改成
-        循环后连续跳过整队也不会叠栈，失败汇总顺序保持不变。
-        """
-        queue = getattr(self, "_history_batch_queue", None) or []
-        if not queue:
-            return False
-        position_var = getattr(self, "_pos_var", None)
-        while queue:
-            item = queue[0]
-            index = self._history_batch_total - len(queue) + 1
-            try:
-                self._apply_history_recommendation(item["row"], navigate=False)
-                # 批量验证同样只借用历史行的策略参数；方向固定为启动批次时的
-                # 左侧选择，绝不被历史快照覆盖。
-                if position_var is not None:
-                    position_var.set(self._history_batch_position)
-            except Exception as exc:
-                self._history_batch_failures.append(f"{item['label']}：{exc}")
-                queue.pop(0)
-                continue
-            self._pending_history_retain_name = item["name"]
-            batch_origin = dict(item.get("origin_meta") or {})
-            batch_origin["batch_id"] = str(
-                getattr(self, "_history_batch_id", "") or "")
-            batch_origin["batch_index"] = index
-            batch_origin["batch_total"] = self._history_batch_total
-            self._pending_history_retain_origin = batch_origin
-            self._set_status(
-                f"批量验证 {index}/{self._history_batch_total}："
-                f"正在按当前路径回测『{item['label']}』…")
-            started = bool(self._run_backtest())
-            if not started:
-                self._pending_history_retain_name = None
-                self._pending_history_retain_origin = None
-                self._history_batch_failures.append(
-                    f"{item['label']}：回测未能启动")
-                queue.pop(0)
-                self._history_batch_skip_rest()
-                self._finish_history_batch()
-            return started
-        self._finish_history_batch()
-        return False
-
-    def _history_batch_advance(self, success):
-        """单条批量验证结束后推进队列；失败即中止，不再污染结果池。"""
-        queue = getattr(self, "_history_batch_queue", None) or []
-        if not queue:
-            return
-        item = queue.pop(0)
-        if success:
-            self._history_batch_done += 1
-            # 记录本批次实际入池的快照，收尾结果条据此直接定位这批结果。
-            retained_id = getattr(self, "_latest_retained_result_id", None)
-            if retained_id:
-                self._history_batch_result_ids.append(retained_id)
-        else:
-            self._history_batch_failures.append(f"{item['label']}：回测失败")
-        if success and queue:
-            self.after(0, self._history_batch_step)
-            return
-        self._history_batch_skip_rest()
-        self._finish_history_batch()
-
-    def _finish_history_batch(self):
-        """收尾批量验证：就地汇报结果，不再抢走用户当前的优选上下文。
-
-        此前成功即跳到结果对比页、失败弹模态框，用户刚才选定的周期和勾选被
-        留在身后。现在结论写在优选页动作区，跳转与失败详情都由用户主动点。
-        """
-        total = getattr(self, "_history_batch_total", 0)
-        done = getattr(self, "_history_batch_done", 0)
-        failures = list(getattr(self, "_history_batch_failures", ()) or ())
-        result_ids = list(
-            getattr(self, "_history_batch_result_ids", ()) or ())
-        self._reset_history_batch()
-        self._publish_history_batch_outcome(done, total, failures, result_ids)
-        # 结果池已经变化，可见时同步刷新；不可见时不抢占当前页面。
-        self._refresh_saved_comparison_if_visible()
-        self._set_status(
-            f"策略优选批量验证完成：{done}/{total} 条已送入结果对比")
-        return done
 
     def _show_results(self, bt, multi_stats=None):
         self._show_summary(bt, multi_stats)
@@ -9141,23 +9613,53 @@ class BacktestApp(tk.Tk):
 
         # (4) 日收益率分布
         ax4 = fig.add_subplot(2, 2, 4)
-        log_ret = np.log(r['prices'][1:] / r['prices'][:-1])
-        ax4.hist(log_ret * 100, bins=max(15, r['n_days'] // 3),
-                 edgecolor='black', alpha=0.7, color='steelblue', density=True)
-        # 叠加正态分布（隐含波动率）
-        x_range = np.linspace(log_ret.min() * 100, log_ret.max() * 100, 200)
-        daily_impl = implied / np.sqrt(ANNUAL_DAYS) * 100
+        # 0 或负价格在这里是已知输入，不是异常：下面显式滤掉非有限收益，
+        # 因此不必让 numpy 再为除零/取负对数刷一屏 RuntimeWarning。
+        with np.errstate(divide='ignore', invalid='ignore'):
+            log_ret = np.log(r['prices'][1:] / r['prices'][:-1])
+        # 价格里出现 0 或负数时对数收益是 ±inf / nan（CSV 与 Wind 都只校验
+        # 条数，不保证价格为正），matplotlib 会直接抛「range is not finite」，
+        # 异常顺着 _show_results 把整页结果一起打掉——和分布页那个 bug 同源。
+        finite_ret = log_ret[np.isfinite(log_ret)]
+        dropped = int(log_ret.size - finite_ret.size)
+        notes = []
+        if dropped:
+            notes.append(f"剔除 {dropped} 个非有限收益")
         from scipy.stats import norm
-        ax4.plot(x_range, norm.pdf(x_range, 0, daily_impl), 'r--', linewidth=1.2,
-                 label=f'隐含波动率正态 σ={daily_impl:.2f}%')
-        daily_real = np.std(log_ret) * 100
-        ax4.plot(x_range, norm.pdf(x_range, np.mean(log_ret) * 100, daily_real),
-                 'b-', linewidth=1.2, alpha=0.7,
-                 label=f'已实现正态 σ={daily_real:.2f}%')
-        ax4.set_title('日收益率分布', fontsize=10)
+        if finite_ret.size:
+            returns_pct = finite_ret * 100
+            # 边界复用分箱兜底：收益率恒定时它已按量级展开，正态曲线的
+            # x 轴也就不会塌成一个点。
+            edges = self._histogram_edges(
+                returns_pct, max(15, r['n_days'] // 3))
+            ax4.hist(returns_pct, bins=edges, edgecolor='black', alpha=0.7,
+                     color='steelblue', density=True)
+            x_range = np.linspace(float(edges[0]), float(edges[-1]), 200)
+            daily_impl = implied / np.sqrt(ANNUAL_DAYS) * 100
+            if daily_impl > 0:
+                ax4.plot(x_range, norm.pdf(x_range, 0, daily_impl), 'r--',
+                         linewidth=1.2,
+                         label=f'隐含波动率正态 σ={daily_impl:.2f}%')
+            daily_real = float(np.std(returns_pct))
+            # σ=0 时 norm.pdf 整条返回 nan：曲线其实画不出来，图例却仍写着
+            # 「σ=0.00%」，看上去像"画了但压成一条线"。不画就不要留标签。
+            if daily_real > 0:
+                ax4.plot(x_range,
+                         norm.pdf(x_range, float(np.mean(returns_pct)),
+                                  daily_real),
+                         'b-', linewidth=1.2, alpha=0.7,
+                         label=f'已实现正态 σ={daily_real:.2f}%')
+            else:
+                notes.append("收益率恒定")
+        else:
+            notes.append("无有效收益率")
+        ax4.set_title(
+            '日收益率分布' + (f"（{'；'.join(notes)}）" if notes else ''),
+            fontsize=10)
         ax4.set_xlabel('日收益率 (%)', fontsize=8)
         ax4.set_ylabel('密度', fontsize=8)
-        ax4.legend(fontsize=7)
+        if ax4.get_legend_handles_labels()[0]:
+            ax4.legend(fontsize=7)
         ax4.grid(True, alpha=0.3)
 
         fig.tight_layout()
@@ -9167,6 +9669,11 @@ class BacktestApp(tk.Tk):
         canvas.get_tk_widget().pack(fill="both", expand=True)
         self._vol_figure = fig
         self._vol_canvas = canvas
+
+    # 分箱兜底与后端 plot_error_dist 共用同一份实现（退化样本会让 numpy
+    # 拒绝整数分箱数，见 pricing.hedge_backtest.histogram_bin_edges）。
+    _histogram_edges = staticmethod(histogram_bin_edges)
+    _padded_histogram_range = staticmethod(padded_histogram_range)
 
     def _show_dist_chart(self, multi_stats):
         """蒙特卡洛盈亏分布图表"""
@@ -9212,10 +9719,12 @@ class BacktestApp(tk.Tk):
 
         fig = Figure(figsize=self._container_figsize(self._dist_container),
                      dpi=self._CHART_DPI)
+        preferred_bins = max(30, n_paths // 15)
 
         # (1) 总盈亏分布直方图
         ax1 = fig.add_subplot(2, 2, 1)
-        ax1.hist(pnl, bins=max(30, n_paths // 15), edgecolor='black',
+        ax1.hist(pnl, bins=self._histogram_edges(pnl, preferred_bins),
+                 edgecolor='black',
                  alpha=0.7, color='steelblue', density=False)
         ax1.axvline(np.mean(pnl), color='red', linestyle='--', linewidth=1.5,
                     label=f'均值={np.mean(pnl):.2f}')
@@ -9230,7 +9739,8 @@ class BacktestApp(tk.Tk):
 
         # (2) 对冲误差分布
         ax2 = fig.add_subplot(2, 2, 2)
-        ax2.hist(errors, bins=max(30, n_paths // 15), edgecolor='black',
+        ax2.hist(errors, bins=self._histogram_edges(errors, preferred_bins),
+                 edgecolor='black',
                  alpha=0.7, color='salmon', density=False)
         ax2.axvline(np.mean(errors), color='red', linestyle='--', linewidth=1.5,
                     label=f'均值={np.mean(errors):.2f}')
@@ -9243,7 +9753,9 @@ class BacktestApp(tk.Tk):
 
         # (3) 已实现波动率分布 vs 隐含波动率
         ax3 = fig.add_subplot(2, 2, 3)
-        ax3.hist(rv * 100, bins=max(30, n_paths // 15), edgecolor='black',
+        ax3.hist(rv * 100,
+                 bins=self._histogram_edges(rv * 100, preferred_bins),
+                 edgecolor='black',
                  alpha=0.7, color='mediumpurple', density=False)
         ax3.axvline(iv * 100, color='red', linestyle='--', linewidth=1.5,
                     label=f'隐含波动率={iv*100:.1f}%')
@@ -9259,8 +9771,13 @@ class BacktestApp(tk.Tk):
         ax4 = fig.add_subplot(2, 2, 4)
         vol_spread = iv - rv
         ax4.scatter(vol_spread * 100, pnl, s=8, alpha=0.4, c='teal')
-        # 线性拟合
-        if len(vol_spread) > 2:
+        # 线性拟合：波动率价差全等时样本里根本没有斜率信息，polyfit 的最小
+        # 范数解却会给出一个具体数字（实测全等样本写出「拟合斜率=2.8e13」），
+        # 画成一个点上的直线还配着这个标签。只有价差真的散开时才拟合。
+        spread_range = float(np.ptp(vol_spread)) if len(vol_spread) else 0.0
+        fitted = (len(vol_spread) > 2 and np.isfinite(spread_range)
+                  and spread_range > 0)
+        if fitted:
             z = np.polyfit(vol_spread * 100, pnl, 1)
             x_fit = np.linspace(np.min(vol_spread) * 100, np.max(vol_spread) * 100, 100)
             ax4.plot(x_fit, np.polyval(z, x_fit), 'r-', linewidth=1.5,
@@ -9270,7 +9787,9 @@ class BacktestApp(tk.Tk):
         ax4.set_title('盈亏 vs 波动率价差', fontsize=10)
         ax4.set_xlabel('波动率价差 (隐含−已实现) %', fontsize=8)
         ax4.set_ylabel('总盈亏', fontsize=8)
-        ax4.legend(fontsize=7)
+        # 拟合线是这张图唯一带标签的图元；没拟合就没有图例可画。
+        if fitted:
+            ax4.legend(fontsize=7)
         ax4.grid(True, alpha=0.3)
 
         fig.tight_layout()

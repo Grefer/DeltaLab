@@ -1007,6 +1007,66 @@ def _format_rescale_info(info):
     return "\n".join(lines)
 
 
+# ---- 直方图分箱 ----
+
+def padded_histogram_range(value):
+    """全等样本的展开区间：固定 ±0.5 在大数上会被浮点精度整个吃掉。
+
+    相对展开自身在接近 ``DBL_MAX`` 时会溢出成 ``inf``，``linspace`` 于是产出
+    ``nan`` 边界——而 ``nan`` 的比较恒为假，塌缩检测与兜底会一起失效。所以
+    两端都先夹回可表示范围。
+    """
+    pad = max(0.5, abs(value) * 2.0 ** -20)
+    lo = value - pad
+    hi = value + pad
+    limit = float(np.finfo(float).max)
+    if not np.isfinite(lo):
+        lo = -limit
+    if not np.isfinite(hi):
+        hi = limit
+    if not lo < hi:
+        lo = float(np.nextafter(value, -np.inf))
+        hi = float(np.nextafter(value, np.inf))
+    return lo, hi
+
+
+def histogram_bin_edges(values, preferred_bins):
+    """返回一定切得开的直方图边界，避免 numpy 的分箱塌缩异常。
+
+    numpy 只接受“能切出 ``n`` 个浮点上互不相等的边界”的整数分箱数，否则抛
+    ``Too many bins for data range``。样本几乎全等时就会踩到：全等样本 numpy
+    只把区间展开 ±0.5，``|x| ≳ 1.5e14`` 时这 1.0 的跨度已小于该量级的浮点
+    分辨率；跨度非零但小于量级 ulp 的 ``bins`` 倍（例如量级 1e6、跨度
+    < 3e-9）同样塌缩；两端量级极大时 ``hi - lo`` 还会直接溢出成 ``inf``。
+
+    这不是纸面上的边界情况：期权深度价外、Δ 取整后一手不建时，多路径回测的
+    每条路径盈亏都等于那点期初权利金，彼此只差一两个 ULP。而这个异常会一路
+    冒到界面的结果渲染入口，把整页结果打掉——一个退化的子图不该有这个权力。
+
+    分箱数只会往下退：先按 ``preferred_bins`` 切，塌缩就减半重试，直到退成
+    单一分箱。宁可画一根柱子说明“这批样本没有分布”，也不要报错。
+    """
+    data = np.asarray(values, dtype=float)
+    data = data[np.isfinite(data)]
+    if data.size == 0:
+        return np.array([-0.5, 0.5])
+    lo = float(np.min(data))
+    hi = float(np.max(data))
+    bins = max(1, int(preferred_bins))
+    if not np.isfinite(hi - lo):
+        # 量级大到相减都溢出：只画一根，如实呈现这批数据本身已不可用。
+        return np.array([lo, hi])
+    if hi <= lo:
+        lo, hi = padded_histogram_range(lo)
+    edges = np.linspace(lo, hi, bins + 1)
+    while bins > 1 and np.any(edges[:-1] >= edges[1:]):
+        bins //= 2
+        edges = np.linspace(lo, hi, bins + 1)
+    if np.any(edges[:-1] >= edges[1:]):
+        edges = np.array(padded_histogram_range(lo))
+    return edges
+
+
 # ---- 多线程工作函数 ----
 
 def _run_single_path(args):
@@ -2220,7 +2280,8 @@ class HedgeBacktest:
             ax.set_xlabel('对冲误差')
             ax.set_ylabel('频数')
             return fig
-        ax.hist(errors, bins=50, edgecolor='black', alpha=0.7, color='steelblue')
+        ax.hist(errors, bins=histogram_bin_edges(errors, 50),
+                edgecolor='black', alpha=0.7, color='steelblue')
         ax.axvline(np.mean(errors), color='red', linestyle='--',
                    label=f'均值={np.mean(errors):.4f}')
         ax.axvline(0, color='gray', linestyle='-', alpha=0.5)

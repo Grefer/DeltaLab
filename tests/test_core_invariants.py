@@ -29,6 +29,8 @@ from pricing.hedge_backtest import (
     _rescale_option_to_real_s0,
     _format_rescale_info,
     _PRICE_FIELDS_BY_CLS,
+    histogram_bin_edges,
+    padded_histogram_range,
 )
 from pricing.mc_engine import McGbmQ
 from pricing.Option_AB import Option_AB
@@ -804,3 +806,61 @@ def test_run_multi_keeps_successful_paths_when_one_path_fails():
     assert np.isnan(res["errors"][1])
     assert np.isfinite(res["errors"][0])
     assert np.isfinite(res["errors"][2])
+
+
+# ---------------------------------------------------------------------------
+#  直方图分箱：退化样本不得让 numpy 拒绝分箱
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("label", "values"),
+    [
+        ("全等大数", np.full(10, 1e15)),
+        ("全等 DBL_MAX", np.full(4, np.finfo(float).max)),
+        ("全等 -DBL_MAX", np.full(4, -np.finfo(float).max)),
+        ("量级内微小跨度", np.array([1e6, 1e6 + 1e-9, 1e6 + 2e-9])),
+        ("跨度溢出", np.array([-np.finfo(float).max, np.finfo(float).max])),
+        ("含非有限值", np.array([1.0, np.nan, np.inf, 2.0])),
+        ("空样本", np.array([])),
+        ("正常分布", np.linspace(-5.0, 5.0, 40)),
+    ],
+)
+def test_histogram_bin_edges_are_finite_and_strictly_increasing(label, values):
+    """边界必须有限且严格递增，否则 numpy 会拒绝分箱、matplotlib 画空白图。
+
+    ``padded_histogram_range`` 的相对展开在 ``DBL_MAX`` 附近会溢出成 inf，
+    而 nan 参与的比较恒为假，塌缩检测与兜底会一起失效——那一档必须覆盖。
+    """
+    edges = histogram_bin_edges(values, 30)
+
+    assert np.all(np.isfinite(edges)), (label, edges)
+    assert np.all(np.diff(edges) > 0), (label, edges)
+
+
+@pytest.mark.parametrize(
+    "value", [0.0, 3.5, 1e15, 1e300, np.finfo(float).max,
+              -np.finfo(float).max])
+def test_padded_histogram_range_stays_representable(value):
+    lo, hi = padded_histogram_range(value)
+
+    assert np.isfinite(lo) and np.isfinite(hi)
+    assert lo < hi
+
+
+def test_plot_error_dist_handles_degenerate_errors(monkeypatch):
+    """后端绘图入口与 GUI 共用同一份分箱兜底，退化样本不得抛错。"""
+    import matplotlib
+    matplotlib.use("Agg")
+    monkeypatch.setattr(matplotlib.pyplot, "show", lambda *a, **k: None)
+
+    opt = Option_Vanilla("Vanilla", s0=100.0, sr=[], K=100.0, T=2,
+                         sigma=0.20, cp=1, r=0.03, q=0.0)
+    bt = HedgeBacktest(opt, np.array([100.0, 101.0, 102.0]), hedge_freq=1,
+                       tc_rate=0.0, position=1, quantity=1.0, multiplier=0)
+
+    for errors in (np.full(10, 1e15), np.array([1e6, 1e6 + 1e-9]),
+                   np.array([-1e308, 1e308]), np.array([np.nan, 1.0])):
+        figure = bt.plot_error_dist(errors)
+        assert figure is not None
+        matplotlib.pyplot.close(figure)

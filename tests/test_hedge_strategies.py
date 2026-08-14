@@ -29,7 +29,10 @@ from pricing import (
     recommend_by_contract_history_pool,
 )
 from pricing.constants import ANNUAL_DAYS
-from pricing.hedge_analysis import _strict_lookback_segment_lengths
+from pricing.hedge_analysis import (
+    _daily_metrics,
+    _strict_lookback_segment_lengths,
+)
 from pricing.hedge_backtest import _infer_intraday_steps, _trading_day_groups
 
 
@@ -1084,7 +1087,7 @@ def test_history_window_summary_exposes_independent_daily_curves_and_metrics():
     assert row["start_ts"] == pd.Timestamp("2026-01-02 15:00")
     assert row["end_ts"] == pd.Timestamp("2026-01-06 15:00")
     assert row["days_used"] == 2
-    assert row["score"] == pytest.approx(np.sqrt(8.5))
+    assert row["daily_net_pnl_rms"] == pytest.approx(np.sqrt(8.5))
     assert row["total_net_pnl"] == pytest.approx(3.0)
     assert row["total_tc"] == pytest.approx(2.0)
     assert row["total_gross_pnl"] == pytest.approx(5.0)
@@ -1149,7 +1152,7 @@ def test_history_window_summary_preserves_strategy_and_endpoint_failures():
     assert fixed["failure_scope"] == "strategy"
     assert fixed["failure_reason"] == "第 2 个交易日缺失 [11:30]"
     assert fixed["days_used"] == 0
-    assert np.isnan(fixed["score"])
+    assert np.isnan(fixed["daily_net_pnl_rms"])
     assert all(
         isinstance(fixed[column], np.ndarray) and fixed[column].size == 0
         for column in (
@@ -1375,7 +1378,7 @@ def test_summarize_strategy_result_returns_comparison_compatible_metrics():
     assert row["hedging_error"] == pytest.approx(3.0)
     assert row["n_trade_days"] == 2
     assert row["daily_net_pnl_rms"] == pytest.approx(np.sqrt(8.5))
-    assert row["score"] == pytest.approx(np.sqrt(8.5))
+    assert row["daily_net_pnl_rms"] == pytest.approx(np.sqrt(8.5))
     assert row["mean_daily_pnl"] == pytest.approx(1.5)
     assert row["pnl_volatility"] == pytest.approx(np.std([4.0, -1.0], ddof=1))
     assert row["avg_daily_tc"] == pytest.approx(1.0)
@@ -2203,10 +2206,10 @@ def test_history_zero_cost_buy_sell_are_mirrors_with_same_rms_ranking(mode):
     assert buy_rank["position"].eq(-1).all()
     assert sell_rank["strategy"].tolist() == buy_rank["strategy"].tolist()
     np.testing.assert_allclose(
-        sell_rank["score"], buy_rank["score"], rtol=1e-12, atol=1e-12)
+        sell_rank["daily_net_pnl_rms"], buy_rank["daily_net_pnl_rms"], rtol=1e-12, atol=1e-12)
     np.testing.assert_allclose(
-        sell_rank["baseline_score"],
-        buy_rank["baseline_score"],
+        sell_rank["baseline_daily_net_pnl_rms"],
+        buy_rank["baseline_daily_net_pnl_rms"],
         rtol=1e-12,
         atol=1e-12,
     )
@@ -2831,18 +2834,18 @@ def test_rolling_history_ranks_candidates_by_same_window_c2c_improvement(
     baseline = ranking[ranking["strategy"] == "c2c_reference"].iloc[0]
     better = ranking[ranking["strategy"] == "earns_less"].iloc[0]
     worse = ranking[ranking["strategy"] == "earns_more"].iloc[0]
-    assert baseline["score"] == pytest.approx(4.0)
-    assert baseline["baseline_score"] == pytest.approx(4.0)
+    assert baseline["daily_net_pnl_rms"] == pytest.approx(4.0)
+    assert baseline["baseline_daily_net_pnl_rms"] == pytest.approx(4.0)
     assert baseline["improvement_vs_c2c"] == pytest.approx(0.0)
-    assert better["score"] == pytest.approx(1.0)
-    assert better["baseline_score"] == pytest.approx(4.0)
-    assert better["score_delta_vs_c2c"] == pytest.approx(-3.0)
+    assert better["daily_net_pnl_rms"] == pytest.approx(1.0)
+    assert better["baseline_daily_net_pnl_rms"] == pytest.approx(4.0)
+    assert better["rms_delta_vs_c2c"] == pytest.approx(-3.0)
     assert better["improvement_vs_c2c"] == pytest.approx(0.75)
     assert better["window_win_rate_vs_c2c"] == pytest.approx(1.0)
     assert better["median_window_improvement_vs_c2c"] == pytest.approx(0.75)
-    assert worse["score"] == pytest.approx(8.0)
-    assert worse["baseline_score"] == pytest.approx(4.0)
-    assert worse["score_delta_vs_c2c"] == pytest.approx(4.0)
+    assert worse["daily_net_pnl_rms"] == pytest.approx(8.0)
+    assert worse["baseline_daily_net_pnl_rms"] == pytest.approx(4.0)
+    assert worse["rms_delta_vs_c2c"] == pytest.approx(4.0)
     assert worse["improvement_vs_c2c"] == pytest.approx(-1.0)
     assert worse["window_win_rate_vs_c2c"] == pytest.approx(0.0)
     assert worse["median_window_improvement_vs_c2c"] == pytest.approx(-1.0)
@@ -2970,7 +2973,7 @@ def test_history_ranking_never_compares_an_amount_against_a_ratio():
         "complete_window": True, "paired_windows": 11,
         "baseline_windows": 11, "rolling_windows": 11,
         "comparison_coverage": 1.0, "window_win_rate_vs_c2c": 0.5,
-        "score": 1.0, "baseline_score": 1.0,
+        "daily_net_pnl_rms": 1.0, "baseline_daily_net_pnl_rms": 1.0,
         "selection_metric": "strict_lookback_daily_rms_advantage_vs_c2c",
     }
 
@@ -3020,7 +3023,7 @@ def test_rolling_history_zero_c2c_score_never_produces_infinite_improvement(
     )
 
     candidate = ranking[ranking["strategy"] == "candidate"].iloc[0]
-    assert candidate["baseline_score"] == pytest.approx(0.0)
+    assert candidate["baseline_daily_net_pnl_rms"] == pytest.approx(0.0)
     assert np.isnan(candidate["improvement_vs_c2c"])
     assert np.isnan(candidate["median_window_improvement_vs_c2c"])
     assert candidate["selection_improvement_vs_c2c"] == pytest.approx(-1.0)
@@ -3212,7 +3215,7 @@ def test_rolling_fixed_time_missing_bar_does_not_abort_other_strategies():
     ], ignore_index=True)
     expected_paired_baseline_score = float(np.sqrt(np.mean(np.square(
         paired_c2c_daily["net_pnl"].to_numpy(dtype=float)))))
-    assert fixed_row["baseline_score"] == pytest.approx(
+    assert fixed_row["baseline_daily_net_pnl_rms"] == pytest.approx(
         expected_paired_baseline_score)
     assert fixed_row["baseline_days_used"] == fixed_row["days_used"]
     # 部分同窗只能留作排错，既不是正式比较，也不是完整历史的诊断资格。
@@ -4027,3 +4030,39 @@ def test_rerank_history_tolerates_empty_ranking():
     from pricing import rerank_history
     rec, ranking = rerank_history(pd.DataFrame(), "incremental_pnl")
     assert rec.empty and ranking.empty
+
+
+def test_daily_metrics_no_longer_ships_a_score_alias():
+    """RMS 只以 daily_net_pnl_rms 一个名字出现。
+
+    它此前还以 "score" 为名重复输出一份，同一个数两个键；读代码的人得先
+    确认它们没分叉，加新字段的人还得记得两处都改。
+    """
+    daily = pd.DataFrame(
+        {"net_pnl": [1.0, -3.0], "tc_paid": [0.1, 0.2]})
+
+    metrics = _daily_metrics(daily)
+
+    assert metrics["daily_net_pnl_rms"] == pytest.approx(np.sqrt(5.0))
+    assert "score" not in metrics
+
+
+def test_rolling_history_ranking_uses_the_rms_column_names():
+    """严格区间排名输出的是 rms 系列列名，下游据此消费。"""
+    prices = _variable_return_history(120)
+    cases = [
+        StrategyCase("每日收盘", CloseToCloseStrategy(),
+                     {"strategy_name": "close_to_close"}),
+        StrategyCase("固定间隔(1σ)", HedgeBandStrategy("sigma", 1.0),
+                     {"strategy_name": "hedge_band"}),
+    ]
+
+    _recs, ranking, _windows = recommend_by_rolling_history(
+        _option(days=20), prices, cases,
+        {"multiplier": 1.0, "quantity": 1.0, "tc_rate": 0.0005},
+        lookbacks={"month": 20}, target_endpoints=20)
+
+    assert "daily_net_pnl_rms" in ranking.columns
+    assert "baseline_daily_net_pnl_rms" in ranking.columns
+    assert "rms_delta_vs_c2c" in ranking.columns
+    assert not [column for column in ranking.columns if "score" in column]

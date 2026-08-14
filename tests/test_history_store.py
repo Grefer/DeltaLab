@@ -383,7 +383,8 @@ def test_replay_payload_carries_warmup_kwargs(tmp_path):
         objective="incremental_pnl",
         replay_index={"quarter": {"segment_1": spec}})
     stored = store.save_result(payload, directory=str(tmp_path))
-    _series, specs = store.restore_replay_payload(store.load_result(stored))
+    _series_map, specs = store.restore_replay_payload(
+        store.load_result(stored))
 
     warmup = specs[0]["warmup_kwargs"]["每日收盘"]
     assert warmup["strict_sigma_warmup"] is True
@@ -635,3 +636,157 @@ def test_default_filename_is_descriptive_and_filesystem_safe(tmp_path):
     assert name.endswith(".json.gz")
     for illegal in ("/", "\\", ":", "*", "?", '"', "<", ">", "|"):
         assert illegal not in name
+
+
+def _pool_replay_index(prices_a, prices_b, *, start_b=3):
+    """造一个双合约重放索引：两段日期区间重叠，同一天价格不同（换月）。"""
+    from pricing.hedge_analysis import HistoryReplaySpec
+    from pricing import CloseToCloseStrategy, Option_Vanilla
+
+    def spec_for(window_id, contract, first_day, values):
+        index = pd.DatetimeIndex([
+            pd.Timestamp(f"2026-06-{first_day + i:02d} 15:00")
+            for i in range(len(values))])
+        return HistoryReplaySpec(
+            lookback="sample", window_id=window_id,
+            option=Option_Vanilla("Vanilla", s0=float(values[0]), sr=[],
+                                  K=100.0, T=len(values), sigma=0.18, cp=1,
+                                  r=0.03, q=0.03),
+            external_path=pd.Series(np.asarray(values, dtype=float),
+                                    index=index),
+            evaluation_days=len(values) - 1, steps_per_day=1,
+            strategies={"每日收盘": CloseToCloseStrategy()},
+            backtest_kwargs={"tc_rate": 0.0},
+            metadata={"history_mode": "product_contract_pool",
+                      "contract_code": contract})
+
+    return {"sample": {
+        "c_A": spec_for("c_A", "P2601.DCE", 1, prices_a),
+        "c_B": spec_for("c_B", "P2605.DCE", start_b, prices_b),
+    }}
+
+
+def test_contract_pool_segments_survive_the_round_trip():
+    """不同合约的分段不能被并成一条序列——换月处会串价。
+
+    原本无条件 ``pd.concat`` 后 ``keep="first"`` 去重，前提是「各段都是同
+    一条已拉取序列的精确切片」。那只对单标的成立：品种池各段来自不同合
+    约，换月处同一天有两个价，后入的段会被前一段顶掉。实测 P2605 段原本
+    ``[105,106,107,108]`` 载回来变成 ``[203,204,107,108]``——串掉的第一根
+    还是 Day 0 锚点，``_rescale_option_to_real_s0`` 会拿它给整段期权重定
+    基，错的远不止那两根 bar。
+    """
+    prices_a = [201.0, 202.0, 203.0, 204.0]
+    prices_b = [105.0, 106.0, 107.0, 108.0]
+    index = _pool_replay_index(prices_a, prices_b)
+
+    payload = store.build_replay_payload(index)
+    blob = json.loads(json.dumps({"replay": payload}, default=str))
+    series_by_key, specs = store.restore_replay_payload(blob)
+    assert specs
+
+    # 必须是**按合约**分的桶。逐段拆开也能得出正确数字，但那是兜底路径，
+    # 空间翻倍；这里要确认走的是正路。
+    assert set(series_by_key) == {"P2601.DCE", "P2605.DCE"}, series_by_key
+    assert {spec["series_key"] for spec in specs} == set(series_by_key)
+
+    for spec in specs:
+        original = index["sample"][spec["window_id"]].external_path
+        series = series_by_key[spec["series_key"]]
+        got = series.loc[pd.Timestamp(spec["start_ts"]):
+                         pd.Timestamp(spec["end_ts"])]
+        assert len(got) == len(original), spec["window_id"]
+        assert np.array_equal(got.to_numpy(), original.to_numpy()), (
+            spec["window_id"], list(got.to_numpy()),
+            list(original.to_numpy()))
+
+
+def test_single_instrument_still_shares_one_series():
+    """单标的仍然只存一条序列——分桶不能把省下来的空间又吐回去。
+
+    各段都是同一条已拉取序列的切片时合并是对的，一年 1 分钟 gzip 后约
+    206 KB。按段各存各的要翻好几倍，只在合并确实会串价时才允许退化。
+    """
+    from pricing.hedge_analysis import HistoryReplaySpec
+    from pricing import CloseToCloseStrategy, Option_Vanilla
+
+    stamps = pd.DatetimeIndex([
+        pd.Timestamp(f"2026-06-{day:02d} 15:00") for day in range(1, 9)])
+    whole = pd.Series(np.linspace(100.0, 107.0, 8), index=stamps)
+
+    def spec_for(window_id, lo, hi):
+        piece = whole.iloc[lo:hi]
+        return HistoryReplaySpec(
+            lookback="sample", window_id=window_id,
+            option=Option_Vanilla("Vanilla", s0=float(piece.iloc[0]), sr=[],
+                                  K=100.0, T=len(piece), sigma=0.18, cp=1,
+                                  r=0.03, q=0.03),
+            external_path=piece, evaluation_days=len(piece) - 1,
+            steps_per_day=1,
+            strategies={"每日收盘": CloseToCloseStrategy()},
+            backtest_kwargs={"tc_rate": 0.0}, metadata={})
+
+    # 刻意重叠：近周那几天也在近月里，这正是当初要去重的原因。
+    index = {"sample": {"w1": spec_for("w1", 0, 8),
+                        "w2": spec_for("w2", 3, 8)}}
+    series_by_key, key_by_window = store.replay_series_buckets(index)
+    assert list(series_by_key) == [store.DEFAULT_SERIES_KEY], series_by_key
+    assert len(series_by_key[store.DEFAULT_SERIES_KEY]) == 8
+    assert set(key_by_window.values()) == {store.DEFAULT_SERIES_KEY}
+
+
+def test_old_flat_contract_pool_package_is_refused():
+    """修复前存的品种池包不可救，必须判定不可重放而不是画错价。
+
+    那时多合约已经在保存时就被并成一条、换月处的价被顶掉了，包里存的就是
+    错数——重建时无从分辨。拿它画出来的曲线不会报错，还能被保留进结果对
+    比页当成真结果用，所以这里宁可让下钻不可用。
+    """
+    legacy = {"replay": {
+        "price_series": {
+            "index": [f"2026-06-0{d} 15:00:00" for d in (1, 2, 3, 4)],
+            "values": [201.0, 202.0, 203.0, 204.0],
+        },
+        "specs": [
+            {"lookback": "sample", "window_id": "c_A",
+             "start_ts": "2026-06-01 15:00:00", "end_ts": "2026-06-02 15:00:00",
+             "metadata": {"contract_code": "P2601.DCE"}},
+            {"lookback": "sample", "window_id": "c_B",
+             "start_ts": "2026-06-03 15:00:00", "end_ts": "2026-06-04 15:00:00",
+             "metadata": {"contract_code": "P2605.DCE"}},
+        ],
+    }}
+    assert store.restore_replay_payload(legacy) == ({}, [])
+
+    # 单标的的旧包不受影响，照常可用。
+    single = json.loads(json.dumps(legacy))
+    for spec in single["replay"]["specs"]:
+        spec["metadata"] = {}
+    series_by_key, specs = store.restore_replay_payload(single)
+    assert list(series_by_key) == [store.DEFAULT_SERIES_KEY]
+    assert len(specs) == 2
+
+
+def test_conflicting_segments_are_split_even_without_contract_codes():
+    """认不出合约时，也不能把互相冲突的段并成一条。
+
+    按合约分桶要靠 ``metadata["contract_code"]``，而它不是每条路径都填。
+    所以合并前还要逐段验一遍「能不能原样切回来」——验不过就退化成按段各
+    存各的。这两层任缺其一，都会在另一层失效时静默串价。
+
+    这条刻意**不填** contract_code，只留价格冲突，专测兜底那层。
+    """
+    index = _pool_replay_index([201.0, 202.0, 203.0, 204.0],
+                               [105.0, 106.0, 107.0, 108.0])
+    for spec in index["sample"].values():
+        spec.metadata.clear()
+
+    series_by_key, key_by_window = store.replay_series_buckets(index)
+    assert len(series_by_key) == 2, series_by_key
+    assert store.DEFAULT_SERIES_KEY not in series_by_key
+
+    for (_lookback, window_id), key in key_by_window.items():
+        original = index["sample"][window_id].external_path
+        got = series_by_key[key].loc[original.index[0]:original.index[-1]]
+        assert np.array_equal(got.to_numpy(), original.to_numpy()), (
+            window_id, list(got.to_numpy()), list(original.to_numpy()))

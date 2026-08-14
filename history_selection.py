@@ -113,11 +113,12 @@ def validate_payload(
         import pandas as pd
         rolling_windows = pd.to_numeric(
             ranking["rolling_windows"], errors="coerce").to_numpy(dtype=float)
-        scores = pd.to_numeric(
-            ranking["score"], errors="coerce").to_numpy(dtype=float)
+        rms_values = pd.to_numeric(
+            ranking["daily_net_pnl_rms"], errors="coerce"
+        ).to_numpy(dtype=float)
     except (KeyError, TypeError, ValueError) as exc:
         raise ValueError("历史择优排名缺少有效样本或评分字段。") from exc
-    if not np.any((rolling_windows > 0) & np.isfinite(scores)):
+    if not np.any((rolling_windows > 0) & np.isfinite(rms_values)):
         # fixed_times 的逐代理段失败已由历史分析层保留原始原因。若全部
         # 代理段都因目标时刻缺失而失败，应把真实数据问题直接反馈给
         # 用户，而不是误报成历史区间长度不足。
@@ -416,17 +417,17 @@ def row_improvement(row, baseline=None):
         return value
     if str(row.get("strategy_type", "")) == "close_to_close":
         return 0.0 if finite_value(
-            row.get("score")) is not None else None
-    candidate_score = finite_value(row.get("score"))
-    baseline_score = finite_value(
-        row.get("baseline_score"))
-    if baseline_score is None and baseline:
-        baseline_score = finite_value(
-            baseline.get("score"))
-    if (candidate_score is None or baseline_score is None
-            or np.isclose(baseline_score, 0.0, rtol=1e-12, atol=1e-12)):
+            row.get("daily_net_pnl_rms")) is not None else None
+    candidate_rms = finite_value(row.get("daily_net_pnl_rms"))
+    baseline_rms = finite_value(
+        row.get("baseline_daily_net_pnl_rms"))
+    if baseline_rms is None and baseline:
+        baseline_rms = finite_value(
+            baseline.get("daily_net_pnl_rms"))
+    if (candidate_rms is None or baseline_rms is None
+            or np.isclose(baseline_rms, 0.0, rtol=1e-12, atol=1e-12)):
         return None
-    return (baseline_score - candidate_score) / abs(baseline_score)
+    return (baseline_rms - candidate_rms) / abs(baseline_rms)
 
 
 def row_uses_recognized_metric(row):
@@ -631,27 +632,28 @@ def recommendation_rows(
                     "close_to_close")
             ]
             leader = eligible_group.sort_values(
-                ["rank", "score", "strategy"],
+                ["rank", "daily_net_pnl_rms", "strategy"],
                 kind="stable").iloc[0].to_dict()
         else:
             leader = baseline
 
-        leader_score = (
-            finite_value(leader.get("score"))
+        leader_rms = (
+            finite_value(leader.get("daily_net_pnl_rms"))
             if leader is not None else None)
         leader_effective = (
             safe_int(
                 leader.get("rolling_windows"), 0)
             if leader is not None else 0)
-        if leader_score is None or leader_effective <= 0:
+        if leader_rms is None or leader_effective <= 0:
             leader = None
 
         if leader is None:
             context = _sampling_context(context_row)
             rows.append({
                 "lookback": key, "period": display, "strategy": "—",
-                "strategy_label": "—", "score": None,
-                "baseline_score": None, "improvement_vs_c2c": None,
+                "strategy_label": "—", "daily_net_pnl_rms": None,
+                "baseline_daily_net_pnl_rms": None,
+                "improvement_vs_c2c": None,
                 "selection_improvement_vs_c2c": None,
                 "incremental_pnl": None, "incremental_sharpe": None,
                 "incremental_tc": None, "max_drawdown": None,
@@ -681,11 +683,11 @@ def recommendation_rows(
         strategy = str(leader.get("strategy", "—"))
         best_is_baseline = (
             str(leader.get("strategy_type", "")) == "close_to_close")
-        baseline_score = finite_value(
-            leader.get("baseline_score"))
-        if baseline_score is None and baseline:
-            baseline_score = finite_value(
-                baseline.get("score"))
+        baseline_rms = finite_value(
+            leader.get("baseline_daily_net_pnl_rms"))
+        if baseline_rms is None and baseline:
+            baseline_rms = finite_value(
+                baseline.get("daily_net_pnl_rms"))
         improvement = row_improvement(
             leader, baseline)
         uses_strict_metric = (
@@ -718,8 +720,8 @@ def recommendation_rows(
             "period": display,
             "strategy": strategy,
             "strategy_label": strategy_label,
-            "score": leader_score,
-            "baseline_score": baseline_score,
+            "daily_net_pnl_rms": leader_rms,
+            "baseline_daily_net_pnl_rms": baseline_rms,
             "improvement_vs_c2c": improvement,
             "selection_improvement_vs_c2c": (
                 improvement if uses_strict_metric else None),

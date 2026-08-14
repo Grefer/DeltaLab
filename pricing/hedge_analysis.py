@@ -423,10 +423,10 @@ def _daily_metrics(daily):
         "avg_daily_tc": avg_tc,
         "total_tc": float(np.sum(tc)) if len(tc) else 0.0,
         "total_net_pnl": float(np.sum(net)) if len(net) else 0.0,
+        # net_pnl 已经扣除 tc_paid；其相对 0 的 RMS 既衡量对冲波动，也让
+        # 持续成本造成的负漂移只进入一次。此前它还以 "score" 为名重复输出
+        # 一份，两个名字指同一个数，读代码时得先确认它们没分叉。
         "max_drawdown": _max_drawdown(net),
-        # net_pnl 已经扣除 tc_paid；用其相对 0 的 RMS 作为唯一 score，既衡量
-        # 对冲波动，也让持续成本造成的负漂移只进入一次。
-        "score": rms,
     }
 
 
@@ -460,7 +460,7 @@ _HISTORY_WINDOW_SUMMARY_COLUMNS = (
     "start_ts",
     "end_ts",
     "days_used",
-    "score",
+    "daily_net_pnl_rms",
     "total_net_pnl",
     "total_gross_pnl",
     "total_tc",
@@ -518,7 +518,7 @@ def _history_failure_summary_row(
         "start_ts": start_ts,
         "end_ts": end_ts,
         "days_used": 0,
-        "score": np.nan,
+        "daily_net_pnl_rms": np.nan,
         "total_net_pnl": np.nan,
         "total_gross_pnl": np.nan,
         "total_tc": np.nan,
@@ -786,7 +786,7 @@ def history_window_summary(window_results):
                     "start_ts": start_ts,
                     "end_ts": end_ts,
                     "days_used": metrics["n_trade_days"],
-                    "score": metrics["score"],
+                    "daily_net_pnl_rms": metrics["daily_net_pnl_rms"],
                     "total_net_pnl": metrics["total_net_pnl"],
                     "total_gross_pnl": float(np.sum(daily_gross)),
                     "total_tc": metrics["total_tc"],
@@ -824,12 +824,12 @@ def _rank_rows(rows):
     ranking = pd.DataFrame(rows)
     if ranking.empty:
         return ranking
-    # 完整窗口永远优先于不完整窗口；同一完整性内先按 score，再按总成本、
+    # 完整窗口永远优先于不完整窗口；同一完整性内先按日净 PnL RMS，再按总成本、
     # 策略名稳定排序。这样分数相同的推荐可复现，也自然偏向成本更低的策略。
     ranking = ranking.sort_values(
         [
-            "lookback_days", "complete_window", "score", "window_tc",
-            "strategy",
+            "lookback_days", "complete_window", "daily_net_pnl_rms",
+            "window_tc", "strategy",
         ],
         ascending=[True, False, True, True, True],
         kind="stable",
@@ -855,11 +855,11 @@ def _history_baseline_case(cases):
     return baselines[0]
 
 
-def _history_improvement_vs_c2c(score, baseline_score):
+def _history_improvement_vs_c2c(rms, baseline_rms):
     """返回日净 PnL RMS 相对 C2C 的改善；正值表示候选更优。"""
     try:
-        candidate = float(score)
-        baseline = float(baseline_score)
+        candidate = float(rms)
+        baseline = float(baseline_rms)
     except (TypeError, ValueError, OverflowError):
         return np.nan
     if (not np.isfinite(candidate) or not np.isfinite(baseline)
@@ -901,7 +901,7 @@ def _incremental_metrics(candidate_daily, baseline_daily):
     return {"incremental_pnl": total, "incremental_sharpe": sharpe}
 
 
-def _history_selection_advantage_vs_c2c(score, baseline_score):
+def _history_selection_advantage_vs_c2c(rms, baseline_rms):
     """返回有界的同段/同证据区间 C2C 优势。
 
     RMS 均为非负数，使用 ``(baseline - candidate) / max(baseline,
@@ -910,8 +910,8 @@ def _history_selection_advantage_vs_c2c(score, baseline_score):
     静默排除。
     """
     try:
-        candidate = float(score)
-        baseline = float(baseline_score)
+        candidate = float(rms)
+        baseline = float(baseline_rms)
     except (TypeError, ValueError, OverflowError):
         return np.nan
     if (not np.isfinite(candidate) or not np.isfinite(baseline)
@@ -1158,7 +1158,7 @@ def compare_strategies(option, prices, cases, backtest_kwargs=None):
     返回 ``(summary, results)``：summary 是按综合得分升序排列的 DataFrame，
     results 是 ``case.name -> HedgeBacktest.run()`` 的明细字典。
 
-    所有 bar 级损益与成本会先按交易日聚合。``score`` 明确定义为每日净 PnL
+    所有 bar 级损益与成本会先按交易日聚合。``daily_net_pnl_rms`` 定义为每日净 PnL
     相对 0 的 RMS；由于净 PnL 已经扣除交易成本，不会再叠加一次成本。分数越
     低，表示对冲后的逐日偏离越小。
     """
@@ -1194,7 +1194,7 @@ def compare_strategies(option, prices, cases, backtest_kwargs=None):
     summary = pd.DataFrame(rows)
     if not summary.empty:
         summary = summary.sort_values(
-            ["score", "total_tc", "strategy"], kind="stable"
+            ["daily_net_pnl_rms", "total_tc", "strategy"], kind="stable"
         ).reset_index(drop=True)
         summary.insert(0, "rank", np.arange(1, len(summary) + 1))
     return summary, results
@@ -1255,7 +1255,6 @@ def recommend_by_lookback(results, steps_per_day=None, lookbacks=None):
                 "mean_daily_pnl": metrics["mean_daily_pnl"],
                 "pnl_volatility": metrics["pnl_volatility"],
                 "max_drawdown": metrics["max_drawdown"],
-                "score": metrics["score"],
             })
 
     ranking = _rank_rows(rows)
@@ -1744,8 +1743,9 @@ def recommend_by_rolling_history(
                 strategy_types[case.name] = result.get(
                     "strategy_name", "unknown")
                 per_case[case.name] = result
-                # 只记录构造参数：同段候选共享行情切片与缩放后的期权，
-                # 展示层据此按需重跑单段，无需长期保留 bar 级结果数组。
+                # 只记录构造参数：同段候选共享行情切片与缩放后的期权，无需长期
+                # 保留 bar 级结果数组。展示层正常读 history_bar_cache，读不到时
+                # 才据此重算单段。
                 replay_option = scaled_option
                 replay_strategies[case.name] = scaled_strategy
                 if warmup_kwargs:
@@ -1823,23 +1823,23 @@ def recommend_by_rolling_history(
                     columns=["net_pnl", "tc_paid"])
                 baseline_metrics = _daily_metrics(baseline_combined)
 
-            score = metrics["score"]
-            baseline_score = baseline_metrics["score"]
-            if np.isfinite(score) and np.isfinite(baseline_score):
-                score_delta = float(score - baseline_score)
+            rms = metrics["daily_net_pnl_rms"]
+            baseline_rms = baseline_metrics["daily_net_pnl_rms"]
+            if np.isfinite(rms) and np.isfinite(baseline_rms):
+                rms_delta = float(rms - baseline_rms)
             else:
-                score_delta = np.nan
-            if case.name == baseline_case.name and np.isfinite(score):
+                rms_delta = np.nan
+            if case.name == baseline_case.name and np.isfinite(rms):
                 improvement = 0.0
                 selection_advantage = 0.0
                 incremental = {
                     "incremental_pnl": 0.0, "incremental_sharpe": 0.0}
             else:
                 improvement = _history_improvement_vs_c2c(
-                    score, baseline_score)
+                    rms, baseline_rms)
                 selection_advantage = (
                     _history_selection_advantage_vs_c2c(
-                        score, baseline_score)
+                        rms, baseline_rms)
                 )
                 incremental = _incremental_metrics(
                     combined, baseline_combined)
@@ -1848,21 +1848,21 @@ def recommend_by_rolling_history(
             segment_wins = 0
             for candidate_daily, baseline_daily in zip(
                     daily_windows, paired_baseline_windows):
-                candidate_segment_score = _daily_metrics(
-                    candidate_daily)["score"]
-                baseline_segment_score = _daily_metrics(
-                    baseline_daily)["score"]
-                if (np.isfinite(candidate_segment_score)
-                        and np.isfinite(baseline_segment_score)
-                        and candidate_segment_score < baseline_segment_score
+                candidate_segment_rms = _daily_metrics(
+                    candidate_daily)["daily_net_pnl_rms"]
+                baseline_segment_rms = _daily_metrics(
+                    baseline_daily)["daily_net_pnl_rms"]
+                if (np.isfinite(candidate_segment_rms)
+                        and np.isfinite(baseline_segment_rms)
+                        and candidate_segment_rms < baseline_segment_rms
                         and not np.isclose(
-                            candidate_segment_score,
-                            baseline_segment_score,
+                            candidate_segment_rms,
+                            baseline_segment_rms,
                             rtol=1e-12,
                             atol=1e-12)):
                     segment_wins += 1
                 segment_improvement = _history_improvement_vs_c2c(
-                    candidate_segment_score, baseline_segment_score)
+                    candidate_segment_rms, baseline_segment_rms)
                 if np.isfinite(segment_improvement):
                     segment_improvements.append(segment_improvement)
 
@@ -1977,10 +1977,9 @@ def recommend_by_rolling_history(
                 "mean_daily_pnl": metrics["mean_daily_pnl"],
                 "pnl_volatility": metrics["pnl_volatility"],
                 "max_drawdown": evidence_drawdown,
-                "score": score,
-                "baseline_score": baseline_score,
+                "baseline_daily_net_pnl_rms": baseline_rms,
                 "baseline_days_used": baseline_metrics["n_trade_days"],
-                "score_delta_vs_c2c": score_delta,
+                "rms_delta_vs_c2c": rms_delta,
                 "improvement_vs_c2c": improvement,
                 # 分段胜率只作诊断；主排名只使用下方完整 L 日有界优势。
                 "window_win_rate_vs_c2c": segment_win_rate,
@@ -2238,17 +2237,17 @@ def _recommend_from_explicit_history_plans(
                     columns=["net_pnl", "tc_paid"])
                 baseline_metrics = _daily_metrics(baseline_combined)
 
-            score = metrics["score"]
-            baseline_score = baseline_metrics["score"]
-            if np.isfinite(score) and np.isfinite(baseline_score):
-                score_delta = float(score - baseline_score)
+            rms = metrics["daily_net_pnl_rms"]
+            baseline_rms = baseline_metrics["daily_net_pnl_rms"]
+            if np.isfinite(rms) and np.isfinite(baseline_rms):
+                rms_delta = float(rms - baseline_rms)
             else:
-                score_delta = np.nan
-            if case.name == baseline_case.name and np.isfinite(score):
+                rms_delta = np.nan
+            if case.name == baseline_case.name and np.isfinite(rms):
                 improvement = 0.0
             else:
                 improvement = _history_improvement_vs_c2c(
-                    score, baseline_score)
+                    rms, baseline_rms)
 
             window_improvements = []
             window_selection_advantages = []
@@ -2256,23 +2255,23 @@ def _recommend_from_explicit_history_plans(
             window_wins = 0
             for candidate_daily, baseline_daily in zip(
                     daily_windows, paired_baseline_windows):
-                candidate_window_score = _daily_metrics(
-                    candidate_daily)["score"]
-                baseline_window_score = _daily_metrics(
-                    baseline_daily)["score"]
-                if (np.isfinite(candidate_window_score)
-                        and np.isfinite(baseline_window_score)
-                        and candidate_window_score < baseline_window_score
+                candidate_window_rms = _daily_metrics(
+                    candidate_daily)["daily_net_pnl_rms"]
+                baseline_window_rms = _daily_metrics(
+                    baseline_daily)["daily_net_pnl_rms"]
+                if (np.isfinite(candidate_window_rms)
+                        and np.isfinite(baseline_window_rms)
+                        and candidate_window_rms < baseline_window_rms
                         and not np.isclose(
-                            candidate_window_score, baseline_window_score,
+                            candidate_window_rms, baseline_window_rms,
                             rtol=1e-12, atol=1e-12)):
                     window_wins += 1
                 window_improvement = _history_improvement_vs_c2c(
-                    candidate_window_score, baseline_window_score)
+                    candidate_window_rms, baseline_window_rms)
                 if np.isfinite(window_improvement):
                     window_improvements.append(window_improvement)
                 selection_advantage = _history_selection_advantage_vs_c2c(
-                    candidate_window_score, baseline_window_score)
+                    candidate_window_rms, baseline_window_rms)
                 if np.isfinite(selection_advantage):
                     window_selection_advantages.append(selection_advantage)
                     window_selection_weights.append(
@@ -2362,10 +2361,9 @@ def _recommend_from_explicit_history_plans(
                 "mean_daily_pnl": metrics["mean_daily_pnl"],
                 "pnl_volatility": metrics["pnl_volatility"],
                 "max_drawdown": worst_drawdown,
-                "score": score,
-                "baseline_score": baseline_score,
+                "baseline_daily_net_pnl_rms": baseline_rms,
                 "baseline_days_used": baseline_metrics["n_trade_days"],
-                "score_delta_vs_c2c": score_delta,
+                "rms_delta_vs_c2c": rms_delta,
                 "improvement_vs_c2c": improvement,
                 "window_win_rate_vs_c2c": window_win_rate,
                 "median_window_improvement_vs_c2c": (

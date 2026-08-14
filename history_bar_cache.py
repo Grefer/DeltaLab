@@ -51,8 +51,31 @@ _GIVE_UP = object()
 # 为什么无关。
 _IGNORED_ATTRS = frozenset({
     "name",            # 策略类型名，已由类名覆盖
-    "optiontype",      # 期权的展示标签，行为由 exe_mode 等字段决定
 })
+# ``optiontype`` 曾经在这张名单里，理由写的是「期权的展示标签」——那只对
+# Option_Vanilla 成立，它是唯一从不读 self.optiontype 的类。实际上它是定价
+# 方法的**分派键**：Option_AB/DE/SNB 走 ``getattr(self, self.optiontype)()``，
+# Option_AS 走 ``match self.optiontype``。排除它的后果实测是 Option_DE 的
+# 13 个子类型算出同一个 key，互相读到对方的 bar 级数组且不报错。
+
+
+def _all_numbers(seq):
+    """序列是否全是数字（bool 不算——它是 int 的子类但语义不同）。"""
+    if not len(seq):
+        return False
+    return all(
+        isinstance(item, (int, float, np.integer, np.floating))
+        and not isinstance(item, (bool, np.bool_))
+        for item in seq)
+
+
+def _digest_numbers(seq):
+    """把数字序列按 float64 摘要；装不进 float64 就放弃缓存。"""
+    try:
+        values = np.asarray(seq, dtype=np.float64)
+    except (TypeError, ValueError):
+        return _GIVE_UP
+    return f"n{values.shape}{hashlib.sha1(values.tobytes()).hexdigest()}"
 
 
 def _digest_value(value, depth=0):
@@ -77,7 +100,15 @@ def _digest_value(value, depth=0):
     if isinstance(value, np.ndarray):
         if value.dtype == object:
             return _digest_value(value.tolist(), depth + 1)
+        if value.dtype.kind in "fiu":
+            return _digest_numbers(value)
         return f"a{value.shape}{hashlib.sha1(value.tobytes()).hexdigest()}"
+    if isinstance(value, (list, tuple)) and _all_numbers(value):
+        # 数字序列一律按 float64 数组摘要，容器类型不参与。包里存的预热对数
+        # 收益是 list，实跑时是 ndarray，同一串数走两条分支就会算出不同的
+        # key——载入结果包后 realized σ 候选因此**永远**命中不了缓存，每次
+        # 下钻都在重算。装在 list 还是 ndarray 里不影响回测结果，不该换 key。
+        return _digest_numbers(value)
     if isinstance(value, (list, tuple, set, frozenset)):
         items = sorted(value, key=repr) if isinstance(
             value, (set, frozenset)) else value
@@ -167,6 +198,69 @@ def key_for(spec, strategy_name):
     return hashlib.sha256(material.encode("utf-8")).hexdigest()[:32]
 
 
+# 快照配方里唯一不影响回测数字的键。它是展示元数据——重放时由配方原样塞
+# 回 ``bt._gui_meta``，不参与任何计算。算进 key 只会凭空制造 miss。名单要
+# 短，且每一项都要能说出为什么无关（与 ``_IGNORED_ATTRS`` 同一条纪律）。
+_RECIPE_IGNORED_KEYS = frozenset({"gui_meta"})
+
+
+def key_for_recipe(recipe):
+    """把结果池快照的重放配方压成 key；刻画不全时返回 ``None``。
+
+    与 ``key_for`` 同样保守失败：宁可白跑一次，也不能读到不匹配的结果。
+    配方本身已经是可序列化的纯数据（它要进快照包），所以直接摘它，不必像
+    ``HistoryReplaySpec`` 那样枚举对象属性。
+
+    价格与时间戳单独哈希：一条序列几千个点，走 ``_digest_value`` 会先拼出
+    一个几百 KB 的中间字符串，白费内存。
+    """
+    if not recipe:
+        return None
+    try:
+        body = dict(recipe)
+    except (TypeError, ValueError):
+        return None
+    prices = body.pop("prices", None)
+    index = body.pop("index", None)
+    for name in _RECIPE_IGNORED_KEYS:
+        body.pop(name, None)
+    try:
+        values = np.asarray(list(prices or ()), dtype=float)
+    except (TypeError, ValueError):
+        return None
+    if values.size < 2:
+        return None
+    if index is None:
+        stamps = "noindex"
+    else:
+        try:
+            joined = "\u0000".join(str(item) for item in index)
+        except TypeError:
+            return None
+        stamps = (f"{len(index)}|"
+                  f"{hashlib.sha1(joined.encode('utf-8')).hexdigest()}")
+    rest = _digest_value(body)
+    if rest is _GIVE_UP:
+        return None
+    material = "\n".join([
+        "recipe",
+        f"{values.size}|{hashlib.sha1(values.tobytes()).hexdigest()}",
+        stamps,
+        rest,
+    ])
+    return hashlib.sha256(material.encode("utf-8")).hexdigest()[:32]
+
+
+def store_recipe(recipe, result, *, directory=None):
+    """按快照配方落盘一次回测的 bar 级结果。"""
+    return store_by_key(key_for_recipe(recipe), result, directory=directory)
+
+
+def load_recipe(recipe, *, directory=None):
+    """按快照配方读回 bar 级结果；未命中返回 None（调用方重跑即可）。"""
+    return load_by_key(key_for_recipe(recipe), directory=directory)
+
+
 def _paths(key, directory=None):
     directory = directory or cache_dir()
     stem = os.path.join(directory, key)
@@ -178,8 +272,13 @@ def store(spec, strategy_name, result, *, directory=None):
 
     缓存写失败绝不能让主流程出错——它只是省时间的东西，没有它一切照常。
     """
+    return store_by_key(
+        key_for(spec, strategy_name), result, directory=directory)
+
+
+def store_by_key(key, result, *, directory=None):
+    """按已算好的 key 落盘。``key`` 为 None 表示这次不缓存，直接返回 None。"""
     directory = directory or cache_dir()
-    key = key_for(spec, strategy_name)
     if key is None:
         return None
     npz_path, meta_path = _paths(key, directory)
@@ -236,7 +335,11 @@ def _jsonable_scalars(scalars):
 
 def load(spec, strategy_name, *, directory=None):
     """读回一段结果；未命中或文件损坏时返回 None（调用方重跑即可）。"""
-    key = key_for(spec, strategy_name)
+    return load_by_key(key_for(spec, strategy_name), directory=directory)
+
+
+def load_by_key(key, *, directory=None):
+    """按已算好的 key 读回；未命中、损坏或 key 为 None 时返回 None。"""
     if key is None:
         return None
     npz_path, meta_path = _paths(key, directory)

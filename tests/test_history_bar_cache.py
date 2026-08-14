@@ -260,3 +260,47 @@ def test_cache_dir_sits_under_the_disposable_cache_root():
     assert "cache" in bars
     assert bars != results
     assert not bars.startswith(results + os.sep)
+
+
+def test_option_subtypes_do_not_share_a_key():
+    """``optiontype`` 必须进摘要——它是定价方法的分派键，不是展示标签。
+
+    Option_AB/DE/SNB 走 ``getattr(self, self.optiontype)()``，Option_AS 走
+    ``match self.optiontype``。只有 Option_Vanilla 从不读它，而那条特例一度
+    被当成通例写进 ``_IGNORED_ATTRS``：实测 Option_DE 的 13 个子类型算出同
+    一个 digest，谁先跑完谁的 bar 级数组就被另外 12 个读走，且不报错。
+    """
+    from pricing.Option_DE import Option_DE
+
+    subtypes = [n for n in dir(Option_DE) if n.startswith("Opt_")]
+    assert len(subtypes) > 1, subtypes
+    digests = {}
+    for subtype in subtypes:
+        option = Option_DE(
+            subtype, s0=100.0, sr=[], K=100.0, T_over=20, T_days=20,
+            observ=[], sigma=0.18, H=110.0, N=1, cp=1, r=0.03, q=0.03,
+            nPath=10, fix=0.0, P=100.0, amount=1)
+        digest = cache._digest_object(option)
+        assert digest is not None, subtype
+        digests[subtype] = digest
+    assert len(set(digests.values())) == len(subtypes), (
+        f"{len(subtypes)} 个子类型只算出 {len(set(digests.values()))} 个摘要")
+
+
+def test_number_sequences_digest_the_same_in_any_container():
+    """同一串数装在 list 还是 ndarray 里必须算出同一个摘要。
+
+    结果包把预热对数收益存成 list，实跑时它是 ndarray。两条分支各摘各的，
+    载入包之后 realized σ 候选就**永远**命中不了缓存——不是错数据，是每次
+    下钻都白跑一次。容器类型不影响回测结果，不该换 key。
+    """
+    values = [0.011, -0.004, 0.0072]
+    assert (cache._digest_value(np.asarray(values))
+            == cache._digest_value(values))
+    assert (cache._digest_value(tuple(values))
+            == cache._digest_value(values))
+    # 但数变了必须换 key，bool 也不能被当成 0/1 混进来。
+    assert cache._digest_value([0.011, -0.004]) != cache._digest_value(
+        [0.011, -0.005])
+    assert cache._digest_value([True, False]) != cache._digest_value(
+        [1.0, 0.0])
