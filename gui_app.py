@@ -22,7 +22,18 @@ from tkinter import ttk, filedialog, messagebox, simpledialog
 import tkinter.font as tkfont
 import numpy as np
 import matplotlib
-matplotlib.use("TkAgg")
+# 拿不到窗口服务器时（CI 的 headless Linux、无 DISPLAY 的批处理调用），
+# TkAgg 会抛 ImportError："Cannot load backend 'TkAgg' ... as 'headless' is
+# currently running"。回退到 Agg 只为让 **import 本身**成功——真要画图的那批
+# 测试仍在 xvfb 下跑，那时 DISPLAY 有效，选中的照样是 TkAgg。
+#
+# 这里不回退的话，`pytest -m "not gui"` 也救不了：marker 要把模块 import 完
+# 才读得到，而炸点恰恰就在 import gui_app 这一步，于是连一条纯逻辑测试都收集
+# 不起来（实测 CI 上 4 个模块全部 collection error）。
+try:
+    matplotlib.use("TkAgg")
+except ImportError:
+    matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib import font_manager
 
