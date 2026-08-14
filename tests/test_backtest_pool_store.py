@@ -204,3 +204,136 @@ def test_view_state_round_trip(tmp_path):
 def test_corrupt_view_state_degrades_to_nothing_selected(tmp_path):
     (tmp_path / "view_state.json").write_text("{ 坏文件", encoding="utf-8")
     assert store.read_view_state(str(tmp_path)) == set()
+
+
+def test_string_arrays_survive_the_round_trip():
+    """非数值数组曾经**写得进读不出**：包在盘上，载入时抛 ValueError。
+
+    ``decode`` 一律按 float 还原，而 ``encode`` 对任意 dtype 都打同一个标
+    签。结果是快照写盘成功、下次启动 ``_payload_to_snapshot`` 抛
+    ValueError，这一条被记成「字段无法还原」丢掉，随后还会被上限淘汰。
+    """
+    original = np.array(["段一", "段二"])
+    back = store.decode(store.encode(original))
+    assert list(back) == ["段一", "段二"]
+    # 数值数组仍旧按数值还原，不能因为记了 dtype 就变成 object。
+    floats = store.decode(store.encode(np.array([1.5, 2.5])))
+    assert floats.dtype.kind == "f"
+    assert list(floats) == [1.5, 2.5]
+
+
+def test_object_arrays_do_not_explode_at_json_dumps():
+    """arr 分支曾是唯一不过滤 ``_DROP`` 的容器，哨兵一路带到 json.dumps。
+
+    其余三个容器都过滤了。漏这一个的后果就是 ``_DROP`` 存在的理由本身：
+    「只在顶层判 callable 会让它一路走到 json.dumps 才炸」。
+    """
+    encoded = store.encode({"x": np.array([1.0, len], dtype=object)})
+    text = json.dumps(encoded, ensure_ascii=False)
+    assert "1.0" in text
+
+
+def test_series_and_index_survive_the_round_trip():
+    """DataFrame 早就逐类型往返了，Series / Index 却被无声丢掉。"""
+    series = pd.Series([1.0, 2.0], index=pd.Index([10, 20], name="trade_day"),
+                       name="净损益")
+    back = store.decode(store.encode(series))
+    assert isinstance(back, pd.Series)
+    assert list(back) == [1.0, 2.0]
+    assert list(back.index) == [10, 20]
+    assert back.index.name == "trade_day"
+    assert back.name == "净损益"
+
+    stamps = pd.DatetimeIndex(["2026-05-20 09:30", "2026-05-20 09:31"])
+    restored = store.decode(store.encode(stamps))
+    assert isinstance(restored, pd.DatetimeIndex)
+    assert list(restored) == list(stamps)
+
+
+def test_non_string_dict_keys_survive_the_round_trip():
+    """键被 ``str()`` 掉会让重放配方在重开程序前后算出两个缓存 key。
+
+    ``history_bar_cache.key_for_recipe`` 直接摘这份配方，{1: …} 往返成
+    {"1": …} 之后摘要不同——同一条快照「刚保留」时命中的缓存，重开程序后
+    永远命中不了，加载明细每次都要重跑 620 ms 且无从察觉。
+    """
+    original = {"warmup": {1: 0.5, 2: 0.25}, "文字键": "照旧"}
+    assert store.decode(store.encode(original)) == original
+
+
+@pytest.mark.parametrize("text", ["[1, 2]", '{"selected": 3}', '"字符串"'])
+def test_view_state_that_is_not_an_object_degrades_to_nothing_selected(
+        tmp_path, text):
+    """合法 JSON 但形状不对时也只能回到「全部隐藏」。
+
+    ``payload.get`` 对数组抛 AttributeError，集合推导对数字抛 TypeError，
+    两者都不在原来的 (OSError, ValueError) 里。而调用方那一句在保护
+    ``read_all`` 的 try 之外，漏出去会让整池结果都载不进来。
+    """
+    (tmp_path / "view_state.json").write_text(text, encoding="utf-8")
+    assert store.read_view_state(str(tmp_path)) == set()
+
+
+def test_limit_does_not_read_any_package_while_under_the_cap(
+        tmp_path, monkeypatch):
+    """没到上限时一个包都不该解压。
+
+    ``write_snapshot`` 每存一条就调一次 enforce_limit，而 read_all 会把每个
+    包（各带一整条价格序列）gunzip + json.load 一遍：实测 20 份一年 1 分钟
+    序列的包，光这一趟就 0.14 s，每次「保留结果」都白付。
+    """
+    for seq in range(1, 4):
+        store.write_snapshot(_payload(seq), directory=str(tmp_path))
+
+    calls = []
+    original = store.read_all
+
+    def _counted(directory=None):
+        calls.append(directory)
+        return original(directory)
+
+    monkeypatch.setattr(store, "read_all", _counted)
+    assert store.enforce_limit(directory=str(tmp_path)) == []
+    assert calls == []
+
+
+def test_limit_orders_by_filename_and_matches_the_authoritative_order(
+        tmp_path, monkeypatch):
+    """满池时也不该解压任何包——而结果池稳态就是满的。
+
+    文件名是 ``default_filename`` 拿 payload 的 sequence 与 saved_at 拼出来
+    的，顺序由构造保证一致。这里同时钉死「淘汰结果与读包定序完全一致」，
+    免得哪天文件名格式改了、顺序悄悄换成字典序（1, 10, 11, 2 …）。
+    """
+    for seq in (3, 1, 12, 2, 11):
+        store.write_snapshot(_payload(seq), directory=str(tmp_path),
+                             enforce=False)
+
+    def _forbidden(directory=None):
+        raise AssertionError("满池淘汰不该读包")
+
+    monkeypatch.setattr(store, "read_all", _forbidden)
+    evicted = store.enforce_limit(3, directory=str(tmp_path))
+
+    assert len(evicted) == 2
+    monkeypatch.undo()
+    payloads, _skipped = store.read_all(str(tmp_path))
+    assert [item["sequence"] for item in payloads] == [3, 11, 12]
+
+
+def test_limit_falls_back_to_reading_when_a_name_is_unrecognisable(tmp_path):
+    """名字认不出来时必须退回读包定序，绝不按名字猜着删。"""
+    paths = [store.write_snapshot(_payload(seq), directory=str(tmp_path),
+                                  enforce=False)
+             for seq in (1, 2, 3)]
+    stray = tmp_path / ("我自己改的名字" + store._SUFFIX)
+    stray.write_bytes(b"not gzip")
+
+    evicted = store.enforce_limit(2, directory=str(tmp_path))
+
+    # 走的是 read_all 那条路：坏包不在 payloads 里，于是淘汰的是包内序号最
+    # 小的那份，而认不出的文件原样留着——没有按文件名猜着删。
+    assert evicted == [paths[0]]
+    assert stray.exists()
+    payloads, _skipped = store.read_all(str(tmp_path))
+    assert [item["sequence"] for item in payloads] == [2, 3]

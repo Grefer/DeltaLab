@@ -527,11 +527,20 @@ STRATEGY_CHART_COLORS = (
     "#9333EA", "#C2410C", "#4F46E5", "#047857",
 )
 STRATEGY_CHART_MARKERS = ("o", "s", "^", "D", "v", "P", "X", "<", ">", "h")
-# 同一策略的多条结果共用颜色（跨页同色是有意的），组内靠线型分开。换区间、
-# 换行情、换方向重跑同一个策略恰恰是结果对比页的头号用途，不分开的话一勾多
-# 条就是一团完全同色的线。
+# 同一策略的多条结果共用**色相**（跨页同色是有意的），组内靠明度加线型分开。
+# 换区间、换行情、换方向重跑同一个策略恰恰是结果对比页的头号用途，不分开的话
+# 一勾多条就是一团完全同色的线。
 STRATEGY_CHART_DASHES = (
     "solid", (0, (5, 2)), (0, (1, 1.4)), (0, (7, 2, 1.5, 2)))
+# 组内明度档：原色 / 提亮 / 压暗。正数往白里混，负数往黑里压。
+#
+# **只要三档**是因为线型有四种，3 与 4 互质，(明度, 线型) 的组合到第 12 条才
+# 重复，而图上最多同时画 8 条（MAX_COMPARISON_CHART_CURVES）——够用了。档数少
+# 才调得开：实测六种基色下三档的最小亮度差是 34，摊成八档只剩 8，那种深浅在
+# 691×226 px 的画布上根本读不出来。相邻两条因此明度与线型必定同时不同。
+#
+# 第 0 档恒为原色：跨页对照靠同一策略的第一条与策略优选页严格同色。
+STRATEGY_CHART_SHADES = (0.0, 0.34, -0.40)
 # 对比图同时画的曲线上限。指标表不受限——20 行照排照导，「全选 → 点列头
 # 排序 → 看第一行」这条路要留着；闸门只加在图上：691×226 px 的画布、12 色取
 # 模，20 条叠上去谁也认不出谁。数字与策略优选页的
@@ -5579,12 +5588,52 @@ class BacktestApp(tk.Tk):
         """
         try:
             path = backtest_pool_store.write_snapshot(
-                BacktestApp._snapshot_to_payload(snapshot))
+                BacktestApp._snapshot_to_payload(snapshot), enforce=False)
         except Exception as exc:                              # noqa: BLE001
             snapshot.store_path = ""
             return f"（未能写入本机：{exc}）"
         snapshot.store_path = path
-        return "并已保存到本机"
+        # 先写入再淘汰，顺序不能反（与 _save_history_result 同一条约定）：反
+        # 过来会在写失败时白删一份。自己调 enforce_limit 而不是让
+        # write_snapshot 代劳，是因为要拿到被淘汰的清单——store 那边的约定
+        # 就是「调用方应当把返回值报给用户」。
+        try:
+            evicted = backtest_pool_store.enforce_limit()
+        except Exception:                                     # noqa: BLE001
+            evicted = []
+        return "并已保存到本机" + BacktestApp._forget_evicted_snapshots(
+            self, evicted)
+
+    def _forget_evicted_snapshots(self, evicted_paths):
+        """把已淘汰出磁盘的快照同步移出内存池，返回一句状态栏后缀。
+
+        内存池此前不受 ``MAX_RESULTS`` 约束，只有磁盘受。存到第 21 条时盘上
+        第 1 条已经被删，标签页却仍写着 (21)、对比页也仍列着它——用户重开程
+        序才发现少了一条，而那时已无从追查。留在内存里还有第二个后果：重命
+        名它会走 ``write_snapshot(path=...)`` 把文件原样写回来，目录随即又超
+        出上限。
+
+        删除不可逆，即使是按规则删的也必须说一声。
+        """
+        paths = {str(path) for path in (evicted_paths or ()) if path}
+        if not paths:
+            return ""
+        dropped = [
+            snapshot for snapshot in self._saved_backtests.values()
+            if str(getattr(snapshot, "store_path", "") or "") in paths
+        ]
+        for snapshot in dropped:
+            self._saved_backtests.pop(snapshot.result_id, None)
+            self._saved_comparison_selection.discard(snapshot.result_id)
+            if getattr(self, "_latest_retained_result_id", None) == (
+                    snapshot.result_id):
+                self._latest_retained_result_id = None
+        if not dropped:
+            return ""
+        names = "、".join(str(snapshot.name) for snapshot in dropped[:3])
+        more = f" 等 {len(dropped)} 条" if len(dropped) > 3 else ""
+        return (f"；已达上限 {backtest_pool_store.MAX_RESULTS} 条，"
+                f"淘汰最旧的「{names}」{more}")
 
     def _load_saved_pool(self):
         """启动时载入结果池，并把序号推到已有最大值之后。
@@ -8154,30 +8203,46 @@ class BacktestApp(tk.Tk):
         self._update_comparison_selection()
 
     @staticmethod
-    def _lighten_hex(color, step):
-        """把颜色往浅里推 ``step`` 档；0 档原样返回。
+    def _shift_hex(color, step):
+        """把颜色挪到 ``STRATEGY_CHART_SHADES`` 的第 ``step`` 档明度。
 
-        0 档必须原样：同一策略的第一条曲线要与策略优选页严格同色，跨页对照
-        靠的就是这一点，只有它之后的同策略结果才允许挪明度。
+        0 档原样返回：同一策略的第一条曲线要与策略优选页严格同色，跨页对照
+        靠的就是这一点。
+
+        既提亮也压暗，不是一味往浅里推：单向变浅到第三档就接近白色，在浅色
+        画布上直接看不见了；一深一浅在同一色相里既拉得开距离，又不会跑出
+        "这是蓝色系那一组"的识别。
         """
-        if step <= 0:
+        ratio = STRATEGY_CHART_SHADES[step % len(STRATEGY_CHART_SHADES)]
+        if not ratio:
             return color
         try:
             channels = [int(color[index:index + 2], 16) for index in (1, 3, 5)]
         except (TypeError, ValueError, IndexError):
+            # 不是 #RRGGBB（例如 matplotlib 的 "tab:blue"）：挪不动就原样退回，
+            # 曲线宁可同色也不能画不出来。
             return color
-        ratio = min(0.55, 0.22 * step)
+        if ratio > 0:
+            return "#" + "".join(
+                f"{int(round(value + (255 - value) * ratio)):02X}"
+                for value in channels)
         return "#" + "".join(
-            f"{int(round(value + (255 - value) * ratio)):02X}"
-            for value in channels)
+            f"{int(round(value * (1 + ratio))):02X}" for value in channels)
 
     def _comparison_curve_styles(self, style_keys):
         """定出每条曲线的颜色与线型，返回两张映射表。
 
-        颜色仍按策略身份取——同一策略在优选页与本页同色是有意设计。代价是
-        同策略跑多次时那几条会拿到**完全相同**的颜色，而"同一策略换区间、换
-        行情、换方向各跑一次"正是本页的头号用途；一勾多条就是一团分不开的同
-        色线。所以组内再按出现顺序换线型，线型用完一轮才动明度。
+        色相按策略身份取——同一策略在优选页与本页同色是有意设计。但"同一策略
+        换区间、换行情、换方向各跑一次"正是本页的头号用途，同组因此常有好几
+        条，光靠色相是分不开的。
+
+        所以组内**明度与线型逐条同时变**。此前明度是每四条才升一档
+        （``index // 4``），于是前四条严格同色、区分全压在线型上——而虚线与点
+        划线在 691×226 px 的画布上、细线宽的密集 PnL 曲线里基本读不出来，实测
+        八条同策略只得到两种颜色。改成逐条变之后是八种。
+
+        3 档明度与 4 种线型互质，组合到第 12 条才重复，图上最多 8 条，够用；
+        相邻两条则必定明度与线型同时不同。
         """
         colors, dashes = {}, {}
         seen = {}
@@ -8188,8 +8253,7 @@ class BacktestApp(tk.Tk):
             seen[key] = index + 1
             dashes[name] = STRATEGY_CHART_DASHES[
                 index % len(STRATEGY_CHART_DASHES)]
-            colors[name] = BacktestApp._lighten_hex(
-                base, index // len(STRATEGY_CHART_DASHES))
+            colors[name] = BacktestApp._shift_hex(base, index)
         return colors, dashes
 
     @staticmethod

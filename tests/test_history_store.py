@@ -841,3 +841,63 @@ def test_conflicting_segments_are_split_even_without_contract_codes():
         got = series_by_key[key].loc[original.index[0]:original.index[-1]]
         assert np.array_equal(got.to_numpy(), original.to_numpy()), (
             window_id, list(got.to_numpy()), list(original.to_numpy()))
+
+
+def test_delete_result_reports_failure_instead_of_raising(tmp_path,
+                                                          monkeypatch):
+    """删不掉要返回 False，不能把异常甩给保存流程。
+
+    只接 FileNotFoundError 是不够的：只读文件或被占用会抛 PermissionError，
+    它从 enforce_limit 一路冒到保存流程的 except，弹出「保存失败」——而
+    save_result 早就把包写进盘了。用户被告知 85 秒跑出来的结果没保存，实际
+    它就在目录里。
+    """
+    path = _save(tmp_path)
+    _save(tmp_path)
+
+    def _denied(_target):
+        raise PermissionError("只读")
+
+    monkeypatch.setattr(store.os, "remove", _denied)
+    assert store.delete_result(path) is False
+
+    # 淘汰阶段同样不能炸：它在 save_result 写盘成功**之后**才跑，异常冒出去
+    # 会让用户看到「保存失败」，而包已经在目录里了。
+    assert store.enforce_limit(1, directory=str(tmp_path)) == []
+    assert len(store.list_results(str(tmp_path))) == 2
+
+
+def test_listing_verdict_skips_rows_without_a_rank(tmp_path):
+    """缺名次的行必须跳过，不能落成 0 去压过真正的第 1 名。
+
+    ``_jsonable`` 把 NaN 写成 null，读回来是 None，``None or 0`` 得到 0——
+    而选优取 rank 最小者，于是一行没有名次的记录稳定压过第 1 名，列表的
+    「结论」列报出一个落败候选。
+    """
+    ranking = pd.DataFrame([
+        {"lookback": "year", "lookback_days": 243, "rank": 1,
+         "strategy": "固定间隔(1σ)", "strategy_type": "hedge_band",
+         "recommendation_eligible": True},
+        {"lookback": "year", "lookback_days": 243, "rank": np.nan,
+         "strategy": "固定时刻(10:30)", "strategy_type": "fixed_times",
+         "recommendation_eligible": True},
+    ])
+
+    path = _save(tmp_path, ranking=ranking)
+    item = next(i for i in store.list_results(str(tmp_path))
+                if i["path"] == path)
+
+    assert item["verdict"] == "固定间隔(1σ)"
+
+
+def test_limit_does_not_peek_any_package_while_under_the_cap(tmp_path,
+                                                             monkeypatch):
+    """没到上限时一份都不该读。实测 _peek 约 9 ms/份、30 份 272 ms。"""
+    _save(tmp_path)
+    _save(tmp_path)
+
+    calls = []
+    monkeypatch.setattr(store, "list_results",
+                        lambda directory=None: calls.append(directory) or [])
+    assert store.enforce_limit(10, directory=str(tmp_path)) == []
+    assert calls == []

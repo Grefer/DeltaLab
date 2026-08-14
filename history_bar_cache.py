@@ -60,9 +60,15 @@ _IGNORED_ATTRS = frozenset({
 
 
 def _all_numbers(seq):
-    """序列是否全是数字（bool 不算——它是 int 的子类但语义不同）。"""
+    """序列是否全是数字（bool 不算——它是 int 的子类但语义不同）。
+
+    空序列算「全是数字」。它没有元素可分类，而下面那条 list/ndarray 等价
+    规则必须一路成立到长度 0：曾经返回 False，于是空 list 走通用分支得到
+    ``"[]"``、空 ndarray 走数值分支得到 ``n(0,)…``，同一个「预热没凑够天
+    数」的分段在实跑与载入包之后算出两个 key，永远命中不了缓存。
+    """
     if not len(seq):
-        return False
+        return True
     return all(
         isinstance(item, (int, float, np.integer, np.floating))
         and not isinstance(item, (bool, np.bool_))
@@ -278,9 +284,14 @@ def store(spec, strategy_name, result, *, directory=None):
 
 def store_by_key(key, result, *, directory=None):
     """按已算好的 key 落盘。``key`` 为 None 表示这次不缓存，直接返回 None。"""
-    directory = directory or cache_dir()
     if key is None:
         return None
+    # 空结果不进缓存。它没有任何可省的东西，却会在盘上留下一条「命中」——
+    # load 只用 ``is None`` 判命中，读回来的 {} 会被调用方当成有效结果塞进
+    # ``bt._results``，明细页于是全空且不报错。
+    if not result:
+        return None
+    directory = directory or cache_dir()
     npz_path, meta_path = _paths(key, directory)
     # npz 只认 ndarray，pandas 的容器类型进去就化成裸数组了。把原始容器类
     # 型单独记下来，load 才能还原成**与真跑逐位且同型**的结果——本模块开
@@ -302,20 +313,36 @@ def store_by_key(key, result, *, directory=None):
             containers[str(name)] = "index"
         else:
             scalars[str(name)] = value
+    # **sidecar 必须先于 npz 落地。** 一条缓存由两个文件组成，而 load 只看
+    # npz 在不在。反过来写的话，崩在两次写之间（或 meta 写失败）会留下一条
+    # 「npz 有、meta 没有」的条目，它照样被判成命中，读回来却缺了全部标量
+    # 字段、pandas 容器类型也退化成裸数组——正是本模块承诺绝不发生的「读到
+    # 不匹配的结果」。npz 最后发布，条目就只在两半都齐了之后才可见。
     try:
         os.makedirs(directory, exist_ok=True)
-        tmp = npz_path + ".part"
-        np.savez_compressed(tmp, **arrays)
-        # np.savez 会补 .npz 后缀，这里统一回目标名再原子替换。
-        produced = tmp if os.path.exists(tmp) else tmp + ".npz"
-        os.replace(produced, npz_path)
-        with open(meta_path, "w", encoding="utf-8") as handle:
+        meta_tmp = meta_path + ".part"
+        with open(meta_tmp, "w", encoding="utf-8") as handle:
             json.dump(
                 {"scalars": _jsonable_scalars(scalars),
                  "containers": containers,
                  "written_at": time.time()},
                 handle, ensure_ascii=False)
+        os.replace(meta_tmp, meta_path)
     except Exception:                                  # noqa: BLE001
+        return None
+    try:
+        tmp = npz_path + ".part"
+        np.savez_compressed(tmp, **arrays)
+        # np.savez 会补 .npz 后缀，这里统一回目标名再原子替换。
+        produced = tmp if os.path.exists(tmp) else tmp + ".npz"
+        os.replace(produced, npz_path)
+    except Exception:                                  # noqa: BLE001
+        # 数组没写成，留着的 meta 是条无主记录：load 看不到它（没有 npz），
+        # 但它会一直占着盘，顺手清掉。
+        try:
+            os.remove(meta_path)
+        except OSError:
+            pass
         return None
     return npz_path
 
@@ -354,19 +381,21 @@ def load_by_key(key, *, directory=None):
     if key is None:
         return None
     npz_path, meta_path = _paths(key, directory)
-    if not os.path.isfile(npz_path):
+    # 两个文件缺一不可。**缺 meta 不是「老条目」而是残条目**：标量字段全在
+    # 里面，少了它读回来的是一份静默残缺的结果。写入侧现在保证 npz 最后落
+    # 地，所以这种组合只可能来自旧版本写下的、或写到一半崩掉的条目——一律
+    # 判未命中，重跑 620 ms 换一份完整的。
+    if not os.path.isfile(npz_path) or not os.path.isfile(meta_path):
         return None
     try:
         result = {}
         with np.load(npz_path, allow_pickle=False) as bundle:
             for name in bundle.files:
                 result[name] = bundle[name]
-        containers = {}
-        if os.path.isfile(meta_path):
-            with open(meta_path, encoding="utf-8") as handle:
-                meta = json.load(handle)
-            result.update(dict(meta.get("scalars", {})))
-            containers = dict(meta.get("containers", {}))
+        with open(meta_path, encoding="utf-8") as handle:
+            meta = json.load(handle)
+        result.update(dict(meta.get("scalars", {})))
+        containers = dict(meta.get("containers", {}))
         # 还原 pandas 容器类型。缺 containers 的是本字段之前写下的老条目，
         # 保持 ndarray 与旧行为一致（摘要改过之后它们本就不该再被命中）。
         for name, kind in containers.items():
@@ -380,7 +409,9 @@ def load_by_key(key, *, directory=None):
         os.utime(npz_path, None)
     except Exception:                                  # noqa: BLE001
         return None
-    return result
+    # 空结果与未命中同义。调用方只判 ``is None``，返回 {} 会被当成有效结果
+    # 塞进 ``bt._results``，明细页全空且不报错。
+    return result or None
 
 
 def usage_bytes(directory=None):

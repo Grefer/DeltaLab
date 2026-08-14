@@ -10,6 +10,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
+import backtest_pool_store
 import gui_app
 import history_selection
 import history_bar_cache
@@ -2665,23 +2666,91 @@ def test_same_strategy_results_stay_telling_apart_on_the_chart():
 
         same = ["控制A", "控制B", "控制C"]
         assert len({dashes[name] for name in same}) == 3, "同策略得靠线型分开"
-        assert len({colors[name] for name in same}) == 1, (
-            "头几条同策略仍共用颜色，成组才看得出是同一个策略")
-        assert colors["控制A"] == app._strategy_style("close_to_close")[0]
+        # 同策略也要逐条换明度。此前是每四条才升一档，前四条严格同色、区分全
+        # 压在线型上——而虚线与点划线在这块画布的细线宽下基本读不出来。
+        assert len({colors[name] for name in same}) == 3, (
+            "同策略的几条必须颜色也不同，只靠线型分不开")
+        assert colors["控制A"] == app._strategy_style("close_to_close")[0], (
+            "每组第一条仍要与策略优选页严格同色，跨页对照靠的就是这一点")
         assert colors["带宽"] != colors["控制A"], "不同策略本来就该不同色"
     finally:
         app.destroy()
 
 
-def test_lighten_only_kicks_in_after_the_dash_cycle_runs_out():
-    """线型先用完一轮才动明度；0 档必须原样返回。"""
+def _relative_luminance(color):
+    channels = [int(color[index:index + 2], 16) for index in (1, 3, 5)]
+    return 0.2126 * channels[0] + 0.7152 * channels[1] + 0.0722 * channels[2]
+
+
+def test_shade_ladder_alternates_light_and_dark_around_the_base_colour():
+    """明度档要一深一浅围着原色走，0 档原样返回。
+
+    一味往浅里推的话第三档就接近白色，浅色画布上直接看不见了——此前那版
+    正是单向变浅，而且要等线型用完一轮（每四条）才升一档。
+    """
     base = "#2563EB"
-    assert BacktestApp._lighten_hex(base, 0) == base
-    lighter = BacktestApp._lighten_hex(base, 1)
-    assert lighter != base
-    assert int(lighter[1:3], 16) > int(base[1:3], 16)
+    assert BacktestApp._shift_hex(base, 0) == base
+
+    lighter = BacktestApp._shift_hex(base, 1)
+    darker = BacktestApp._shift_hex(base, 2)
+    assert _relative_luminance(lighter) > _relative_luminance(base)
+    assert _relative_luminance(darker) < _relative_luminance(base)
+
+    # 档位循环：3 档与 4 种线型互质，组合到第 12 条才重复。
+    assert BacktestApp._shift_hex(base, 3) == base
+    assert len(gui_app.STRATEGY_CHART_SHADES) == 3
+    assert math.gcd(len(gui_app.STRATEGY_CHART_SHADES),
+                    len(gui_app.STRATEGY_CHART_DASHES)) == 1
+
     # 非法输入不能把整张图带崩，原样退回即可。
-    assert BacktestApp._lighten_hex("tab:blue", 2) == "tab:blue"
+    assert BacktestApp._shift_hex("tab:blue", 2) == "tab:blue"
+
+
+def test_shade_ladder_stays_legible_across_every_palette_colour():
+    """三档明度在每种基色下都要拉得开，且不会浅到看不见或黑成一团。
+
+    档数少正是为了调得开：摊成八档时最小亮度差只剩 8，那种深浅在
+    691×226 px 的画布上根本读不出来。
+    """
+    for base in gui_app.STRATEGY_CHART_COLORS:
+        shades = [
+            BacktestApp._shift_hex(base, step)
+            for step in range(len(gui_app.STRATEGY_CHART_SHADES))
+        ]
+        assert len(set(shades)) == len(shades), f"{base} 的档位撞色"
+        lums = sorted(_relative_luminance(color) for color in shades)
+        gaps = [high - low for low, high in zip(lums, lums[1:])]
+        assert min(gaps) >= 25, f"{base} 相邻档太接近：{gaps}"
+        # 白底上太浅会消失，压过头则糊成一团黑。
+        assert lums[-1] <= 215, f"{base} 最浅档看不见"
+        assert lums[0] >= 20, f"{base} 最深档糊成黑"
+
+
+def test_same_strategy_curves_never_repeat_a_colour_dash_pairing():
+    """八条同策略曲线各有独一无二的 (颜色, 线型)，且相邻两条两样都不同。
+
+    区分力来自 3 档明度与 4 种线型的**组合**（互质，到第 12 条才重复），不是
+    八种颜色——八档明度实测最小亮度差只剩 8，在 691×226 px 的画布上读不出来。
+    此前明度是 ``index // 4``，前四条严格同色、区分全压在线型上，而虚线与点
+    划线在细线宽的密集 PnL 曲线里分不出来。
+    """
+    app = _comparison_app()
+    try:
+        app._comparison_daily_curves = {f"第{i}条": None for i in range(8)}
+        keys = {name: "close_to_close" for name in app._comparison_daily_curves}
+        colors, dashes = BacktestApp._comparison_curve_styles(app, keys)
+
+        ordered = list(app._comparison_daily_curves)
+        pairs = [(colors[name], str(dashes[name])) for name in ordered]
+        assert len(set(pairs)) == 8, "(颜色, 线型) 组合不得重复"
+        assert len(set(colors.values())) == len(gui_app.STRATEGY_CHART_SHADES)
+
+        # 相邻两条必定同时换明度与线型——挨着画的那两条最容易看混。
+        for left, right in zip(ordered, ordered[1:]):
+            assert colors[left] != colors[right], f"{left}/{right} 同色"
+            assert dashes[left] != dashes[right], f"{left}/{right} 同线型"
+    finally:
+        app.destroy()
 
 
 def test_deleting_a_multi_row_selection_takes_all_their_files(monkeypatch):
@@ -3172,3 +3241,47 @@ def test_deleted_results_drop_out_of_the_restored_selection():
         assert reopened._saved_comparison_selection == {first.result_id}
     finally:
         reopened.destroy()
+
+
+def test_disk_eviction_is_mirrored_into_the_memory_pool_and_announced():
+    """磁盘淘汰必须同步到内存池，并且说一声。
+
+    内存池此前不受 ``MAX_RESULTS`` 约束，只有磁盘受：存到第 21 条时盘上第
+    1 条已被删，标签页却仍写着 (21)、对比页也仍列着它——用户重开程序才发现
+    少了一条，而那时已无从追查。留在内存里还有第二个后果：重命名它会走
+    ``write_snapshot(path=...)`` 把文件原样写回来，目录随即又超出上限。
+    """
+    evicted = _snapshot("result-0001", "最旧的一条")
+    evicted.store_path = "/tmp/pool/pool-20260715-120000-0001.json.gz"
+    kept = _snapshot("result-0002", "留下的一条")
+    kept.store_path = "/tmp/pool/pool-20260715-120001-0002.json.gz"
+    fake = SimpleNamespace(
+        _saved_backtests={evicted.result_id: evicted, kept.result_id: kept},
+        _saved_comparison_selection={evicted.result_id, kept.result_id},
+        _latest_retained_result_id=evicted.result_id,
+    )
+
+    note = BacktestApp._forget_evicted_snapshots(fake, [evicted.store_path])
+
+    assert list(fake._saved_backtests) == [kept.result_id]
+    assert fake._saved_comparison_selection == {kept.result_id}
+    assert fake._latest_retained_result_id is None
+    assert "最旧的一条" in note
+    assert str(backtest_pool_store.MAX_RESULTS) in note
+
+
+def test_nothing_evicted_means_no_status_noise():
+    """没淘汰任何东西时不能往状态栏挂一句空话。"""
+    kept = _snapshot("result-0002", "留下的一条")
+    kept.store_path = "/tmp/pool/pool-20260715-120001-0002.json.gz"
+    fake = SimpleNamespace(
+        _saved_backtests={kept.result_id: kept},
+        _saved_comparison_selection={kept.result_id},
+        _latest_retained_result_id=None,
+    )
+
+    assert BacktestApp._forget_evicted_snapshots(fake, []) == ""
+    # 淘汰了盘上一条本来就不在内存池里的（上次会话留下的），也不该报。
+    assert BacktestApp._forget_evicted_snapshots(
+        fake, ["/tmp/pool/别的.json.gz"]) == ""
+    assert list(fake._saved_backtests) == [kept.result_id]

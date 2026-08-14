@@ -332,3 +332,66 @@ def test_number_sequences_digest_the_same_in_any_container():
         [0.011, -0.005])
     assert cache._digest_value([True, False]) != cache._digest_value(
         [1.0, 0.0])
+
+
+def test_empty_number_sequences_digest_the_same_in_any_container():
+    """长度 0 也要守住上面那条等价规则。
+
+    ``_all_numbers`` 曾经对空序列返回 False，于是空 list 走通用分支得到
+    ``"[]"``、空 ndarray 走数值分支得到 ``n(0,)…``。预热没凑够天数的分段，
+    实跑给的是空 ndarray、载入结果包后给的是空 list，同一段因此**永远**命
+    中不了缓存——与上一条测试防的是同一个 bug，只是落在边界上。
+    """
+    assert (cache._digest_value(np.asarray([], dtype=float))
+            == cache._digest_value([]))
+    assert cache._digest_value(()) == cache._digest_value([])
+    # 空与非空仍然必须分开。
+    assert cache._digest_value([]) != cache._digest_value([0.0])
+
+
+def test_an_entry_missing_its_sidecar_is_a_miss_not_a_partial_hit(tmp_path):
+    """缺 meta 的条目必须判未命中：标量字段全在里面。
+
+    meta 里装着 position / steps_per_day / evaluation_days 这些标量，以及
+    pandas 容器类型的还原信息。此前 load 把「没有 meta」当成老条目照常返
+    回，于是崩在两次写之间留下的残条目会被判成命中，读回来是一份**静默残
+    缺**的结果——timestamps 从 DatetimeIndex 退化成裸数组，标量全没了，而
+    调用方直接把它塞进 ``bt._results``。
+    """
+    spec = _spec()
+    cache.store(spec, NAME, spec.replay(NAME)._results,
+                directory=str(tmp_path))
+    assert cache.load(spec, NAME, directory=str(tmp_path)) is not None
+
+    meta = [n for n in os.listdir(str(tmp_path)) if n.endswith(".json")][0]
+    os.remove(os.path.join(str(tmp_path), meta))
+
+    assert cache.load(spec, NAME, directory=str(tmp_path)) is None
+
+
+def test_the_npz_is_published_only_after_its_sidecar(tmp_path, monkeypatch):
+    """sidecar 写不成时不能留下一个「看起来命中」的 npz。
+
+    两个文件里只有 npz 决定命中与否，所以它必须最后落地。反过来写的话，
+    meta 写失败（磁盘满）会留下一条残条目，而且之后每次下钻都读它。
+    """
+    def _boom(*_args, **_kwargs):
+        raise OSError("磁盘满")
+
+    monkeypatch.setattr(cache.json, "dump", _boom)
+    spec = _spec()
+
+    assert cache.store(spec, NAME, spec.replay(NAME)._results,
+                       directory=str(tmp_path)) is None
+    assert not [n for n in os.listdir(str(tmp_path)) if n.endswith(".npz")]
+
+
+def test_empty_results_are_never_cached(tmp_path):
+    """空结果写进去就成了一条「命中」，读回来把明细页清空且不报错。
+
+    命中与否只看 ``is None``，返回 {} 会被 ``_replay_with_cache`` 与
+    ``_replay_saved_snapshot`` 当成有效结果直接塞进 ``bt._results``。
+    """
+    assert cache.store_by_key("空结果", {}, directory=str(tmp_path)) is None
+    assert os.listdir(str(tmp_path)) == []
+    assert cache.load_by_key("空结果", directory=str(tmp_path)) is None

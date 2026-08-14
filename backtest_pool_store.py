@@ -36,6 +36,7 @@ import gzip
 import json
 import math
 import os
+import re
 import sys
 
 import numpy as np
@@ -111,7 +112,38 @@ def encode(value):
             return {_TAG: "f", "v": "inf" if value > 0 else "-inf"}
         return value
     if isinstance(value, np.ndarray):
-        return {_TAG: "arr", "v": [encode(item) for item in value.tolist()]}
+        # dtype 必须记下来：解码侧曾经一律按 float 还原，于是字符串 / object
+        # 数组**写得进读不出**——包在盘上，载入时 np.asarray(['a'], float) 抛
+        # ValueError，整条快照被判「字段无法还原」而丢掉。
+        # ``_DROP`` 也要在这里过滤：其余三个容器都过滤了，只有这一条把哨兵
+        # 原样塞进列表，一路带到 json.dumps 才炸——那正是 _DROP 要避免的。
+        return {
+            _TAG: "arr",
+            "dtype": value.dtype.str,
+            "v": [item for item in (encode(v) for v in value.tolist())
+                  if item is not _DROP],
+        }
+    if isinstance(value, pd.Series):
+        # DataFrame 早就逐类型往返了，Series / Index 却没有分支，会一路落到
+        # 末尾的 _DROP 被容器无声丢掉——同一批 pandas 容器，两个存储层给了
+        # 不同答案（history_bar_cache.store_by_key 是逐类型显式处理的）。
+        return {
+            _TAG: "ser",
+            "index": [encode(item) for item in value.index.tolist()],
+            "index_name": (None if value.index.name is None
+                           else str(value.index.name)),
+            "name": None if value.name is None else str(value.name),
+            "v": [encode(item) for item in value.tolist()],
+        }
+    if isinstance(value, pd.Index):
+        # DatetimeIndex 是 Index 的子类，靠 kind 区分而不是靠分支顺序。
+        return {
+            _TAG: "idx",
+            "kind": ("datetimeindex" if isinstance(value, pd.DatetimeIndex)
+                     else "index"),
+            "name": None if value.name is None else str(value.name),
+            "v": [encode(item) for item in value.tolist()],
+        }
     if isinstance(value, tuple):
         return {
             _TAG: "tup",
@@ -127,8 +159,16 @@ def encode(value):
         pairs = []
         for key, item in value.items():
             converted = encode(item)
-            if converted is not _DROP:
-                pairs.append([str(key), converted])
+            if converted is _DROP:
+                continue
+            # 键也走 encode：``str(key)`` 会让 {1: …} 往返成 {"1": …}，而
+            # history_bar_cache.key_for_recipe 直接摘这份配方——同一条快照在
+            # 「刚保留」与「重开程序后」算出两个 key，加载明细每次都得重跑。
+            # 字符串键 encode 后仍是它自己，包格式对旧包保持一致。
+            encoded_key = encode(key)
+            if encoded_key is _DROP:
+                encoded_key = str(key)
+            pairs.append([encoded_key, converted])
         return {_TAG: "map", "v": pairs}
     if value is pd.NaT:
         return None
@@ -159,10 +199,31 @@ def decode(value):
     if tag == "tup":
         return tuple(decode(item) for item in value.get("v", ()))
     if tag == "arr":
-        return np.asarray(
-            [decode(item) for item in value.get("v", ())], dtype=float)
+        items = [decode(item) for item in value.get("v", ())]
+        # 包里记的 dtype 优先；旧包没这个字段，按老行为先试 float，装不下
+        # 再退到 object——比原来直接抛 ValueError 多救回一批旧包。
+        for dtype in ([value.get("dtype")] if value.get("dtype") else []) + [
+                float, object]:
+            try:
+                return np.asarray(items, dtype=dtype)
+            except (TypeError, ValueError):
+                continue
+        return np.asarray(items, dtype=object)
+    if tag == "ser":
+        series = pd.Series(
+            [decode(item) for item in value.get("v", ())],
+            name=value.get("name"))
+        index = [decode(item) for item in value.get("index", ())]
+        if len(index) == len(series):
+            series.index = pd.Index(index, name=value.get("index_name"))
+        return series
+    if tag == "idx":
+        items = [decode(item) for item in value.get("v", ())]
+        if value.get("kind") == "datetimeindex":
+            return pd.DatetimeIndex(items, name=value.get("name"))
+        return pd.Index(items, name=value.get("name"))
     if tag == "map":
-        return {str(k): decode(v) for k, v in value.get("v", ())}
+        return {decode(k): decode(v) for k, v in value.get("v", ())}
     if tag == "ts":
         return pd.Timestamp(value.get("v"))
     if tag == "date":
@@ -323,12 +384,19 @@ def read_view_state(directory=None):
     """
     directory = directory or pool_dir()
     path = os.path.join(directory, _VIEW_STATE_NAME)
+    # 兜底范围要覆盖到「合法 JSON 但不是预期形状」：文件内容是数组时
+    # ``payload.get`` 抛 AttributeError，``selected`` 是个数字时集合推导抛
+    # TypeError，两者都不在 (OSError, ValueError) 里。而调用方
+    # （gui_app._load_saved_pool）这一句在保护 read_all 的 try 之外，漏出去
+    # 会让整池结果都载不进来——本函数承诺的是「最多回到全部隐藏」。
     try:
         with open(path, "r", encoding="utf-8") as handle:
             payload = json.load(handle)
-    except (OSError, ValueError):
+        if not isinstance(payload, dict):
+            return set()
+        return {str(item) for item in payload.get("selected", ())}
+    except (OSError, ValueError, TypeError, AttributeError):
         return set()
-    return {str(item) for item in payload.get("selected", ())}
 
 
 def write_view_state(selected, directory=None):
@@ -356,16 +424,67 @@ def delete_snapshot(path):
         return False
 
 
+# ``default_filename`` 的形状，外加 ``write_snapshot`` 撞名时补的那个序号。
+_NAME_PATTERN = re.compile(
+    r"^pool-(\d{8}-\d{6})-(\d{4})(?:-(\d+))?" + re.escape(_SUFFIX) + r"$")
+
+
+def _order_by_filename(paths):
+    """按文件名推出与 ``read_all`` 相同的先后顺序；认不出就返回 None。
+
+    文件名是 ``default_filename`` 拿 payload 里的 ``sequence`` 和 ``saved_at``
+    拼出来的，所以对本程序写下的包，它与包内顺序**由构造保证**一致，排序键
+    也照 read_all 取（先序号后时刻）。手工改过名的文件匹配不上，那时退回去
+    逐个读包——删错一份是不可逆的，宁可慢。
+    """
+    ordered = []
+    for path in paths:
+        matched = _NAME_PATTERN.match(os.path.basename(path))
+        if matched is None:
+            return None
+        ordered.append((
+            int(matched.group(2)),          # sequence
+            matched.group(1),               # 保存时刻
+            int(matched.group(3) or 0),     # 撞名补的序号
+            path,
+        ))
+    ordered.sort()
+    return [item[-1] for item in ordered]
+
+
 def enforce_limit(max_results=MAX_RESULTS, *, directory=None):
     """只保留最近 ``max_results`` 条，返回被淘汰的路径列表。
 
     删除不可逆，调用方应当把返回值报给用户——按规则删的也要说一声。
     """
     directory = directory or pool_dir()
-    payloads, _skipped = read_all(directory)
-    if max_results is None or max_results <= 0 or len(payloads) <= max_results:
+    if max_results is None or max_results <= 0:
+        return []
+    # 一个包都不读就能定序。``write_snapshot`` 每存一条就调一次这里，而
+    # read_all 会把每个包（各带一整条价格序列）gunzip + json.load 一遍：实测
+    # 20 份一年 1 分钟序列的包，光这一趟就 0.14 s，每次「保留结果」都白付，
+    # 而结果池稳态就是满的，这笔钱躲不掉。文件数先判要不要动手，真要淘汰时
+    # 再从文件名取顺序。
+    try:
+        names = glob.glob(os.path.join(directory, "*" + _SUFFIX))
+    except OSError:
+        return []
+    if len(names) <= max_results:
         return []
     evicted = []
+    ordered = _order_by_filename(names)
+    if ordered is not None:
+        # 这条路上坏包也算数、也会被淘汰——上限本来就是给磁盘占用设的，而
+        # 用户看到的那句话是「最多 20 条」。
+        for path in ordered[:len(ordered) - max_results]:    # 升序，旧的在前
+            if delete_snapshot(path):
+                evicted.append(path)
+        return evicted
+    # 有名字认不出来，退回权威顺序。注意这条路上坏包与版本不符的包不进
+    # payloads，因此不会被淘汰——目录可能长期超出上限，代价是慢，不是删错。
+    payloads, _skipped = read_all(directory)
+    if len(payloads) <= max_results:
+        return []
     for payload in payloads[:len(payloads) - max_results]:   # 升序，旧的在前
         path = payload.get("_path")
         if path and delete_snapshot(path):

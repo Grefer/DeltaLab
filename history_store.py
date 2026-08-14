@@ -494,13 +494,26 @@ def save_result(payload, *, directory=None, filename=None, enforce=True):
 
 
 def enforce_limit(max_results=MAX_RESULTS, *, directory=None):
-    """只保留最近 ``max_results`` 份记录，返回被淘汰的路径列表。
+    """只保留最近 ``max_results`` 份记录，返回被淘汰的记录元数据列表。
+
+    返回的是 ``list_results`` 那种元数据字典（带 ``path`` / ``label`` /
+    ``filename``），不是裸路径——调用方要拿名字报给用户。注意与
+    ``backtest_pool_store.enforce_limit`` 不同，那边返回的是路径字符串。
 
     删除是不可逆的，所以调用方应当把返回值报给用户——静默删掉别人 85 秒
     跑出来的东西，即使是按规则删的，也必须说一声。
     """
+    if max_results is None or max_results <= 0:
+        return []
+    # 没到上限就不必 _peek 每一份（实测约 9 ms/份、30 份 272 ms）。文件数
+    # 足以判定要不要动手，真要淘汰时才去读保存时刻定序。
+    resolved = directory or results_dir()
+    if not os.path.isdir(resolved):
+        return []
+    if len(glob.glob(os.path.join(resolved, "*" + _SUFFIX))) <= max_results:
+        return []
     items = list_results(directory)
-    if max_results is None or max_results <= 0 or len(items) <= max_results:
+    if len(items) <= max_results:
         return []
     evicted = []
     for item in items[max_results:]:          # list_results 已按时间倒序
@@ -582,8 +595,15 @@ def _verdict(records):
         if not name or name == "—":
             continue
         period = str(record.get("lookback") or "")
+        # 缺名次的行必须跳过，不能落成 0。``_jsonable`` 把 NaN 写成 null，
+        # 读回来是 None，``None or 0`` 得到 0——而下面按 rank 最小者选优，
+        # 于是一行没有名次的记录稳定压过真正的第 1 名，列表的「结论」列报出
+        # 一个落败候选。这正是本函数上面那段注释在防的错误方向。
+        raw_rank = record.get("rank")
+        if raw_rank is None:
+            continue
         try:
-            rank = int(record.get("rank") or 0)
+            rank = int(raw_rank)
         except (TypeError, ValueError):
             continue
         is_baseline = (
@@ -755,11 +775,18 @@ def list_results(directory=None):
 
 
 def delete_result(path):
-    """删除一个结果包；不存在时静默返回 False。"""
+    """删除一个结果包；删不掉时静默返回 False。
+
+    只接 ``FileNotFoundError`` 是不够的：只读文件或被别的进程占用会抛
+    ``PermissionError``，它从 ``enforce_limit`` 一路冒到保存流程的 except，
+    弹出「保存失败」——而 ``save_result`` 早就把包写进盘了。用户被告知 85 秒
+    跑出来的结果没保存，实际它就在目录里。与 ``backtest_pool_store.
+    delete_snapshot`` 对齐。
+    """
     try:
         os.remove(path)
         return True
-    except FileNotFoundError:
+    except OSError:
         return False
 
 
