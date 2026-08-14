@@ -1,0 +1,28 @@
+# DeltaLab 工程配置
+#
+# 这个文件目前只承担一件事：约束 pytest 的收集范围。
+# 项目本身不通过 pip 安装（GUI 用 PyInstaller 打包，见 deltalab.spec），
+# 所以这里不放 [project] 元数据，避免给人「可以 pip install .」的错觉。
+
+[tool.pytest.ini_options]
+# 只收集 tests/ 目录。
+#
+# 必须显式限定，否则 `pytest` 裸跑（不带路径）会从仓库根开始递归收集，
+# 把根目录的 test_checkbox.py 一并收进来——那是个手工验收脚本，模块导入
+# 期就 tk.Tk() + mainloop()，会让整个收集阶段卡死或直接 abort。
+# 限定 testpaths 之后，`pytest` / `pytest -q` 都能开箱即用。
+testpaths = ["tests"]
+
+# 只把 tests/ 下的 test_*.py 当测试模块。与 testpaths 双保险：即使有人
+# 显式传了仓库根路径，根目录那些 test_ 开头的演示脚本也不会被误收。
+python_files = ["test_*.py"]
+
+# 断言输出更紧凑；-ra 汇总非通过用例的原因（含 skip 理由）。
+addopts = "-ra"
+
+# GUI 测试需要真实 Tk 根窗口，拿不到窗口服务器时会整进程 abort（macOS 沙箱、
+# 无 DISPLAY 的 Linux 都会）。用 marker 标出来，便于在这类环境下用
+# `pytest -m "not gui"` 只跑纯逻辑测试。
+markers = [
+    "gui: 需要真实 Tk 根窗口的测试（无窗口服务器时会导致进程 abort）",
+]

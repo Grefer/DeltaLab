@@ -282,14 +282,24 @@ def store_by_key(key, result, *, directory=None):
     if key is None:
         return None
     npz_path, meta_path = _paths(key, directory)
-    arrays, scalars = {}, {}
+    # npz 只认 ndarray，pandas 的容器类型进去就化成裸数组了。把原始容器类
+    # 型单独记下来，load 才能还原成**与真跑逐位且同型**的结果——本模块开
+    # 头就承诺"命中与重跑一致"，而 `timestamps` 真跑是 DatetimeIndex、命中
+    # 回来却是 ndarray，下游那些 isinstance(..., pd.DatetimeIndex) 的分支
+    # 会因此走向另一条路（例如 _history_trading_day_groups 的日内分组）。
+    arrays, scalars, containers = {}, {}, {}
     for name, value in dict(result).items():
         if isinstance(value, np.ndarray):
             arrays[str(name)] = value
         elif isinstance(value, pd.Series):
             arrays[str(name)] = value.to_numpy()
-        elif isinstance(value, (pd.DatetimeIndex, pd.Index)):
+        # DatetimeIndex 是 Index 的子类，必须先判它。
+        elif isinstance(value, pd.DatetimeIndex):
             arrays[str(name)] = np.asarray(value)
+            containers[str(name)] = "datetimeindex"
+        elif isinstance(value, pd.Index):
+            arrays[str(name)] = np.asarray(value)
+            containers[str(name)] = "index"
         else:
             scalars[str(name)] = value
     try:
@@ -302,6 +312,7 @@ def store_by_key(key, result, *, directory=None):
         with open(meta_path, "w", encoding="utf-8") as handle:
             json.dump(
                 {"scalars": _jsonable_scalars(scalars),
+                 "containers": containers,
                  "written_at": time.time()},
                 handle, ensure_ascii=False)
     except Exception:                                  # noqa: BLE001
@@ -350,9 +361,21 @@ def load_by_key(key, *, directory=None):
         with np.load(npz_path, allow_pickle=False) as bundle:
             for name in bundle.files:
                 result[name] = bundle[name]
+        containers = {}
         if os.path.isfile(meta_path):
             with open(meta_path, encoding="utf-8") as handle:
-                result.update(dict(json.load(handle).get("scalars", {})))
+                meta = json.load(handle)
+            result.update(dict(meta.get("scalars", {})))
+            containers = dict(meta.get("containers", {}))
+        # 还原 pandas 容器类型。缺 containers 的是本字段之前写下的老条目，
+        # 保持 ndarray 与旧行为一致（摘要改过之后它们本就不该再被命中）。
+        for name, kind in containers.items():
+            if name not in result:
+                continue
+            if kind == "datetimeindex":
+                result[name] = pd.DatetimeIndex(result[name])
+            elif kind == "index":
+                result[name] = pd.Index(result[name])
         # 命中即刷新 mtime，LRU 才有意义。
         os.utime(npz_path, None)
     except Exception:                                  # noqa: BLE001

@@ -516,6 +516,16 @@ STRATEGY_CHART_COLORS = (
     "#9333EA", "#C2410C", "#4F46E5", "#047857",
 )
 STRATEGY_CHART_MARKERS = ("o", "s", "^", "D", "v", "P", "X", "<", ">", "h")
+# 同一策略的多条结果共用颜色（跨页同色是有意的），组内靠线型分开。换区间、
+# 换行情、换方向重跑同一个策略恰恰是结果对比页的头号用途，不分开的话一勾多
+# 条就是一团完全同色的线。
+STRATEGY_CHART_DASHES = (
+    "solid", (0, (5, 2)), (0, (1, 1.4)), (0, (7, 2, 1.5, 2)))
+# 对比图同时画的曲线上限。指标表不受限——20 行照排照导，「全选 → 点列头
+# 排序 → 看第一行」这条路要留着；闸门只加在图上：691×226 px 的画布、12 色取
+# 模，20 条叠上去谁也认不出谁。数字与策略优选页的
+# MAX_HISTORY_CHART_CANDIDATES 取齐，两页对"几条还看得清"该给同一个答案。
+MAX_COMPARISON_CHART_CURVES = 8
 # 每日收盘在两页都是固定基准，必须始终占用同一个颜色位，不能因为登记顺序
 # 不同而换色。
 BASELINE_STRATEGY_STYLE_KEY = "close_to_close"
@@ -569,6 +579,17 @@ class SavedBacktestResult:
     sequence: int = 0
     # 重放配方；缺失（旧包、或行情拿不到）时「加载明细」置灰而不是假装成功。
     replay: dict = field(default_factory=dict)
+    # 下拉里选的那个 bar 粒度原值（可能是「自动（推荐）」）。纯展示字段，
+    # **不进任何签名**：market_key 里的 wind_bar_size 已经是解析后的实际粒度，
+    # 签名要的是"实际跑的是什么"。把它加进 market_key 会改变签名的键集合，
+    # 于是新旧快照混选时 _differing_field_names 两侧键集合不同、整体退回属性
+    # 级——差异比对会被这个纯展示需求悄悄削弱一档。
+    bar_size_requested: str = ""
+    # 引擎实际用的每交易日 bar 数。同样是纯展示字段、同样不进签名：
+    # economics_key 里的 steps_per_day 记的是 GUI **传进去**的值，而真实行情
+    # 下那是占位 1（见 _gui_steps_per_day），引擎自己再从时间索引推断。0 表示
+    # 本字段上线前保留的快照没有记。
+    intraday_steps: int = 0
     # 该快照在磁盘上的位置，载入时回填；重命名原地覆盖、删除据此删文件。
     store_path: str = ""
 
@@ -1023,6 +1044,31 @@ class BacktestApp(tk.Tk):
                   darkcolor=[("active", PALETTE["primary_light"]),
                              ("pressed", PALETTE["selected"])])
 
+        # 危险按钮：删数据且不可撤销的那一类。做成红字描边而不是实心红——它
+        # 不是主行动，实心红摆在一排常规按钮里会比「运行回测」还抢眼；红字
+        # 加悬停浅红底，足够在点下去之前把性质说清楚。
+        style.configure("Danger.TButton",
+                        font=btn_font,
+                        background=PALETTE["surface"],
+                        foreground=PALETTE["danger"],
+                        bordercolor=PALETTE["border"],
+                        lightcolor=PALETTE["surface"],
+                        darkcolor=PALETTE["surface"],
+                        focusthickness=0,
+                        padding=(10, 6),
+                        relief="flat")
+        style.map("Danger.TButton",
+                  background=[("active", PALETTE["danger_light"]),
+                              ("pressed", PALETTE["danger_light"]),
+                              ("disabled", PALETTE["surface"])],
+                  foreground=[("disabled", PALETTE["text_light"])],
+                  bordercolor=[("active", PALETTE["danger"]),
+                               ("disabled", PALETTE["border_soft"])],
+                  lightcolor=[("active", PALETTE["danger_light"]),
+                              ("pressed", PALETTE["danger_light"])],
+                  darkcolor=[("active", PALETTE["danger_light"]),
+                             ("pressed", PALETTE["danger_light"])])
+
         # ---- Notebook (现代卡片式 Tab) ----
         style.configure("TNotebook",
                         background=PALETTE["bg"],
@@ -1166,39 +1212,70 @@ class BacktestApp(tk.Tk):
             self._left_canvas.itemconfigure(self._left_inner_id, width=event.width)
         self._left_canvas.bind("<Configure>", _on_canvas_configure)
 
-        # 鼠标滚轮处理: 只在鼠标进入左侧面板时启用, 离开则取消, 避免劫持右侧图表/表格的滚轮.
-        def _on_left_mousewheel(event):
-            # Windows: event.delta 为 ±120 的倍数; 正值向上滚, 负值向下滚.
-            self._left_canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
-            return "break"
+        # ─── 鼠标滚轮 ───
+        # 旧实现是 <Enter> 时 bind_all、<Leave> 时 unbind_all. 问题在于指针只要
+        # 从 Canvas 挪到面板内任意子控件 (LabelFrame / Label / Entry / Combobox…),
+        # Canvas 就会收到 <Leave> 把滚轮解绑 —— 而参数区表面几乎全被子控件盖住,
+        # 于是表现为「鼠标停在参数上滚轮没反应, 只有压着右侧滚动条才滚得动」
+        # (滚动条能滚是 Tk 自带的 Scrollbar 类绑定, 与这里无关).
+        #
+        # 改成常驻一条全局绑定, 每次事件按**指针位置**判断是否落在左侧面板内:
+        # 落在外面就原样放行, 不会劫持右侧图表/表格的滚轮.
+        # 用指针位置而不是 event.widget, 是因为 Windows 上 Tk 把 <MouseWheel>
+        # 投递给**焦点控件**而非指针下的控件, 只看 event.widget 会判错.
+        _self_scrolling = {"Text", "Listbox", "Treeview"}
 
-        def _on_left_mousewheel_linux(event):
-            units = -3 if event.num == 4 else 3
+        def _wheel_over_left_panel(event):
+            try:
+                widget = self.winfo_containing(event.x_root, event.y_root)
+                while widget is not None:
+                    if widget is self._left_canvas:
+                        return True
+                    # 指针下方是自带滚动的控件, 让它自己处理, 不抢事件
+                    if widget.winfo_class() in _self_scrolling:
+                        return False
+                    widget = getattr(widget, "master", None)
+            except (KeyError, tk.TclError):
+                # 指针不在本程序窗口内 / 控件刚被销毁
+                return False
+            return False
+
+        def _on_left_mousewheel(event):
+            if not _wheel_over_left_panel(event):
+                return None
+            # Windows: delta 为 ±120 的倍数; macOS: 每格 ±1 (触控板还更小).
+            step = -event.delta if _SYSTEM == "Darwin" else -event.delta / 120
+            units = int(step)
+            if units == 0 and step:
+                units = 1 if step > 0 else -1
             self._left_canvas.yview_scroll(units, "units")
             return "break"
 
-        def _bind_left_wheel(_event=None):
+        def _on_left_mousewheel_linux(event):
+            if not _wheel_over_left_panel(event):
+                return None
+            self._left_canvas.yview_scroll(-3 if event.num == 4 else 3, "units")
+            return "break"
+
+        # 供测试/其它代码直接调用的入口 (指向本平台实际生效的那个处理器)
+        self._left_wheel_handler = (
+            _on_left_mousewheel_linux if _SYSTEM == "Linux" else _on_left_mousewheel)
+
+        if _SYSTEM == "Linux":
+            self.bind_all("<Button-4>", _on_left_mousewheel_linux, add="+")
+            self.bind_all("<Button-5>", _on_left_mousewheel_linux, add="+")
+        else:
+            self.bind_all("<MouseWheel>", _on_left_mousewheel, add="+")
+
+        # ttk 的 Combobox/Spinbox 自带滚轮类绑定, 悬停其上滚动会直接改选中值 ——
+        # 参数区里全是这种控件, 既会误改「大类」「子类型」等参数, 又会让人以为
+        # 面板滚不动. 覆盖成空处理: 不返回 "break", 事件继续走到上面的全局绑定,
+        # 于是滚轮在整个界面里统一是「滚面板」而不是「改值」.
+        for _wheel_cls in ("TCombobox", "TSpinbox"):
+            self.bind_class(_wheel_cls, "<MouseWheel>", lambda _event: None)
             if _SYSTEM == "Linux":
-                self._left_canvas.bind_all("<Button-4>", _on_left_mousewheel_linux)
-                self._left_canvas.bind_all("<Button-5>", _on_left_mousewheel_linux)
-            else:
-                self._left_canvas.bind_all("<MouseWheel>", _on_left_mousewheel)
-
-        def _unbind_left_wheel(_event=None):
-            if _SYSTEM == "Linux":
-                self._left_canvas.unbind_all("<Button-4>")
-                self._left_canvas.unbind_all("<Button-5>")
-            else:
-                self._left_canvas.unbind_all("<MouseWheel>")
-
-        # 保留引用, 其它地方如需手动启停滚轮可复用
-        self._left_wheel_bind = _bind_left_wheel
-        self._left_wheel_unbind = _unbind_left_wheel
-
-        self._left_canvas.bind("<Enter>", _bind_left_wheel)
-        self._left_canvas.bind("<Leave>", _unbind_left_wheel)
-        self._left_inner.bind("<Enter>", _bind_left_wheel)
-        self._left_inner.bind("<Leave>", _unbind_left_wheel)
+                self.bind_class(_wheel_cls, "<Button-4>", lambda _event: None)
+                self.bind_class(_wheel_cls, "<Button-5>", lambda _event: None)
 
         # 之后所有原本放在 left 里的控件, 父容器改为 left_inner
         left = self._left_inner
@@ -3508,6 +3585,38 @@ class BacktestApp(tk.Tk):
             raise ValueError(
                 "每日固定时刻策略不支持 Wind 日频行情。粒度现在按策略自动"
                 "推导，出现该错误说明用的是旧快照里保存的手动日频配置。")
+        if src == "csv" and BacktestApp._csv_is_daily(gs.get("csv_path")):
+            raise ValueError(
+                "每日固定时刻策略需要日内时间戳，所选 CSV 是日频数据"
+                "（每个交易日只有一行）。请换用分钟级 CSV，或改用其它策略。")
+
+    # 判定日频只需要看到"连着好些行都是不同的日子"，读前 200 行足矣：日频
+    # 的话这就是 200 个交易日，分钟级的话还没走完第一天。整份读进来只为判一
+    # 个粒度，大文件上是白等——而这里的职责恰恰是"在拉取行情前**快速**拒绝"。
+    _CSV_GRANULARITY_PROBE_ROWS = 200
+
+    @staticmethod
+    def _csv_is_daily(path):
+        """CSV 是不是日频（每个交易日一行）。读不出来时一律返回 False。
+
+        读不出就放行，把报错留给随后的 ``from_csv``：文件不存在、首列不是时
+        间、列名拼错，它给的消息都比"这个文件是不是日频"精确得多。本函数只
+        负责拦住"文件没问题、但粒度配不上固定时刻策略"这一种。
+        """
+        path = str(path or "").strip()
+        if not path:
+            return False
+        try:
+            import pandas as pd
+            frame = pd.read_csv(
+                path, parse_dates=[0], index_col=0,
+                nrows=BacktestApp._CSV_GRANULARITY_PROBE_ROWS)
+            index = frame.index
+            if len(index) < 2 or not isinstance(index, pd.DatetimeIndex):
+                return False
+            return int(_infer_intraday_steps(index)) <= 1
+        except Exception:                                  # noqa: BLE001
+            return False
 
     def _sync_history_button_state(self):
         """使策略优选入口始终与真实数据来源及后台任务状态一致。"""
@@ -5166,6 +5275,47 @@ class BacktestApp(tk.Tk):
         return "  ·  ".join(parts)
 
     @staticmethod
+    def _signature_keys_from_state(gui_state, *, data_digest=None,
+                                   steps_per_day=None):
+        """从一份 gui_state 造出行情 / 期权 / 规模与成本三组签名。
+
+        单独抽出来是因为**策略优选的参数详情也要用它**：那边只有一份运行时
+        冻结的 state、没有 bt，但要摊出的字段与结果池详情必须逐项对齐。留在
+        ``_make_saved_backtest_result`` 里的话两处各写一份字典，加一个字段只
+        同步一边，同一次回测在两个窗口就会显示出不一样的输入。
+        """
+        return (
+            BacktestApp._freeze_snapshot_value({
+                "source": gui_state.get("source"),
+                # 价格序列本身的摘要。可读字段（标的、区间、粒度）说不清的
+                # 差异由它兜底：日内滚动的两段、同一区间取到了不同数据，都能
+                # 认出来。反过来，跨周期取到同一段末尾时数据逐字节相同，它也
+                # 不会造出假差异——用分段编号就会，那三段编号不同而数据一模
+                # 一样。优选那边跑的是多段，没有单一摘要，传 None。
+                "data_digest": data_digest,
+                "seed": gui_state.get("seed"),
+                "csv_path": gui_state.get("csv_path"),
+                "csv_col": gui_state.get("csv_col"),
+                "wind_code": gui_state.get("wind_code"),
+                "wind_start": gui_state.get("wind_start"),
+                "wind_end": gui_state.get("wind_end"),
+                "wind_bar_size": gui_state.get("wind_bar_size"),
+            }),
+            BacktestApp._freeze_snapshot_value({
+                "cls_name": gui_state.get("cls_name"),
+                "subtype": gui_state.get("subtype"),
+                "params": gui_state.get("params", {}),
+            }),
+            BacktestApp._freeze_snapshot_value({
+                "quantity": gui_state.get("quantity"),
+                "multiplier": gui_state.get("multiplier"),
+                "tc_rate": gui_state.get("tc_rate"),
+                "slippage_bps": gui_state.get("slippage_bps", 0.0),
+                "steps_per_day": steps_per_day,
+            }),
+        )
+
+    @staticmethod
     def _make_saved_backtest_result(
             bt, gui_state, result_id, name, saved_at=None, *,
             origin=SNAPSHOT_ORIGIN_MANUAL, origin_meta=None, sequence=0):
@@ -5181,35 +5331,13 @@ class BacktestApp(tk.Tk):
             bt._results)
         strategy_label, parameter_summary = (
             BacktestApp._strategy_snapshot_labels(gui_state))
-        params = gui_state.get("params", {})
         path_key = BacktestApp._backtest_path_key(bt, gui_state)
-        market_key = BacktestApp._freeze_snapshot_value({
-            "source": gui_state.get("source"),
-            # 价格序列本身的摘要。可读字段（标的、区间、粒度）说不清的差异
-            # 由它兜底：日内滚动的两段、同一区间取到了不同数据，都能认出来。
-            # 反过来，跨周期取到同一段末尾时数据逐字节相同，它也不会造出假
-            # 差异——用分段编号就会，那三段编号不同而数据一模一样。
-            "data_digest": path_key[2],
-            "seed": gui_state.get("seed"),
-            "csv_path": gui_state.get("csv_path"),
-            "csv_col": gui_state.get("csv_col"),
-            "wind_code": gui_state.get("wind_code"),
-            "wind_start": gui_state.get("wind_start"),
-            "wind_end": gui_state.get("wind_end"),
-            "wind_bar_size": gui_state.get("wind_bar_size"),
-        })
-        contract_key = BacktestApp._freeze_snapshot_value({
-            "cls_name": gui_state.get("cls_name"),
-            "subtype": gui_state.get("subtype"),
-            "params": params,
-        })
-        economics_key = BacktestApp._freeze_snapshot_value({
-            "quantity": gui_state.get("quantity"),
-            "multiplier": gui_state.get("multiplier"),
-            "tc_rate": gui_state.get("tc_rate"),
-            "slippage_bps": gui_state.get("slippage_bps", 0.0),
-            "steps_per_day": bt._results.get("steps_per_day"),
-        })
+        market_key, contract_key, economics_key = (
+            BacktestApp._signature_keys_from_state(
+                gui_state,
+                data_digest=path_key[2],
+                steps_per_day=bt._results.get("steps_per_day"),
+            ))
         subtype = gui_state.get("subtype", "—")
         replay_recipe = BacktestApp._snapshot_replay_recipe(bt, gui_state)
         # 保留的这一刻 bar 级结果还在手里，顺手落盘：之后点「加载明细」就
@@ -5238,7 +5366,41 @@ class BacktestApp(tk.Tk):
             form_state=BacktestApp._snapshot_form_state(gui_state),
             sequence=int(sequence or 0),
             replay=replay_recipe,
+            bar_size_requested=str(
+                gui_state.get("wind_bar_size_requested", "") or ""),
+            intraday_steps=BacktestApp._effective_intraday_steps(bt),
         )
+
+    @staticmethod
+    def _effective_intraday_steps(bt):
+        """本次回测**实际**的每交易日 bar 数。
+
+        不能只读 ``_results["steps_per_day"]``：那是 GUI 传给引擎的值，而
+        ``_gui_steps_per_day`` 对真实行情一律返回占位 1（CSV 分支干脆传
+        ``None``），引擎再自己从时间索引推断并取两者较大值。照那个值展示，
+        一条 15 分钟 Wind 回测会写着「日内采样 1」，而它每天实际十几根 bar。
+
+        推不出来时退回传入值——模拟路径的索引常常不是 DatetimeIndex，而它那
+        个值本来就是用户直接填的真实采样密度。
+        """
+        results = getattr(bt, "_results", None) or {}
+        declared = max(1, int(results.get("steps_per_day", 1) or 1))
+        timestamps = getattr(bt, "timestamps", None)
+        if timestamps is None or len(timestamps) < 2:
+            return declared
+        try:
+            inferred = int(_infer_intraday_steps(timestamps))
+        except (AttributeError, TypeError, ValueError):
+            return declared
+        return max(declared, inferred)
+
+    @staticmethod
+    def _snapshot_source(snapshot):
+        """快照的行情来源；取不到时 ``None``。"""
+        flat = BacktestApp._flatten_signature(
+            tuple(getattr(snapshot, "market_key", ()) or ()))
+        source = flat.get(("source",))
+        return source if isinstance(source, str) else None
 
     @staticmethod
     def _snapshot_form_state(gui_state):
@@ -5266,6 +5428,59 @@ class BacktestApp(tk.Tk):
             "sigma_window": BacktestApp._comparison_safe_int(
                 gui_state.get("sigma_window"), 20),
         }
+
+    # 每种对冲策略实际读取的 form_state 字段。用于对比签名——回填不需要它，
+    # 回填要的是"把表单恢复原样"，全量记录对回填是正确的。
+    _STRATEGY_RELEVANT_FORM_FIELDS = {
+        "close_to_close": (),
+        "fixed_times": ("fixed_times",),
+        "hedge_band": (
+            "interval_type", "price_interval", "sigma_source", "sigma_window"),
+    }
+    # 签名里恒定出现的策略参数字段（无关时填 None，保持键集合稳定）。
+    _STRATEGY_SIGNATURE_FIELDS = tuple(dict.fromkeys(
+        field
+        for fields in _STRATEGY_RELEVANT_FORM_FIELDS.values()
+        for field in fields
+    ))
+
+    @staticmethod
+    def _snapshot_strategy_signature(snapshot):
+        """对比用的对冲策略签名：只含**这个策略真正读取**的字段。
+
+        不能拿整份 ``form_state`` 当签名。``_snapshot_form_state`` 是为回填
+        表单服务的，它不看 ``strategy_name`` 就全量记录固定时刻与带宽三项；
+        而 ``_collect_history_state`` 每轮优选都会把本轮候选配置写回 state，
+        重放快照因此带着与自己无关的残值。结果是两条**跑的是同一策略、逐日
+        损益完全相同**的结果被报成「本次对比的变量：对冲策略」，还被染成绿色
+        （干净的单变量实验）——例如两轮优选只有固定时刻候选文本不同，都选
+        每日收盘基线、加载同一段，close_to_close 根本不读 fixed_times。
+
+        未知策略名保守起见回退到全量比较：宁可多报一次差异，也不要把真的
+        不同说成相同。
+
+        **键集合必须恒定**，无关字段填 ``None`` 而不是删掉。``
+        _differing_field_names`` 在两侧键集合不同时会整体放弃字段级定位、
+        只报到属性级；若这里按策略删键，「每日收盘 vs 固定间隔」这种正当的
+        跨策略对比就再也说不出「策略类型 / 带宽单位 / 带宽阈值变了」，退化
+        成一句光秃秃的「对冲策略」。填 ``None`` 则两边仍可逐字段比：同策略
+        时无关项两边都是 ``None`` 不产生假差异，跨策略时 ``None`` 与实际值
+        不同，照常点名。
+        """
+        state = dict(getattr(snapshot, "form_state", None) or {})
+        name = str(state.get("strategy_name", "") or "")
+        relevant = BacktestApp._STRATEGY_RELEVANT_FORM_FIELDS.get(name)
+        if relevant is None:
+            return BacktestApp._freeze_snapshot_value(state)
+        # 策略名与收盘保底对所有策略都生效，恒参与比较。
+        signature = {
+            "strategy_name": name,
+            "force_day_close_hedge": bool(
+                state.get("force_day_close_hedge", False)),
+        }
+        for key in BacktestApp._STRATEGY_SIGNATURE_FIELDS:
+            signature[key] = state.get(key) if key in relevant else None
+        return BacktestApp._freeze_snapshot_value(signature)
 
     @staticmethod
     def _validate_saved_result_name(saved_results, name, exclude_id=None):
@@ -5307,7 +5522,7 @@ class BacktestApp(tk.Tk):
         "strategy_label", "parameter_summary", "source_label", "option_label",
         "path_key", "market_key", "contract_key", "economics_key", "position",
         "style_key", "origin", "origin_meta", "form_state", "sequence",
-        "replay",
+        "replay", "bar_size_requested", "intraday_steps",
     )
 
     @staticmethod
@@ -5430,6 +5645,30 @@ class BacktestApp(tk.Tk):
             f"（共 {len(self._saved_backtests)} 条）")
         return snapshot
 
+    @staticmethod
+    def _next_default_name_number(saved_results, base):
+        """同前缀名字接着往下编号：池里已有『X #05』就返回 6。
+
+        默认编号不能用入池序号 ``_saved_backtest_sequence``：那是整个结果池
+        的保存次序，中间存过别的策略就会跳号——存到「每日收盘 #05」后再存
+        十条固定间隔，下一条每日收盘会默认成 #16。用户读这个数字时问的是
+        「这是我第几次存这个策略」，所以只数同前缀的那几条。
+
+        只认前缀完全一致、后缀是纯 ASCII 数字的名字：用户改过的名字（如
+        「每日收盘 最终版」）不参与编号，也就不会把编号顶到莫名其妙的位置。
+        """
+        prefix = f"{base} #"
+        highest = 0
+        for snapshot in saved_results.values():
+            name = str(getattr(snapshot, "name", "") or "")
+            if not name.startswith(prefix):
+                continue
+            tail = name[len(prefix):]
+            # 光 isdigit() 会放过上标之类的字符，而 int() 认不出它们。
+            if tail.isascii() and tail.isdigit():
+                highest = max(highest, int(tail))
+        return highest + 1
+
     def _retain_current_backtest(self):
         bt = getattr(self, "_latest_backtest", None)
         gui_state = getattr(self, "_latest_backtest_state", None)
@@ -5440,14 +5679,15 @@ class BacktestApp(tk.Tk):
             messagebox.showinfo("结果已保留", "当前回测结果已经在对比结果池中。")
             return
 
-        next_sequence = self._saved_backtest_sequence + 1
         strategy_label, parameters = self._strategy_snapshot_labels(gui_state)
         short_parameters = parameters.split("；", 1)[0]
         if gui_state.get("strategy_name") == "close_to_close":
-            default_name = f"{strategy_label} #{next_sequence:02d}"
+            base_name = strategy_label
         else:
-            default_name = (
-                f"{strategy_label} · {short_parameters} #{next_sequence:02d}")
+            base_name = f"{strategy_label} · {short_parameters}"
+        next_number = BacktestApp._next_default_name_number(
+            self._saved_backtests, base_name)
+        default_name = f"{base_name} #{next_number:02d}"
         while True:
             name = simpledialog.askstring(
                 "保留回测结果",
@@ -5524,12 +5764,17 @@ class BacktestApp(tk.Tk):
     # (属性键, 中文名, 取值函数)
     _COMPARISON_ASPECTS = (
         ("market", "行情", lambda s: getattr(s, "market_key", ())),
-        ("contract", "期权", lambda s: getattr(s, "contract_key", ())),
+        # 这一组统辖的是「是哪一种期权」外加它的全部合约参数，组名必须把两
+        # 件事都说到：只写「期权类型」的话，改了执行价、类型没动的那次对比
+        # 会被报成「本次对比的变量：期权类型（执行价：100 vs 105）」——句子
+        # 本身就在说类型变了。
+        ("contract", "期权类型与参数",
+         lambda s: getattr(s, "contract_key", ())),
         ("position", "头寸方向", lambda s: (
             ("position", BacktestApp._saved_snapshot_position(s)),)),
         ("economics", "规模与成本", lambda s: getattr(s, "economics_key", ())),
-        ("strategy", "对冲策略", lambda s: BacktestApp._freeze_snapshot_value(
-            dict(getattr(s, "form_state", None) or {}))),
+        ("strategy", "对冲策略",
+         lambda s: BacktestApp._snapshot_strategy_signature(s)),
     )
 
     # 字段级差异的中文名。签名保留了键名，所以能说到具体是哪一项不同，
@@ -5540,7 +5785,7 @@ class BacktestApp(tk.Tk):
         "csv_col": "CSV 列", "wind_code": "标的代码",
         "wind_start": "起始日", "wind_end": "截止日",
         "wind_bar_size": "bar 粒度", "data_digest": "行情数据",
-        "cls_name": "期权大类", "subtype": "期权子类",
+        "cls_name": "期权大类", "subtype": "期权类型",
         "quantity": "交易数量", "multiplier": "合约乘数",
         "tc_rate": "成本率", "slippage_bps": "滑点", "steps_per_day": "日内采样",
         "position": "头寸方向",
@@ -5551,14 +5796,35 @@ class BacktestApp(tk.Tk):
     }
 
     @staticmethod
-    def _option_param_labels():
+    def _option_param_labels(cls_name=None):
         """期权合约参数的键 → 中文名，以及取值的中文回译。
 
         标签就写在 OPTION_CLASSES 的参数定义里（第二项），带 choices 的参数
         （如方向 1/-1）还能把数值译回"看涨/看跌"。
+
+        **给了大类就以那个大类自己的定义为准。** 同一个键在不同大类下是不同
+        的东西，全局合并会张冠李戴：
+
+        - ``N`` 在累计里是杠杆倍数，在亚式里是观察日数；
+        - ``T_days`` 在香草里是期限，在累计里是剩余期限；
+        - ``s0`` 在雪球里是最新价而非初始价格；
+        - ``cp`` 最狠——雪球的 ``-1`` 是「雪球 (卖看跌)」、``+1`` 是「反雪球
+          (卖看涨)」，其余各类是「看跌 / 看涨」。译错的不是名字而是取值本身。
+
+        此前一律 ``setdefault`` 且按 OPTION_CLASSES 的定义序合并，等于永远
+        用香草那一套去解释所有期权。
+
+        实现是把目标大类排到最前面再合并：它的定义先落进 setdefault 因而胜
+        出，其余大类留作回退，未在本类定义的键仍能拿到一个名字而不是裸键名。
+        拿不到大类时（跨大类比对）行为与从前一致——那时两侧键集合本来就对不
+        上，差异只报到属性级，标签取谁都不影响结论。
         """
+        configs = [OPTION_CLASSES[cls_name]] if cls_name in OPTION_CLASSES else []
+        configs.extend(
+            config for name, config in OPTION_CLASSES.items()
+            if name != cls_name)
         labels, choices = {}, {}
-        for config in OPTION_CLASSES.values():
+        for config in configs:
             for spec in config.get("params", ()):
                 key = str(spec[0])
                 labels.setdefault(key, str(spec[1]))
@@ -5566,6 +5832,20 @@ class BacktestApp(tk.Tk):
                     choices.setdefault(key, {
                         value: text for text, value in spec[4].items()})
         return labels, choices
+
+    @staticmethod
+    def _signature_cls_name(flats):
+        """从若干摊平签名里取共同的期权大类；不一致或没有则 ``None``。
+
+        标签与取值回译要按大类取（见 ``_option_param_labels``），而
+        ``_differing_field_names`` 是五组属性共用的——不含 ``cls_name`` 的那
+        几组自然拿到 ``None``，正好退回全局合并。
+        """
+        names = {flat.get(("cls_name",)) for flat in flats}
+        if len(names) != 1:
+            return None
+        name = names.pop()
+        return name if isinstance(name, str) else None
 
     @staticmethod
     def _flatten_signature(value, prefix=()):
@@ -5600,12 +5880,16 @@ class BacktestApp(tk.Tk):
     }
 
     @staticmethod
-    def _format_signature_value(key, value):
-        """把签名里的取值渲染成人看的字符串。"""
+    def _format_signature_value(key, value, cls_name=None):
+        """把签名里的取值渲染成人看的字符串。
+
+        ``cls_name`` 决定用哪一套合约参数回译：不给的话 ``cp=-1`` 在雪球上会
+        被译成「看跌 (Put)」，而雪球的 ``-1`` 是「雪球 (卖看跌)」。
+        """
         mapping = BacktestApp._COMPARISON_VALUE_LABELS.get(key)
         if mapping and value in mapping:
             return str(mapping[value])
-        _labels, choices = BacktestApp._option_param_labels()
+        _labels, choices = BacktestApp._option_param_labels(cls_name)
         mapping = choices.get(key)
         if mapping and value in mapping:
             return str(mapping[value])
@@ -5619,7 +5903,11 @@ class BacktestApp(tk.Tk):
 
     @staticmethod
     def _differing_field_names(values):
-        """逐字段比出差异，返回 ["波动率：0.18 vs 0.15", ...]。
+        """逐字段比出差异，返回 [(中文名, [各条的取值]), ...]。
+
+        取值按传入顺序原样返回，不拼成 "A vs B" ——三条以上时那种串既看不
+        出谁是谁，又会把标题撑到七八十字。拼不拼、怎么排版交给展示层。
+        不可读的字段（价格序列摘要）取值给 None，表示"只说不同、无值可看"。
 
         键集合本身不同时（换期权大类会整体换掉参数集）说不出具体字段，返回
         空表示"整组不同"，由调用方按属性级报告。
@@ -5628,7 +5916,8 @@ class BacktestApp(tk.Tk):
         paths = {frozenset(flat) for flat in flats}
         if len(paths) != 1:
             return []
-        param_labels, _choices = BacktestApp._option_param_labels()
+        cls_name = BacktestApp._signature_cls_name(flats)
+        param_labels, _choices = BacktestApp._option_param_labels(cls_name)
         order = list(BacktestApp._COMPARISON_FIELD_LABELS) + list(param_labels)
         changed = []
         opaque = {"data_digest"}
@@ -5642,21 +5931,260 @@ class BacktestApp(tk.Tk):
             rank = order.index(key) if key in order else len(order)
             if key in opaque:
                 # 摘要是一串哈希，摊出来没人看得懂；它只负责"确实不一样"。
-                changed.append((rank, label, True))
+                changed.append((rank, label, None))
                 continue
-            shown = " vs ".join(
-                BacktestApp._format_signature_value(key, value)
-                for value in taken)
-            changed.append((rank, f"{label}：{shown}", False))
+            changed.append((rank, label, [
+                BacktestApp._format_signature_value(key, value, cls_name)
+                for value in taken
+            ]))
         # 可读字段已经说清了差异时，就不必再补一句"行情数据不同"——那是
         # 同一件事的两种说法。只有摘要单独不同才值得说：输入看着一样，跑出
         # 来的价格序列却不是同一条。
-        if any(not is_opaque for _rank, _text, is_opaque in changed):
-            changed = [item for item in changed if not item[2]]
+        if any(shown is not None for _rank, _label, shown in changed):
+            changed = [item for item in changed if item[2] is not None]
         # 按定义顺序输出，而不是签名的字典序——"策略类型、带宽阈值"读着顺。
-        # 次级键是文本本身：路径集合是 frozenset，迭代序不确定，只按 rank
+        # 次级键是标签本身：路径集合是 frozenset，迭代序不确定，只按 rank
         # 排的话未列入定义表的字段每次出来的顺序都可能不同。
-        return [text for _rank, text, _opaque in sorted(changed)]
+        changed.sort(key=lambda item: (item[0], item[1]))
+        return [(label, shown) for _rank, label, shown in changed]
+
+    # 详情窗里不列的字段。行情数据摘要是一串 sha256：在差异串里它至少还回答
+    # 了"这两条确实不是同一段数据"，单看一条时一个哈希什么也没说。
+    _SNAPSHOT_DETAIL_HIDDEN_FIELDS = frozenset({"data_digest"})
+
+    # 行情组按来源只列本次真正用到的那几项。三种来源的字段互斥，但
+    # market_key 恒定记全部键（键集合恒定是差异比对的要求），未用到的那几项
+    # 存的是**左侧控件当时的值**——不是空值，所以"渲染成 — 就跳过"拦不住：
+    # 模拟跑出来的快照照样会列出「CSV 列 close」「标的代码 510050.SH」，那是
+    # Wind 代码框里恰好还留着的内容，这次回测根本没碰过它。
+    _MARKET_DETAIL_FIELDS = {
+        "simulate": ("source", "seed"),
+        "csv": ("source", "csv_path", "csv_col"),
+        "wind": ("source", "wind_code", "wind_start", "wind_end",
+                 "wind_bar_size"),
+    }
+
+    @staticmethod
+    def _bar_size_detail_text(actual, requested):
+        """bar 粒度的显示串：把「实际用了什么」和「是不是自动推的」都写上。
+
+        快照的 ``wind_bar_size`` 存的已经是 ``_resolve_wind_bar_size`` 解析后
+        的实际粒度（见 ``_resolve_wind_backtest_state``），下拉原值另存在
+        ``bar_size_requested``。只显示实际值看不出这个「15分钟」是自己挑的还
+        是程序按策略推出来的；只显示「自动（推荐）」更糟——那根本不是一个粒度，
+        是个待解析的占位。
+        """
+        actual = str(actual or "").strip()
+        requested = str(requested or "").strip()
+        if requested != WIND_AUTO_BAR_SIZE:
+            return actual or "—"
+        if not actual or actual == WIND_AUTO_BAR_SIZE:
+            # 本字段上线前保留的快照没记原值，也可能记的就是未解析的占位：
+            # 诚实说没记，不要把「自动（推荐）」摆出来充当一个粒度。
+            return f"{WIND_AUTO_BAR_SIZE} · 未记录实际粒度"
+        return f"{actual}（自动推荐）"
+
+    @staticmethod
+    def _intraday_steps_detail_text(snapshot, declared):
+        """日内采样的显示串：写引擎**实际**用的那个数。
+
+        见 ``_effective_intraday_steps``——签名里的值对真实行情是占位 1。
+        """
+        effective = int(getattr(snapshot, "intraday_steps", 0) or 0)
+        if effective > 0:
+            return str(effective)
+        if declared is None:
+            # 优选的一行覆盖多段，没有单一采样密度可言：交回 "—" 让渲染层
+            # 整条略过，而不是含糊地说一句"未记录"。
+            return "—"
+        if BacktestApp._snapshot_source(snapshot) == "simulate":
+            # 模拟的采样密度是用户直接填进去的，签名里那个值就是事实。
+            return str(max(1, int(declared or 1)))
+        # 真实行情的旧快照只记了占位值，说不出实际粒度就别假装说得出。
+        return "未记录（旧快照存的是占位值）"
+
+    # 展示层要覆盖签名取值的那几项：签名记的是「当时传给引擎的输入」，而这
+    # 两项的输入是占位或待解析的，人要看的是「实际跑的是什么」。收成一张表
+    # 而不是在渲染循环里堆 if——第三项迟早会来。
+    _DETAIL_VALUE_OVERRIDES = {
+        ("market", "wind_bar_size"): (
+            lambda snapshot, value: BacktestApp._bar_size_detail_text(
+                value, getattr(snapshot, "bar_size_requested", ""))),
+        ("economics", "steps_per_day"): (
+            lambda snapshot, value: BacktestApp._intraday_steps_detail_text(
+                snapshot, value)),
+    }
+
+    @staticmethod
+    def _format_detail_value(key, value, cls_name=None):
+        """详情窗的取值渲染：在差异串那套回译之上补一条多值参数的排版。
+
+        签名里的数组被冻成 ``("ndarray", dtype, shape, 摘要)`` 四元组，普通
+        列表冻成元组；两者直接 ``str()`` 出来都是 Python 字面量。
+        """
+        if isinstance(value, tuple):
+            if not value:
+                return "—"
+            if value[0] == "ndarray" and len(value) == 4:
+                count = int(np.prod(value[2])) if value[2] else 1
+                return f"数组（{count} 项）"
+            return "、".join(
+                BacktestApp._format_signature_value(key, item, cls_name)
+                for item in value)
+        return BacktestApp._format_signature_value(key, value, cls_name)
+
+    @staticmethod
+    def _snapshot_detail_sections(snapshot):
+        """把一条快照的全部输入摊成 [(组名, [(字段名, 取值), ...]), ...]。
+
+        分组、字段中文名和取值回译全部走对比页那一套（``_COMPARISON_ASPECTS``
+        / ``_COMPARISON_FIELD_LABELS`` / ``_option_param_labels`` /
+        ``_format_signature_value``），于是详情窗里读到的措辞与说明卡报差异时
+        用的一定是同一个词。各写一套中文名的话，改了期权参数标签只同步一边，
+        用户就会在两处看到同一项的两个名字。
+
+        渲染成 ``—`` 的字段整条略过：签名为了让键集合恒定（见
+        ``_snapshot_strategy_signature``），会给与本条无关的项填 ``None``——
+        每日收盘的快照带着 ``fixed_times=None``，Wind 行情的快照带着
+        ``csv_path=None``。差异比对需要这些占位，人看的详情不需要，列出来只
+        会让真正有值的那几行更难找。合约参数不会因此漏项：它们全是数值型，
+        取不到值的情况不存在，所以每种期权定义了几项就列几项（香草 7、累计
+        14、亚式 12、气囊 11、雪球 18）。
+
+        标签、取值回译和**行序**都按这条快照自己的期权大类取：``param_labels``
+        把该大类的参数排在最前，于是详情里的参数顺序就是左侧表单里的定义顺序。
+        """
+        cls_name = BacktestApp._signature_cls_name(
+            [BacktestApp._flatten_signature(
+                tuple(getattr(snapshot, "contract_key", ()) or ()))])
+        param_labels, _choices = BacktestApp._option_param_labels(cls_name)
+        order = list(BacktestApp._COMPARISON_FIELD_LABELS) + list(param_labels)
+        sections = []
+        for aspect, label, getter in BacktestApp._COMPARISON_ASPECTS:
+            rows = []
+            flat = BacktestApp._flatten_signature(tuple(getter(snapshot)))
+            # 行情组只列本次来源用得上的那几项；来源不认识时全列，宁可多几行
+            # 也不要因为一个没见过的来源名把整组抹空。
+            allowed = (
+                BacktestApp._MARKET_DETAIL_FIELDS.get(flat.get(("source",)))
+                if aspect == "market" else None)
+            for path, value in flat.items():
+                field = path[-1]
+                if field in BacktestApp._SNAPSHOT_DETAIL_HIDDEN_FIELDS:
+                    continue
+                if allowed is not None and field not in allowed:
+                    continue
+                override = BacktestApp._DETAIL_VALUE_OVERRIDES.get(
+                    (aspect, field))
+                shown = (
+                    override(snapshot, value) if override
+                    else BacktestApp._format_detail_value(
+                        field, value, cls_name))
+                if shown == "—":
+                    continue
+                rows.append((
+                    order.index(field) if field in order else len(order),
+                    BacktestApp._COMPARISON_FIELD_LABELS.get(
+                        field, param_labels.get(field, field)),
+                    shown,
+                ))
+            # 与差异串同一个排序依据：先按定义顺序，同 rank 再按文本。
+            # _flatten_signature 的键来自 frozenset 化的路径集合，不兜底按文
+            # 本排的话，同一条快照两次打开可能排出不同的顺序。
+            sections.append(
+                (label, [(name, text) for _rank, name, text in sorted(rows)]))
+        return sections
+
+    @staticmethod
+    def _history_row_form_state(row):
+        """把优选排名行的 ``meta_*`` 还原成一份对冲策略 form_state。
+
+        这几个字段正是「应用策略到左侧参数」读的那些，够拼出完整的策略签名。
+        候选带宽一律以 σ 表达：整批候选共用左侧输入的波动率，排名比的就是 σ
+        倍数本身（见 ``_collect_history_state``）。
+        """
+        fallback = row.get("meta_force_day_close_hedge")
+        return {
+            "strategy_name": str(
+                row.get("meta_strategy_name")
+                or row.get("strategy_type") or "").strip(),
+            "fixed_times": str(row.get("meta_fixed_times", "") or ""),
+            "interval_type": "sigma",
+            "price_interval": BacktestApp._comparison_finite(
+                row.get("meta_candidate_sigma")),
+            "sigma_source": str(
+                row.get("meta_sigma_source", "") or "implied"),
+            "sigma_window": BacktestApp._comparison_safe_int(
+                row.get("meta_sigma_window"), 20),
+            "force_day_close_hedge": (
+                bool(fallback)
+                if isinstance(fallback, (bool, np.bool_)) else False),
+        }
+
+    # 期权参数那一组在优选页必须带的限定。每段实际用的期权是按该段首价整体
+    # 缩放过的（见 _history_replay_gui_state / _replay_scaled_params），一行覆
+    # 盖十几段就有十几组实际行权价——照单看会拿去对账，对不上。
+    #
+    # 出口写「加载明细」而不是「回测这一段」：分段的 bar 级明细在优选跑完时
+    # 就已落盘，那个按钮是读回来（约 27 ms）不是重算，_build_history_replay_bar
+    # 那条注释专门交代过不能叫「回测」。
+    _HISTORY_CONTRACT_NOTE = (
+        "⚠ 以下是左侧填入的参考值。每段实际用的期权按该段首价整体缩放，"
+        "逐段不同。要看某一段实际用的参数，在图表下方「查看某段明细」选中该段"
+        "并点「加载明细」，回测摘要页会列出按该段首价伸缩后的期权要素。")
+
+    @staticmethod
+    def _history_row_detail_sections(row, history_state):
+        """把优选排名的一行摊成可展示的分组。
+
+        与结果池最大的不同是**参数天然分两层**：优选的全部候选共用同一套期权、
+        行情与规模成本（那正是控制变量的做法），只有对冲策略逐条不同。所以这
+        里拿运行时冻结的 state 造出前四组，再把这一行自己的 ``meta_*`` 拼成
+        第五组的 form_state——五组的字段、中文名和取值回译于是与结果池详情完全
+        同构，两个窗口不会对同一项给出两种说法。
+
+        末尾另加一组「本行的取样口径」：它回答"这一行的数字是在多大样本上算
+        出来的"，是优选特有的、结果池没有的一层。
+        """
+        history_state = dict(history_state or {})
+        row = dict(row or {})
+        market_key, contract_key, economics_key = (
+            BacktestApp._signature_keys_from_state(history_state))
+        try:
+            position = BacktestApp._normalize_position(
+                history_state.get("position"))
+        except ValueError:
+            position = 1
+        probe = SimpleNamespace(
+            market_key=market_key,
+            contract_key=contract_key,
+            economics_key=economics_key,
+            position=position,
+            form_state=BacktestApp._history_row_form_state(row),
+            bar_size_requested=str(
+                history_state.get("wind_bar_size_requested", "") or ""),
+            intraday_steps=0,
+        )
+        sections = BacktestApp._snapshot_detail_sections(probe)
+
+        scope = []
+        for key, label in (
+                ("period", "周期"),
+                ("strategy", "候选"),
+        ):
+            text = str(row.get(key, "") or "").strip()
+            if text:
+                scope.append((label, text))
+        paired = BacktestApp._comparison_safe_int(
+            row.get("paired_windows", row.get("rolling_windows")), 0)
+        if paired:
+            scope.append(("参与评分段数", str(paired)))
+        baseline = BacktestApp._comparison_safe_int(
+            row.get("baseline_windows"), 0)
+        if baseline:
+            scope.append(("基准段数", str(baseline)))
+        sections.append(("本行的取样口径", scope))
+        return sections
 
     @staticmethod
     def _comparison_aspect_diff(snapshots):
@@ -5677,43 +6205,43 @@ class BacktestApp(tk.Tk):
 
     @staticmethod
     def _comparison_variable_summary(snapshots):
-        """把属性异同压成一句话：这次的变量是谁，还是有好几个。"""
+        """把属性异同拆成三层：标题、逐字段取值、其余一致。
+
+        标题只说"变量是哪个属性"，长度恒定；具体取值交给 ``fields``，由展示
+        层按序号排成网格。此前三层挤在一行粗体里，三条结果差两项就是七八十
+        个字，还得靠 "A vs B vs C" 硬串——那串既看不出谁是谁，也没法截断。
+        """
         report = BacktestApp._comparison_aspect_diff(snapshots)
         if not report:
             return None
         changed = [(label, fields) for label, same, fields in report if not same]
         same_labels = [label for label, same, _f in report if same]
 
-        def _detail(label, fields):
-            if not fields:
-                return label
-            # 字段名与属性名重合时省掉前缀：头寸方向这个属性就只有这一个
-            # 同名字段，写成「头寸方向（头寸方向：买入 vs 卖出）」是废话。
-            fields = [
-                field[len(label) + 1:]
-                if field.startswith(f"{label}：") else field
-                for field in fields
-            ]
-            if len(fields) > 3:
-                # "等 N 项"直接跟在第三项后面会读成"带宽阈值等 5 项"，
-                # 用分隔符断开。
-                shown = "；".join(fields[:3]) + f"；……共 {len(fields)} 项不同"
-            else:
-                shown = "；".join(fields)
-            return f"{label}（{shown}）"
+        def _rows(entries):
+            """把各属性的字段摊平；字段名与属性名重合时不重复。"""
+            rows = []
+            for label, fields in entries:
+                if not fields:
+                    rows.append((label, None))
+                    continue
+                for name, values in fields:
+                    rows.append((name, values))
+            return rows
 
         if not changed:
             return {
                 "state": "identical",
                 "headline": "所选结果的输入完全相同",
-                "rest": ("行情、期权、头寸方向、规模与成本、对冲策略逐项一致；"
+                "fields": [],
+                "rest": ("行情、期权类型与参数、头寸方向、规模与成本、"
+                         "对冲策略逐项一致；"
                          "若数字仍有差异，只可能来自未记录的输入。"),
             }
         if len(changed) == 1:
-            label, fields = changed[0]
             return {
                 "state": "single",
-                "headline": f"本次对比的变量：{_detail(*changed[0])}",
+                "headline": f"本次对比的变量：{changed[0][0]}",
+                "fields": _rows(changed),
                 "rest": (f"其余一致：{'、'.join(same_labels)}"
                          if same_labels else ""),
             }
@@ -5721,8 +6249,8 @@ class BacktestApp(tk.Tk):
             "state": "multiple",
             "headline": (
                 f"同时有 {len(changed)} 项不同："
-                + "、".join(_detail(label, fields)
-                            for label, fields in changed)),
+                + "、".join(label for label, _fields in changed)),
+            "fields": _rows(changed),
             "rest": ("差异无法归因到其中任何一项；"
                      + (f"一致的是：{'、'.join(same_labels)}"
                         if same_labels else "没有任何一项是一致的")),
@@ -6047,13 +6575,25 @@ class BacktestApp(tk.Tk):
             }
             for _index, row in summary.iterrows()
         ])
-        curves = pd.DataFrame({
-            name: np.asarray(
-                daily.get("cumulative_net_pnl", []), dtype=float)
+        # 逐条建 Series 再按索引横向拼，不能用 dict-of-arrays 直接建表：
+        # 后者要求各列等长，而"各条交易日数不同"恰恰是本页显式支持的状态
+        # （_saved_comparison_warnings 有专门提示、绘图侧对每条各自算
+        # x = arange(1, len+1)），换区间做对比更是本页头号用途。等长要求会
+        # 让整个导出抛 ValueError，被调用方转成"没有可导出的结果"，连同已
+        # 经拼好的排名表一起丢掉——结果明明就在屏幕上。
+        # 索引即交易日序号，短的那几条自动补 NaN，与图表的对齐方式一致。
+        columns = [
+            pd.Series(
+                np.asarray(
+                    daily.get("cumulative_net_pnl", []), dtype=float),
+                name=name,
+            ).rename_axis(None)
             for name, daily in getattr(
                 self, "_comparison_daily_curves", {}).items()
-        })
-        curves.index = np.arange(1, len(curves) + 1)
+        ]
+        for column in columns:
+            column.index = np.arange(1, len(column) + 1)
+        curves = pd.concat(columns, axis=1) if columns else pd.DataFrame()
         curves.index.name = "交易日序号"
         return ranking, curves
 
@@ -6155,16 +6695,163 @@ class BacktestApp(tk.Tk):
             f"已把『{snapshot.name}』的对冲策略应用到左侧参数  |  "
             "期权结构、方向与行情来源保持不变")
 
+    def _show_saved_snapshot_params(self):
+        """右键菜单「参数详情」：只读列出聚焦那条快照的全部原始输入。
+
+        与「加载明细」的分工：那一条要的是**结果**（逐日损益、对冲图表），
+        因此必须重放，代价是顶掉当前回测并切页，旧快照没有配方还点不动；
+        这一条要的是**输入**，四个签名里全存着，读一读就有——不重放、不动
+        当前回测、不依赖 ``replay``，上线前保留的快照照样打得开。
+        """
+        if not BacktestApp._saved_pool_actions_allowed(self):
+            return
+        result_id = self._focused_saved_backtest_id()
+        if result_id not in self._saved_backtests:
+            messagebox.showinfo("请选择结果", "请先在结果池中点击一条结果。")
+            return
+        BacktestApp._open_snapshot_params_window(
+            self, self._saved_backtests[result_id])
+
+    def _open_snapshot_params_window(self, snapshot):
+        """结果池那条快照的参数详情窗。"""
+        meta = [
+            BacktestApp._saved_snapshot_origin_label(snapshot),
+            snapshot.saved_at.strftime("%Y-%m-%d %H:%M:%S"),
+        ]
+        detail = BacktestApp._snapshot_origin_detail(snapshot)
+        if detail:
+            meta.append(detail)
+        return BacktestApp._open_params_window(
+            self,
+            heading=snapshot.name,
+            subtitle="  ·  ".join(meta),
+            sections=BacktestApp._snapshot_detail_sections(snapshot),
+        )
+
+    def _open_params_window(self, *, heading, subtitle, sections, notes=None):
+        """摆出参数详情窗。结果池与策略优选共用这一套渲染。
+
+        正文用只读 ``Text`` 而不是一排 ``Label``：内容长度随期权大类差着数
+        倍（香草 7 个合约参数，雪球 18 个），Text 自带滚动，而且文本可以选中
+        复制——把一条结果的参数贴给别人是这个窗口的第二个用途。
+
+        ``notes`` 是 ``{组名: 说明}``，用于给整组加一句限定。策略优选那边靠它
+        说明「期权参数是参考值，每段按段初价缩放」——那句话属于整组，挂在某
+        一行上都不对。
+        """
+        notes = dict(notes or {})
+        window = tk.Toplevel(self)
+        window.title(f"参数详情 — {heading}")
+        window.geometry("560x620")
+        window.transient(self)
+        body = ttk.Frame(window, style="Surface.TFrame", padding=12)
+        body.pack(fill="both", expand=True)
+
+        ttk.Label(
+            body, text=heading, style="Surface.TLabel",
+            font=(_UI_FONT_FAMILY, 13, "bold"), anchor="w",
+        ).pack(fill="x")
+        ttk.Label(
+            body, text=subtitle, style="SurfaceMuted.TLabel",
+            anchor="w", wraplength=520, justify="left",
+        ).pack(fill="x", pady=(2, 8))
+
+        text_frame = ttk.Frame(body, style="Surface.TFrame")
+        text_frame.pack(fill="both", expand=True)
+        text = tk.Text(
+            text_frame, wrap="word", relief="flat", padx=10, pady=8,
+            bg=PALETTE["surface_alt"], fg=PALETTE["text"],
+            font=(_MONO_FONT_FAMILY, 10), highlightthickness=0,
+        )
+        scrollbar = ttk.Scrollbar(
+            text_frame, orient="vertical", command=text.yview)
+        text.configure(yscrollcommand=scrollbar.set)
+        text.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+        text.tag_configure(
+            "group", foreground=PALETTE["primary"],
+            font=(_UI_FONT_FAMILY, 11, "bold"), spacing1=10, spacing3=4)
+        text.tag_configure("label", foreground=PALETTE["text_muted"])
+        text.tag_configure("value", foreground=PALETTE["text"])
+        text.tag_configure("empty", foreground=PALETTE["text_light"])
+        text.tag_configure(
+            "note", foreground=PALETTE["warning"], lmargin1=16, lmargin2=16,
+            spacing3=2)
+
+        # 取值全部起在同一竖列上。用制表位按**像素**对齐，不能按字符数补空格：
+        # 等宽字体里一个汉字占两格而 len() 只算一个，`初始价格 S0`（7 字、11
+        # 格）和 `期限(交易日)`（8 字、12 格）补完反而错开。
+        # 制表位按全窗最长的字段名算，不是逐组算——逐组算的话五组的取值会各起
+        # 各的位置。
+        name_font = tkfont.Font(font=(_MONO_FONT_FAMILY, 10))
+        stop = 14 + max(
+            (name_font.measure(name)
+             for _label, rows in sections for name, _v in rows),
+            default=0) + 18
+        text.configure(tabs=(stop,))
+        for label, rows in sections:
+            text.insert("end", f"{label}\n", "group")
+            note = str(notes.get(label, "") or "").strip()
+            if note:
+                text.insert("end", f"{note}\n", "note")
+            if not rows:
+                text.insert("end", "  （本组没有已记录的输入）\n", "empty")
+                continue
+            for name, shown in rows:
+                text.insert("end", f"  {name}\t", "label")
+                text.insert("end", f"{shown}\n", "value")
+        # 插完再锁：disabled 状态下 insert 是静默无效的。
+        text.configure(state="disabled")
+
+        ttk.Button(
+            body, text="关闭", width=10, command=window.destroy,
+        ).pack(anchor="e", pady=(10, 0))
+        return window
+
     # 结果池表的列：(列键, 表头, 初始宽度, 对齐)。初始宽度按表头与内容实际
     # 需要分配，总和接近容器宽度，配合全列 stretch 使窗口缩放不改变列比例。
+    # 这一列宽度同时是自动伸缩的下限，见 _SAVED_POOL_COLUMN_MAX。
+    # 「期权类型」排在「策略」前面：一条结果先是"测的哪一种期权"，才轮到
+    # "用什么对冲它"。此前这一列完全不在表上——``option_label`` 存了却只在
+    # 保留成功的提示框和导出的 meta_description 里露过面，想在池子里认出一条
+    # 是香草还是累计，只能右键「加载明细」把当前回测顶掉重跑一遍。
     _SAVED_POOL_COLUMNS = (
-        ("name", "结果名称", 190, "w"),
+        ("name", "结果名称", 175, "w"),
         ("origin", "产生方式", 96, "center"),
-        ("strategy", "策略", 110, "center"),
-        ("parameters", "策略参数", 250, "w"),
-        ("source", "行情来源", 175, "w"),
-        ("saved_at", "保留时间", 110, "center"),
+        ("option", "期权类型", 110, "center"),
+        ("strategy", "策略", 104, "center"),
+        ("parameters", "策略参数", 240, "w"),
+        ("source", "行情来源", 170, "w"),
+        ("saved_at", "保留时间", 104, "center"),
     )
+    # 自动伸缩的上限。同一列的内容长度差着数倍：「策略参数」在每日收盘时是
+    # 一句话，在固定间隔时要写下绝对 / 相对 / σ 三种口径的等价换算；「行情
+    # 来源」在模拟时只有一个 seed，在 Wind 时是代码加起止日加频率。定死一个
+    # 宽度只能二选一——要么长的那种被截断，要么短的那种空出一大片。
+    # 「期权类型」的上限按最长的子类中文名留：「熔断每日双固赔累计」9 个
+    # 汉字，与历史结果窗口那张表给子类型的 150px 是同一个依据。
+    # 加进第七列后上限之和（含 #0 列）约 1400px，超出常见窗口的容器宽度——
+    # 但七列同时顶到各自上限要求每一格都是最长内容，实际到不了；真到了由
+    # _fit_pool_columns_to_width 按比例削，不会像 minwidth 那样把右边的列裁掉。
+    _SAVED_POOL_COLUMN_MAX = {
+        "name": 230, "origin": 110, "option": 150, "strategy": 130,
+        "parameters": 380, "source": 250, "saved_at": 116,
+    }
+    # 容器放不下、要按比例削的时候，这一列尽量保住的宽度。「策略参数」是这
+    # 张表里唯一需要逐字读的列——固定间隔在这里写下绝对 / 相对 / σ 三种口径
+    # 的等价换算，被削到基准宽以下就只剩一个「绝对 1.5；等价…」的开头，这一
+    # 列等于白占。其余列要么是短标签（产生方式、策略、保留时间），要么截了
+    # 还认得出（结果名称、行情来源的 Wind 串），所以只有这一列有这条保护。
+    #
+    # 300 → 250 是给第七列腾的，而且必须腾。这个数字直接进
+    # _fit_pool_columns_to_width 的下限和：下限和一旦超过容器可用宽，那个函数
+    # 就放弃缩放原样返回，于是总宽超出、右边的列被 Treeview 直接裁掉（没有横向
+    # 滚动条，也不会有任何提示）。加一列就把下限和抬高约 48px，等于「窗口最窄
+    # 能缩到多少」跟着退 48px——新增一列不该以此为代价。250 让七列的下限和落在
+    # 829px、临界容器宽 879px，与改动前的六列（831 / 881px）持平。
+    # 代价只在挤的时候出现：970px 容器下这一列从 305px 变成 294px。宽敞时不受
+    # 影响，它照样能长到 _SAVED_POOL_COLUMN_MAX 给的 380。
+    _SAVED_POOL_COLUMN_KEEP = {"parameters": 250}
 
     def _show_saved_comparison_page(self, *, navigate=True):
         """构建并渲染结果对比页；``navigate`` 为假时只构建不抢占当前页。"""
@@ -6194,28 +6881,55 @@ class BacktestApp(tk.Tk):
         pool.pack(fill="x", padx=8, pady=(4, 8))
         toolbar = ttk.Frame(pool, style="Surface.TFrame")
         toolbar.pack(fill="x", pady=(0, 4))
-        # 工具栏只留作用于「整池」的动作；作用于单条快照的（显示、应用策
-        # 略、重命名、删除）改走行右键菜单——它们本来就需要先点中一行，做
-        # 成常驻按钮等于让用户先读一句「点击其它列聚焦后…」才知道怎么用。
-        # 「全部显示 / 全部隐藏」原名「全选 / 清空」：选的是什么、清的是什
-        # 么都没说，而「清空」紧挨着「删除」，很像是要把结果池倒掉。
+        # 这一排分三组，从左到右：两个只换视图的（幽灵样式）、两个删数据的
+        # （危险样式，与前面隔开一段单独成组）、一个产出文件的收在最右。
+        #
+        # 「全选 / 取消全选」管的是「显示」列那一列勾选框，「全部清空」倒的
+        # 是整个结果池——两组名字都带各自的作用对象，区分靠的是样式（幽灵 vs
+        # 危险红）、间距分组和确认框，不再靠名字本身绕开。
+        #
+        # 「删除选中」作用于**行选择**而不是「显示」勾选集，这条不能松：勾选
+        # 集的语义只有"画不画到下方"，它跨会话落盘、每保留一条新结果自动勾
+        # 上，而「全选」一键就能把它赋成全池——让它兼任删除范围，「全选 →
+        # 删除选中」两击就清空了整个结果池，还绕过写明条数的确认框。改名之
+        # 后这条更要盯紧：「全选」听上去比原先的「全部显示」更像是在给删除选料。
         ttk.Label(
             toolbar,
-            text="右键结果行可显示、加载明细、应用策略、重命名或删除",
+            text=("右键结果行可显示、看参数详情、加载明细、应用策略、"
+                  "重命名或删除；Shift / ⌘ 可多选行"),
             style="SurfaceMuted.TLabel",
         ).pack(side="left", fill="x", expand=True)
-        ttk.Button(
-            toolbar, text="全部显示", width=9,
+        self._saved_pool_show_all_btn = ttk.Button(
+            toolbar, text="全选", width=9, style="Ghost.TButton",
             command=self._select_all_saved_backtests,
-        ).pack(side="left", padx=(4, 0))
-        ttk.Button(
-            toolbar, text="全部隐藏", width=9,
+        )
+        self._saved_pool_show_all_btn.pack(side="left", padx=(4, 0))
+        self._saved_pool_hide_all_btn = ttk.Button(
+            toolbar, text="取消全选", width=9, style="Ghost.TButton",
             command=self._clear_saved_backtest_selection,
-        ).pack(side="left", padx=(4, 0))
-        ttk.Button(
+        )
+        self._saved_pool_hide_all_btn.pack(side="left", padx=(4, 0))
+        # 条数写进按钮文案，这样"要删几条"在点下去之前就已经在屏幕上；宽度
+        # 按带条数时的最长文案定死，免得每次改选都抖一下版面。
+        self._saved_pool_delete_btn = ttk.Button(
+            toolbar, text="删除选中", width=13, style="Danger.TButton",
+            command=self._prompt_delete_saved_backtest,
+        )
+        self._saved_pool_delete_btn.pack(side="left", padx=(20, 0))
+        self._saved_pool_clear_btn = ttk.Button(
+            toolbar, text="全部清空", width=9, style="Danger.TButton",
+            command=self._clear_saved_backtest_pool,
+        )
+        # 两个红按钮之间也要留出手指宽度：它们的后果差着一整个结果池，而
+        # 「删除选中」是这一排最常点的那个。
+        self._saved_pool_clear_btn.pack(side="left", padx=(14, 0))
+        # 导出收在最右，与两个红按钮隔开：它是这一排唯一不改变任何状态的
+        # 动作，挨着删除放会让"点错一格"的代价过大。
+        self._saved_pool_export_btn = ttk.Button(
             toolbar, text="导出 CSV", width=9,
             command=self._export_saved_comparison,
-        ).pack(side="left", padx=(8, 0))
+        )
+        self._saved_pool_export_btn.pack(side="left", padx=(20, 0))
 
         pool_columns = BacktestApp._SAVED_POOL_COLUMNS
         tree_frame = ttk.Frame(pool, style="Surface.TFrame")
@@ -6223,7 +6937,10 @@ class BacktestApp(tk.Tk):
         tree = ttk.Treeview(
             tree_frame,
             columns=[key for key, _text, _width, _anchor in pool_columns],
-            show="tree headings", height=5, selectmode="browse",
+            # extended：Shift / ⌘ 多选行，供「删除选中」与右键批量删除使用。
+            # 于是本表两套"选中"彻底分家——打勾只管画不画到下方，选行才是
+            # 动作的作用对象。
+            show="tree headings", height=5, selectmode="extended",
         )
         tree.heading("#0", text="显示")
         tree.column("#0", width=46, minwidth=44, stretch=False, anchor="center")
@@ -6241,6 +6958,12 @@ class BacktestApp(tk.Tk):
         scrollbar.pack(side="right", fill="y")
         tree.bind("<Button-1>", self._toggle_saved_backtest_click)
         tree.bind("<space>", self._toggle_focused_saved_backtest)
+        # 「删除选中」的文案与启停跟着行选择走，而行选择的变化不经过结果池
+        # 刷新链路（用户拖一下选区、按住 ⌘ 点一行都不会重建表）。
+        tree.bind("<<TreeviewSelect>>", self._sync_saved_pool_buttons)
+        # 列宽要跟着容器走：构建的那一刻还没布局，宽度是 1，真正的宽度是在
+        # 第一次 <Configure> 才知道的；之后窗口每次缩放也要重排。
+        tree.bind("<Configure>", self._on_saved_pool_resize)
         # 单条快照的动作全部收进右键菜单。三个序列都绑：macOS 的 Tk 在不同
         # 小版本里把右键映射成 Button-2 或 Button-3，Control+左键又是系统级
         # 的右键等价操作；Windows / Linux 只认 Button-3。
@@ -6268,12 +6991,37 @@ class BacktestApp(tk.Tk):
             self._refresh_saved_pool_tree()
             self._refresh_saved_comparison_view()
 
+    @staticmethod
+    def _neighbour_pool_row(previous, removed, children):
+        """选中的行整批消失后，焦点该落到哪一行。
+
+        取被删那几行里最靠后的位置，先往下找第一条还在的，没有再往上找。
+        此前一律落到 ``children[-1]``，也就是表尾最新那条——逐条清理旧结果
+        时焦点每删一次就从表头蹦到表尾，人得重新找一遍自己删到哪儿了。
+        """
+        alive = set(children)
+        positions = [
+            index for index, item in enumerate(previous) if item in removed]
+        anchor = positions[-1] if positions else len(previous)
+        for item in previous[anchor + 1:]:
+            if item in alive:
+                return item
+        for item in reversed(previous[:anchor]):
+            if item in alive:
+                return item
+        return children[-1] if children else None
+
     def _refresh_saved_pool_tree(self):
         tree = getattr(self, "_saved_pool_tree", None)
         if tree is None:
             return
+        # 整个选区都要记下来，不能只记焦点：多选是删除类动作的作用对象，而
+        # 这条刷新每勾选一次就会跑一遍，只恢复一行等于每打一个勾就把用户的
+        # 多选悄悄塌成单选。
+        previous = tuple(tree.get_children())
+        picked = tuple(tree.selection())
         focus = tree.focus()
-        for item in tree.get_children():
+        for item in previous:
             tree.delete(item)
         for snapshot in self._saved_backtests.values():
             is_selected = snapshot.result_id in self._saved_comparison_selection
@@ -6284,6 +7032,7 @@ class BacktestApp(tk.Tk):
                     (
                         snapshot.name,
                         BacktestApp._saved_snapshot_origin_label(snapshot),
+                        snapshot.option_label,
                         snapshot.strategy_label,
                         snapshot.parameter_summary, snapshot.source_label,
                         snapshot.saved_at.strftime("%m-%d %H:%M:%S"),
@@ -6293,17 +7042,165 @@ class BacktestApp(tk.Tk):
                 ),
             )
         children = tree.get_children()
-        if focus in children:
-            tree.selection_set(focus)
-            tree.focus(focus)
-        elif children:
-            tree.selection_set(children[-1])
-            tree.focus(children[-1])
+        survivors = [item for item in picked if item in children]
+        if not survivors and focus in children:
+            survivors = [focus]
+        if not survivors and children:
+            neighbour = BacktestApp._neighbour_pool_row(
+                previous, set(picked) or {focus}, children)
+            survivors = [neighbour] if neighbour else []
+        if survivors:
+            tree.selection_set(survivors)
+            # 焦点优先留在原处：打勾不该把焦点拽到选区的第一行去。
+            tree.focus(focus if focus in children else survivors[0])
         count_var = getattr(self, "_saved_pool_count_var", None)
         if count_var is not None:
             count_var.set(
                 f"回测结果池 · 已保存 {len(self._saved_backtests)} 条 · "
                 f"当前显示 {len(self._saved_comparison_selection)} 条")
+        BacktestApp._autosize_saved_pool_columns(self)
+        BacktestApp._sync_saved_pool_buttons(self)
+
+    def _saved_pool_fonts(self):
+        """结果池表的（单元格字体, 表头字体），供测量列宽用。
+
+        与 style 里给 Treeview / Treeview.Heading 配的那两个保持一致；
+        测量对象和渲染对象不是同一个字体的话，量出来的宽度没有意义。
+        """
+        fonts = getattr(self, "_saved_pool_fonts_cache", None)
+        if fonts is None:
+            fonts = (
+                tkfont.Font(font=(_MONO_FONT_FAMILY, 9)),
+                tkfont.Font(font=(_UI_FONT_FAMILY, 10, "bold")),
+            )
+            self._saved_pool_fonts_cache = fonts
+        return fonts
+
+    # 「显示」复选框列的固定宽度，以及表格边框吃掉的那几像素。算可用宽度时
+    # 要先扣掉它们，否则每次都会多分出去五十来个像素。
+    _SAVED_POOL_CHECK_WIDTH = 46
+    _SAVED_POOL_TABLE_CHROME = 4
+
+    def _autosize_saved_pool_columns(self):
+        """按内容与当前容器宽度重新分配七列的宽度。
+
+        两件事一起做，缺一件都不成立：
+
+        1. 每列先按当前这一池的最长内容量一个需求宽，夹在基准宽与上限之间。
+           同一列的内容长度差着数倍（每日收盘的参数是一句话，固定间隔要写下
+           三种口径的等价换算），定死一个宽度只能二选一。
+        2. 再把这些需求宽整体缩放到**容器放得下**。ttk.Treeview 没有横向滚
+           动条，总宽超出容器时它既不压缩也不提示，直接把右边的列裁掉——此前
+           「保留时间」整列看不见就是这么来的，minwidth 只在手动拖列边界时
+           才起作用，拦不住这个。富余时按需求比例把余量分下去，长内容的列多
+           吃一点；不够时按"高出下限的那部分"等比削减，谁也不会被压到看不清。
+
+        容器宽度要等布局完成才有意义，构建的那一刻拿到的是 1，所以这里在拿
+        不到有效宽度时只做第 1 步，第 2 步由 ``<Configure>`` 那次回调补上。
+        """
+        tree = getattr(self, "_saved_pool_tree", None)
+        if tree is None:
+            return
+        try:
+            cell_font, head_font = BacktestApp._saved_pool_fonts(self)
+            rows = tree.get_children()
+            widths, floors = {}, {}
+            for key, text, base, _anchor in BacktestApp._SAVED_POOL_COLUMNS:
+                # 表头两侧的留白比单元格宽：排序标记之外还有 Treeview 自己的
+                # 表头内边距。
+                need = head_font.measure(text) + 26
+                for iid in rows:
+                    need = max(need, cell_font.measure(tree.set(iid, key)) + 16)
+                ceiling = BacktestApp._SAVED_POOL_COLUMN_MAX.get(key, base)
+                floor = max(44, base - 30)
+                # 下限用 minwidth 而不是基准宽：内容短的列（产生方式、策略、
+                # 保留时间）占着基准宽不放，省下的空间本该归内容长的那几列。
+                widths[key] = max(floor, min(need, ceiling))
+                keep = BacktestApp._SAVED_POOL_COLUMN_KEEP.get(key)
+                floors[key] = (
+                    max(floor, min(widths[key], keep)) if keep else floor)
+            widths = BacktestApp._fit_pool_columns_to_width(
+                widths, floors,
+                tree.winfo_width() - BacktestApp._SAVED_POOL_CHECK_WIDTH
+                - BacktestApp._SAVED_POOL_TABLE_CHROME)
+            for key, width in widths.items():
+                tree.column(key, width=width)
+        except tk.TclError:
+            # 表已随窗口销毁：列宽只是展示，不该反过来打断刷新链路。
+            pass
+
+    @staticmethod
+    def _fit_pool_columns_to_width(widths, floors, available):
+        """把各列的需求宽缩放到 ``available``；放不下下限时原样返回。
+
+        纯函数，不碰控件——这样"够宽 / 不够宽 / 宽度还不知道"三种分支可以直
+        接测，不必真去摆一个窗口出来。
+        """
+        total = sum(widths.values())
+        if not total or available <= sum(floors.values()):
+            # 宽度还没算出来（构建那一刻是 1），或者窄到连下限都排不下：
+            # 后者再缩也只是把每列都压成看不清，不如维持原样让人去拉窗口。
+            return dict(widths)
+        if total > available:
+            slack = total - sum(floors.values())
+            cut = total - available
+            return {
+                key: int(width - (width - floors[key]) * cut / slack)
+                for key, width in widths.items()
+            }
+        extra = available - total
+        return {
+            key: width + int(extra * width / total)
+            for key, width in widths.items()
+        }
+
+    def _on_saved_pool_resize(self, event):
+        """容器宽度变了才重排列宽——``<Configure>`` 高度变化也会发。"""
+        if event.width == getattr(self, "_saved_pool_last_width", None):
+            return
+        self._saved_pool_last_width = event.width
+        BacktestApp._autosize_saved_pool_columns(self)
+
+    def _sync_saved_pool_buttons(self, _event=None):
+        """把工具栏五个按钮的启停与文案对齐当前状态。
+
+        「有没有可操作对象」在这个项目里一律用置灰表达，而不是点了再弹一句
+        提示（历史结果窗口的三个按钮、右键「加载明细」、「＋ 保留当前结果」
+        都是这么做的）。此前这一排只有「全部清空」兑现了这条规则，清空之
+        后页面上会留下三个照样可点、点了什么也不发生的按钮。
+
+        按钮随对比页重建，旧引用可能已经被销毁；拿不到就当这一排还没建出
+        来，静默跳过——状态同步不该反过来打断刷新链路。
+        """
+        pool = getattr(self, "_saved_backtests", None) or {}
+        shown = getattr(self, "_saved_comparison_selection", None) or set()
+        picked = len(BacktestApp._picked_saved_backtest_ids(self))
+        for attr, enabled in (
+            # 全都勾上时「全选」已经没有可勾的了，同「清空 0 条」一样
+            # 是个点了不会有任何变化的按钮。
+            ("_saved_pool_show_all_btn",
+             bool(pool) and any(rid not in shown for rid in pool)),
+            ("_saved_pool_hide_all_btn", bool(shown)),
+            # 导出的作用域是「当前显示的那几条」，一条不显示时它导不出东西；
+            # 原先是点了弹一句「没有可导出的结果」，那句兜底仍然留着防御。
+            ("_saved_pool_export_btn", bool(shown)),
+            ("_saved_pool_delete_btn", picked > 0),
+            ("_saved_pool_clear_btn", bool(pool)),
+        ):
+            button = getattr(self, attr, None)
+            try:
+                if button is None or not button.winfo_exists():
+                    continue
+                button.state(["!disabled"] if enabled else ["disabled"])
+            except tk.TclError:
+                continue
+        delete_btn = getattr(self, "_saved_pool_delete_btn", None)
+        try:
+            if delete_btn is not None and delete_btn.winfo_exists():
+                delete_btn.configure(
+                    text=f"删除选中 ({picked})" if picked > 1 else "删除选中")
+        except tk.TclError:
+            pass
 
     def _build_saved_pool_menu(self):
         """结果池的行右键菜单：只放作用于「点中那一条」的动作。
@@ -6314,6 +7211,10 @@ class BacktestApp(tk.Tk):
         menu.add_command(label="显示",
                          command=self._toggle_focused_saved_backtest)
         menu.add_separator()
+        # 「参数详情」排在「加载明细」前面：前者读的是输入、恒可用、不改变
+        # 任何状态，后者要重放并顶掉当前回测。先给代价小的那个。
+        menu.add_command(label="参数详情…",
+                         command=self._show_saved_snapshot_params)
         menu.add_command(label="加载明细",
                          command=self._load_saved_snapshot_detail)
         menu.add_command(label="应用策略",
@@ -6325,13 +7226,22 @@ class BacktestApp(tk.Tk):
                          command=self._prompt_delete_saved_backtest)
         return menu
 
-    _POOL_MENU_DETAIL_INDEX = 2
+    # 只有「加载明细」按有没有重放配方启停，名字要写全：同排的「参数详情」
+    # 读的是签名，任何快照都打得开，两者不能共用一个 DETAIL 索引。
+    _POOL_MENU_LOAD_DETAIL_INDEX = 3
+
+    # 除末项「删除」外，其余五项都只对一条快照说得通，多选时一并置灰。
+    _POOL_MENU_SINGLE_INDEXES = (0, 2, 3, 4, 5)
+    _POOL_MENU_DELETE_INDEX = 7
 
     def _popup_saved_pool_menu(self, event):
-        """右键先把光标下那行设成作用对象，再弹菜单。
+        """右键先确定作用对象，再弹菜单。
 
         空白处右键没有作用对象，直接不弹——弹一份点了只会跳「请选择结果」
         的菜单，比不弹更费解。
+
+        点在**已经选中的行**上时保留整个选区，点在选区外才重置成这一行：
+        反过来就永远右键不出多条，攒好的选区在菜单弹出前就被打散了。
         """
         if not BacktestApp._saved_pool_actions_allowed(self):
             return "break"
@@ -6342,19 +7252,30 @@ class BacktestApp(tk.Tk):
         result_id = tree.identify_row(event.y)
         if not result_id:
             return None
-        tree.selection_set(result_id)
+        if result_id not in tree.selection():
+            tree.selection_set(result_id)
         tree.focus(result_id)
+        picked = BacktestApp._picked_saved_backtest_ids(self)
+        multiple = len(picked) > 1
         menu.entryconfigure(
             0,
             label=("取消显示" if result_id in self._saved_comparison_selection
                    else "显示"))
+        for index in BacktestApp._POOL_MENU_SINGLE_INDEXES:
+            menu.entryconfigure(
+                index, state=("disabled" if multiple else "normal"))
         # 没有重放配方就置灰：本功能上线前保留的快照只有汇总层，点了只能
         # 弹一句"没有配方"，不如直接让它点不动。
         snapshot = self._saved_backtests.get(result_id)
+        if not multiple:
+            menu.entryconfigure(
+                BacktestApp._POOL_MENU_LOAD_DETAIL_INDEX,
+                state=("normal" if getattr(snapshot, "replay", None)
+                       else "disabled"))
+        # 末项文案跟着选中条数走，这样"这一下要删几条"在菜单里就已经写着。
         menu.entryconfigure(
-            BacktestApp._POOL_MENU_DETAIL_INDEX,
-            state=("normal" if getattr(snapshot, "replay", None)
-                   else "disabled"))
+            BacktestApp._POOL_MENU_DELETE_INDEX,
+            label=(f"删除选中的 {len(picked)} 条" if multiple else "删除"))
         try:
             menu.tk_popup(event.x_root, event.y_root)
         finally:
@@ -6375,7 +7296,8 @@ class BacktestApp(tk.Tk):
         result_id = tree.identify_row(event.y)
         if not result_id or tree.identify_column(event.x) != "#0":
             return None
-        tree.selection_set(result_id)
+        # 只挪焦点、不碰选区：打勾管的是"画不画到下方"，动一下它不该把用户
+        # 攒起来的多选选区塌掉。
         tree.focus(result_id)
         self._toggle_saved_backtest_selection(result_id)
         return "break"
@@ -6408,7 +7330,10 @@ class BacktestApp(tk.Tk):
     def _select_all_saved_backtests(self):
         if not BacktestApp._saved_pool_actions_allowed(self):
             return
-        self._saved_comparison_selection = set(self._saved_backtests)
+        # 原地改而不是重新绑定属性：「取消全选」走的是 .clear()，两个入口对
+        # 同一个集合一个换对象一个改内容，拿着旧引用的地方就会看到两种结果。
+        self._saved_comparison_selection.clear()
+        self._saved_comparison_selection.update(self._saved_backtests)
         BacktestApp._persist_pool_view(self)
         self._refresh_saved_pool_tree()
         self._refresh_saved_comparison_view()
@@ -6427,6 +7352,28 @@ class BacktestApp(tk.Tk):
             return None
         selection = tree.selection()
         return selection[0] if selection else (tree.focus() or None)
+
+    def _picked_saved_backtest_ids(self):
+        """当前行选择里仍然存在的那几条，按结果池顺序返回。
+
+        行选择是删除类动作的唯一作用对象。选区里可能留着已经被删掉的行
+        （确认框跑的是嵌套事件循环，开着的时候池子仍可能变），表也可能已经
+        销毁，所以这里统一过滤一次再交出去。
+
+        **只认选区，不回退到焦点行。** 焦点是不可见的：⌘ 点掉最后一个选中
+        行之后表上一个高亮都没有，焦点却还留在那一行；回退到它，「删除选中」
+        就会在屏幕上什么都没选中的情况下照样可点，并删掉一条看不出被选中的
+        结果——而删除是真删文件、不可撤销。键盘那条路径（空格键切换显示）走
+        的是 ``_focused_saved_backtest_id``，不受这里影响。
+        """
+        tree = getattr(self, "_saved_pool_tree", None)
+        try:
+            selection = tuple(tree.selection()) if tree is not None else ()
+        except tk.TclError:
+            selection = ()
+        picked = {str(item) for item in selection}
+        pool = getattr(self, "_saved_backtests", None) or {}
+        return [result_id for result_id in pool if result_id in picked]
 
     def _prompt_rename_saved_backtest(self):
         if not BacktestApp._saved_pool_actions_allowed(self):
@@ -6452,26 +7399,93 @@ class BacktestApp(tk.Tk):
         self._refresh_saved_comparison_view()
         self._set_status(f"已将回测结果重命名为『{snapshot.name}』")
 
+    @staticmethod
+    def _saved_pool_name_digest(snapshots):
+        """把一批快照压成一句可读的名字串：前三条点名，其余记数。
+
+        确认框与状态栏共用。必须截断：结果名是用户自由输入且没有长度上限
+        （``_validate_saved_result_name`` 只校验非空与唯一），二十个名字会
+        把不能滚动的 Tk 消息框撑出屏幕。写法与结果包淘汰那处一致。
+        """
+        snapshots = list(snapshots)
+        names = "、".join(f"『{snapshot.name}』" for snapshot in snapshots[:3])
+        more = f" 等 {len(snapshots)} 条" if len(snapshots) > 3 else ""
+        return f"{names}{more}"
+
     def _prompt_delete_saved_backtest(self):
+        """删除当前选中的结果：一条和多条走同一条路。
+
+        作用对象是**行选择**，不是「显示」勾选集——理由见工具栏那段注释。
+        单条时的标题与正文与此前逐字一致；多条才换成点名前三条的版本。
+        """
         if not BacktestApp._saved_pool_actions_allowed(self):
             return
-        result_id = self._focused_saved_backtest_id()
-        if result_id not in self._saved_backtests:
+        picked = BacktestApp._picked_saved_backtest_ids(self)
+        if not picked:
             messagebox.showinfo("请选择结果", "请先在结果池中点击一条结果。")
             return
-        snapshot = self._saved_backtests[result_id]
-        if not messagebox.askyesno(
-                # 结果池已落盘，这是真删文件。措辞必须比「从当前会话删除」
-                # 重——那句的轻描淡写建立在「反正关程序也会没」之上。
-                "删除回测结果",
-                f"删除『{snapshot.name}』？将同时删掉本机上的结果文件，"
-                "此操作不可撤销。"):
+        snapshots = [self._saved_backtests[result_id] for result_id in picked]
+        # 结果池已落盘，这是真删文件。措辞必须比「从当前会话删除」重——那
+        # 句的轻描淡写建立在「反正关程序也会没」之上。
+        tail = "将同时删掉本机上的结果文件，此操作不可撤销。"
+        if len(picked) == 1:
+            title = "删除回测结果"
+            message = f"删除『{snapshots[0].name}』？{tail}"
+        else:
+            rest = len(self._saved_backtests) - len(picked)
+            # 选满整池时它和「全部清空」是同一件事，不点名的话用户不会意
+            # 识到自己正在清空。
+            title = "删除选中的结果"
+            message = (
+                f"删除选中的 {len(picked)} 条？\n\n"
+                f"{BacktestApp._saved_pool_name_digest(snapshots)}\n\n"
+                f"{tail}\n"
+                + (f"删除后结果池还剩 {rest} 条。" if rest
+                   else "删除后结果池将变空。"))
+        if not messagebox.askyesno(title, message):
             return
-        self._delete_saved_backtest(result_id)
+        # 确认框跑的是嵌套事件循环，开着的这段时间 after 回调照常执行，池子
+        # 可能已经变了；_delete_saved_backtest 用的是无默认值的 pop，撞上已
+        # 经不在的 id 会 KeyError，把批量删除停在半路且不报任何状态。
+        deleted = [
+            self._delete_saved_backtest(result_id)
+            for result_id in picked if result_id in self._saved_backtests
+        ]
         self._refresh_saved_pool_tree()
         self._refresh_saved_comparison_view()
-        self._set_status(
-            f"已删除『{snapshot.name}』  |  剩余 {len(self._saved_backtests)} 条")
+        if not deleted:
+            self._set_status("选中的结果已不在结果池里，未删除任何东西")
+            return
+        digest = BacktestApp._saved_pool_name_digest(deleted)
+        # 删除不可逆，必须说出删了哪些而不只是几条。
+        head = (f"已删除{digest}" if len(deleted) == 1
+                else f"已删除 {len(deleted)} 条结果：{digest}")
+        self._set_status(f"{head}  |  剩余 {len(self._saved_backtests)} 条")
+
+    def _clear_saved_backtest_pool(self):
+        """清空整池：逐条删除，同时删掉本机上的结果文件。
+
+        和右键菜单的「删除」是同一件事，只是作用域从一条变成全部——攒到
+        二十条时逐条删要点二十次、确认二十次。确认框的标题写全「清空结果
+        池」而不是按钮上那个「全部清空」：按钮靠位置和红色说明自己清的是
+        什么，弹出来的框没有那两样，只能靠字面。
+        """
+        if not BacktestApp._saved_pool_actions_allowed(self):
+            return
+        total = len(self._saved_backtests)
+        if not total:
+            return
+        if not messagebox.askyesno(
+                "清空结果池",
+                f"删除全部 {total} 条已保留结果？将同时删掉本机上的结果文件，"
+                "此操作不可撤销。"):
+            return
+        # 先固化 id 列表：_delete_saved_backtest 会就地改这个字典。
+        for result_id in list(self._saved_backtests):
+            self._delete_saved_backtest(result_id)
+        self._refresh_saved_pool_tree()
+        self._refresh_saved_comparison_view()
+        self._set_status(f"已清空结果池  |  删除 {total} 条已保留结果")
 
     def _selected_saved_backtests(self):
         """纯查询：按结果池顺序返回已勾选的快照。"""
@@ -6526,14 +7540,14 @@ class BacktestApp(tk.Tk):
             if not snapshots:
                 # 「空」现在有三种含义，必须分清：本机从没存过 / 存过但载入
                 # 失败 / 存着但全被隐藏了。第三种最容易被误读成数据没了——
-                # 用户刚点完「全部隐藏」，页面回一句「尚未选择」就像清空了。
+                # 用户刚点完「取消全选」，页面回一句「尚未选择」就像清空了。
                 pooled = len(self._saved_backtests)
                 load_error = getattr(self, "_saved_pool_load_error", "")
                 if pooled:
                     self._render_saved_comparison_empty(
                         "当前没有显示任何结果",
                         f"已保留的 {pooled} 条都在上方结果池里，"
-                        "点「显示」列或按「全部显示」即可放上来。")
+                        "点「显示」列或按「全选」即可放上来。")
                 elif load_error:
                     self._render_saved_comparison_empty(
                         "没有可显示的结果", load_error)
@@ -6549,7 +7563,6 @@ class BacktestApp(tk.Tk):
             self._render_saved_comparison_empty("无法生成对比", str(exc))
             return
         BacktestApp._ensure_comparison_frame(self, content)
-        BacktestApp._refresh_comparison_variable_card(self, snapshots)
         self._populate_comparison_view(summary, daily_curves)
 
     def _ensure_comparison_frame(self, content):
@@ -6602,13 +7615,21 @@ class BacktestApp(tk.Tk):
         )
         self._comparison_variable_label.grid(row=0, column=0, sticky="w")
 
+        # 逐字段的取值网格：一行一个字段，取值按 #序号 排开，序号与指标表
+        # 首列一致。此前这些值拼成 "A vs B vs C" 塞进标题，三条以上就分不
+        # 清谁是谁了。
+        self._comparison_field_grid = tk.Frame(
+            body, bg=PALETTE["surface_alt"])
+        self._comparison_field_grid.grid(row=1, column=0, sticky="w",
+                                         pady=(6, 0))
+
         self._comparison_same_var = tk.StringVar(value="")
         tk.Label(
             body, textvariable=self._comparison_same_var,
             bg=PALETTE["surface_alt"], fg=PALETTE["text_muted"],
             font=(_UI_FONT_FAMILY, 9), anchor="w", justify="left",
             wraplength=980,
-        ).grid(row=1, column=0, sticky="w", pady=(4, 0))
+        ).grid(row=2, column=0, sticky="w", pady=(6, 0))
 
         self._comparison_caveat_var = tk.StringVar(value="")
         self._comparison_caveat_label = tk.Label(
@@ -6617,7 +7638,49 @@ class BacktestApp(tk.Tk):
             font=(_UI_FONT_FAMILY, 9), anchor="w", justify="left",
             wraplength=980,
         )
-        self._comparison_caveat_label.grid(row=2, column=0, sticky="w")
+        self._comparison_caveat_label.grid(row=3, column=0, sticky="w")
+
+    def _fill_comparison_field_grid(self, fields):
+        """一行一个差异字段：字段名 + 各结果的取值，取值按 #序号 排开。
+
+        序号与指标表首列一致，所以三条以上也认得出谁是谁——此前这些值拼成
+        "A vs B vs C" 塞在标题里，既分不清对应关系，又能把标题撑到七八十字。
+        """
+        grid = getattr(self, "_comparison_field_grid", None)
+        if grid is None:
+            return
+        try:
+            for widget in list(grid.winfo_children()):
+                widget.destroy()
+        except tk.TclError:
+            return
+        for row, (label, values) in enumerate(fields):
+            tk.Label(
+                grid, text=label, bg=PALETTE["surface_alt"],
+                fg=PALETTE["text_muted"], font=(_UI_FONT_FAMILY, 9),
+                anchor="w", width=12,
+            ).grid(row=row, column=0, sticky="w", pady=(0, 2))
+            if values is None:
+                # 价格序列摘要之类：只说不同，没有可读的值。
+                tk.Label(
+                    grid, text="（不同）", bg=PALETTE["surface_alt"],
+                    fg=PALETTE["text"], font=(_UI_FONT_FAMILY, 10),
+                    anchor="w",
+                ).grid(row=row, column=1, sticky="w", pady=(0, 2))
+                continue
+            for column, value in enumerate(values):
+                cell = tk.Frame(grid, bg=PALETTE["surface_alt"])
+                cell.grid(row=row, column=column + 1, sticky="w",
+                          padx=(0, 18), pady=(0, 2))
+                tk.Label(
+                    cell, text=f"#{column + 1}", bg=PALETTE["surface_alt"],
+                    fg=PALETTE["text_muted"], font=(_UI_FONT_FAMILY, 8),
+                ).pack(side="left", padx=(0, 4))
+                tk.Label(
+                    cell, text=str(value), bg=PALETTE["surface_alt"],
+                    fg=PALETTE["text"],
+                    font=(_UI_FONT_FAMILY, 10, "bold"),
+                ).pack(side="left")
 
     def _refresh_comparison_variable_card(self, snapshots):
         """把变量结论与看数提醒写进说明卡。"""
@@ -6640,12 +7703,14 @@ class BacktestApp(tk.Tk):
                 "页面会说明所选结果之间差在哪一项，数值判断留给你。")
             caveat_var.set("")
             accent.configure(bg=PALETTE["border_soft"])
+            BacktestApp._fill_comparison_field_grid(self, [])
             return
 
         summary = BacktestApp._comparison_variable_summary(snapshots)
         state = summary["state"]
         variable_var.set(summary["headline"])
         same_var.set(summary["rest"])
+        BacktestApp._fill_comparison_field_grid(self, summary["fields"])
         accent.configure(bg={
             "single": PALETTE["success"],
             "identical": PALETTE["primary"],
@@ -6684,6 +7749,10 @@ class BacktestApp(tk.Tk):
             "_history_conclusion_stats", "_history_splitter",
             "_history_lookbacks", "_history_uses_strict_metric",
             "_history_uses_window_equal_metric",
+            # 排名口径也属于视图状态：不在这张清单里就会跨次渲染残留，
+            # 渲染失败时也回滚不掉。
+            "_history_result_objective", "_history_result_objective_var",
+            "_history_objectives_available",
         )
         missing = object()
         old_view_state = {
@@ -6743,6 +7812,14 @@ class BacktestApp(tk.Tk):
                     setattr(self, name, value)
             raise
 
+        # 顶部摘要必须在视图构建**之后**再刷一次。上面那次调用发生在
+        # _build_history_comparison_view 之前，而排名口径要到它里面的
+        # _build_history_scope_note 才写进 _history_result_objective_var——
+        # 早刷的那次读到的是上一次结果的口径。于是换过一次口径再跑第二次
+        # 优选时，表头标的是「增量收益 ↓」，顶部 pill 却还写着「增量信噪
+        # 比」，而这两个口径给出的第一名可能正好相反。
+        BacktestApp._update_history_header_summary(self)
+
         # 新视图完整构建后再一次性替换，渲染失败不破坏上次成功页面。
         old_figure = old_view_state.get("_history_chart_figure", missing)
         if (old_figure is not missing and old_figure is not None
@@ -6775,6 +7852,10 @@ class BacktestApp(tk.Tk):
 
     # 各列的对齐方向。未列出的都是数字列，一律右对齐——与优选页同一套规则。
     _COMPARISON_COLUMN_ANCHORS = {"rank": "center", "strategy": "w"}
+
+    # 不可排序的列：`#` 就是当前显示顺序的行号，本身不是数据字段
+    # （见 _comparison_sorted_rows）。这些列既不绑排序命令也不打排序标记。
+    _COMPARISON_UNSORTABLE_COLUMNS = frozenset({"rank"})
 
     @staticmethod
     def _comparison_column_anchor(key):
@@ -6872,7 +7953,9 @@ class BacktestApp(tk.Tk):
         active = getattr(self, "_comparison_sort_column", None)
         descending = getattr(self, "_comparison_sort_descending", False)
         for key, text, _width in BacktestApp._COMPARISON_RANKING_COLUMNS:
-            if key == active:
+            if key in BacktestApp._COMPARISON_UNSORTABLE_COLUMNS:
+                marker = ""
+            elif key == active:
                 marker = " ▼" if descending else " ▲"
             else:
                 marker = " ⇅"
@@ -6951,9 +8034,15 @@ class BacktestApp(tk.Tk):
             # 表头与本列数据同向对齐。表头一律居中而数字右对齐时，一列里没
             # 有任何一条共同的竖边，眼睛就找不到列的界限。
             anchor = BacktestApp._comparison_column_anchor(key)
-            tree.heading(
-                key, text=text, anchor=anchor,
-                command=lambda k=key: self._sort_comparison_by(k))
+            if key in BacktestApp._COMPARISON_UNSORTABLE_COLUMNS:
+                # `#` 是当前显示顺序的行号、不是数据字段，_comparison_sorted_rows
+                # 对它直接原样返回。给它绑 command 再打上 ⇅，等于告诉用户
+                # "这列可以排"，点下去却毫无反应。
+                tree.heading(key, text=text, anchor=anchor)
+            else:
+                tree.heading(
+                    key, text=text, anchor=anchor,
+                    command=lambda k=key: self._sort_comparison_by(k))
             # 所有列一起 stretch：只让某一列可拉伸时它会独吞全部剩余空间
             # ——本页的容器约 986px 而列宽总和 642px，那 329px 此前全灌给
             # 了结果名列，把它撑到内容宽度的三倍多，数字列却全挤在左边。
@@ -6989,12 +8078,8 @@ class BacktestApp(tk.Tk):
                 if name and name not in style_keys:
                     style_keys[name] = str(
                         item.get("meta_style_key") or f"result_name:{name}")
-        self._comparison_color_map = {
-            name: self._strategy_style(
-                style_keys.get(name, f"result_name:{name}"))[0]
-            for name in self._comparison_daily_curves
-        }
-        self._rebuild_comparison_curve_toggles()
+        self._comparison_color_map, self._comparison_dash_map = (
+            BacktestApp._comparison_curve_styles(self, style_keys))
 
         tree = self._comparison_tree
         rows = {}
@@ -7007,6 +8092,9 @@ class BacktestApp(tk.Tk):
         ordered = BacktestApp._comparison_sorted_rows(
             summary, getattr(self, "_comparison_sort_column", None),
             getattr(self, "_comparison_sort_descending", False))
+        # 曲线闸门要在排序之后定：图上画的是"按当前排序靠前的那几条"。
+        self._rebuild_comparison_curve_toggles(
+            BacktestApp._comparison_chartable_names(ordered))
         # 清表会让选中行消失并发出 TreeviewSelect；重填期间抑制回调，填完再
         # 主动刷新一次，避免拿着半张表去画图。
         self._comparison_populating = True
@@ -7044,15 +8132,95 @@ class BacktestApp(tk.Tk):
                 tree.focus(initial_iid)
         finally:
             self._comparison_populating = False
+        # 说明卡的 #序号必须与指标表首列对得上，所以按**显示顺序**取快照：
+        # 用户点列头换排序后，两边的编号要一起变。
+        BacktestApp._refresh_comparison_variable_card(self, [
+            self._saved_backtests[result_id]
+            for result_id in (
+                str(item.get("meta_result_id", "") or "") for item in ordered)
+            if result_id in self._saved_backtests
+        ])
         self._update_comparison_selection()
 
-    def _rebuild_comparison_curve_toggles(self):
-        """重建曲线勾选框；本页不显示它们时只登记全选状态。"""
+    @staticmethod
+    def _lighten_hex(color, step):
+        """把颜色往浅里推 ``step`` 档；0 档原样返回。
+
+        0 档必须原样：同一策略的第一条曲线要与策略优选页严格同色，跨页对照
+        靠的就是这一点，只有它之后的同策略结果才允许挪明度。
+        """
+        if step <= 0:
+            return color
+        try:
+            channels = [int(color[index:index + 2], 16) for index in (1, 3, 5)]
+        except (TypeError, ValueError, IndexError):
+            return color
+        ratio = min(0.55, 0.22 * step)
+        return "#" + "".join(
+            f"{int(round(value + (255 - value) * ratio)):02X}"
+            for value in channels)
+
+    def _comparison_curve_styles(self, style_keys):
+        """定出每条曲线的颜色与线型，返回两张映射表。
+
+        颜色仍按策略身份取——同一策略在优选页与本页同色是有意设计。代价是
+        同策略跑多次时那几条会拿到**完全相同**的颜色，而"同一策略换区间、换
+        行情、换方向各跑一次"正是本页的头号用途；一勾多条就是一团分不开的同
+        色线。所以组内再按出现顺序换线型，线型用完一轮才动明度。
+        """
+        colors, dashes = {}, {}
+        seen = {}
+        for name in self._comparison_daily_curves:
+            key = style_keys.get(name, f"result_name:{name}")
+            base, _marker = self._strategy_style(key)
+            index = seen.get(key, 0)
+            seen[key] = index + 1
+            dashes[name] = STRATEGY_CHART_DASHES[
+                index % len(STRATEGY_CHART_DASHES)]
+            colors[name] = BacktestApp._lighten_hex(
+                base, index // len(STRATEGY_CHART_DASHES))
+        return colors, dashes
+
+    @staticmethod
+    def _comparison_chartable_names(ordered):
+        """图上该画哪几条：按指标表当前排序取前 N 条的结果名。
+
+        跟着排序走而不是按保留顺序截断，是为了让「全选 → 点期末净损益
+        列头 → 看图」这条路成立：换一列排序，图上就换成那一列的前几名。
+        """
+        names = []
+        for item in ordered:
+            name = str(item.get("strategy", "") or "")
+            if name and name not in names:
+                names.append(name)
+            if len(names) >= MAX_COMPARISON_CHART_CURVES:
+                break
+        return names
+
+    def _rebuild_comparison_curve_toggles(self, visible=None):
+        """重建曲线勾选框；本页不显示它们时只登记开关状态。
+
+        ``visible`` 是闸门放行的那几条，其余曲线登记为关——指标表与导出照
+        样覆盖全部勾选结果，被挡住的只是图上那几根线。
+        """
+        allowed = None if visible is None else set(visible)
         self._comparison_curve_vars = {
-            name: tk.BooleanVar(value=True)
+            name: tk.BooleanVar(value=allowed is None or name in allowed)
             for name in self._comparison_daily_curves
         }
         container = getattr(self, "_comparison_curve_choices", None)
+        # 挡下了几条一定要说出来——不说的话，"我勾了 11 条、图上只有 8 条"
+        # 看起来就是数据丢了。有勾选框时接在「显示曲线:」后面，没有时那行标
+        # 签本来就是空的，整句写进去。
+        hidden = len(self._comparison_daily_curves) - len(
+            allowed if allowed is not None else self._comparison_daily_curves)
+        hint_var = getattr(self, "_comparison_curve_hint_var", None)
+        if hint_var is not None:
+            note = (
+                f"图上只画按当前排序靠前的 {MAX_COMPARISON_CHART_CURVES} 条；"
+                f"其余 {hidden} 条仍在下方指标表与导出里" if hidden > 0 else "")
+            head = "显示曲线:" if container is not None else ""
+            hint_var.set("  ".join(part for part in (head, note) if part))
         if container is None:
             return
         for widget in container.winfo_children():
@@ -7095,6 +8263,8 @@ class BacktestApp(tk.Tk):
             focused = name == focused_name
             ax.plot(
                 x, y, label=name, color=self._comparison_color_map[name],
+                linestyle=getattr(
+                    self, "_comparison_dash_map", {}).get(name, "solid"),
                 linewidth=2.8 if focused else 1.7,
                 alpha=1.0 if focused or focused_name is None else 0.58,
                 marker="o", markersize=3.5 if focused else 2.5,
@@ -7589,12 +8759,21 @@ class BacktestApp(tk.Tk):
         }.get(state, PALETTE["text_muted"])
         # 这是全页唯一一枚一致性 pill，因此把「几种结论」也写进来——顶部
         # 那枚重复的已经移除，它携带的计数不能跟着丢。
-        distinct = len({
+        #
+        # 计数只能数**有结论的**周期，不能用 len(items)：items 恒等于已选周
+        # 期数（recommendation_rows 对无 leader 的周期照样 append 一行
+        # strategy="—"），而一致性判定只统计有结论的那些。五选全勾、只有近月
+        # 与近季形成结论时，pill 会写「5 个周期结论一致」，而同一份数据算出
+        # 的悬停提示写的是「2 个周期一致推荐 …」。pill 常驻可见、提示要悬停，
+        # 用户会把 2 个周期的证据当成 5 个周期的交叉验证——正是本页在
+        # disagree 文案里特意强调要避免的那种误读。
+        concluded = [
             str(item.get("strategy", "")) for item in items
             if item.get("strategy") and str(item.get("strategy")) != "—"
-        })
+        ]
+        distinct = len(set(concluded))
         pill_text = {
-            "agree": f"✓ {len(items)} 个周期结论一致",
+            "agree": f"✓ {len(concluded)} 个周期结论一致",
             "disagree": f"⚠ 各周期结论不一致（{distinct} 种）",
         }.get(state, "各周期均无可比结论")
         consensus_pill = tk.Label(
@@ -7675,6 +8854,14 @@ class BacktestApp(tk.Tk):
         rank_tree.bind("<space>", self._toggle_focused_history_chart_candidate)
         rank_tree.bind(
             "<<TreeviewSelect>>", self._update_history_rank_selection)
+        # 右键菜单。三个序列都绑，与结果池同理：macOS 的 Tk 在不同小版本里把
+        # 右键映射成 Button-2 或 Button-3，Control+左键又是系统级的右键等价
+        # 操作；Windows / Linux 只认 Button-3。
+        for sequence in ("<Button-3>", "<Button-2>", "<Control-Button-1>"):
+            rank_tree.bind(sequence, self._popup_history_rank_menu)
+        self._history_rank_menu = tk.Menu(self, tearoff=0)
+        self._history_rank_menu.add_command(
+            label="参数详情…", command=self._show_history_row_params)
         self._history_rank_tree = rank_tree
 
         # 选中策略的原始损益波动值：表格七列之外的补充，仍留在表格脚下，
@@ -7801,12 +8988,26 @@ class BacktestApp(tk.Tk):
         # 次留下的内容（多半是刚才下钻的那个分段）。刚点完「应用参数」就落
         # 在一页别人的数字上，会被当成本策略的结果读——这正是「感觉它把明
         # 细也加载了」的来源，其实它什么都没加载，只是跳了页。
+        # command 必须自己接住异常。tkinter 的默认 report_callback_exception
+        # 只把 Traceback 打到 stderr，打包成 .app 之后没人看得见——用户点下
+        # 去的观感是「按钮坏了」。而 _apply_history_recommendation 有四条正
+        # 常的 raise 路径（S0/σ 非法、缺固定时刻参数、缺 σ 参数、无法识别候
+        # 选），全都会走到这里。结果池右键的同名动作一直是包着的，历史页这
+        # 处是遗漏。
         ttk.Button(
             actions, text="应用策略", width=16,
             style="Accent.TButton",
-            command=lambda: self._apply_history_recommendation(
-                navigate=False),
+            command=lambda: BacktestApp._apply_history_recommendation_safely(
+                self),
         ).pack(fill="x")
+
+    def _apply_history_recommendation_safely(self):
+        """「应用策略」按钮的入口：失败必须让用户看见。"""
+        try:
+            return self._apply_history_recommendation(navigate=False)
+        except Exception as exc:                       # noqa: BLE001
+            messagebox.showerror("无法应用历史策略", str(exc))
+            return None
 
     def _history_conclusion_stat_specs(self, row):
         """结论卡上的数字：优先给增量口径，缺失时退回损益波动原值。
@@ -7820,9 +9021,14 @@ class BacktestApp(tk.Tk):
             row.get("paired_windows", row.get("rolling_windows")), 0)
         baseline_windows = BacktestApp._comparison_safe_int(
             row.get("baseline_windows", paired), paired)
+        # 第三个元素只驱动着色，规则是 >0 绿、<0 红。胜段占比是 [0,1] 的
+        # 比例，中性点在 **0.5** 而不是 0——直接把它传下去，5 段里只赢 1 段
+        # （20%，明显比基准差）也会被染成"优于基准"的绿色。减掉 0.5 之后
+        # 才是"比一半多还是少"，与其余增量列"正=更好"的语义对齐。
         tail = (
             ("胜段占比", BacktestApp._format_comparison_value(
-                win_rate, 0, percent=True), win_rate),
+                win_rate, 0, percent=True),
+             None if win_rate is None else win_rate - 0.5),
             ("可比样本", f"{paired}/{baseline_windows} 段", None),
         )
         if getattr(self, "_history_objectives_available", True):
@@ -8150,6 +9356,71 @@ class BacktestApp(tk.Tk):
             else:
                 tree.item(iid, image="", text="—")
 
+    def _popup_history_rank_menu(self, event):
+        """排名行右键：先把该行设成作用对象，再弹菜单。
+
+        空白处右键不弹——弹一份点了只会提示"请先选一行"的菜单比不弹更费解，
+        与结果池那张表同一条规矩。右键只挪选择，不碰「显示到图上」的勾选：
+        那是 ``<Button-1>`` 在 #0 列的职责。
+        """
+        tree = getattr(self, "_history_rank_tree", None)
+        menu = getattr(self, "_history_rank_menu", None)
+        if tree is None or menu is None:
+            return None
+        iid = tree.identify_row(event.y)
+        if not iid:
+            return None
+        tree.selection_set(iid)
+        tree.focus(iid)
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+        return "break"
+
+    def _show_history_row_params(self):
+        """右键菜单「参数详情」：列出选中候选这一行背后的全部输入。"""
+        row = self._selected_history_rank_row()
+        if not row:
+            messagebox.showinfo(
+                "请选择策略", "请先在周期排名表中点击一条策略。")
+            return
+        # 两条渲染路径设的属性不同：跑完一轮和载入结果包走 _latest_history_
+        # state，而 _show_history_recommendation 自己记的是 _history_last_
+        # state。两个都兜住，免得从某一条路进来就打不开。
+        history_state = (
+            getattr(self, "_latest_history_state", None)
+            or getattr(self, "_history_last_state", None) or {})
+        # 判据是"有没有冻结期权大类"而不是"dict 是不是空的"：旧结果包解出来
+        # 的 state 可能只剩周期勾选那几项，非空却一个参数也说不出。
+        if not str(history_state.get("cls_name", "") or "").strip():
+            messagebox.showinfo(
+                "缺少运行参数",
+                "这份优选结果没有记录运行时的期权与行情参数"
+                "（本功能上线前保存的结果包）。\n\n"
+                "重新运行一次优选即可看到完整参数。")
+            return
+        BacktestApp._open_params_window(
+            self,
+            heading=str(row.get("strategy", "未命名候选")),
+            subtitle=BacktestApp._history_params_subtitle(row, history_state),
+            sections=BacktestApp._history_row_detail_sections(
+                row, history_state),
+            notes={"期权类型与参数": BacktestApp._HISTORY_CONTRACT_NOTE},
+        )
+
+    @staticmethod
+    def _history_params_subtitle(row, history_state):
+        """详情窗副标题：这一行属于哪个周期、跑在哪份行情上。"""
+        parts = ["策略优选"]
+        period = str(row.get("period", "") or "").strip()
+        if period:
+            parts.append(f"周期 {period}")
+        source = BacktestApp._snapshot_source_label(history_state)
+        if source:
+            parts.append(source)
+        return "  ·  ".join(parts)
+
     def _toggle_history_chart_click(self, event):
         tree = self._history_rank_tree
         iid = tree.identify_row(event.y)
@@ -8459,8 +9730,10 @@ class BacktestApp(tk.Tk):
     def _cache_history_bars(window_results):
         """把一轮优选的全部分段结果写进磁盘缓存。
 
-        缓存写失败绝不能影响主流程——它只省时间，没有它一切照常，所以整
-        体兜底并在结束时按 LRU 裁到容量上限内。
+        缓存写失败绝不能影响主流程——它只省时间，没有它一切照常，所以这里
+        整体兜底。不在这里按 LRU 裁容量是有意的：占用改由「最多保留 20 份
+        优选记录」间接约束（见 history_bar_cache 模块头与 history_store.
+        MAX_RESULTS）。
         """
         try:
             index = history_replay_index(window_results or {})
@@ -8469,11 +9742,12 @@ class BacktestApp(tk.Tk):
         written = 0
         for _lookback, windows in index.items():
             for _window_id, spec in windows.items():
-                per_case = None
+                try:
+                    per_case = window_results[spec.lookback][spec.window_id]
+                except Exception:                      # noqa: BLE001
+                    continue
                 for name in spec.strategy_names():
                     try:
-                        per_case = window_results[spec.lookback][
-                            spec.window_id]
                         result = per_case.get(name)
                     except Exception:                  # noqa: BLE001
                         continue
@@ -9119,11 +10393,43 @@ class BacktestApp(tk.Tk):
             sigma_window = self._comparison_safe_int(
                 row.get("meta_sigma_window"), 20)
             sigma_window = max(2, sigma_window)
+            # 三个带宽口径必须恒等价，所以这一组写入要么全成、要么全不动。
+            # strict 校验（S0 或 sigma 非法时抛错）发生在写入**之后**：此前
+            # 失败会留下「σ 已改成候选值、绝对/相对还是旧值」的中间态，三者
+            # 不再等价。配合按钮那边异常无人接管，用户看到的就是「点了没反
+            # 应」外加一份自相矛盾的带宽。
+            restore = {
+                "abs": self._band_abs_var.get(),
+                "rel": self._band_rel_var.get(),
+                "sigma": self._band_sigma_var.get(),
+                "interval": self._price_interval_var.get(),
+                "interval_type": self._interval_type_var.get(),
+                "sigma_src": self._sigma_src_var.get(),
+                "sigma_win": self._sigma_win_var.get(),
+                "last_edited": self._band_last_edited,
+            }
             self._sigma_src_var.set(SIGMA_SOURCE_DISPLAY[sigma_source])
             self._sigma_win_var.set(str(sigma_window))
             self._band_sigma_var.set(f"{candidate_sigma:.10g}")
             self._mark_band_edited("sigma")
-            self._sync_band_inputs("sigma", strict=True)
+            try:
+                self._sync_band_inputs("sigma", strict=True)
+            except Exception:
+                self._band_abs_var.set(restore["abs"])
+                self._band_rel_var.set(restore["rel"])
+                self._band_sigma_var.set(restore["sigma"])
+                self._price_interval_var.set(restore["interval"])
+                self._interval_type_var.set(restore["interval_type"])
+                self._sigma_src_var.set(restore["sigma_src"])
+                self._sigma_win_var.set(restore["sigma_win"])
+                self._band_last_edited = restore["last_edited"]
+                # 上面的 ``_mark_band_edited`` 顺手把历史页那个勾选项改写成
+                # 了「编辑完成后自动换算」，它读的是同一份带宽状态却不在
+                # ``restore`` 里。数值都退回去之后若不重算这一行，用户看到的
+                # 就是「带宽还是旧值、标签却说正在等换算」——一个永远不会到
+                # 来的换算，除非他再手动碰一次带宽输入框。
+                self._refresh_history_current_band_label()
+                raise
             self._strategy_var.set(STRATEGY_DISPLAY[strategy_name])
             applied.update({
                 "candidate_sigma": candidate_sigma,

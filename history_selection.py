@@ -154,9 +154,28 @@ def validate_payload(
             )
         if len(endpoint_failures):
             first_failure = str(endpoint_failures.iloc[0])
+            # 文案必须跟着实际模式走。endpoint 失败在**两条**路径上都会出
+            # 现：品种池是某个具体合约的行情不可用，单序列（CSV / 单合约）
+            # 则是严格区间凑不齐交易日。此前一律报成"历史具体合约池…"，
+            # CSV 用户于是拿到一条与自己模式毫无关系的错误，而下面那句
+            # "请扩大 CSV/Wind 历史区间"永远走不到——单序列历史不足时
+            # recommend_by_rolling_history 设的正是 endpoint 失败。
+            try:
+                uses_pool = bool(
+                    "history_mode" in ranking
+                    and ranking["history_mode"].fillna("").astype(str).eq(
+                        "product_contract_pool").any())
+            except (AttributeError, KeyError, TypeError, ValueError):
+                uses_pool = False
+            if uses_pool:
+                raise ValueError(
+                    "历史具体合约池没有形成任何可评估代理段；"
+                    f"首个失败原因：{first_failure}"
+                )
             raise ValueError(
-                "历史具体合约池没有形成任何可评估代理段；"
-                f"首个失败原因：{first_failure}"
+                "真实历史长度不足，尚未形成任何可评估严格区间；"
+                f"首个失败原因：{first_failure} "
+                "请扩大 CSV/Wind 历史区间后重试。"
             )
         raise ValueError(
             "真实历史长度不足，尚未形成任何可评估严格区间；"
@@ -811,12 +830,29 @@ def chart_pairs(summary, lookback, strategy):
     end_values = pairs.get("end_ts_candidate")
     if end_values is None:
         end_values = pairs.get("end_ts_baseline")
+    # 段号必须按**自然序**兜底，不能让 window_id 走字符串序。时间戳并非
+    # 总是可用：数组入参、RangeIndex 序列、以及 object dtype 的索引都会让
+    # bt.timestamps 为 None，两个时间列于是整列 NaT，排序键只剩 window_id。
+    # 而段名是 "segment_1" … "segment_11"，字典序会排成 1, 10, 11, 2 …，
+    # multi_chart_model(mode="full") 正是按这个顺序 concat 日损益再 cumsum
+    # 的——画出来的累计路径全错，而终值因为求和可交换恰好相同，一路不报错。
+    # 排名表的 max_drawdown 按正确数字序算，于是图与表自相矛盾。
+    window_text = pairs["window_id"].astype(str)
     pairs = pairs.assign(
         _chart_start_ts=pd.to_datetime(start_values, errors="coerce"),
-        _chart_end_ts=pd.to_datetime(end_values, errors="coerce"))
+        _chart_end_ts=pd.to_datetime(end_values, errors="coerce"),
+        _chart_window_stem=window_text.str.replace(
+            r"\d+$", "", regex=True),
+        _chart_window_no=pd.to_numeric(
+            window_text.str.extract(r"(\d+)$", expand=False),
+            errors="coerce"),
+    )
     return pairs.sort_values(
-        ["_chart_start_ts", "_chart_end_ts", "window_id"], kind="stable",
-        na_position="last",
+        [
+            "_chart_start_ts", "_chart_end_ts",
+            "_chart_window_stem", "_chart_window_no", "window_id",
+        ],
+        kind="stable", na_position="last",
     ).reset_index(drop=True)
 
 
@@ -1123,9 +1159,13 @@ def multi_chart_model(
             and required_curve_column not in successful.columns):
         return {
             "state": "empty", "mode": mode, "metric": metric,
+            # 不要让用户"改用单回测分段路径"：single / typical 两个视图仍在
+            # 模型层实现着，但界面已经没有入口（_history_chart_view_options
+            # 恒返回 "full"），照这句做只会白找一圈。给能实际操作的出路。
             "message": (
-                "跨合约历史路径缺少安全归一化数据；"
-                "请改用单回测分段路径查看原始金额。"),
+                "跨合约历史路径缺少安全归一化数据（各段名义金额不可比），"
+                "无法绘制该周期的接续路径；请改选单一具体合约的周期，"
+                "或改用其它指标查看。"),
             "window_options": [], "strategies": candidates,
             "baseline_strategy": baseline_strategy,
             "uses_normalized_notional": True,
@@ -1166,9 +1206,10 @@ def multi_chart_model(
             "state": "empty", "mode": mode, "metric": metric,
             "message": (
                 "跨合约历史路径没有可安全归一化的共同回测分段；"
-                "请改用单回测分段路径查看原始金额。"
+                "请减少勾选的候选，或改选单一具体合约的周期。"
                 if uses_normalized_notional else
-                "所选候选之间没有共同的严格配对回测分段。"),
+                "所选候选之间没有共同的严格配对回测分段；"
+                "请减少勾选的候选后重试。"),
             "window_options": [], "strategies": candidates,
             "baseline_strategy": baseline_strategy,
             "uses_normalized_notional": uses_normalized_notional,

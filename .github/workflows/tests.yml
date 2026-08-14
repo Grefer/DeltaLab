@@ -1,0 +1,71 @@
+name: Tests
+
+# 触发条件：推主干、开 PR、以及手动触发。
+# 与 release.yml 分开：那条只在打 tag 时跑 PyInstaller 打包，不跑测试。
+on:
+  push:
+    branches: ["master", "main"]
+  pull_request:
+  workflow_dispatch:
+
+# 同一分支上新的推送取消尚未跑完的旧任务，省 runner 额度。
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  test:
+    name: pytest (ubuntu, py${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 3.10 是 README 声明的最低版本（用到 match/case 与 PEP 604 union），
+        # 3.13 是当前开发机版本。两头都跑，中间版本由它们夹逼覆盖。
+        python-version: ["3.10", "3.13"]
+
+    steps:
+      - uses: actions/checkout@v5
+
+      # gui_app.py 顶层就 `import tkinter` + `matplotlib.use("TkAgg")`，
+      # 所以**全部**测试（包括纯逻辑那批）都需要 _tkinter 能 import。
+      # actions/setup-python 的 Linux 构建不保证带 Tk，必须先装系统 Tk 库，
+      # 否则连收集阶段都会 ModuleNotFoundError: No module named '_tkinter'。
+      # xvfb 用于给建真实 Tk 根窗口的 GUI 测试提供虚拟显示。
+      - name: Install Tk and virtual display
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends tk-dev python3-tk xvfb
+
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Verify tkinter is importable
+        # 提前把「Python 构建不带 Tk」这类环境问题暴露成一条清晰的失败，
+        # 而不是让它伪装成几百条测试的收集错误。
+        run: python -c "import tkinter; print('tkinter', tkinter.TkVersion)"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pytest
+
+      # 先跑纯逻辑那批。它们不建窗口，失败信息最干净，
+      # 也让「是不是显示环境问题」一眼可判。
+      - name: Run non-GUI tests
+        run: pytest -m "not gui" -q -p no:cacheprovider
+
+      # GUI 测试会构造真实 BacktestApp（tk.Tk 子类）。没有窗口服务器时
+      # Tk 是整进程 abort 而不是抛异常，所以必须包在 xvfb-run 里。
+      - name: Run GUI tests (xvfb)
+        # -p no:cacheprovider：CI 每次都是干净 checkout，缓存没有收益；
+        # 关掉还能顺带避开 .pytest_cache 陈旧 lastfailed 影响用例执行的坑
+        # （本地实测过：残留缓存会让两条 intraday 用例假失败，删掉即恢复）。
+        run: xvfb-run -a pytest -m "gui" -q -p no:cacheprovider

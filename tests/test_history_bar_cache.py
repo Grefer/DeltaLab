@@ -78,6 +78,34 @@ def test_cached_result_is_bit_identical_to_a_fresh_run(tmp_path):
             assert np.array_equal(restored, original), key
 
 
+def test_pandas_container_types_survive_the_round_trip(tmp_path):
+    """命中不能把 pandas 容器降级成裸数组。
+
+    npz 只认 ndarray，`timestamps` 真跑是 DatetimeIndex，存进去就化成
+    datetime64 数组了。取值一样不代表等价：这个代码库到处在用
+    ``isinstance(index, pd.DatetimeIndex)`` 分流（日内分组、交易日切分、
+    图表配对都靠它），类型一变就会走去另一条分支，而且不会报错。所以
+    "命中与重跑一致"这条承诺必须包含类型。
+
+    注：np.float64 标量经 JSON 往返会变成 Python float，数值逐位相同、
+    算术与比较行为完全一致，不在此列。
+    """
+    spec = _spec()
+    fresh = spec.replay(NAME)._results
+    pandas_keys = [
+        key for key, value in fresh.items()
+        if isinstance(value, (pd.Index, pd.Series))
+    ]
+    assert pandas_keys, "这段回测没产出 pandas 容器，测试就没有意义"
+
+    cache.store(spec, NAME, fresh, directory=str(tmp_path))
+    back = cache.load(spec, NAME, directory=str(tmp_path))
+
+    for key in pandas_keys:
+        assert type(back[key]) is type(fresh[key]), key
+        assert list(back[key]) == list(fresh[key]), key
+
+
 def test_scalar_fields_survive_alongside_the_arrays(tmp_path):
     spec = _spec()
     fresh = spec.replay(NAME)._results

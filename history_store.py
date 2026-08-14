@@ -561,12 +561,22 @@ def _verdict(records):
 
     各周期都指向同一策略才写策略名；有分歧就写「不一致（N 种）」而不是
     挑一个报出来——把弱证据伪装成强结论，正是这个页面一直在避免的事。
+
+    **基准行必须参与选优，不能跳过。** 这里曾经 ``continue`` 掉
+    ``close_to_close``，于是当历史证据支持「维持每日收盘」时，列表的结论列
+    显示的是排第 2 的**落败候选**——与结果页的「每日收盘（基准最优）」正好
+    相反。而且这不是偶发：``_history_recommendations`` 以「该周期存在至少
+    一条 eligible 且非 C2C 的行」为准入闸门，那条行恰恰就是被挑出来报的
+    那一行，所以只要该周期进得了结论，就必然报错方向。
+
+    准入与选优两步必须分开，且与 ``_history_recommendations`` 完全一致：
+    准入看「有没有可比候选」（没有候选就无所谓推荐），选优看「eligible 里
+    rank 最小的是谁」（可以是基准本身）。
     """
-    best_by_period = {}
+    eligible_by_period = {}
+    has_candidate = set()
     for record in records:
         if not record.get("recommendation_eligible"):
-            continue
-        if str(record.get("strategy_type") or "") == "close_to_close":
             continue
         name = str(record.get("strategy") or "").strip()
         if not name or name == "—":
@@ -576,10 +586,18 @@ def _verdict(records):
             rank = int(record.get("rank") or 0)
         except (TypeError, ValueError):
             continue
-        current = best_by_period.get(period)
+        is_baseline = (
+            str(record.get("strategy_type") or "") == "close_to_close")
+        if not is_baseline:
+            has_candidate.add(period)
+        label = "每日收盘" if is_baseline else name
+        current = eligible_by_period.get(period)
         if current is None or rank < current[0]:
-            best_by_period[period] = (rank, name)
-    picks = [name for _rank, name in best_by_period.values()]
+            eligible_by_period[period] = (rank, label)
+    picks = [
+        label for period, (_rank, label) in eligible_by_period.items()
+        if period in has_candidate
+    ]
     if not picks:
         return "无可比结论"
     unique = set(picks)

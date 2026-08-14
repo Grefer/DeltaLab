@@ -270,6 +270,57 @@ def test_listing_verdict_ignores_the_baseline_and_ineligible_rows(tmp_path):
     assert item["verdict"] == "无可比结论"
 
 
+def test_listing_verdict_says_baseline_when_the_baseline_wins(tmp_path):
+    """基准排第一时结论就是「每日收盘」，不能报第二名。
+
+    这里曾经无条件跳过 close_to_close，于是历史证据支持"维持每日收盘"的
+    周期，列表结论列显示的是**落败**的那个候选——与结果页的「每日收盘
+    （基准最优）」正好相反，用户照它决定要不要改用 2σ 带宽就会做反。
+
+    而且这不是偶发：_history_recommendations 以"该周期存在至少一条
+    eligible 且非 C2C 的行"为准入闸门，那条行恰恰就是被误报出来的那行，
+    所以只要该周期进得了结论，就必然报错方向。
+    """
+    ranking = pd.DataFrame([
+        {"lookback": "quarter", "lookback_days": 61, "rank": 1,
+         "strategy": "每日收盘", "strategy_type": "close_to_close",
+         "recommendation_eligible": True},
+        {"lookback": "quarter", "lookback_days": 61, "rank": 2,
+         "strategy": "固定间隔(2σ)", "strategy_type": "hedge_band",
+         "recommendation_eligible": True},
+    ])
+
+    path = _save(tmp_path, ranking=ranking)
+    item = next(i for i in store.list_results(str(tmp_path))
+                if i["path"] == path)
+
+    assert item["verdict"] == "每日收盘"
+
+
+def test_listing_verdict_counts_a_baseline_win_as_its_own_conclusion(tmp_path):
+    """一个周期选基准、另一个周期选候选，那就是分歧，不能抹平成单一结论。"""
+    ranking = pd.DataFrame([
+        {"lookback": "month", "lookback_days": 20, "rank": 1,
+         "strategy": "每日收盘", "strategy_type": "close_to_close",
+         "recommendation_eligible": True},
+        {"lookback": "month", "lookback_days": 20, "rank": 2,
+         "strategy": "固定间隔(2σ)", "strategy_type": "hedge_band",
+         "recommendation_eligible": True},
+        {"lookback": "quarter", "lookback_days": 61, "rank": 1,
+         "strategy": "固定间隔(2σ)", "strategy_type": "hedge_band",
+         "recommendation_eligible": True},
+        {"lookback": "quarter", "lookback_days": 61, "rank": 2,
+         "strategy": "每日收盘", "strategy_type": "close_to_close",
+         "recommendation_eligible": True},
+    ])
+
+    path = _save(tmp_path, ranking=ranking)
+    item = next(i for i in store.list_results(str(tmp_path))
+                if i["path"] == path)
+
+    assert item["verdict"] == "不一致（2 种）"
+
+
 @pytest.mark.parametrize(("params", "expected"), [
     ({"T_days": 22, "sigma": 0.18}, "T22 σ0.18"),
     ({"T_days": 60, "sigma": 0.24}, "T60 σ0.24"),

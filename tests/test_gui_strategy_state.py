@@ -32,6 +32,12 @@ from pricing import (
 from pricing.constants import ANNUAL_DAYS
 
 
+# 本文件多处直接构造真实 BacktestApp（内部是 tk.Tk 子类），拿不到窗口服务器
+# 的环境（无 DISPLAY 的 Linux、macOS 沙箱）会整进程 abort 而不是失败退出。
+# 打上 gui 标记，这类环境下可用 `pytest -m "not gui"` 跳过。
+pytestmark = pytest.mark.gui
+
+
 class _Var:
     def __init__(self, value=""):
         self.value = str(value)
@@ -2270,6 +2276,38 @@ def test_history_chart_pairs_by_window_and_sorts_by_end_timestamp():
     assert pairs["strategy_type_baseline"].eq("close_to_close").all()
 
 
+def test_history_chart_pairs_fall_back_to_natural_segment_order():
+    """时间戳全缺时按段号自然序，不能退化成字符串序。
+
+    数组入参、RangeIndex 序列、object dtype 索引都会让 bt.timestamps 为
+    None，两个时间列于是整列 NaT，排序键只剩 window_id。段名是
+    "segment_1" … "segment_11"，字典序排成 1, 10, 11, 2 …，而
+    multi_chart_model(mode="full") 正是按这个顺序把各段日损益 concat 再
+    cumsum——画出的累计路径全错，终值却因为求和可交换恰好相同，一路不
+    报错。排名表的 max_drawdown 按正确数字序算，于是图与表自相矛盾。
+    """
+    rows = []
+    for segment_no in range(1, 13):
+        for strategy, strategy_type in (
+                ("固定间隔(1σ)", "hedge_band"), ("每日收盘", "close_to_close")):
+            rows.append({
+                "lookback": "quarter",
+                "window_id": f"segment_{segment_no}",
+                "strategy": strategy, "strategy_type": strategy_type,
+                "success": True,
+                "daily_net_pnl": np.array([float(segment_no)] * 2),
+                "cumulative_net_pnl": np.array(
+                    [float(segment_no), 2.0 * segment_no]),
+            })
+
+    pairs = BacktestApp._history_chart_pairs(
+        pd.DataFrame(rows), "quarter", "固定间隔(1σ)")
+
+    assert pairs["window_id"].tolist() == [
+        f"segment_{no}" for no in range(1, 13)
+    ]
+
+
 @pytest.mark.parametrize(
     ("metric", "column"),
     [
@@ -2481,7 +2519,11 @@ def test_history_cross_contract_typical_chart_fails_closed_without_normalization
 
     assert model["state"] == "empty"
     assert "安全归一化" in model["message"]
-    assert "单回测分段路径" in model["message"]
+    # 空态提示只能给用户**够得着**的出路。single / typical 两个视图仍在模型
+    # 层实现着，但界面已经没有入口（_history_chart_view_options 恒返回
+    # "full"），所以不能再让用户"改用单回测分段路径"。
+    assert "单回测分段路径" not in model["message"]
+    assert "单一具体合约" in model["message"]
 
 
 def test_history_cross_contract_single_chart_keeps_raw_amount_curves():
@@ -3042,6 +3084,9 @@ def test_zero_window_contract_pool_payload_reports_exact_contract_error():
         "strategy": "daily", "strategy_type": "close_to_close",
         "rolling_windows": 0, "daily_net_pnl_rms": float("inf"),
         "failure_scope": "endpoint", "failure_reason": reason,
+        # 真实品种池排名恒带这一列——分析层把 plan["row_metadata"] 整个摊
+        # 进每一行。文案要靠它区分品种池与单序列，夹具必须照实带上。
+        "history_mode": "product_contract_pool",
     }])
 
     with pytest.raises(ValueError) as exc_info:
@@ -3054,6 +3099,36 @@ def test_zero_window_contract_pool_payload_reports_exact_contract_error():
     assert "历史具体合约池没有形成任何可评估代理段" in message
     assert "P2509.DCE" in message
     assert "历史长度不足" not in message
+
+
+def test_single_series_endpoint_failure_does_not_blame_the_contract_pool():
+    """CSV / 单合约的 endpoint 失败不能报成品种池文案。
+
+    endpoint 失败在两条路径上都会出现：品种池是某个具体合约行情不可用，
+    单序列则是严格区间凑不齐交易日（recommend_by_rolling_history 在
+    evidence_available 为假时设的正是 endpoint 失败）。此前一律报成「历史
+    具体合约池…」，CSV 用户拿到一条与自己模式毫无关系的错误，而真正对症
+    的「请扩大 CSV/Wind 历史区间」永远走不到。
+    """
+    reason = "week 严格区间需要 5 个交易日及此前一个 Day 0 锚点，实际仅有 3 个"
+    ranking = pd.DataFrame([{
+        "strategy": "每日收盘", "strategy_type": "close_to_close",
+        "rolling_windows": 0, "daily_net_pnl_rms": float("inf"),
+        "failure_scope": "endpoint", "failure_reason": reason,
+    }])
+
+    with pytest.raises(ValueError) as exc_info:
+        BacktestApp._validate_history_recommendation_payload(
+            pd.DataFrame(), ranking,
+            {"week": {"segment_1": {"_window_error": reason}}},
+        )
+
+    message = str(exc_info.value)
+    assert "历史具体合约池" not in message
+    assert "真实历史长度不足" in message
+    # 具体原因必须带上，否则用户只知道"不足"却不知道差多少。
+    assert "实际仅有 3 个" in message
+    assert "扩大 CSV/Wind 历史区间" in message
 
 
 def test_history_delivery_preserves_saved_comparison_pool_and_selection():
@@ -3243,6 +3318,43 @@ def test_apply_history_band_recommendation_updates_only_backtest_band_controls()
             == history_candidates_before)
     assert fake._history_fixed_times_var.get() == history_fixed_times_before
     assert navigated == []
+
+
+def test_failed_band_recommendation_rolls_back_the_history_band_label():
+    """带宽写入失败回滚时，历史页那行摘要必须跟着退回去。
+
+    ``_mark_band_edited`` 会把标签改成「编辑完成后自动换算」，而它不在
+    ``restore`` 字典里。若回滚只管数值不管标签，用户就会停在「带宽还是旧
+    值、标签却说正在等换算」的矛盾态——那个换算永远不会来，除非他自己再
+    去碰一次输入框。
+    """
+    fake, _navigated, _statuses = _fake_history_apply_target()
+    # 用真实的联动实现，假的空壳会把这个 bug 一起吞掉。
+    fake._history_current_band_label_var = _Var(
+        "加入当前回测带宽：1σ（绝对输入换算）")
+    fake._mark_band_edited = lambda source: BacktestApp._mark_band_edited(
+        fake, source)
+    fake._refresh_history_current_band_label = (
+        lambda: BacktestApp._refresh_history_current_band_label(fake))
+    # S0 非法 -> strict 校验在带宽已写入之后才抛错，正是要回滚的那条路径。
+    fake._param_entries["s0"][0].set("0")
+    band_before = (fake._band_abs_var.get(), fake._band_rel_var.get(),
+                   fake._band_sigma_var.get(), fake._band_last_edited)
+
+    with pytest.raises(ValueError):
+        BacktestApp._apply_history_recommendation(
+            fake, {
+                "strategy": "固定间隔(1.5σ)",
+                "meta_strategy_name": "hedge_band",
+                "meta_candidate_sigma": 1.5,
+            }, navigate=False)
+
+    assert (fake._band_abs_var.get(), fake._band_rel_var.get(),
+            fake._band_sigma_var.get(),
+            fake._band_last_edited) == band_before
+    label = fake._history_current_band_label_var.get()
+    assert "编辑完成后自动换算" not in label
+    assert label == "加入当前回测带宽：0.779423σ（绝对输入换算）"
 
 
 def test_successfully_started_backtest_reports_true_to_auto_retain_caller(
@@ -4030,6 +4142,73 @@ def test_history_ranking_flags_detect_product_contract_pool():
     assert flags["uses_product_pool"] is True
 
 
+def test_conclusion_card_falls_back_to_rms_when_increments_are_missing():
+    """品种池没有增量列，结论卡必须退回损益波动原值而不是四个破折号。
+
+    这条降级分支此前一行断言都没有：把两个值写死成 None 也全绿。
+    """
+    app = object.__new__(BacktestApp)
+    app._history_objectives_available = False
+    row = {
+        "daily_net_pnl_rms": 1.25,
+        "baseline_daily_net_pnl_rms": 1.60,
+        "window_win_rate_vs_c2c": 0.75,
+        "paired_windows": 3, "baseline_windows": 3,
+    }
+
+    specs = BacktestApp._history_conclusion_stat_specs(app, row)
+    captions = [caption for caption, _text, _signed in specs]
+    texts = {caption: text for caption, text, _signed in specs}
+
+    assert captions[:2] == ["损益波动", "每日收盘"]
+    assert texts["损益波动"] == "1.25"
+    assert texts["每日收盘"] == "1.60"
+    assert texts["可比样本"] == "3/3 段"
+    # 增量口径可用时才是那两列，别把降级分支和正常分支搞混。
+    app._history_objectives_available = True
+    normal = [c for c, _t, _s in BacktestApp._history_conclusion_stat_specs(
+        app, {**row, "incremental_pnl_vs_c2c": 0.4})]
+    assert normal[:2] == ["增量收益 vs 每日收盘", "增量信噪比"]
+
+
+@pytest.mark.parametrize(("win_rate", "expect_positive"), [
+    (0.75, True),    # 4 段里赢 3 段，确实优于基准
+    (0.50, False),   # 平手就是平手
+    (0.20, False),   # 5 段里只赢 1 段，比基准差，不能显示成"更好"
+])
+def test_conclusion_card_colours_win_rate_around_fifty_percent(
+        win_rate, expect_positive):
+    """胜段占比的中性点在 50%，不是 0。
+
+    结论卡按第三个元素的正负着色（>0 绿、<0 红）。直接把 [0,1] 的比例传
+    下去，20% 胜率也会被染成"优于基准"的绿色。
+    """
+    app = object.__new__(BacktestApp)
+    app._history_objectives_available = False
+    specs = BacktestApp._history_conclusion_stat_specs(app, {
+        "daily_net_pnl_rms": 1.0, "baseline_daily_net_pnl_rms": 1.0,
+        "window_win_rate_vs_c2c": win_rate,
+        "paired_windows": 4, "baseline_windows": 4,
+    })
+    signed = next(s for caption, _t, s in specs if caption == "胜段占比")
+
+    assert (signed > 0) is expect_positive
+
+
+def test_contract_codes_text_dedupes_and_truncates():
+    """详情栏的参与合约文本：去重、保序、超限带总数。"""
+    text = history_selection.contract_codes_text
+    assert text(["P2601.DCE", "P2605.DCE", "P2601.DCE"]) == (
+        "P2601.DCE、P2605.DCE")
+    assert text("P2601.DCE") == "P2601.DCE"
+    assert text([]) == ""
+    # "nan" 是 DataFrame 缺失值 str() 之后的样子，不能当成合约代码。
+    assert text(["P2601.DCE", "nan", "  "]) == "P2601.DCE"
+    many = text([f"P260{n}.DCE" for n in range(8)], limit=3)
+    assert many.startswith("P2600.DCE、P2601.DCE、P2602.DCE")
+    assert many.endswith("等8个")
+
+
 def test_history_ranking_flags_stay_neutral_on_empty_ranking():
     flags = history_selection.ranking_flags(pd.DataFrame())
 
@@ -4068,8 +4247,13 @@ def test_validate_payload_reports_short_history_when_failure_columns_missing():
 @pytest.mark.parametrize(("overrides", "expected"), [
     ({"strategy_type": "fixed_times", "failure_scope": "strategy",
       "failure_reason": "14:22 无对应 Bar"}, "固定时刻策略没有形成"),
-    ({"failure_scope": "endpoint", "failure_reason": "主力映射日不足"},
-     "历史具体合约池没有形成"),
+    # endpoint 失败的文案必须跟着实际模式走：带 history_mode 的是品种池，
+    # 不带的是 CSV / 单合约单序列。真实品种池排名恒带这一列（分析层把
+    # plan["row_metadata"] 整个摊进每一行，见 hedge_analysis.py:2767）。
+    ({"failure_scope": "endpoint", "failure_reason": "主力映射日不足",
+      "history_mode": "product_contract_pool"}, "历史具体合约池没有形成"),
+    ({"failure_scope": "endpoint", "failure_reason": "严格区间需要 61 个交易日"},
+     "真实历史长度不足"),
     ({"failure_scope": "", "failure_reason": ""}, "真实历史长度不足"),
 ])
 def test_validate_payload_keeps_each_failure_message(overrides, expected):
@@ -4923,6 +5107,10 @@ def test_drilldown_button_is_named_load_not_backtest(history_store_dir):
     重算。它被改名成「单独回测这一段」过一次，而旁边的说明写的是「加载已
     保存的明细」——同一个控件自相矛盾，用户会以为点一下要再算一遍。这条
     把语义钉在名字上，防止再漂回去。
+
+    **指向这个按钮的文案受同一条约束。** 参数详情窗让用户去下钻看某一段的
+    实际期权参数，那句出口一度写成「单独回测这一段」——按钮本身没被改名，
+    但被否掉的说法从旁边的文案漂了回来，用户读到的仍然是"要再算一遍"。
     """
     app = _fresh_app()
     try:
@@ -4932,6 +5120,10 @@ def test_drilldown_button_is_named_load_not_backtest(history_store_dir):
         app.destroy()
     assert "加载" in text, text
     assert "回测" not in text, text
+
+    note = BacktestApp._HISTORY_CONTRACT_NOTE
+    assert "加载明细" in note, note
+    assert "回测这一段" not in note, note
 
 
 def test_drilldown_loads_saved_bars_instead_of_recomputing(tmp_path,
@@ -5449,6 +5641,26 @@ def test_candidate_config_pairs_each_strategy_with_its_params_on_one_row():
         app.destroy()
 
 
+# 一份"跑完一轮优选"该冻结下来的公共环境，形状与 _collect_history_state 的
+# 产物一致。参数详情窗要从它摊出期权、行情与规模成本三组。
+_HISTORY_RUN_STATE = {
+    "history_lookbacks": {"quarter": 61, "year": 252},
+    "cls_name": "累计期权 (Decumulator)",
+    "subtype": "Opt_Decumulator_Back",
+    "params": {
+        "s0": 100.0, "K": 90.0, "T_days": 20, "T_over": 0, "sigma": 0.18,
+        "H": 110.0, "N": 2, "cp": 1, "fix": 0.0, "P": 0.0, "amount": 0.0,
+        "r": 0.03, "q": 0.03, "nPath": 100000,
+    },
+    "source": "wind", "wind_code": "AU2512.SHF",
+    "wind_start": "2025-08-14", "wind_end": "2026-08-13",
+    "wind_bar_size": "1分钟",
+    "wind_bar_size_requested": gui_app.WIND_AUTO_BAR_SIZE,
+    "position": 1, "quantity": 100.0, "multiplier": 5.0,
+    "tc_rate": 0.0001, "slippage_bps": 0.0,
+}
+
+
 def _render_history_result_page(*, agree=True):
     """用合成排名渲染一次结果页，返回已构建的 app（调用方负责 destroy）。"""
     import tkinter as tk
@@ -5507,6 +5719,144 @@ def _render_history_result_page(*, agree=True):
         history_state={"history_lookbacks": {"quarter": 61, "year": 252}})
     app.update_idletasks()
     return app
+
+
+def test_history_params_detail_splits_shared_inputs_from_the_row_candidate():
+    """优选排名的参数详情要分两层：公共输入 + 这一条候选自己的策略。
+
+    一次优选的全部候选共用同一套期权、行情与规模成本（控制变量的做法），
+    只有对冲策略逐条不同。五组的字段与中文名走结果池详情那套，两个窗口不会
+    对同一项给出两种说法。
+    """
+    row = {
+        "period": "近一年", "strategy": "固定间隔(0.75σ)",
+        "strategy_type": "hedge_band", "meta_strategy_name": "hedge_band",
+        "meta_candidate_sigma": 0.75, "meta_sigma_source": "implied",
+        "meta_sigma_window": 20, "meta_force_day_close_hedge": True,
+        "paired_windows": 12, "baseline_windows": 12,
+    }
+    sections = BacktestApp._history_row_detail_sections(
+        row, _HISTORY_RUN_STATE)
+    assert [label for label, _rows in sections] == [
+        "行情", "期权类型与参数", "头寸方向", "规模与成本", "对冲策略",
+        "本行的取样口径"]
+
+    grouped = dict(sections)
+    # 公共输入取自运行时冻结的 state，期权参数按大类完整列出。
+    contract = dict(grouped["期权类型与参数"])
+    declared = [
+        str(spec[1])
+        for spec in gui_app.OPTION_CLASSES["累计期权 (Decumulator)"]["params"]]
+    assert [n for n, _v in grouped["期权类型与参数"]][2:] == declared
+    assert contract["期权类型"] == "回归累计"
+    # 大类专属标签：累计的 T_days 是「剩余期限」，不是香草的「期限」。
+    assert "剩余期限(交易日)" in contract
+
+    # 策略组来自这一行自己的 meta_*，不是 state 里的残值。
+    assert dict(grouped["对冲策略"]) == {
+        "策略类型": "价格波动触发调仓", "带宽单位": "σ 倍数",
+        "带宽阈值": "0.75", "收盘兜底": "开启",
+        "波动率口径": "隐含波动率", "波动率窗口": "20"}
+    assert dict(grouped["本行的取样口径"]) == {
+        "周期": "近一年", "候选": "固定间隔(0.75σ)",
+        "参与评分段数": "12", "基准段数": "12"}
+    # 一行覆盖多段，没有单一采样密度可言——那一行整条不出现。
+    assert "日内采样" not in dict(grouped["规模与成本"])
+
+
+def test_history_params_detail_follows_each_row_own_strategy():
+    """换一行就换一组策略参数，且只列该策略真正读的那几项。"""
+    def strategy_group(**row_overrides):
+        row = {"period": "近一年", "strategy": "x", **row_overrides}
+        return dict(dict(BacktestApp._history_row_detail_sections(
+            row, _HISTORY_RUN_STATE))["对冲策略"])
+
+    assert strategy_group(
+        strategy_type="fixed_times", meta_strategy_name="fixed_times",
+        meta_fixed_times="10:30,14:00") == {
+            "策略类型": "每日固定时刻", "固定时刻": "10:30,14:00",
+            "收盘兜底": "关闭"}
+    # 每日收盘基准不读带宽也不读固定时刻，那几项不该占行。
+    assert strategy_group(
+        strategy_type="close_to_close",
+        meta_strategy_name="close_to_close") == {
+            "策略类型": "每日收盘", "收盘兜底": "关闭"}
+
+
+def test_history_rank_rows_offer_a_params_detail_on_right_click():
+    """排名表要有右键菜单，且能对选中行开出参数详情窗。"""
+    app = _render_history_result_page()
+    try:
+        app._latest_history_state = dict(_HISTORY_RUN_STATE)
+        menu = app._history_rank_menu
+        labels = [
+            menu.entrycget(index, "label")
+            for index in range(menu.index("end") + 1)
+            if menu.type(index) == "command"
+        ]
+        assert labels == ["参数详情…"]
+
+        tree = app._history_rank_tree
+        opened = []
+        menu.tk_popup = lambda x_root, y_root: opened.append((x_root, y_root))
+        event = SimpleNamespace(x=10, y=10, x_root=0, y_root=0)
+
+        children = tree.get_children()
+        tree.identify_row = lambda _y: children[2]
+        BacktestApp._popup_history_rank_menu(app, event)
+        assert tree.focus() == children[2], "右键要把该行设成作用对象"
+        assert len(opened) == 1
+
+        # 空白处右键不弹——点了只会提示"请先选一行"的菜单比不弹更费解。
+        tree.identify_row = lambda _y: ""
+        BacktestApp._popup_history_rank_menu(app, event)
+        assert len(opened) == 1
+
+        window = BacktestApp._open_params_window(
+            app, heading="x", subtitle="y",
+            sections=BacktestApp._history_row_detail_sections(
+                app._selected_history_rank_row() or {}, _HISTORY_RUN_STATE),
+            notes={"期权类型与参数": BacktestApp._HISTORY_CONTRACT_NOTE})
+        app.update_idletasks()
+        texts = []
+
+        def walk(widget):
+            for child in widget.winfo_children():
+                if isinstance(child, gui_app.tk.Text):
+                    texts.append(child.get("1.0", "end"))
+                walk(child)
+
+        walk(window)
+        assert len(texts) == 1
+        body = texts[0]
+        assert "期权类型与参数" in body and "回归累计" in body
+        # 参考值那句限定必须在，否则用户会拿这个行权价去对账。
+        assert "参考值" in body and "加载明细" in body
+        window.destroy()
+    finally:
+        app.destroy()
+
+
+def test_history_params_detail_says_so_when_the_run_recorded_no_parameters(
+        monkeypatch):
+    """旧结果包没冻结运行参数时明说，而不是开一个几乎空白的窗口。
+
+    判据是"有没有期权大类"而不是"state 是不是空的"：旧包解出来的 state 可能
+    只剩周期勾选那几项，非空却一个参数也说不出。
+    """
+    shown = []
+    monkeypatch.setattr(
+        gui_app.messagebox, "showinfo",
+        lambda title, message: shown.append((title, message)))
+    app = _render_history_result_page()
+    try:
+        stale = {"history_lookbacks": {"year": 252}}
+        app._latest_history_state = dict(stale)
+        app._history_last_state = dict(stale)
+        BacktestApp._show_history_row_params(app)
+        assert shown and shown[0][0] == "缺少运行参数"
+    finally:
+        app.destroy()
 
 
 def test_history_result_blocks_never_share_a_grid_row():
