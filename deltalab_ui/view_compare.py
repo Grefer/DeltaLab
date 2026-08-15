@@ -108,18 +108,30 @@ class ComparisonMixin:
         header.pack(fill="x", padx=8, pady=(8, 3))
         header.columnconfigure(0, weight=1)
         self._saved_pool_count_var = tk.StringVar()
+
+        title_row = tk.Frame(header, bg=PALETTE["surface"])
+        title_row.grid(row=0, column=0, sticky="ew")
         ttk.Label(
-            header, textvariable=self._saved_pool_count_var,
+            title_row, text="已保留结果对比",
             style="Surface.TLabel",
             font=(_UI_FONT_FAMILY, 12, "bold"),
-        ).grid(row=0, column=0, sticky="w")
+        ).pack(side="left")
+
+        self._saved_pool_badge = tk.Label(
+            title_row, text="0 / 20 条",
+            bg=PALETTE["primary_light"], fg=PALETTE["primary"],
+            font=(_UI_FONT_FAMILY, 9, "bold"),
+            padx=8, pady=1,
+            highlightbackground=PALETTE["border_soft"], highlightthickness=1,
+        )
+        self._saved_pool_badge.pack(side="left", padx=(10, 0))
+
         ttk.Label(
             header,
-            text=(f"自动保存在本机，重开程序后仍在（最多 "
-                  f"{backtest_pool_store.MAX_RESULTS} 条，超出淘汰最旧的）；"
-                  "显示 / 隐藏只换视图，不会重新回测"),
+            text="✦ 本地持久化保存 · 勾选行即时对比 · 拖动中间分割条自由调节高度",
             style="SurfaceMuted.TLabel",
-        ).grid(row=1, column=0, sticky="w", pady=(2, 0))
+            font=(_UI_FONT_FAMILY, 9),
+        ).grid(row=1, column=0, sticky="w", pady=(3, 0))
         pool = ttk.LabelFrame(container, text=" 已保留结果 ", padding=12)
         pool.pack(fill="x", padx=8, pady=(4, 8))
         toolbar = ttk.Frame(pool, style="Surface.TFrame")
@@ -296,10 +308,18 @@ class ComparisonMixin:
             # 焦点优先留在原处：打勾不该把焦点拽到选区的第一行去。
             tree.focus(focus if focus in children else survivors[0])
         count_var = getattr(self, "_saved_pool_count_var", None)
+        pooled = len(self._saved_backtests)
+        shown = len(self._saved_comparison_selection)
         if count_var is not None:
             count_var.set(
-                f"回测结果池 · 已保存 {len(self._saved_backtests)} 条 · "
-                f"当前显示 {len(self._saved_comparison_selection)} 条")
+                f"已保留结果对比 · 已保存 {pooled} 条 · 当前显示 {shown} 条")
+        badge = getattr(self, "_saved_pool_badge", None)
+        if badge is not None:
+            badge.configure(
+                text=f"{shown} 显示 / {pooled} 保留 (上限 {backtest_pool_store.MAX_RESULTS})",
+                bg=PALETTE["primary_light"] if shown > 0 else PALETTE["surface_alt"],
+                fg=PALETTE["primary"] if shown > 0 else PALETTE["text_muted"],
+            )
         ComparisonMixin._autosize_saved_pool_columns(self)
         ComparisonMixin._sync_saved_pool_buttons(self)
 
@@ -762,7 +782,7 @@ class ComparisonMixin:
         self._comparison_toggle_btn = None
         self._comparison_caveat_frame = None
 
-    def _render_saved_comparison_empty(self, title, detail):
+    def _render_saved_comparison_empty(self, title, detail, *args, **kwargs):
         """把内容区换成居中的空状态说明，并释放上一张图表。"""
         content = self._saved_comparison_content
         ComparisonMixin._discard_comparison_frame(self)
@@ -771,12 +791,26 @@ class ComparisonMixin:
         empty_card = tk.Frame(
             content, bg=PALETTE["surface"],
             highlightbackground=PALETTE["border_soft"], highlightthickness=1,
-            padx=32, pady=24,
+            padx=36, pady=26,
         )
-        empty_card.place(relx=0.5, rely=0.42, anchor="center")
+        empty_card.place(relx=0.5, rely=0.45, anchor="center")
+
+        icon = kwargs.get("icon") or (args[0] if args else None)
+        if not icon:
+            if "没有显示" in str(title):
+                icon = "🔍"
+            elif "无法" in str(title):
+                icon = "⚠"
+            else:
+                icon = "📂"
+
+        ttk.Label(
+            empty_card, text=icon, style="Surface.TLabel",
+            font=(_UI_FONT_FAMILY, 28),
+        ).pack(pady=(0, 8))
         ttk.Label(
             empty_card, text=title, style="Surface.TLabel",
-            font=(_UI_FONT_FAMILY, 14, "bold"),
+            font=(_UI_FONT_FAMILY, 13, "bold"),
         ).pack(pady=(0, 6))
         ttk.Label(
             empty_card, text=detail, style="SurfaceMuted.TLabel", justify="center",
@@ -800,15 +834,15 @@ class ComparisonMixin:
                     self._render_saved_comparison_empty(
                         "当前没有显示任何结果",
                         f"已保留的 {pooled} 条都在上方结果池里，"
-                        "点「显示」列或按「全选」即可放上来。")
+                        "点「显示」列勾选框或按「全选」即可放上来对比。")
                 elif load_error:
                     self._render_saved_comparison_empty(
                         "没有可显示的结果", load_error)
                 else:
                     self._render_saved_comparison_empty(
                         "尚未保留任何结果",
-                        "先运行回测，再点『＋ 保留当前结果到对比』。"
-                        "保留的结果会自动存在本机，重开程序后仍在。")
+                        "先在左侧配置参数并运行回测，再点击『＋ 保留当前结果到对比』。"
+                        "保留的结果会自动保存在本机，重开程序后仍在。")
                 return
             content = self._saved_comparison_content
             summary, daily_curves = self._saved_comparison_payload(snapshots)

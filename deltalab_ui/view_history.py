@@ -2289,11 +2289,12 @@ class HistoryViewMixin:
         # 归属上属于周期结论表，因此挂到那张表下方；排名表下面只留与选中
         # 策略有关的内容，两个层级不再混在一行里。
         period_context = getattr(self, "_history_period_context_var", None)
+        formatted_context = "  ·  ".join(extra) if extra else ""
         if period_context is not None:
-            period_context.set(" · ".join(extra))
+            period_context.set(f"📅 取样口径：{formatted_context}" if formatted_context else "")
             self._history_period_detail_prefix = ""
         else:
-            self._history_period_detail_prefix = " · ".join(extra)
+            self._history_period_detail_prefix = formatted_context
         self._history_detail_var.set(self._history_period_detail_prefix)
         self._update_history_rank_selection()
 

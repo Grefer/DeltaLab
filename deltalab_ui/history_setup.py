@@ -276,6 +276,7 @@ class HistorySetupMixin:
             ).pack(side="left", padx=(0, 12))
         ttk.Label(
             period_bar, text="（可多选）",
+            font=(_UI_FONT_FAMILY, 8),
             style="SurfaceMuted.TLabel",
         ).pack(side="left", padx=(2, 0))
 
