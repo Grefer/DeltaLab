@@ -982,7 +982,7 @@ def test_row_actions_live_in_the_right_click_menu():
 
         walk(app._compare_tab)
         assert titles == [
-            "全选", "取消全选", "删除选中", "全部清空", "导出 CSV"], titles
+            "☑ 全选", "☐ 清选", "🗑 删除", "🧹 清空", "📊 导出"], titles
 
         menu = app._saved_pool_menu
         labels = [
@@ -1149,6 +1149,67 @@ def test_selection_callback_stays_quiet_while_the_table_is_refilled():
     )
 
     BacktestApp._update_comparison_selection(fake)
+
+
+def _comparison_chart_fake(names):
+    """假 self + 真 Figure：只为跑 ``_draw_comparison_cumulative_chart``。"""
+    from matplotlib.backends.backend_agg import FigureCanvasAgg
+    from matplotlib.figure import Figure
+
+    figure = Figure(figsize=(7.2, 2.35), constrained_layout=True)
+    ax = figure.add_subplot(111)
+    canvas = FigureCanvasAgg(figure)
+    fake = SimpleNamespace(
+        _comparison_chart_ax=ax,
+        _comparison_chart_canvas=canvas,
+        _comparison_tree=None,
+        _comparison_rows={},
+        _comparison_daily_curves={
+            name: {"cumulative_net_pnl": [0.0, 1.0 + index, 2.0]}
+            for index, name in enumerate(names)},
+        _comparison_curve_vars={},
+        _comparison_color_map={name: "#2563EB" for name in names},
+        _comparison_dash_map={},
+    )
+    return fake, figure, ax
+
+
+def test_comparison_chart_legend_sits_below_the_plot_area():
+    """图例横排到绘图区下方：曲线常贴着上下边缘，图内放哪儿都会压住数据。
+
+    它挂在 figure 上而不是 ax 上（``loc="outside lower center"`` 只有
+    figure 级图例认），所以 ``ax.clear()`` 带不走它——重画时不自己摘干净，
+    刷一次就叠一层。
+    """
+    names = ["每日收盘 #01", "每日收盘 #02"]
+    fake, figure, ax = _comparison_chart_fake(names)
+
+    for _ in range(3):
+        BacktestApp._draw_comparison_cumulative_chart(fake)
+
+    assert ax.get_legend() is None
+    assert len(figure.legends) == 1
+    legend = figure.legends[0]
+    assert [text.get_text() for text in legend.get_texts()] == names
+    figure.canvas.draw()
+    # 屏幕坐标 y 向上：图例整体落在坐标区下沿之下才算没挡住图。
+    renderer = figure.canvas.get_renderer()
+    assert (legend.get_window_extent(renderer).y1
+            <= ax.get_window_extent(renderer).y0)
+
+
+def test_comparison_chart_drops_the_legend_when_nothing_is_plotted():
+    """一条都没勾时图例得跟着消失，否则空图上飘着一串没有曲线的名字。"""
+    names = ["每日收盘 #01", "每日收盘 #02"]
+    fake, figure, _ax = _comparison_chart_fake(names)
+    BacktestApp._draw_comparison_cumulative_chart(fake)
+    assert len(figure.legends) == 1
+
+    fake._comparison_curve_vars = {
+        name: SimpleNamespace(get=lambda: False) for name in names}
+    BacktestApp._draw_comparison_cumulative_chart(fake)
+
+    assert figure.legends == []
 
 
 def test_toggling_selection_reuses_the_chart_and_table_widgets():
@@ -1683,6 +1744,87 @@ def test_variable_card_states_the_variable_and_the_caveats():
         assert app._comparison_caveat_var.get() == ""
         assert app._comparison_variable_accent.cget("bg") == (
             gui_app.PALETTE["border_soft"])
+    finally:
+        app.destroy()
+
+
+def _card_grid_rows(app):
+    """说明卡字段网格当前实际占了几行（含折叠行）。"""
+    grid = app._comparison_field_grid
+    return len({
+        int(widget.grid_info()["row"]) for widget in grid.winfo_children()})
+
+
+def test_variable_card_caps_its_own_height_instead_of_squeezing_the_chart():
+    """字段再多，说明卡也只铺固定行数——剩下的收进详情窗。
+
+    卡片与图表共用一块高度，而 pack 先足额兑现卡片的请求高度。封顶前香草
+    期权五组属性全变就是 17 行、卡片实测 390px，而下半部分（图表 225px +
+    指标表）请求 449px——挤下去先没的是图表。指标表早给自己封过顶
+    （``min(8, len(rows))``），这里锁住卡片这一道。
+    """
+    app = _comparison_app()
+    try:
+        BacktestApp._build_comparison_variable_card(app, app._compare_container)
+        limit = BacktestApp._COMPARISON_FIELD_ROW_LIMIT
+
+        fields = [(f"字段{index}", ["1", "2"]) for index in range(limit + 8)]
+        BacktestApp._fill_comparison_field_grid(app, fields)
+        app.update_idletasks()
+
+        # limit 行字段 + 一行折叠入口，与字段总数无关。
+        assert _card_grid_rows(app) == limit + 1
+        assert app._comparison_field_more is not None
+        assert f"还有 {len(fields) - limit} 项差异" in (
+            app._comparison_field_more.cget("text"))
+        # 网格上截断，但全量留在实例上供详情窗取用。
+        assert app._comparison_field_rows == fields
+
+        capped = app._comparison_field_grid.winfo_reqheight()
+        BacktestApp._fill_comparison_field_grid(
+            app, [(f"字段{index}", ["1", "2"]) for index in range(limit + 40)])
+        app.update_idletasks()
+        # 字段从 14 项涨到 46 项，网格高度一点不涨——这正是图表要的保证。
+        assert app._comparison_field_grid.winfo_reqheight() == capped
+    finally:
+        app.destroy()
+
+
+def test_column_truncation_also_gets_a_way_back_to_the_full_values(monkeypatch):
+    """列被截断时同样要有入口：批量扫参正是行不超限、列超限的那一种。
+
+    20 条结果只差一个参数时字段只有一行，超限的是取值列。若入口只挂在
+    "行超限"上，被截掉的那十几条取值在界面上再也点不出来。
+    """
+    app = _comparison_app()
+    try:
+        BacktestApp._build_comparison_variable_card(app, app._compare_container)
+        columns = BacktestApp._COMPARISON_FIELD_COLUMN_LIMIT
+
+        values = [str(index) for index in range(columns + 14)]
+        BacktestApp._fill_comparison_field_grid(app, [("波动率", values)])
+        app.update_idletasks()
+
+        # 一行字段 + 一行折叠入口；行数本身没超限。
+        assert _card_grid_rows(app) == 2
+        assert app._comparison_field_more is not None
+        assert "另有 14 条" in app._comparison_field_more.cget("text")
+        # 折叠行紧贴唯一那行字段，不是空出五行摆在 row_limit 上。
+        assert int(app._comparison_field_more.grid_info()["row"]) == 1
+
+        opened = {}
+
+        def fake_window(_self, *, heading, subtitle, sections, notes=None):
+            opened.update(heading=heading, subtitle=subtitle, sections=sections)
+            return None
+
+        # 打在类上：``_open_params_window`` 是 BacktestApp 自己的实例方法
+        # （gui_app.py），没有下沉到模块，所以这个 patch 不会静默失效。
+        monkeypatch.setattr(BacktestApp, "_open_params_window", fake_window)
+        BacktestApp._show_comparison_field_detail(app)
+        assert opened["sections"][0][1] == [
+            ("波动率", "   ".join(
+                f"#{index + 1} {value}" for index, value in enumerate(values)))]
     finally:
         app.destroy()
 
@@ -2968,11 +3110,11 @@ def test_delete_button_puts_the_count_in_its_own_label():
 
         tree.selection_set("result-0001")
         BacktestApp._sync_saved_pool_buttons(app)
-        assert app._saved_pool_delete_btn.cget("text") == "删除选中"
+        assert app._saved_pool_delete_btn.cget("text") == "🗑 删除"
 
         tree.selection_set(["result-0001", "result-0003"])
         BacktestApp._sync_saved_pool_buttons(app)
-        assert app._saved_pool_delete_btn.cget("text") == "删除选中 (2)"
+        assert app._saved_pool_delete_btn.cget("text") == "🗑 删除 (2)"
     finally:
         app.destroy()
 

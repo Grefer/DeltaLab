@@ -60,7 +60,7 @@ class HistorySetupMixin:
             widget.destroy()
 
         header = ttk.Frame(container, style="Surface.TFrame")
-        header.pack(fill="x", padx=8, pady=(8, 6))
+        header.pack(fill="x", padx=10, pady=(10, 8))
         header.columnconfigure(0, weight=1)
         for _column in range(1, 5):
             header.columnconfigure(_column, weight=0)
@@ -76,20 +76,20 @@ class HistorySetupMixin:
         # 「已保存结果」是去翻旧结果的入口，「收起/展开候选配置」只是视图
         # 开关——都用幽灵样式，把实心按钮的分量留给「保存结果」和主行动。
         self._history_open_store_btn = ttk.Button(
-            header, text="已保存结果", width=11, style="Ghost.TButton",
+            header, text="📂 结果库", width=9, style="Ghost.TButton",
             command=self._open_history_result_store,
         )
         self._history_open_store_btn.grid(
             row=0, column=1, sticky="e", padx=(12, 0))
         self._history_save_btn = ttk.Button(
-            header, text="保存结果", width=10, state="disabled",
+            header, text="💾 保存", width=8, state="disabled",
             command=self._save_history_result,
         )
         self._history_save_btn.grid(row=0, column=2, sticky="e", padx=(6, 0))
 
         self._history_config_visible = True
         self._history_config_toggle_btn = ttk.Button(
-            header, text="收起候选配置", width=13, style="Ghost.TButton",
+            header, text="▲ 收起配置", width=10, style="Ghost.TButton",
             command=self._toggle_history_config_panel,
         )
         self._history_config_toggle_btn.grid(
@@ -101,11 +101,11 @@ class HistorySetupMixin:
         # 主行动固定在页首：它此前跟在候选配置下方，折叠配置时会随之上跳，
         # 出结果后又被推到滚动区上方，想改参数重跑得先往回滚。
         self._history_btn = ttk.Button(
-            header, text="开始策略优选", style="Run.TButton",
+            header, text="▶ 开始优选", style="Run.TButton",
             command=self._run_history_recommendation,
         )
         self._history_btn.grid(
-            row=0, column=4, sticky="e", padx=(6, 0), ipadx=12, ipady=2)
+            row=0, column=4, sticky="e", padx=(6, 0))
 
         self._history_config_panel = ttk.Frame(
             container, style="Surface.TFrame")
@@ -118,6 +118,7 @@ class HistorySetupMixin:
             highlightbackground=PALETTE["border_soft"], highlightthickness=1,
             padx=14, pady=8)
         base_box.pack(fill="x", pady=(0, 8))
+
         base_summary = tk.Label(
             base_box, textvariable=self._history_base_summary_var,
             bg=PALETTE["primary_light"], fg=PALETTE["primary"],
@@ -127,7 +128,7 @@ class HistorySetupMixin:
 
         settings = ttk.LabelFrame(
             self._history_config_panel,
-            text=" 候选空间（仅属于策略优选） ", padding=14)
+            text=" 候选空间（仅属于策略优选） ", padding=(16, 10))
         settings.pack(fill="x")
         # 面板统一度量。四个输入框此前宽度不一（时刻/带宽 184px，两个日期
         # 107px），左边缘也各走各的，尾部说明跟着错开。这里用一套常量约束：
@@ -402,7 +403,9 @@ class HistorySetupMixin:
             loaded_pill = tk.Label(
                 container, text=text,
                 bg=PALETTE["primary_light"], fg=PALETTE["primary"],
-                font=(_UI_FONT_FAMILY, 9, "bold"), padx=10, pady=3,
+                font=(_UI_FONT_FAMILY, 9, "bold"),
+                highlightbackground=PALETTE["primary"], highlightthickness=1,
+                padx=10, pady=3,
             )
             loaded_pill.pack(side="left", padx=(0, 6))
 
@@ -412,7 +415,9 @@ class HistorySetupMixin:
             pill = tk.Label(
                 container, text=f"⚠ {hint_text}",
                 bg=PALETTE["warning_light"], fg=PALETTE["warning"],
-                font=(_UI_FONT_FAMILY, 9, "bold"), padx=10, pady=3,
+                font=(_UI_FONT_FAMILY, 9, "bold"),
+                highlightbackground=PALETTE["warning"], highlightthickness=1,
+                padx=10, pady=3,
             )
             pill.pack(side="left", padx=(0, 6))
             return
@@ -437,7 +442,9 @@ class HistorySetupMixin:
             src_pill = tk.Label(
                 container, text=f"📊 {source_label}",
                 bg=PALETTE["primary_light"], fg=PALETTE["primary"],
-                font=(_UI_FONT_FAMILY, 9), padx=10, pady=3,
+                font=(_UI_FONT_FAMILY, 9),
+                highlightbackground=PALETTE["border_soft"], highlightthickness=1,
+                padx=10, pady=3,
             )
             src_pill.pack(side="left", padx=(0, 6))
 
@@ -452,7 +459,9 @@ class HistorySetupMixin:
             obj_pill = tk.Label(
                 container, text=f"🆚 {obj_label}",
                 bg=PALETTE["surface_alt"], fg=PALETTE["text_muted"],
-                font=(_UI_FONT_FAMILY, 9), padx=10, pady=3,
+                font=(_UI_FONT_FAMILY, 9),
+                highlightbackground=PALETTE["border_soft"], highlightthickness=1,
+                padx=10, pady=3,
             )
             obj_pill.pack(side="left", padx=(0, 6))
 
@@ -464,7 +473,7 @@ class HistorySetupMixin:
         if getattr(self, "_history_config_visible", True):
             panel.pack_forget()
             self._history_config_visible = False
-            button.configure(text="展开候选配置")
+            button.configure(text="▼ 展开配置")
         else:
             before = getattr(self, "_history_results_container", None)
             pack_options = {
@@ -474,7 +483,7 @@ class HistorySetupMixin:
                 pack_options["before"] = before
             panel.pack(**pack_options)
             self._history_config_visible = True
-            button.configure(text="收起候选配置")
+            button.configure(text="▲ 收起配置")
 
     def _sync_history_save_button(self):
         """页面上确实有可保存的结果时才放开「保存结果」。"""
@@ -1044,18 +1053,31 @@ class HistorySetupMixin:
             return
         for widget in container.winfo_children():
             widget.destroy()
-        placeholder = ttk.Frame(container, style="Surface.TFrame")
+        placeholder = tk.Frame(container, bg=PALETTE["surface"])
         placeholder.place(relx=0.5, rely=0.45, anchor="center")
-        ttk.Label(
-            placeholder, text="尚未运行策略优选", style="Surface.TLabel",
-            font=(_UI_FONT_FAMILY, 14, "bold"),
-        ).pack(pady=(0, 5))
-        ttk.Label(
+
+        icon_lbl = tk.Label(
+            placeholder, text="🎯",
+            font=(_UI_FONT_FAMILY, 42),
+            bg=PALETTE["surface"], fg=PALETTE["text_muted"],
+        )
+        icon_lbl.pack(pady=(0, 10), padx=(14, 0))
+
+        title_lbl = tk.Label(
+            placeholder, text="策略优选",
+            font=(_UI_FONT_FAMILY, 16, "bold"),
+            bg=PALETTE["surface"], fg=PALETTE["text"],
+        )
+        title_lbl.pack(pady=(0, 6))
+
+        desc_lbl = tk.Label(
             placeholder,
-            text=("选择 CSV 或 Wind 真实历史行情，设置候选空间后开始。\n"
-                  "结果仅显示本次勾选周期的严格连续排名与区间诊断。"),
-            style="SurfaceMuted.TLabel", justify="center",
-        ).pack()
+            text="设置上方候选参数与分析周期，点击「▶ 开始策略优选」生成多周期回测排名与最优方案",
+            font=(_UI_FONT_FAMILY, 10),
+            bg=PALETTE["surface"], fg=PALETTE["text_muted"],
+            wraplength=620, justify="center",
+        )
+        desc_lbl.pack(pady=(0, 0))
 
     def _history_objective_from_controls(self):
         """本次运行使用的排名依据。
@@ -1276,12 +1298,9 @@ class HistorySetupMixin:
         if not selected_period_text:
             selected_period_text = "未选择"
         variable.set(
-            f"本次运行将冻结：{source_text}  ·  {subtype or '—'}  ·  "
-            f"代理期限 T={maturity or '—'} 日  ·  "
-            f"严格连续周期 {selected_period_text}  ·  "
-            f"收盘保底 {close_fallback}  ·  "
-            f"头寸方向 {position}  ·  数量 {quantity}  ·  乘数 {multiplier}  ·  "
-            f"成本率 {tc}%  ·  滑点 {slippage} bps  ·  左侧期权参数")
+            f"📌 基准参照 ｜ 【行情】{source_text} ｜ 【合约】{subtype or '—'}（期限 T={maturity or '—'}日） ｜ "
+            f"【周期】{selected_period_text} ｜ 【头寸】{position} 数量{quantity} 乘数{multiplier} ｜ "
+            f"【成本】费率{tc}% 滑点{slippage}bps 保底{close_fallback} ｜ 左侧期权参数")
 
     def _refresh_history_current_band_label(self):
         variable = getattr(self, "_history_current_band_label_var", None)

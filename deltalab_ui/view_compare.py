@@ -37,7 +37,7 @@ import numpy as np
 import backtest_pool_store
 import history_selection
 
-from deltalab_ui import snapshot_detail
+from deltalab_ui import snapshot_detail, widgets
 from deltalab_ui.constants import (
     MAX_COMPARISON_CHART_CURVES,
     STRATEGY_CHART_DASHES,
@@ -143,36 +143,34 @@ class ComparisonMixin:
             style="SurfaceMuted.TLabel",
         ).pack(side="left", fill="x", expand=True)
         self._saved_pool_show_all_btn = ttk.Button(
-            toolbar, text="全选", width=9, style="Ghost.TButton",
+            toolbar, text="☑ 全选", width=7, style="Ghost.TButton",
             command=self._select_all_saved_backtests,
         )
         self._saved_pool_show_all_btn.pack(side="left", padx=(4, 0))
         self._saved_pool_hide_all_btn = ttk.Button(
-            toolbar, text="取消全选", width=9, style="Ghost.TButton",
+            toolbar, text="☐ 清选", width=7, style="Ghost.TButton",
             command=self._clear_saved_backtest_selection,
         )
-        self._saved_pool_hide_all_btn.pack(side="left", padx=(4, 0))
+        self._saved_pool_hide_all_btn.pack(side="left", padx=(2, 0))
         # 条数写进按钮文案，这样"要删几条"在点下去之前就已经在屏幕上；宽度
         # 按带条数时的最长文案定死，免得每次改选都抖一下版面。
         self._saved_pool_delete_btn = ttk.Button(
-            toolbar, text="删除选中", width=13, style="Danger.TButton",
+            toolbar, text="🗑 删除", width=10, style="Danger.TButton",
             command=self._prompt_delete_saved_backtest,
         )
-        self._saved_pool_delete_btn.pack(side="left", padx=(20, 0))
+        self._saved_pool_delete_btn.pack(side="left", padx=(14, 0))
         self._saved_pool_clear_btn = ttk.Button(
-            toolbar, text="全部清空", width=9, style="Danger.TButton",
+            toolbar, text="🧹 清空", width=7, style="Danger.TButton",
             command=self._clear_saved_backtest_pool,
         )
-        # 两个红按钮之间也要留出手指宽度：它们的后果差着一整个结果池，而
-        # 「删除选中」是这一排最常点的那个。
-        self._saved_pool_clear_btn.pack(side="left", padx=(14, 0))
+        self._saved_pool_clear_btn.pack(side="left", padx=(2, 0))
         # 导出收在最右，与两个红按钮隔开：它是这一排唯一不改变任何状态的
         # 动作，挨着删除放会让"点错一格"的代价过大。
         self._saved_pool_export_btn = ttk.Button(
-            toolbar, text="导出 CSV", width=9,
+            toolbar, text="📊 导出", width=7,
             command=self._export_saved_comparison,
         )
-        self._saved_pool_export_btn.pack(side="left", padx=(20, 0))
+        self._saved_pool_export_btn.pack(side="left", padx=(14, 0))
 
         pool_columns = ComparisonMixin._SAVED_POOL_COLUMNS
         tree_frame = ttk.Frame(pool, style="Surface.TFrame")
@@ -266,7 +264,7 @@ class ComparisonMixin:
         focus = tree.focus()
         for item in previous:
             tree.delete(item)
-        for snapshot in self._saved_backtests.values():
+        for index, snapshot in enumerate(self._saved_backtests.values()):
             is_selected = snapshot.result_id in self._saved_comparison_selection
             tree.insert(
                 "", "end", iid=snapshot.result_id,
@@ -283,6 +281,7 @@ class ComparisonMixin:
                     [anchor for _key, _text, _width, anchor
                      in ComparisonMixin._SAVED_POOL_COLUMNS],
                 ),
+                tags=("even",) if index % 2 == 0 else (),
             )
         children = tree.get_children()
         survivors = [item for item in picked if item in children]
@@ -442,7 +441,7 @@ class ComparisonMixin:
         try:
             if delete_btn is not None and delete_btn.winfo_exists():
                 delete_btn.configure(
-                    text=f"删除选中 ({picked})" if picked > 1 else "删除选中")
+                    text=f"🗑 删除 ({picked})" if picked > 1 else "🗑 删除")
         except tk.TclError:
             pass
 
@@ -758,6 +757,10 @@ class ComparisonMixin:
         self._comparison_summary = None
         self._comparison_variable_var = None
         self._comparison_variable_accent = None
+        self._comparison_status_pill = None
+        self._comparison_expandable_container = None
+        self._comparison_toggle_btn = None
+        self._comparison_caveat_frame = None
 
     def _render_saved_comparison_empty(self, title, detail):
         """把内容区换成居中的空状态说明，并释放上一张图表。"""
@@ -765,16 +768,21 @@ class ComparisonMixin:
         ComparisonMixin._discard_comparison_frame(self)
         for widget in content.winfo_children():
             widget.destroy()
-        empty = ttk.Frame(content, style="Surface.TFrame")
-        empty.place(relx=0.5, rely=0.42, anchor="center")
+        empty_card = tk.Frame(
+            content, bg=PALETTE["surface"],
+            highlightbackground=PALETTE["border_soft"], highlightthickness=1,
+            padx=32, pady=24,
+        )
+        empty_card.place(relx=0.5, rely=0.42, anchor="center")
         ttk.Label(
-            empty, text=title, style="Surface.TLabel",
+            empty_card, text=title, style="Surface.TLabel",
             font=(_UI_FONT_FAMILY, 14, "bold"),
-        ).pack(pady=(0, 5))
+        ).pack(pady=(0, 6))
         ttk.Label(
-            empty, text=detail, style="SurfaceMuted.TLabel", justify="center",
+            empty_card, text=detail, style="SurfaceMuted.TLabel", justify="center",
+            font=(_UI_FONT_FAMILY, 9),
             # 这里也会显示异常原文，长度不可控，必须折行。
-            wraplength=420,
+            wraplength=440,
         ).pack()
 
     def _refresh_saved_comparison_view(self):
@@ -830,66 +838,170 @@ class ComparisonMixin:
             ranking_title="已选结果指标（点列头换排序）")
         self._comparison_frame = frame
 
-    def _build_comparison_variable_card(self, parent):
-        """对比说明卡：这次比的变量是哪一项，以及看数时要留意什么。
+    # 说明卡与图表、指标表共用同一块高度，而 pack 是先足额兑现卡片的请求高
+    # 度、剩下的才轮到下面那半（见 _ensure_comparison_frame 的 pack 顺序）。
+    # 所以卡片必须自己封顶：字段行数等于五组属性摊平后的**全部**差异字段，
+    # 本身没有上限——香草期权五组全变就是 17 行、卡片实测 390px，换成 Wind
+    # 行情还要再多四行，而下半部分（图表 225px + 指标表）请求 449px，挤下去
+    # 先没的是图表。指标表早给自己封过顶（_populate_comparison_view 里的
+    # ``min(8, len(rows))``），这里补上同一道闸。
+    # 6 行的依据：同时变两三组属性时字段数多在四到六行之间，原地能看完；再
+    # 多的属于批量扫参，本来就得逐项对，交给详情窗比挤在卡片里强。
+    _COMPARISON_FIELD_ROW_LIMIT = 6
+    # 列数等于当前显示的结果条数，而结果池最多 20 条。20 列的网格请求宽度实
+    # 测 2682px、容器只有约 1240px——超出的宽度会顺着几何传播把整个窗口撑
+    # 开，不是被裁掉就算了。
+    _COMPARISON_FIELD_COLUMN_LIMIT = 6
 
-        这个位置原先是一张"选中结果明细卡"，摆的是名称、五个指标和参数串
-        ——而那些数字指标表里全有，参数与来源结果池表里全有，独有的只剩一
-        个交易日数（已并入指标表）。真正该占这块版面的是本页唯一的结论性
-        信息：这两条结果之间到底差在哪。
+    def _build_comparison_variable_card(self, parent):
+        """对比说明卡：智能折叠/展开结构，保证多要素时不挤压图表。
+
+        - 顶部栏（折叠态）：高度仅约 34px，展示状态徽章、核心结论、受控项及展开按钮；
+        - 可展开区：展示对齐紧凑的差异矩阵表格与看数限制警示条；
+        - 智能折叠策略：差异项 <= 2 时自动展开，差异项 >= 3（多变量）时默认折叠。
         """
+        # 说明卡外层：白底微卡片，左侧色条指示对比状态
         card = tk.Frame(
-            parent, bg=PALETTE["surface_alt"],
+            parent, bg=PALETTE["surface"],
             highlightbackground=PALETTE["border_soft"], highlightthickness=1)
-        card.pack(fill="x", padx=8, pady=(8, 4))
+        card.pack(fill="x", padx=8, pady=(4, 4))
 
         self._comparison_variable_accent = tk.Frame(
             card, bg=PALETTE["border_soft"], width=4)
         self._comparison_variable_accent.pack(side="left", fill="y")
 
-        body = tk.Frame(card, bg=PALETTE["surface_alt"], padx=14, pady=10)
+        body = tk.Frame(card, bg=PALETTE["surface"], padx=14, pady=8)
         body.pack(side="left", fill="both", expand=True)
         body.columnconfigure(0, weight=1)
 
+        # ── 顶部栏：左侧 Badge Pill + 变量标题；右侧折叠按钮 ──
+        top_bar = tk.Frame(body, bg=PALETTE["surface"], cursor="hand2")
+        top_bar.grid(row=0, column=0, sticky="ew")
+
+        self._comparison_status_pill = tk.Label(
+            top_bar, text="ℹ 等待选择", bg=PALETTE["surface_alt"],
+            fg=PALETTE["text_muted"], font=(_UI_FONT_FAMILY, 9, "bold"),
+            padx=8, pady=2,
+            highlightbackground=PALETTE["border_soft"], highlightthickness=1,
+        )
+        self._comparison_status_pill.pack(side="left", padx=(0, 10))
+
         self._comparison_variable_var = tk.StringVar(value="")
         self._comparison_variable_label = tk.Label(
-            body, textvariable=self._comparison_variable_var,
-            bg=PALETTE["surface_alt"], fg=PALETTE["text"],
-            font=(_UI_FONT_FAMILY, 14, "bold"), anchor="w", justify="left",
-            wraplength=980,
+            top_bar, textvariable=self._comparison_variable_var,
+            bg=PALETTE["surface"], fg=PALETTE["text"],
+            font=(_UI_FONT_FAMILY, 11, "bold"), anchor="w", justify="left",
         )
-        self._comparison_variable_label.grid(row=0, column=0, sticky="w")
+        self._comparison_variable_label.pack(side="left", fill="x", expand=True)
+        widgets.track_wraplength(self._comparison_variable_label)
 
-        # 逐字段的取值网格：一行一个字段，取值按 #序号 排开，序号与指标表
-        # 首列一致。此前这些值拼成 "A vs B vs C" 塞进标题，三条以上就分不
-        # 清谁是谁了。
+        self._comparison_toggle_btn = tk.Label(
+            top_bar, text="▼ 展开明细",
+            bg=PALETTE["surface_alt"], fg=PALETTE["primary"],
+            font=(_UI_FONT_FAMILY, 9, "bold"),
+            padx=10, pady=2, cursor="hand2",
+            highlightbackground=PALETTE["border_soft"], highlightthickness=1,
+        )
+        self._comparison_toggle_btn.pack(side="right", padx=(8, 0))
+
+        def _on_hover_toggle(event):
+            try:
+                event.widget.configure(
+                    bg=PALETTE["primary_light"], highlightbackground=PALETTE["primary"])
+            except tk.TclError:
+                pass
+
+        def _on_leave_toggle(event):
+            try:
+                event.widget.configure(
+                    bg=PALETTE["surface_alt"], highlightbackground=PALETTE["border_soft"])
+            except tk.TclError:
+                pass
+
+        top_bar.bind("<Button-1>", lambda _e: self._toggle_comparison_card())
+        self._comparison_toggle_btn.bind("<Button-1>", lambda _e: self._toggle_comparison_card())
+        self._comparison_toggle_btn.bind("<Enter>", _on_hover_toggle)
+        self._comparison_toggle_btn.bind("<Leave>", _on_leave_toggle)
+
+        # ── 可展开明细容器 ──
+        expandable = tk.Frame(body, bg=PALETTE["surface"])
+        expandable.grid(row=1, column=0, sticky="ew", pady=(8, 0))
+        expandable.columnconfigure(0, weight=1)
+        self._comparison_expandable_container = expandable
+
+        # 逐字段的取值网格
         self._comparison_field_grid = tk.Frame(
-            body, bg=PALETTE["surface_alt"])
-        self._comparison_field_grid.grid(row=1, column=0, sticky="w",
-                                         pady=(6, 0))
+            expandable, bg=PALETTE["surface"])
+        self._comparison_field_grid.grid(row=0, column=0, sticky="w", pady=(0, 4))
 
+        # 受控变量（其余一致项）
         self._comparison_same_var = tk.StringVar(value="")
-        tk.Label(
-            body, textvariable=self._comparison_same_var,
-            bg=PALETTE["surface_alt"], fg=PALETTE["text_muted"],
+        self._comparison_same_label = tk.Label(
+            expandable, textvariable=self._comparison_same_var,
+            bg=PALETTE["surface"], fg=PALETTE["text_muted"],
             font=(_UI_FONT_FAMILY, 9), anchor="w", justify="left",
-            wraplength=980,
-        ).grid(row=2, column=0, sticky="w", pady=(6, 0))
+        )
+        self._comparison_same_label.grid(row=1, column=0, sticky="ew", pady=(4, 0))
+        widgets.track_wraplength(self._comparison_same_label)
 
+        # 看数限制/警告条 (Caveats Banner)
+        self._comparison_caveat_frame = tk.Frame(
+            expandable, bg=PALETTE["warning_light"],
+            highlightbackground=PALETTE["warning"], highlightthickness=1,
+            padx=10, pady=4,
+        )
         self._comparison_caveat_var = tk.StringVar(value="")
         self._comparison_caveat_label = tk.Label(
-            body, textvariable=self._comparison_caveat_var,
-            bg=PALETTE["surface_alt"], fg=PALETTE["text_muted"],
+            self._comparison_caveat_frame, textvariable=self._comparison_caveat_var,
+            bg=PALETTE["warning_light"], fg=PALETTE["warning"],
             font=(_UI_FONT_FAMILY, 9), anchor="w", justify="left",
-            wraplength=980,
         )
-        self._comparison_caveat_label.grid(row=3, column=0, sticky="w")
+        self._comparison_caveat_label.pack(side="left", fill="x", expand=True)
+        widgets.track_wraplength(self._comparison_caveat_label)
+        self._comparison_caveat_frame.grid(row=2, column=0, sticky="ew", pady=(6, 0))
+        self._comparison_caveat_frame.grid_remove()
+
+        self._comparison_card_expanded = False
+        self._comparison_card_user_toggled = False
+
+    def _toggle_comparison_card(self):
+        """用户点击切换说明卡的折叠/展开状态。"""
+        self._comparison_card_user_toggled = True
+        self._comparison_card_expanded = not getattr(self, "_comparison_card_expanded", False)
+        self._sync_comparison_card_expansion()
+
+    def _sync_comparison_card_expansion(self):
+        """根据当前展开状态同步 UI。"""
+        container = getattr(self, "_comparison_expandable_container", None)
+        toggle_btn = getattr(self, "_comparison_toggle_btn", None)
+        if container is None or toggle_btn is None:
+            return
+        fields = getattr(self, "_comparison_field_rows", [])
+        caveats = bool(getattr(self, "_comparison_caveat_var", tk.StringVar()).get())
+        has_content = bool(fields or caveats)
+        if not has_content:
+            toggle_btn.pack_forget()
+            container.grid_remove()
+            return
+        toggle_btn.pack(side="right", padx=(8, 0))
+        expanded = getattr(self, "_comparison_card_expanded", False)
+        if expanded:
+            toggle_btn.configure(text="▲ 收起明细")
+            container.grid()
+        else:
+            num = len(fields)
+            toggle_btn.configure(text=f"▼ 展开明细 ({num}项)" if num > 0 else "▼ 展开明细")
+            container.grid_remove()
 
     def _fill_comparison_field_grid(self, fields):
         """一行一个差异字段：字段名 + 各结果的取值，取值按 #序号 排开。
 
         序号与指标表首列一致，所以三条以上也认得出谁是谁——此前这些值拼成
         "A vs B vs C" 塞在标题里，既分不清对应关系，又能把标题撑到七八十字。
+
+        行数与列数都按 ``_COMPARISON_FIELD_ROW_LIMIT`` /
+        ``_COMPARISON_FIELD_COLUMN_LIMIT`` 封顶，超出的收进详情窗——铺满会
+        把卡片撑到几百像素，而那几百像素是从图表身上拿的。
         """
         grid = getattr(self, "_comparison_field_grid", None)
         if grid is None:
@@ -899,33 +1011,104 @@ class ComparisonMixin:
                 widget.destroy()
         except tk.TclError:
             return
-        for row, (label, values) in enumerate(fields):
+        # 详情窗要的是全量，不是网格上还剩下的那几行。
+        self._comparison_field_rows = list(fields)
+        row_limit = ComparisonMixin._COMPARISON_FIELD_ROW_LIMIT
+        column_limit = ComparisonMixin._COMPARISON_FIELD_COLUMN_LIMIT
+        for row, (label, values) in enumerate(fields[:row_limit]):
             tk.Label(
-                grid, text=label, bg=PALETTE["surface_alt"],
+                grid, text=label, bg=PALETTE["surface"],
                 fg=PALETTE["text_muted"], font=(_UI_FONT_FAMILY, 9),
                 anchor="w", width=12,
             ).grid(row=row, column=0, sticky="w", pady=(0, 2))
             if values is None:
                 # 价格序列摘要之类：只说不同，没有可读的值。
                 tk.Label(
-                    grid, text="（不同）", bg=PALETTE["surface_alt"],
+                    grid, text="（不同）", bg=PALETTE["surface"],
                     fg=PALETTE["text"], font=(_UI_FONT_FAMILY, 10),
                     anchor="w",
                 ).grid(row=row, column=1, sticky="w", pady=(0, 2))
                 continue
-            for column, value in enumerate(values):
-                cell = tk.Frame(grid, bg=PALETTE["surface_alt"])
+            for column, value in enumerate(values[:column_limit]):
+                cell = tk.Frame(
+                    grid, bg=PALETTE["surface_alt"],
+                    highlightbackground=PALETTE["border_soft"],
+                    highlightthickness=1, padx=6, pady=1,
+                )
                 cell.grid(row=row, column=column + 1, sticky="w",
-                          padx=(0, 18), pady=(0, 2))
+                          padx=(0, 8), pady=(0, 2))
                 tk.Label(
                     cell, text=f"#{column + 1}", bg=PALETTE["surface_alt"],
-                    fg=PALETTE["text_muted"], font=(_UI_FONT_FAMILY, 8),
-                ).pack(side="left", padx=(0, 4))
+                    fg=PALETTE["primary"], font=(_UI_FONT_FAMILY, 8, "bold"),
+                ).pack(side="left", padx=(0, 3))
                 tk.Label(
                     cell, text=str(value), bg=PALETTE["surface_alt"],
                     fg=PALETTE["text"],
-                    font=(_UI_FONT_FAMILY, 10, "bold"),
+                    font=(_UI_FONT_FAMILY, 9, "bold"),
                 ).pack(side="left")
+            if len(values) > column_limit:
+                # 说的是"这一行还有几条没摆出来"，不是又一个字段。
+                tk.Label(
+                    grid, text=f"…另 {len(values) - column_limit} 条",
+                    bg=PALETTE["surface"], fg=PALETTE["text_muted"],
+                    font=(_UI_FONT_FAMILY, 9), anchor="w",
+                ).grid(row=row, column=column_limit + 1, sticky="w",
+                       pady=(0, 2))
+        # 截断必须有去处，而**列**超限同样是截断。只挂"行超限"这一个入口
+        # 的话，最常见的那种批量扫参就没救了：20 条结果只差一个参数时行数
+        # 根本不超限，被截掉的是 14 条取值，而那 14 条在界面上再也点不出来。
+        hidden_rows = max(0, len(fields) - row_limit)
+        hidden_columns = max(
+            (len(values) - column_limit
+             for _label, values in fields if values is not None),
+            default=0)
+        self._comparison_field_more = None
+        if hidden_rows or hidden_columns > 0:
+            if hidden_rows and hidden_columns > 0:
+                text = (f"＋ 还有 {hidden_rows} 项差异、"
+                        f"每项另有 {hidden_columns} 条取值，点此逐项查看")
+            elif hidden_rows:
+                text = f"＋ 还有 {hidden_rows} 项差异，点此逐项查看"
+            else:
+                text = f"＋ 另有 {hidden_columns} 条结果的取值未列出，点此逐项查看"
+            more = tk.Label(
+                grid, text=text,
+                bg=PALETTE["surface"], fg=PALETTE["primary"],
+                font=(_UI_FONT_FAMILY, 9), anchor="w", cursor="hand2")
+            # 摆在最后一行字段的下面。写死 row_limit 的话，只有列超限时上面
+            # 会空出好几行——那时铺出来的字段数根本没到 row_limit。
+            more.grid(row=min(len(fields), row_limit), column=0,
+                      columnspan=column_limit + 2, sticky="w", pady=(4, 0))
+            more.bind(
+                "<Button-1>",
+                lambda _event: ComparisonMixin._show_comparison_field_detail(
+                    self))
+            more.bind("<Enter>", lambda _e: more.configure(fg=PALETTE["primary_hov"], font=(_UI_FONT_FAMILY, 9, "underline")))
+            more.bind("<Leave>", lambda _e: more.configure(fg=PALETTE["primary"], font=(_UI_FONT_FAMILY, 9)))
+            self._comparison_field_more = more
+
+    def _show_comparison_field_detail(self):
+        """把全部差异字段摆进参数详情窗。
+
+        卡片上只留得下前几行，而"到底差在哪"有时就得逐项看完。复用结果池
+        那扇参数详情窗：正文是只读 ``Text``，长了自带滚动，取值还能选中复
+        制——把差异贴给别人是这个窗口本来就有的第二个用途。
+        """
+        rows = list(getattr(self, "_comparison_field_rows", ()) or ())
+        if not rows:
+            return None
+        return self._open_params_window(
+            heading="本次对比的差异字段",
+            subtitle=f"共 {len(rows)} 项；#序号与说明卡、指标表首列一致",
+            sections=[("全部差异字段", [
+                (label,
+                  "（各条不同，没有可读的取值）" if values is None
+                  else "   ".join(
+                      f"#{index + 1} {value}"
+                      for index, value in enumerate(values)))
+                for label, values in rows
+            ])],
+        )
 
     def _refresh_comparison_variable_card(self, snapshots):
         """把变量结论与看数提醒写进说明卡。"""
@@ -935,6 +1118,8 @@ class ComparisonMixin:
             return
         same_var = self._comparison_same_var
         caveat_var = self._comparison_caveat_var
+        status_pill = getattr(self, "_comparison_status_pill", None)
+        caveat_frame = getattr(self, "_comparison_caveat_frame", None)
         try:
             if not accent.winfo_exists():
                 return
@@ -948,22 +1133,50 @@ class ComparisonMixin:
                 "页面会说明所选结果之间差在哪一项，数值判断留给你。")
             caveat_var.set("")
             accent.configure(bg=PALETTE["border_soft"])
+            if status_pill is not None:
+                status_pill.configure(
+                    text="ℹ 等待选择", bg=PALETTE["surface"], fg=PALETTE["text_muted"])
+            if caveat_frame is not None:
+                caveat_frame.grid_remove()
             ComparisonMixin._fill_comparison_field_grid(self, [])
+            self._sync_comparison_card_expansion()
             return
 
         summary = snapshot_detail.comparison_variable_summary(snapshots)
         state = summary["state"]
         variable_var.set(summary["headline"])
         same_var.set(summary["rest"])
-        ComparisonMixin._fill_comparison_field_grid(self, summary["fields"])
+        fields = summary["fields"]
+        ComparisonMixin._fill_comparison_field_grid(self, fields)
         accent.configure(bg={
             "single": PALETTE["success"],
             "identical": PALETTE["primary"],
             "multiple": PALETTE["warning"],
         }[state])
+        if status_pill is not None:
+            if state == "single":
+                status_pill.configure(
+                    text="✓ 单变量对比", bg=PALETTE["success_light"], fg=PALETTE["success"])
+            elif state == "identical":
+                status_pill.configure(
+                    text="≡ 配置完全相同", bg=PALETTE["primary_light"], fg=PALETTE["primary"])
+            else:
+                status_pill.configure(
+                    text="⚠ 多变量对比", bg=PALETTE["warning_light"], fg=PALETTE["warning"])
         caveats = self._saved_comparison_warnings(snapshots)
-        caveat_var.set(
-            "\n".join(f"· {caveat}" for caveat in caveats) if caveats else "")
+        if caveats:
+            caveat_var.set("\n".join(f"· {caveat}" for caveat in caveats))
+            if caveat_frame is not None:
+                caveat_frame.grid()
+        else:
+            caveat_var.set("")
+            if caveat_frame is not None:
+                caveat_frame.grid_remove()
+
+        # 智能折叠策略：若用户未手动点击过折叠/展开，单变量 (<=2项差异) 自动展开，多变量 (>2项) 默认折叠以解放图表空间
+        if not getattr(self, "_comparison_card_user_toggled", False):
+            self._comparison_card_expanded = (len(fields) <= 2)
+        self._sync_comparison_card_expansion()
 
     # 排名表结构与数据无关，骨架建一次就够。展示的全是每条结果自己的绝对
     # 指标；谁跟谁比、比哪一项，交给排序和并列的曲线回答。
@@ -1097,9 +1310,50 @@ class ComparisonMixin:
             except tk.TclError:
                 return
 
+    def _init_comparison_splitter_ratio(self, splitter, ratio=0.55):
+        """按比例摆放曲线图与指标表的初始分割线。"""
+        state = {"owned": False, "height": None, "target": None, "budget": 6, "pending": False}
+
+        def _apply():
+            state["pending"] = False
+            if state["owned"] or state["budget"] <= 0 or state["target"] is None:
+                return
+            target = state["target"]
+            try:
+                if abs(splitter.sash_coord(0)[1] - target) <= 2:
+                    return
+                state["budget"] -= 1
+                splitter.sash_place(0, 0, target)
+            except tk.TclError:
+                pass
+
+        def _place(_event=None):
+            if state["owned"] or state["budget"] <= 0:
+                return
+            height = splitter.winfo_height()
+            if height <= 1:
+                return
+            previous = state["height"]
+            resized = previous is None or abs(height - previous) > (previous * 0.15)
+            if resized:
+                state["height"] = height
+                state["target"] = max(180, int(height * ratio))
+            elif state["target"] is None:
+                return
+            if not state["pending"]:
+                state["pending"] = True
+                splitter.after_idle(_apply)
+
+        def _hand_over(_event=None):
+            state["owned"] = True
+
+        splitter.bind("<Configure>", _place, add="+")
+        splitter.bind("<ButtonPress-1>", _hand_over, add="+")
+        splitter.after_idle(_place)
+
     def _build_current_comparison_view(
             self, parent, *, show_curve_controls=True,
-            ranking_title="当前路径排名（金额与持仓口径一致）"):
+            ranking_title="已选结果指标（点列头换排序）"):
         """建结果区骨架：图表画布、排名表、详情格。
 
         这里一个数据字段都不读。勾选一次就把整块 destroy 重建，代价是每次
@@ -1107,20 +1361,24 @@ class ComparisonMixin:
         上十次这样的重建。骨架与数据分开之后，刷新只剩下改值。
         """
         parent.columnconfigure(0, weight=1)
-        parent.rowconfigure(0, weight=3)
-        parent.rowconfigure(1, weight=2)
+        parent.rowconfigure(0, weight=1)
+
+        splitter = tk.PanedWindow(
+            parent, orient="vertical", bg=PALETTE["border_soft"],
+            sashwidth=6, sashrelief="flat", borderwidth=0,
+            opaqueresize=False)
+        splitter.grid(row=0, column=0, sticky="nsew", pady=(2, 0))
 
         chart_box = ttk.LabelFrame(
-            parent, text=" 累计净损益（按真实交易日汇总，已扣成本） ", padding=12)
-        chart_box.grid(row=0, column=0, sticky="nsew", pady=(4, 3))
+            splitter, text=" 累计净损益（按真实交易日汇总，已扣成本） ", padding=10)
         controls = ttk.Frame(chart_box, style="Surface.TFrame")
         controls.pack(fill="x", pady=(0, 2))
         self._comparison_curve_hint_var = tk.StringVar(
             value="显示曲线:" if show_curve_controls else "")
-        # 不显示曲线勾选框时这一行没有内容可放；条数顶部已经写了。
         ttk.Label(
             controls, textvariable=self._comparison_curve_hint_var,
             style="SurfaceMuted.TLabel",
+            font=(_UI_FONT_FAMILY, 9),
         ).pack(side="left", padx=(2, 5))
         self._comparison_show_curve_controls = bool(show_curve_controls)
         self._comparison_curve_choices = None
@@ -1142,17 +1400,10 @@ class ComparisonMixin:
             self._comparison_chart_figure, master=chart_box)
         self._comparison_chart_canvas.get_tk_widget().pack(
             fill="both", expand=True)
-
-        lower = ttk.Frame(parent, style="Surface.TFrame")
-        lower.grid(row=1, column=0, sticky="nsew", pady=(3, 0))
-        lower.columnconfigure(0, weight=1)
-        lower.rowconfigure(0, weight=1)
+        splitter.add(chart_box, minsize=180, stretch="always")
 
         result_box = ttk.LabelFrame(
-            lower, text=f" {ranking_title} ", padding=12)
-        result_box.grid(row=0, column=0, sticky="nsew")
-        # 批量验证一次能送十条进来，而窗口高度未必够。给排名表配滚动条，
-        # 高度只作初始请求值——没有它的时候，超出可见区的行既看不到也滚不动。
+            splitter, text=f" {ranking_title} ", padding=10)
         tree_frame = ttk.Frame(result_box, style="Surface.TFrame")
         tree_frame.pack(fill="both", expand=True)
         tree = ttk.Treeview(
@@ -1162,21 +1413,13 @@ class ComparisonMixin:
             show="headings", height=3, selectmode="browse",
         )
         for key, text, width in ComparisonMixin._COMPARISON_RANKING_COLUMNS:
-            # 表头与本列数据同向对齐。表头一律居中而数字右对齐时，一列里没
-            # 有任何一条共同的竖边，眼睛就找不到列的界限。
             anchor = ComparisonMixin._comparison_column_anchor(key)
             if key in ComparisonMixin._COMPARISON_UNSORTABLE_COLUMNS:
-                # `#` 是当前显示顺序的行号、不是数据字段，_comparison_sorted_rows
-                # 对它直接原样返回。给它绑 command 再打上 ⇅，等于告诉用户
-                # "这列可以排"，点下去却毫无反应。
                 tree.heading(key, text=text, anchor=anchor)
             else:
                 tree.heading(
                     key, text=text, anchor=anchor,
                     command=lambda k=key: self._sort_comparison_by(k))
-            # 所有列一起 stretch：只让某一列可拉伸时它会独吞全部剩余空间
-            # ——本页的容器约 986px 而列宽总和 642px，那 329px 此前全灌给
-            # 了结果名列，把它撑到内容宽度的三倍多，数字列却全挤在左边。
             tree.column(
                 key, width=width, minwidth=max(40, width - 30),
                 anchor=anchor, stretch=True,
@@ -1186,14 +1429,12 @@ class ComparisonMixin:
         tree.configure(yscrollcommand=ranking_scroll.set)
         tree.pack(side="left", fill="both", expand=True)
         ranking_scroll.pack(side="right", fill="y")
-        # 行底色只由奇偶决定，与优选页同一条规则。极值不进表格：一行可能
-        # 在多列最优、多行也可能各占一项，而 Treeview 的 tag 是行级的，
-        # 底色说不出"哪一列最优"，只会把整张表染花。这件事交给结论卡——
-        # 徽章列出是哪几项，对应的数字瓦片染绿。
         tree.tag_configure("even", background=PALETTE["surface_alt"])
         self._comparison_tree = tree
         self._comparison_rows = {}
         tree.bind("<<TreeviewSelect>>", self._update_comparison_selection)
+        splitter.add(result_box, minsize=120, stretch="always")
+        ComparisonMixin._init_comparison_splitter_ratio(self, splitter)
 
     def _populate_comparison_view(self, summary, daily_curves):
         """把本次数据灌进已建好的骨架：曲线、配色、排名行、详情。"""
@@ -1392,6 +1633,10 @@ class ComparisonMixin:
         if ax is None or canvas is None:
             return
         ax.clear()
+        # 图例挂在 figure 上而不是 ax 上，ax.clear() 带不走它，重画前得自己摘
+        # 干净，否则每刷一次就叠一层。
+        for legend in list(ax.figure.legends):
+            legend.remove()
         tree = getattr(self, "_comparison_tree", None)
         focused_name = None
         if tree is not None and tree.selection():
@@ -1417,14 +1662,28 @@ class ComparisonMixin:
             )
             plotted += 1
 
-        ax.axhline(0.0, color=PALETTE["text_muted"], linewidth=0.8, alpha=0.7)
-        ax.set_xlabel("交易日", fontsize=8)
-        ax.set_ylabel("累计净损益", fontsize=8)
-        ax.tick_params(labelsize=8)
-        ax.grid(True, alpha=0.65)
+        ax.axhline(0.0, color=PALETTE["text_muted"], linewidth=0.8, linestyle="--", alpha=0.6)
+        ax.set_facecolor(PALETTE["surface"])
+        ax.set_xlabel("交易日", fontsize=8.5, color=PALETTE["text"])
+        ax.set_ylabel("累计净损益", fontsize=8.5, color=PALETTE["text"])
+        ax.tick_params(labelsize=8, colors=PALETTE["text_muted"])
+        ax.grid(True, linestyle="--", linewidth=0.6, color=PALETTE["border_soft"], alpha=0.7)
+        for spine in ("top", "right"):
+            ax.spines[spine].set_visible(False)
+        for spine in ("left", "bottom"):
+            ax.spines[spine].set_color(PALETTE["border"])
         if plotted:
-            ax.legend(loc="best", frameon=False, fontsize=8, ncol=min(3, plotted))
-            ax.margins(x=0.02, y=0.14)
+            # 曲线常贴着上下边缘，图内放哪儿都会压住数据（"best" 也只是挑一
+            # 处压得少的），所以照策略优选的做法横排到绘图区下方。用
+            # figure 级的 outside 位（constrained_layout 才认这个位），让它
+            # 在轴外单占一条：轴自动让出高度，与 X 轴标签互不相干，用户拖分
+            # 割线改变图高时留白也不会跟着放大——换成 ax.legend 配
+            # bbox_to_anchor 的话，锚点是轴高的百分比，高图上就会豁开一道。
+            handles, labels = ax.get_legend_handles_labels()
+            ax.figure.legend(
+                handles, labels, loc="outside lower center",
+                frameon=False, fontsize=8, ncol=min(4, plotted))
+            ax.margins(x=0.02, y=0.12)
         else:
             ax.text(
                 0.5, 0.5, "请至少勾选一个策略",

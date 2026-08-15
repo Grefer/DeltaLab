@@ -342,13 +342,23 @@ class BacktestApp(panel_form.FormPanelMixin,
                         background=PALETTE["surface"],
                         foreground=PALETTE["text"],
                         bordercolor=PALETTE["border"],
+                        lightcolor=PALETTE["surface"],
+                        darkcolor=PALETTE["border"],
                         focusthickness=0,
-                        padding=(10, 6),
+                        padding=(10, 5),
                         relief="flat")
         style.map("TButton",
-                  background=[("active", PALETTE["border_soft"]),
-                              ("pressed", PALETTE["border"])],
-                  bordercolor=[("active", PALETTE["primary"])])
+                  background=[("active", PALETTE["primary_light"]),
+                              ("pressed", PALETTE["selected"]),
+                              ("disabled", PALETTE["surface_alt"])],
+                  foreground=[("active", PALETTE["primary"]),
+                              ("disabled", PALETTE["text_light"])],
+                  bordercolor=[("active", PALETTE["primary"]),
+                               ("disabled", PALETTE["border_soft"])],
+                  lightcolor=[("active", PALETTE["primary_light"]),
+                              ("disabled", PALETTE["border_soft"])],
+                  darkcolor=[("active", PALETTE["primary"]),
+                             ("disabled", PALETTE["border_soft"])])
 
         # 行内小按钮 (如 CSV 的「浏览…」): 纵向内边距与输入框对齐, 同高
         style.configure("Field.TButton", padding=(10, 4))
@@ -359,7 +369,7 @@ class BacktestApp(panel_form.FormPanelMixin,
                         foreground="white",
                         background=PALETTE["primary"],
                         bordercolor=PALETTE["primary"],
-                        padding=(14, 8),
+                        padding=(12, 5),
                         relief="flat")
         style.map("Run.TButton",
                   background=[("active", PALETTE["primary_hov"]),
@@ -373,7 +383,7 @@ class BacktestApp(panel_form.FormPanelMixin,
                         foreground="white",
                         background=PALETTE["accent"],
                         bordercolor=PALETTE["accent"],
-                        padding=(10, 6),
+                        padding=(10, 5),
                         relief="flat")
         style.map("Accent.TButton",
                   background=[("active", PALETTE["accent_hov"]),
@@ -381,31 +391,29 @@ class BacktestApp(panel_form.FormPanelMixin,
                               ("disabled", "#9CA3AF")],
                   foreground=[("disabled", "#E5E7EB")])
 
-        # 幽灵按钮：导航与视图开关这类"不产生结果"的操作。它们和真正的动作
-        # 用同一种带边框实心按钮时，一排四个同权重，主行动就被稀释了。去掉
-        # 边框、文字转为次要色，悬停才浮出主色底。
+        # 幽灵按钮：统一白底与浅描边，文字为次要色，悬停浮出主色底
         style.configure("Ghost.TButton",
                         font=btn_font,
                         background=PALETTE["surface"],
                         foreground=PALETTE["text_muted"],
-                        bordercolor=PALETTE["surface"],
+                        bordercolor=PALETTE["border"],
                         lightcolor=PALETTE["surface"],
-                        darkcolor=PALETTE["surface"],
+                        darkcolor=PALETTE["border"],
                         focusthickness=0,
-                        padding=(10, 6),
+                        padding=(10, 5),
                         relief="flat")
         style.map("Ghost.TButton",
                   background=[("active", PALETTE["primary_light"]),
                               ("pressed", PALETTE["selected"]),
-                              ("disabled", PALETTE["surface"])],
+                              ("disabled", PALETTE["surface_alt"])],
                   foreground=[("active", PALETTE["primary"]),
                               ("disabled", PALETTE["text_light"])],
-                  bordercolor=[("active", PALETTE["primary_light"]),
-                               ("pressed", PALETTE["selected"])],
+                  bordercolor=[("active", PALETTE["primary"]),
+                               ("disabled", PALETTE["border_soft"])],
                   lightcolor=[("active", PALETTE["primary_light"]),
-                              ("pressed", PALETTE["selected"])],
-                  darkcolor=[("active", PALETTE["primary_light"]),
-                             ("pressed", PALETTE["selected"])])
+                              ("disabled", PALETTE["border_soft"])],
+                  darkcolor=[("active", PALETTE["primary"]),
+                             ("disabled", PALETTE["border_soft"])])
 
         # 危险按钮：删数据且不可撤销的那一类。做成红字描边而不是实心红——它
         # 不是主行动，实心红摆在一排常规按钮里会比「运行回测」还抢眼；红字

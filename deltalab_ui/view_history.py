@@ -136,18 +136,20 @@ class HistoryViewMixin:
         if notes:
             first_note = str(notes[0])
             short_note = first_note if len(first_note) <= 92 else first_note[:89] + "…"
-            note_bar = tk.Frame(staging, bg=PALETTE["warning_light"], bd=0)
-            note_bar.pack(fill="x", padx=8, pady=(0, 4))
-            tk.Frame(note_bar, bg=PALETTE["warning"], width=3).pack(side="left", fill="y")
+            note_bar = tk.Frame(
+                staging, bg=PALETTE["warning_light"], bd=0,
+                highlightbackground=PALETTE["warning"], highlightthickness=1)
+            note_bar.pack(fill="x", padx=4, pady=(0, 6))
+            tk.Frame(note_bar, bg=PALETTE["warning"], width=4).pack(side="left", fill="y")
             inner = tk.Frame(note_bar, bg=PALETTE["warning_light"], padx=12, pady=6)
             inner.pack(side="left", fill="x", expand=True)
             tk.Label(
                 inner, text=f"⚠ {len(notes)} 条说明：{short_note}",
                 bg=PALETTE["warning_light"], fg=PALETTE["warning"],
-                font=(_UI_FONT_FAMILY, 9), anchor="w",
+                font=(_UI_FONT_FAMILY, 9, "bold"), anchor="w",
             ).pack(side="left", fill="x", expand=True)
             ttk.Button(
-                inner, text="查看全部", width=8,
+                inner, text="🔍 查看全部", width=9,
                 command=lambda: messagebox.showinfo(
                     "历史择优说明", "\n\n".join(str(note) for note in notes)),
             ).pack(side="right", padx=(6, 0))
@@ -641,6 +643,8 @@ class HistoryViewMixin:
                 period_bar, text=str(item.get("period", key)),
                 font=(_UI_FONT_FAMILY, 10), padx=16, pady=5,
                 cursor="hand2", bd=0,
+                bg=PALETTE["surface_alt"], fg=PALETTE["text"],
+                highlightbackground=PALETTE["border_soft"], highlightthickness=1,
             )
             chip.pack(side="left", padx=(0, 6))
             chip.bind(
@@ -666,6 +670,10 @@ class HistoryViewMixin:
             "agree": PALETTE["success"],
             "disagree": PALETTE["warning"],
         }.get(state, PALETTE["text_muted"])
+        pill_border = {
+            "agree": "#BBF7D0",
+            "disagree": "#FDE68A",
+        }.get(state, PALETTE["border_soft"])
         # 这是全页唯一一枚一致性 pill，因此把「几种结论」也写进来——顶部
         # 那枚重复的已经移除，它携带的计数不能跟着丢。
         #
@@ -687,7 +695,8 @@ class HistoryViewMixin:
         }.get(state, "各周期均无可比结论")
         consensus_pill = tk.Label(
             period_bar, text=pill_text, bg=pill_bg, fg=pill_fg,
-            font=(_UI_FONT_FAMILY, 9, "bold"), padx=10, pady=4,
+            font=(_UI_FONT_FAMILY, 9, "bold"), padx=12, pady=4,
+            highlightbackground=pill_border, highlightthickness=1,
         )
         consensus_pill.pack(side="right")
         widgets.attach_tooltip(consensus_pill, note)
@@ -724,7 +733,8 @@ class HistoryViewMixin:
             style="SurfaceMuted.TLabel",
         ).pack(side="left", fill="x", expand=True)
         ttk.Button(
-            chart_selection_bar, text="清空勾选", width=8,
+            chart_selection_bar, text="✕ 清空勾选", width=9,
+            style="Ghost.TButton",
             command=self._clear_history_chart_candidates,
         ).pack(side="right", padx=(8, 0))
 
@@ -885,7 +895,7 @@ class HistoryViewMixin:
         card = tk.Frame(
             parent, bg=PALETTE["surface_alt"],
             highlightbackground=PALETTE["border_soft"], highlightthickness=1)
-        card.grid(row=2, column=0, sticky="ew", padx=2, pady=(6, 2))
+        card.grid(row=2, column=0, sticky="ew", padx=2, pady=(4, 2))
         self._history_conclusion_card = card
 
         # 左侧色条随结论性质变色：领先绿、基准蓝、数据不全黄。
@@ -908,12 +918,12 @@ class HistoryViewMixin:
         tk.Label(
             body, textvariable=self._history_conclusion_name_var,
             bg=PALETTE["surface_alt"], fg=PALETTE["text"],
-            font=(_UI_FONT_FAMILY, 16, "bold"), anchor="w", justify="left",
+            font=(_UI_FONT_FAMILY, 15, "bold"), anchor="w", justify="left",
         ).grid(row=1, column=0, sticky="w", pady=(1, 6))
 
         self._history_conclusion_stats = tk.Frame(
             body, bg=PALETTE["surface_alt"])
-        self._history_conclusion_stats.grid(row=2, column=0, sticky="w")
+        self._history_conclusion_stats.grid(row=2, column=0, sticky="ew", pady=(2, 0))
 
         self._build_history_action_bar(body)
         HistoryViewMixin._refresh_history_conclusion_card(self)
@@ -921,7 +931,7 @@ class HistoryViewMixin:
     def _build_history_action_bar(self, body):
         """把结论用到当下的动作栏；逐段下钻另在图表下方，两者对象不同。"""
         actions = tk.Frame(body, bg=PALETTE["surface_alt"])
-        actions.grid(row=0, column=1, rowspan=3, sticky="ne", padx=(18, 0))
+        actions.grid(row=0, column=1, rowspan=3, sticky="ne", padx=(18, 0), pady=(4, 0))
         # 只留一个动作。原先并排的「应用并用当前行情回测」等于本按钮 + 左
         # 侧「运行回测」，两条路做同一件事，先要分辨点哪个本身就是负担。
         #
@@ -936,7 +946,7 @@ class HistoryViewMixin:
         # 选），全都会走到这里。结果池右键的同名动作一直是包着的，历史页这
         # 处是遗漏。
         ttk.Button(
-            actions, text="应用策略", width=16,
+            actions, text="应用策略", width=14,
             style="Accent.TButton",
             command=lambda: HistoryViewMixin._apply_history_recommendation_safely(
                 self),
@@ -1044,15 +1054,22 @@ class HistoryViewMixin:
         name_var.set(str(row.get("strategy", "—")))
         HistoryViewMixin._set_history_conclusion_accent(self, accent)
 
-        for column, (caption, text, signed) in enumerate(
-                self._history_conclusion_stat_specs(row)):
-            tile = tk.Frame(stats, bg=PALETTE["surface_alt"])
-            tile.grid(row=0, column=column, sticky="w", padx=(0, 26))
+        stat_specs = list(self._history_conclusion_stat_specs(row))
+        for column, (caption, text, signed) in enumerate(stat_specs):
+            stats.columnconfigure(column, weight=1, uniform="stat_tile", minsize=130)
+            tile = tk.Frame(
+                stats, bg=PALETTE["surface"],
+                highlightbackground=PALETTE["border_soft"], highlightthickness=1,
+                padx=12, pady=7)
+            tile.grid(
+                row=0, column=column, sticky="nsew",
+                padx=(0, 8 if column < len(stat_specs) - 1 else 0),
+            )
             tk.Label(
-                tile, text=caption, bg=PALETTE["surface_alt"],
+                tile, text=caption, bg=PALETTE["surface"],
                 fg=PALETTE["text_muted"], font=(_UI_FONT_FAMILY, 8),
                 anchor="w",
-            ).pack(anchor="w")
+            ).pack(fill="x", anchor="w")
             if signed is None or is_baseline:
                 value_fg = PALETTE["text"]
             elif signed > 0:
@@ -1062,9 +1079,9 @@ class HistoryViewMixin:
             else:
                 value_fg = PALETTE["text_muted"]
             tk.Label(
-                tile, text=text, bg=PALETTE["surface_alt"], fg=value_fg,
+                tile, text=text, bg=PALETTE["surface"], fg=value_fg,
                 font=(_UI_FONT_FAMILY, 12, "bold"), anchor="w",
-            ).pack(anchor="w")
+            ).pack(fill="x", anchor="w", pady=(2, 0))
 
     def _set_history_conclusion_accent(self, color):
         accent = getattr(self, "_history_conclusion_accent", None)
@@ -2019,11 +2036,17 @@ class HistoryViewMixin:
             if key == current:
                 chip.configure(
                     bg=PALETTE["primary"], fg="#FFFFFF",
-                    font=(_UI_FONT_FAMILY, 10, "bold"))
+                    font=(_UI_FONT_FAMILY, 10, "bold"),
+                    highlightbackground=PALETTE["primary"],
+                    highlightthickness=1,
+                )
             else:
                 chip.configure(
                     bg=PALETTE["surface_alt"], fg=PALETTE["text_muted"],
-                    font=(_UI_FONT_FAMILY, 10))
+                    font=(_UI_FONT_FAMILY, 10),
+                    highlightbackground=PALETTE["border_soft"],
+                    highlightthickness=1,
+                )
 
     def _update_history_selection(self, _event=None):
         rank_tree = getattr(self, "_history_rank_tree", None)
