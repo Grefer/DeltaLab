@@ -34,6 +34,7 @@ from pricing import HedgeBandStrategy
 from pricing.constants import ANNUAL_DAYS
 from pricing.hedge_backtest import histogram_bin_edges, padded_histogram_range
 
+from deltalab_ui import formatting
 from deltalab_ui.constants import SUBTYPE_DISPLAY
 from deltalab_ui.structure_docs import STRUCTURE_DOCS
 from deltalab_ui.theme import (
@@ -750,17 +751,6 @@ class ResultsMixin:
         detail.insert(0, "触发来源", sources)
         return detail, source_positions
 
-    @staticmethod
-    def _format_detail_index(value, *, include_time=False):
-        """格式化表格索引；日内触发必须保留时分。"""
-        if hasattr(value, "strftime"):
-            pattern = "%Y-%m-%d %H:%M" if include_time else "%Y-%m-%d"
-            try:
-                return value.strftime(pattern)
-            except (TypeError, ValueError):
-                pass
-        return str(value)
-
     def _show_table(self, bt):
         self._hide_placeholder("table")
         # table 没有单独 container；占位符是 tab 的直接子控件。保留其
@@ -836,7 +826,7 @@ class ResultsMixin:
 
         for display_i, ((idx, row), source_position) in enumerate(
                 zip(df.iterrows(), source_positions)):
-            idx_str = self._format_detail_index(
+            idx_str = formatting.format_detail_index(
                 idx, include_time=is_intraday)
             values = [int(source_position), idx_str] + [
                 f"{v:.4f}" if isinstance(v, (float, np.floating)) else str(v)

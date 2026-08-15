@@ -14,6 +14,7 @@ import backtest_pool_store
 import gui_app
 import history_selection
 import history_bar_cache
+from deltalab_ui import snapshot_store
 from gui_app import BacktestApp
 from pricing import HedgeBandStrategy
 
@@ -155,10 +156,15 @@ def test_saved_payload_uses_cached_results_without_running_backtest(monkeypatch)
     def unexpected(*_args, **_kwargs):
         raise AssertionError("选择保存结果时不得重新运行回测")
 
+    # 后两个必须打在 snapshot_store 上：_saved_comparison_payload 与它调用的
+    # _snapshot_comparison_data 都已搬进 deltalab_ui/snapshot_store.py，那两个
+    # 名字现在从**那个模块**的全局里取。补在 gui_app 上不会报错，只会让这条
+    # 「不得重新运行回测」的断言悄悄失效——本用例是反向断言，失效即假绿。
     monkeypatch.setattr(gui_app, "compare_strategies", unexpected)
     monkeypatch.setattr(gui_app.HedgeBacktest, "run", unexpected)
-    monkeypatch.setattr(gui_app, "summarize_strategy_result", unexpected)
-    monkeypatch.setattr(gui_app, "result_daily_frame", unexpected)
+    monkeypatch.setattr(
+        snapshot_store, "summarize_strategy_result", unexpected)
+    monkeypatch.setattr(snapshot_store, "result_daily_frame", unexpected)
 
     summary, daily_curves = BacktestApp._saved_comparison_payload([first, second])
 

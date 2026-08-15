@@ -12,6 +12,7 @@
 暴露，与 ``history_selection`` / ``wind_resolve`` 两组一致。
 """
 
+import copy
 import datetime
 import hashlib
 from types import SimpleNamespace
@@ -667,3 +668,10 @@ def saved_comparison_warnings(snapshots):
             "同时包含买入与卖出：期末净损益与最大回撤的正负来自方向本身，"
             "横向看应比总成本、再触发与换手额。")
     return warnings
+
+
+def copy_snapshot_gui_state(gui_state):
+    """去掉不可序列化的构造器，仅保留本次运行的参数快照。"""
+    return copy.deepcopy({
+        key: value for key, value in gui_state.items() if key != "cfg"
+    })

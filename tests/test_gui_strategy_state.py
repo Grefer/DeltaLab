@@ -6299,8 +6299,13 @@ def _default_chart_selection(rows, *, unplottable=(), monkeypatch=None):
             return {"state": "no_common_windows"}
         return {"state": "ok"}
 
+    # 打在模块函数上，而不是 BacktestApp 的同名 staticmethod 别名上：
+    # _history_top_chart_candidates 搬进 deltalab_ui/view_history.py 之后，
+    # 直接调 history_selection.multi_chart_model，不再经过类属性查找——补在
+    # 类上的替身不会被看见（而且这个测试传的是 SimpleNamespace 假 self，
+    # 走实例查找那条路本来也不通）。
     monkeypatch.setattr(
-        BacktestApp, "_history_multi_chart_model", staticmethod(fake_model))
+        history_selection, "multi_chart_model", fake_model)
     fake = SimpleNamespace(
         _history_rank_tree=_Tree(),
         _history_rank_rows={f"row{i}": row for i, row in enumerate(rows)},
