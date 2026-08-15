@@ -1,0 +1,325 @@
+# _*_ coding: utf-8 _*_
+"""界面层的静态注册表与显示名映射。
+
+三类内容：期权类型注册表（``OPTION_CLASSES``，含各结构的构造闭包）、GUI 显示
+名 ↔ 后端内部键的双向映射、以及图表配色/上限这类展示常量。
+
+这里只依赖 ``pricing``，不依赖界面层其他模块，也不 import ``gui_app``——
+``OPTION_CLASSES`` 几乎被界面每个角落引用，它一旦反向依赖就必然成环。
+"""
+
+import history_store
+from pricing import Option_AB, Option_AS, Option_DE, Option_SNB, Option_Vanilla
+
+
+# ============================================================
+#  期权类型注册表
+# ============================================================
+
+def _snowball_ko_observ(T, first_obs, period):
+    """按"锁定期 + 固定间隔 + 末次=到期"生成敲出观察交易日序号（1-based）。
+
+    全用交易日：首个观察在第 first_obs 日，其后每 period 个交易日一次，并
+    强制最后一次落在到期日 T（与到期不齐时末段为短桩）。返回升序去重列表。
+    """
+    T = int(T)
+    first_obs = max(1, int(first_obs))
+    period = max(1, int(period))
+    days = list(range(first_obs, T + 1, period))
+    if not days or days[-1] != T:
+        days.append(T)                         # 末次观察 = 到期
+    return sorted({d for d in days if 1 <= d <= T})
+
+
+def _build_snowball(st, p):
+    """构造雪球（act=1 交易日计息）。观察日按锁定期+固定间隔生成（按完整交易日计算）；
+    ko_step>0 时为降敲，KO 自期初值每观察日递减 ko_step 个点，得逐观察日 KO 向量。"""
+    T = int(p["T"])
+    ko_observ = _snowball_ko_observ(T, p["first_obs_d"], p["obs_period_d"])
+    step = float(p.get("ko_step", 0.0) or 0.0)
+    KO = [p["KO"] - step * i for i in range(len(ko_observ))] if step else p["KO"]
+    return Option_SNB(
+        st, p["s00"], p["s0"], p["K"], p["KI"], KO, T,
+        p["sigma"], p["coupon"], p["coupon_ko"], p["margin"], 1, p["cp"],
+        r=p["r"], q=p["q"], sr=[], ko_observ=ko_observ, nPath=p["nPath"],
+        margin_call=bool(p["margin_call"]),
+    )
+
+
+OPTION_CLASSES = {
+    "香草期权 (Vanilla)": {
+        "class": Option_Vanilla,
+        "subtypes": ["Eu"],
+        "params": [
+            ("s0",     "初始价格 S0",    float, 100.0),
+            ("K",      "行权价",        float, 100.0),
+            ("T_days", "期限(交易日)",   int,   22),
+            ("sigma",  "波动率",        float, 0.18),
+            ("cp",     "方向",          int,   1, {"看涨 (Call)": 1, "看跌 (Put)": -1}),
+            ("r",      "无风险利率",     float, 0.03),
+            ("q",      "分红率",        float, 0.03),
+        ],
+        "build": lambda st, p: Option_Vanilla(
+            st, p["s0"], [], p["K"], p["T_days"],
+            p["sigma"], p["cp"],
+            r=p["r"], q=p["q"], exe_mode=st,
+        ),
+    },
+    "累计期权 (Decumulator)": {
+        "class": Option_DE,
+        "subtypes": [
+            "Opt_Decumulator", "Opt_Decumulator_Back",
+            "Opt_Decumulator_Fix", "Opt_Decumulator_Fix_E",
+            "Opt_EnDecumulator", "Opt_EnDecumulator_Fix",
+            "Opt_ASGQ_call_put", "Opt_ASGQ_EP", "Opt_ASGQ_EF", "Opt_ASGQ_EFF",
+            "Opt_ASGQ_DP", "Opt_ASGQ_DF", "Opt_ASGQ_DFF",
+        ],
+        "params": [
+            ("s0",     "初始价格 S0",    float, 100.0),
+            ("K",      "行权价",        float, 90.0),
+            ("T_days", "剩余期限(交易日)", int, 20),
+            ("T_over", "已过天数",       int,   0),
+            ("sigma",  "波动率",        float, 0.18),
+            ("H",      "障碍价格",       float, 110.0),
+            ("N",      "杠杆倍数",       int,   2),
+            ("cp",     "方向",          int,   1, {"看涨 (Call)": 1, "看跌 (Put)": -1}),
+            ("fix",    "固定赔付(可选)",  float, 0.0),
+            ("P",      "保障价格(可选)",  float, 0.0),
+            ("amount", "固定金额(可选)",  float, 0.0),
+            ("r",      "无风险利率",     float, 0.03),
+            ("q",      "分红率",        float, 0.03),
+            ("nPath",  "定价路径数 (MC)", int,   100000),
+        ],
+        "build": lambda st, p: Option_DE(
+            st, p["s0"], [], p["K"], p["T_over"], p["T_days"],
+            list(range(1, p["T_days"] + p["T_over"] + 1)),
+            p["sigma"], p["H"], p["N"], p["cp"],
+            r=p["r"], q=p["q"], nPath=p["nPath"],
+            fix=p["fix"] if p["fix"] else None,
+            P=p["P"] if p["P"] else None,
+            amount=p["amount"] if p["amount"] else None,
+        ),
+    },
+    "亚式期权 (Asian)": {
+        "class": Option_AS,
+        "subtypes": ["Asian", "EnhanceAsian"],
+        "params": [
+            ("s0",     "初始价格 S0",    float, 100.0),
+            ("K",      "行权价",        float, 100.0),
+            ("E",      "增强价(Enhanced)", float, 100.0),
+            ("T",      "期限(交易日)",   int,   22),
+            ("N",      "观察日数",       int,   22),
+            ("sigma",  "波动率",        float, 0.15),
+            ("cp",     "方向",          int,   1, {"看涨 (Call)": 1, "看跌 (Put)": -1}),
+            ("minPay", "最低赔付",       float, 0.0),
+            ("maxPay", "最高赔付",       float, 999999.0),
+            ("r",      "无风险利率",     float, 0.03),
+            ("q",      "分红率",        float, 0.03),
+            ("nPath",  "定价路径数 (MC)", int,   100000),
+        ],
+        "build": lambda st, p: Option_AS(
+            st, p["s0"], [], p["K"], p["E"], p["T"], p["N"],
+            p["sigma"], p["cp"], p["minPay"], p["maxPay"],
+            r=p["r"], q=p["q"], nPath=p["nPath"]
+        ),
+    },
+    "气囊期权 (Airbag)": {
+        "class": Option_AB,
+        "subtypes": ["Opt_Airbag"],
+        "params": [
+            ("s0",    "初始价格 S0",    float, 100.0),
+            ("K",     "行权价",        float, 100.0),
+            ("KI",    "敲入价",        float, 90.0),
+            ("T_days","期限(交易日)",   int,   20),
+            ("sigma", "波动率",        float, 0.18),
+            ("pr",    "参与率",        float, 0.8),
+            ("pr_ki", "敲入参与率",     float, 1.0),
+            ("cp",    "方向",          int,   1, {"看涨 (Call)": 1, "看跌 (Put)": -1}),
+            ("r",     "无风险利率",     float, 0.03),
+            ("q",     "分红率",        float, 0.03),
+            ("nPath", "定价路径数 (MC)", int,   100000),
+        ],
+        "build": lambda st, p: Option_AB(
+            st, p["s0"], [], p["K"], p["KI"], p["T_days"],
+            list(range(1, p["T_days"] + 1)),
+            p["sigma"], p["pr"], p["pr_ki"], p["cp"],
+            r=p["r"], q=p["q"], nPath=p["nPath"]
+        ),
+    },
+    "雪球期权 (Snowball)": {
+        "class": Option_SNB,
+        "subtypes": ["Opt_Snowball"],
+        "params": [
+            ("s00",        "入场价 S00",        float, 100.0),
+            ("s0",         "最新价 S0",         float, 100.0),
+            ("K",          "行权价",            float, 100.0),
+            ("KI",         "敲入价",            float, 80.0),
+            ("KO",         "期初敲出价",         float, 103.0),
+            ("T",          "剩余期限(交易日)",    int,   243),
+            # 锁定期/观察间隔：值用交易日(与引擎一致)，下拉给月度预设辅助输入，
+            # 可编辑——既能选预设也能手填自定义交易日数（21 交易日 ≈ 1 个月）。
+            ("first_obs_d","首次敲出观察",        int,   63,
+             {"锁1月 (21)": 21, "锁2月 (42)": 42, "锁3月 (63)": 63, "锁6月 (126)": 126},
+             {"editable": True}),
+            ("obs_period_d","观察间隔",          int,   21,
+             {"月度 (21)": 21, "双月 (42)": 42, "季度 (63)": 63, "半年 (126)": 126},
+             {"editable": True}),
+            ("ko_step",    "每期降敲(点,0=平敲)", float, 0.0),
+            ("sigma",      "波动率",            float, 0.15),
+            ("coupon",     "未敲出票息率(年化)",  float, 0.15),
+            ("coupon_ko",  "敲出票息率(年化)",    float, 0.15),
+            ("margin_call", "保证金模式",          int,   1, {"追保(亏损不封顶)": 1, "不追保(有限亏损)": 0}),
+            ("margin",     "保证金比例(不追保封顶)", float, 0.2),
+            ("cp",         "方向",             int,   -1, {"雪球 (卖看跌)": -1, "反雪球 (卖看涨)": 1}),
+            ("r",          "无风险利率",        float, 0.03),
+            ("q",          "分红率",            float, 0.03),
+            ("nPath",      "定价路径数 (MC)",    int,   20000),
+        ],
+        # act 固定为 1（交易日计息，无需交易日历）；观察日=锁定期+固定间隔+末次到期，
+        # ko_step>0 时为降敲（逐观察日 KO 递减），见 _build_snowball。
+        "build": _build_snowball,
+    },
+}
+
+
+# ============================================================
+#  GUI 显示名 ↔ 后端内部键 映射
+#  说明：后端 (hedge_backtest / Option_* 类) 使用英文/方法名做字符串匹配，
+#  这里仅影响界面显示；读取 Combobox 值后需通过 *_FROM_DISPLAY 反向映射
+#  还原为内部键再传给后端。
+# ============================================================
+
+SUBTYPE_DISPLAY = {
+    "Eu":                    "欧式",
+    "Opt_Decumulator":       "普通累计",
+    "Opt_Decumulator_Back":  "回归累计",
+    "Opt_Decumulator_Fix":   "固定赔付回归累计",
+    "Opt_Decumulator_Fix_E": "固赔到期结算累计",
+    "Opt_EnDecumulator":     "增强回归累计",
+    "Opt_EnDecumulator_Fix": "固定赔付增强累计",
+    "Opt_ASGQ_call_put":     "到期熔断保障累计",
+    "Opt_ASGQ_EP":           "熔断每日保障累计",
+    "Opt_ASGQ_EF":           "熔断每日固赔累计",
+    "Opt_ASGQ_EFF":          "熔断每日双固赔累计",
+    "Opt_ASGQ_DP":           "每日熔断保障累计",
+    "Opt_ASGQ_DF":           "每日熔断固赔累计",
+    "Opt_ASGQ_DFF":          "每日熔断双固赔累计",
+    "Asian":                 "标准亚式",
+    "EnhanceAsian":          "增强亚式",
+    "Opt_Airbag":            "气囊",
+    "Opt_Snowball":          "雪球",
+}
+SUBTYPE_FROM_DISPLAY = {v: k for k, v in SUBTYPE_DISPLAY.items()}
+
+# 已保存结果列表要显示子类型的中文名。history_store 保持纯逻辑、不反
+# 向依赖 GUI，所以由这里把映射注入进去。
+history_store.SUBTYPE_DISPLAY = SUBTYPE_DISPLAY
+
+STRATEGY_DISPLAY = {
+    "close_to_close": "每日收盘",
+    "fixed_times": "每日固定时刻",
+    "hedge_band": "价格波动触发调仓",
+}
+STRATEGY_FROM_DISPLAY = {v: k for k, v in STRATEGY_DISPLAY.items()}
+
+
+# Wind 仍需要明确的起止边界和 BarSize；GUI 用“自动（推荐）”把这组底层
+# 参数按单次回测 / 历史择优语义解析后，再传给既有后端 API。
+WIND_AUTO_BAR_SIZE = "自动（推荐）"
+WIND_BAR_SIZE_OPTIONS = (
+    WIND_AUTO_BAR_SIZE, "日频", "60分钟", "30分钟", "15分钟", "5分钟", "1分钟",
+)
+_WIND_BAR_MINUTES = {
+    "60分钟": 60, "30分钟": 30, "15分钟": 15, "5分钟": 5, "1分钟": 1,
+}
+# 采样粒度只有 WIND_BAR_SIZE_OPTIONS 一套标签；自动推荐与 Wind 请求参数
+# 都从 _WIND_BAR_MINUTES 派生，避免下拉改名后留下对不上的字面量。
+_WIND_FIXED_TIME_BAR_LABELS = ("15分钟", "5分钟", "1分钟")
+# 价格波动触发只比较 bar 收盘价（HedgeBandStrategy.should_hedge），bar 内
+# 穿带后回落的行情完全不可见，且漏掉的方向是单边的：少调仓 -> 低估交易
+# 成本 -> 高估策略表现。因此自动粒度一律取最细的 1 分钟，不按带宽分档：
+# 分档会让同一个候选的评分依赖“本批次里最窄的候选是谁”，而宽带下省下
+# 的数据量也换不到可测量的精度。带宽与粒度的关系只用于量化手动选粗时
+# 的代价，见 _WIND_BAND_MISS_RATES。
+_WIND_BAND_BAR_LABEL = "1分钟"
+_WIND_DATE_BUFFER_DAYS = 21
+
+# 排名依据的中英映射。两个口径都相对“日内不动”的基线取增量，区别只在于
+# 看绝对多赚了多少，还是看这份增量的信噪比（每单位波动换来多少增量）。
+HISTORY_OBJECTIVE_DISPLAY = {
+    "incremental_pnl": "增量收益（赚更多）",
+    "incremental_sharpe": "增量信噪比（更稳）",
+}
+HISTORY_OBJECTIVE_FROM_DISPLAY = {
+    value: key for key, value in HISTORY_OBJECTIVE_DISPLAY.items()
+}
+# 表格里对应两个排名口径的列，其表头可点击切换排名依据。
+_OBJECTIVE_COLUMN_KEYS = {
+    "incremental_pnl": "incremental_pnl",
+    "incremental_sharpe": "incremental_sharpe",
+}
+# ranking 里承载这两个口径的列名。品种池模式不产出它们（跨合约不能直接
+# 把金额 PnL 相加），展示层据此降级——见 _build_history_metric_tree。
+_OBJECTIVE_RANKING_COLUMNS = (
+    "incremental_pnl_vs_c2c",
+    "incremental_sharpe_vs_c2c",
+)
+
+# 图表口径固定为整段接续（模式 "full"），不再有模式下拉，因此这里只留
+# 指标的显示名。history_selection 的模型层仍实现着 single / typical，供
+# 直接调用，但界面不再提供入口——它们与排名口径不一致。
+HISTORY_CHART_METRIC_DISPLAY = {
+    "net": "净损益",
+    "gross": "成本前损益",
+    "tc": "交易成本",
+}
+HISTORY_CHART_METRIC_FROM_DISPLAY = {
+    value: key for key, value in HISTORY_CHART_METRIC_DISPLAY.items()
+}
+
+# 结果对比页与策略优选页此前各有一套曲线配色，同一个策略在两页会拿到不同
+# 颜色，用户无法把两页的曲线对应起来。两页现在共用这一份色表和标记表，由
+# BacktestApp._strategy_style 按会话内首次出现顺序登记。
+STRATEGY_CHART_COLORS = (
+    "#2563EB", "#D97706", "#7C3AED", "#0F766E",
+    "#DB2777", "#DC2626", "#0891B2", "#65A30D",
+    "#9333EA", "#C2410C", "#4F46E5", "#047857",
+)
+STRATEGY_CHART_MARKERS = ("o", "s", "^", "D", "v", "P", "X", "<", ">", "h")
+# 同一策略的多条结果共用**色相**（跨页同色是有意的），组内靠明度加线型分开。
+# 换区间、换行情、换方向重跑同一个策略恰恰是结果对比页的头号用途，不分开的话
+# 一勾多条就是一团完全同色的线。
+STRATEGY_CHART_DASHES = (
+    "solid", (0, (5, 2)), (0, (1, 1.4)), (0, (7, 2, 1.5, 2)))
+# 组内明度档：原色 / 提亮 / 压暗。正数往白里混，负数往黑里压。
+#
+# **只要三档**是因为线型有四种，3 与 4 互质，(明度, 线型) 的组合到第 12 条才
+# 重复，而图上最多同时画 8 条（MAX_COMPARISON_CHART_CURVES）——够用了。档数少
+# 才调得开：实测六种基色下三档的最小亮度差是 34，摊成八档只剩 8，那种深浅在
+# 691×226 px 的画布上根本读不出来。相邻两条因此明度与线型必定同时不同。
+#
+# 第 0 档恒为原色：跨页对照靠同一策略的第一条与策略优选页严格同色。
+STRATEGY_CHART_SHADES = (0.0, 0.34, -0.40)
+# 对比图同时画的曲线上限。指标表不受限——20 行照排照导，「全选 → 点列头
+# 排序 → 看第一行」这条路要留着；闸门只加在图上：691×226 px 的画布、12 色取
+# 模，20 条叠上去谁也认不出谁。数字与策略优选页的
+# MAX_HISTORY_CHART_CANDIDATES 取齐，两页对"几条还看得清"该给同一个答案。
+MAX_COMPARISON_CHART_CURVES = 8
+# 每日收盘在两页都是固定基准，必须始终占用同一个颜色位，不能因为登记顺序
+# 不同而换色。
+BASELINE_STRATEGY_STYLE_KEY = "close_to_close"
+
+# 快照来源：只有 origin 是结构化字段，可供结果池分组与回跳使用；此前来源
+# 只体现在用户可改的结果名前缀里，改名即丢失。
+SNAPSHOT_ORIGIN_MANUAL = "manual"
+SNAPSHOT_ORIGIN_HISTORY_REPLAY = "history_replay"
+SNAPSHOT_ORIGIN_DISPLAY = {
+    SNAPSHOT_ORIGIN_MANUAL: "手工回测",
+    SNAPSHOT_ORIGIN_HISTORY_REPLAY: "分段重放",
+}
+
+SIGMA_SOURCE_DISPLAY = {
+    "implied":  "隐含波动率",
+    "realized": "已实现波动率",
+}
+SIGMA_SOURCE_FROM_DISPLAY = {v: k for k, v in SIGMA_SOURCE_DISPLAY.items()}
