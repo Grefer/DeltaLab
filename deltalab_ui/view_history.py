@@ -114,6 +114,7 @@ class HistoryViewMixin:
             "_history_conclusion_card", "_history_conclusion_accent",
             "_history_conclusion_badge_var", "_history_conclusion_name_var",
             "_history_conclusion_stats", "_history_splitter",
+            "_history_sash_placer",
             "_history_lookbacks", "_history_uses_strict_metric",
             "_history_uses_window_equal_metric",
             # 排名口径也属于视图状态：不在这张清单里就会跨次渲染残留，
@@ -452,6 +453,9 @@ class HistoryViewMixin:
 
         if getattr(self, "_history_period_rows", None):
             self._update_history_selection()
+            # 填完才知道排名表的请求高度，这时补摆一次分割线——上面那次是在
+            # 空表上算的，会被填充后的请求高度顶下去。
+            splitter.after_idle(self._history_sash_placer)
 
     def _assign_history_chart_styles(self, candidate_names, ranking=None):
         """为本次候选固定颜色与标记，使排名表与图表配色始终一致。
@@ -800,15 +804,41 @@ class HistoryViewMixin:
         调用 300+ 次，高度在 621↔645 之间反复横跳，界面永远画不完一帧，
         内存被 Agg 缓冲区反复分配撑到 GB 级。
 
-        所以只响应**真实**的尺寸变化：相对幅度小于
-        ``_HISTORY_SASH_ECHO_TOLERANCE`` 的高度变化是自己引起的回波，直接
-        忽略；用户拉窗口那种大幅变化才重新按比例摆。另有两道兜底——已经在
+        所以**目标位只在真实尺寸变化时重算**：相对幅度小于
+        ``_HISTORY_SASH_ECHO_TOLERANCE`` 的高度变化是自己引起的回波，不重
+        算；用户拉窗口那种大幅变化才按比例取新目标。另有两道兜底——已经在
         目标位就不动（minsize 钳住目标时不会反复试），以及一个硬性次数预
         算。平时也不需要持续跟随：两格都是 ``stretch="always"``，窗口缩放
         时 tk 自己会按比例分配。
+
+        **但"不重算目标"不等于"不回到目标"。** 分割线还会被另一件事推走：
+        排名表是在本函数之后才填充的，填完那一刻它的请求高度从空表的两三
+        行涨到十来行，PanedWindow 据此重排，分割线被顶下去——而 splitter
+        自己的高度一点没变，于是上面那条回波判据把这次纠正也一起挡掉了。
+        表现就是默认窗口下载入一份优选结果，图表被压到只剩三成高。所以只
+        要还没交给用户，每次 ``<Configure>`` 都把分割线拉回当前目标位，重
+        算与否只影响目标是多少。这不会重新引出自激：拉回之后分割线就等于
+        目标位，下一次 ``<Configure>`` 在第一道判断就返回了。
         """
-        state = {"owned": False, "height": None,
-                 "left": HistoryViewMixin._HISTORY_SASH_PLACEMENT_BUDGET}
+        state = {"owned": False, "height": None, "target": None,
+                 "left": HistoryViewMixin._HISTORY_SASH_PLACEMENT_BUDGET,
+                 "pending": False}
+
+        def _apply():
+            # 真正摆分割线的动作推到 idle 才做。在 ``<Configure>`` 里同步摆会
+            # 被这一轮尚未走完的几何计算覆盖掉：窗口拉高时实测摆到 355 之后
+            # 仍然停在 437，因为重排是在事件回调之后才结束的。
+            state["pending"] = False
+            if state["owned"] or state["left"] <= 0 or state["target"] is None:
+                return
+            target = state["target"]
+            try:
+                if abs(splitter.sash_coord(0)[1] - target) <= 2:
+                    return
+                state["left"] -= 1
+                splitter.sash_place(0, 0, target)
+            except tk.TclError:
+                pass
 
         def _place(_event=None):
             if state["owned"] or state["left"] <= 0:
@@ -817,18 +847,23 @@ class HistoryViewMixin:
             if height <= 1:
                 return
             previous = state["height"]
-            if previous is not None and abs(height - previous) <= (
-                    previous * HistoryViewMixin._HISTORY_SASH_ECHO_TOLERANCE):
+            resized = previous is None or abs(height - previous) > (
+                previous * HistoryViewMixin._HISTORY_SASH_ECHO_TOLERANCE)
+            if resized:
+                state["height"] = height
+                state["target"] = max(150, int(height * ratio))
+            elif state["target"] is None:
                 return
-            state["height"] = height
-            target = max(150, int(height * ratio))
-            try:
-                if abs(splitter.sash_coord(0)[1] - target) <= 2:
-                    return
-                state["left"] -= 1
-                splitter.sash_place(0, 0, target)
-            except tk.TclError:
-                pass
+            # pending 标志防止一串 <Configure>（拖窗口时每帧都有）堆出一串
+            # 回调；它们要做的是同一件事。
+            if not state["pending"]:
+                state["pending"] = True
+                splitter.after_idle(_apply)
+
+        # 排名表填完之后要再摆一次，见上面第二段。这里存下入口而不是等
+        # ``<Configure>`` 自己来：填充是否会顺带触发一次事件取决于行数有没有
+        # 真的改变控件尺寸，赌它必然发生就会剩下一个偶发的压扁。
+        self._history_sash_placer = _place
 
         def _hand_over(_event=None):
             # 分割线属于 PanedWindow 自身；点在表格或图表里是子控件的事件，

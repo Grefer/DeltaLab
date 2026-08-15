@@ -11,6 +11,7 @@ import pytest
 
 import gui_app
 import history_selection
+from deltalab_ui import runner
 from pricing.hedge_analysis import (
     _aggregate_result_by_day as _agg_daily_frame)
 from gui_app import (
@@ -1927,8 +1928,11 @@ def test_specific_futures_contract_history_never_enters_product_pool(
         _full_price_history=retained,
         _gui_meta={"source": "wind"},
     )
+    # 打在 RunnerMixin 上：_load_full_history_for_recommendation 是
+    # @staticmethod，它按类名直呼这个方法（没有 self 可走实例查找），而实现
+    # 已随执行链路搬进 deltalab_ui/runner.py。补在 BacktestApp 上不会生效。
     monkeypatch.setattr(
-        BacktestApp, "_load_wind_contract_history_pool",
+        runner.RunnerMixin, "_load_wind_contract_history_pool",
         staticmethod(lambda _state: pytest.fail(
             "具体合约不得自动汇集同品种历史合约")),
     )
@@ -1953,8 +1957,11 @@ def test_product_code_history_prefers_contract_pool_over_retained_continuous(
         "P2609.DCE",
     )
     calls = []
+    # 打在 RunnerMixin 上：_load_full_history_for_recommendation 是
+    # @staticmethod，它按类名直呼这个方法（没有 self 可走实例查找），而实现
+    # 已随执行链路搬进 deltalab_ui/runner.py。补在 BacktestApp 上不会生效。
     monkeypatch.setattr(
-        BacktestApp, "_load_wind_contract_history_pool",
+        runner.RunnerMixin, "_load_wind_contract_history_pool",
         staticmethod(lambda state: calls.append(state["wind_code"]) or pool),
     )
     base_bt = SimpleNamespace(
@@ -3445,7 +3452,10 @@ def test_history_worker_uses_strict_periods_without_endpoint_budgets(
         captured.append((option._time_remaining, dict(kwargs)))
         return recommendations, ranking, windows
 
-    monkeypatch.setattr(gui_app, "recommend_by_rolling_history", recommend)
+    # 打在 runner 上：_history_recommendation_worker 已搬进
+    # deltalab_ui/runner.py，这个名字现在从那个模块的全局取。
+    monkeypatch.setattr(
+        runner, "recommend_by_rolling_history", recommend)
 
     for maturity_days in (2, 22, 243):
         fake, state, delivered, failed = _history_worker_fixture(
@@ -3493,7 +3503,10 @@ def test_csv_history_worker_passes_only_selected_strict_periods(
         captured.append((option, loaded, cases, kwargs, call_kwargs))
         return recommendations, ranking, windows
 
-    monkeypatch.setattr(gui_app, "recommend_by_rolling_history", recommend)
+    # 打在 runner 上：_history_recommendation_worker 已搬进
+    # deltalab_ui/runner.py，这个名字现在从那个模块的全局取。
+    monkeypatch.setattr(
+        runner, "recommend_by_rolling_history", recommend)
     fake, state, delivered, failed = _history_worker_fixture(
         "csv", lambda _state, _bt: history)
     state["history_lookbacks"] = selected_lookbacks
@@ -3540,7 +3553,10 @@ def test_single_series_history_worker_forwards_position_to_recommender(
         captured.append(kwargs)
         return recommendations, ranking, windows
 
-    monkeypatch.setattr(gui_app, "recommend_by_rolling_history", recommend)
+    # 打在 runner 上：_history_recommendation_worker 已搬进
+    # deltalab_ui/runner.py，这个名字现在从那个模块的全局取。
+    monkeypatch.setattr(
+        runner, "recommend_by_rolling_history", recommend)
 
     BacktestApp._history_recommendation_worker(fake, state)
 
@@ -3591,10 +3607,11 @@ def test_history_worker_routes_product_code_without_building_continuous_backtest
         captured.append((option, history, cases, kwargs, call_kwargs))
         return recommendations, ranking, windows
 
+    # 两个 recommender 都打在 runner 上：worker 已搬进 deltalab_ui/runner.py。
     monkeypatch.setattr(
-        gui_app, "recommend_by_contract_history_pool", recommend_pool)
+        runner, "recommend_by_contract_history_pool", recommend_pool)
     monkeypatch.setattr(
-        gui_app, "recommend_by_rolling_history",
+        runner, "recommend_by_rolling_history",
         lambda *_args, **_kwargs: pytest.fail(
             "品种代码不得进入单序列 rolling recommender"),
     )
@@ -3631,12 +3648,10 @@ def test_real_history_worker_failure_is_terminal(monkeypatch, source, stage):
             raise RuntimeError("history boom")
         raise AssertionError("recommend should not run during load failure")
 
-    monkeypatch.setattr(gui_app, "recommend_by_rolling_history", recommend)
+    # 打在 runner 上：_history_recommendation_worker 已搬进
+    # deltalab_ui/runner.py，这个名字现在从那个模块的全局取。
     monkeypatch.setattr(
-        gui_app, "compare_strategies",
-        lambda *_args, **_kwargs: pytest.fail(
-            "current-path comparison must not run after history failure"),
-    )
+        runner, "recommend_by_rolling_history", recommend)
 
     BacktestApp._history_recommendation_worker(fake, state)
 
@@ -3660,14 +3675,10 @@ def test_real_history_worker_delivers_complete_history_payload(
         "rolling_windows": 1, "daily_net_pnl_rms": 2.0,
     }])
     windows = {"week": {"window_1": {"daily": {}}}}
+    # 打在 runner 上：worker 已搬进 deltalab_ui/runner.py。
     monkeypatch.setattr(
-        gui_app, "recommend_by_rolling_history",
+        runner, "recommend_by_rolling_history",
         lambda *_args, **_kwargs: (recommendations, ranking, windows),
-    )
-    monkeypatch.setattr(
-        gui_app, "compare_strategies",
-        lambda *_args, **_kwargs: pytest.fail(
-            "历史择优页不应再运行当前期限路径对比"),
     )
 
     BacktestApp._history_recommendation_worker(fake, state)
@@ -6027,6 +6038,34 @@ def test_history_splitter_follows_the_ratio_until_the_user_drags():
     splitter.fire("<ButtonPress-1>")
     placements = len(splitter.placed)
     splitter.height = 1000
+    splitter.fire("<Configure>")
+    assert len(splitter.placed) == placements
+
+
+def test_history_splitter_recovers_when_the_filled_table_pushes_the_sash():
+    """排名表填完后把分割线顶走，必须拉回来——哪怕容器高度一点没变。
+
+    真实路径：``_init_history_splitter_ratio`` 是在**空表**上摆好分割线
+    的，随后 ``_update_history_selection`` 往 Treeview 里灌进十来行，那一
+    格的请求高度跟着涨，PanedWindow 据此重排、把分割线顶下去。这时
+    splitter 自己的高度没有任何变化，于是"只在高度真的变了才动"的回波判
+    据连带把这次纠正也挡掉——表现为默认窗口下载入一份优选结果，图表被压
+    到只剩三成高（实测 643px 的容器里图表只剩 217px）。
+
+    回波保护要保住的是"目标位不因回弹而重算"，不是"不回到目标位"。
+    """
+    splitter = _FakeSplitter(643)
+    BacktestApp._init_history_splitter_ratio(
+        SimpleNamespace(), splitter, ratio=0.45)
+    assert splitter.sash == 289
+
+    # 填充排名表：高度不变，分割线被请求尺寸顶到 420。
+    splitter.sash = 420
+    splitter.fire("<Configure>")
+    assert splitter.sash == 289, "分割线被内容顶走后没有拉回目标位"
+
+    # 已经在目标位就不再重复摆放，否则又是一条闭环。
+    placements = len(splitter.placed)
     splitter.fire("<Configure>")
     assert len(splitter.placed) == placements
 

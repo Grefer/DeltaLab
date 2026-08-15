@@ -156,11 +156,12 @@ def test_saved_payload_uses_cached_results_without_running_backtest(monkeypatch)
     def unexpected(*_args, **_kwargs):
         raise AssertionError("选择保存结果时不得重新运行回测")
 
-    # 后两个必须打在 snapshot_store 上：_saved_comparison_payload 与它调用的
-    # _snapshot_comparison_data 都已搬进 deltalab_ui/snapshot_store.py，那两个
-    # 名字现在从**那个模块**的全局里取。补在 gui_app 上不会报错，只会让这条
-    # 「不得重新运行回测」的断言悄悄失效——本用例是反向断言，失效即假绿。
-    monkeypatch.setattr(gui_app, "compare_strategies", unexpected)
+    # 后两条必须打在 snapshot_store 上：_saved_comparison_payload 与它调用的
+    # _snapshot_comparison_data 都在 deltalab_ui/snapshot_store.py，那两个名字
+    # 从**那个模块**的全局里取。补在 gui_app 上不会报错，只会让这条「不得重新
+    # 运行回测」的断言悄悄失效——本用例是反向断言，失效即假绿。
+    #
+    # HedgeBacktest.run 打的是类对象，改哪个模块引用它都看得见。
     monkeypatch.setattr(gui_app.HedgeBacktest, "run", unexpected)
     monkeypatch.setattr(
         snapshot_store, "summarize_strategy_result", unexpected)

@@ -110,6 +110,8 @@ def snapshot_source(snapshot):
     return source if isinstance(source, str) else None
 
 
+# 每种对冲策略实际读取的 form_state 字段。用于对比签名——回填不需要它，
+# 回填要的是"把表单恢复原样"，全量记录对回填是正确的。
 _STRATEGY_RELEVANT_FORM_FIELDS = {
     "close_to_close": (),
     "fixed_times": ("fixed_times",),
@@ -118,6 +120,7 @@ _STRATEGY_RELEVANT_FORM_FIELDS = {
 }
 
 
+# 签名里恒定出现的策略参数字段（无关时填 None，保持键集合稳定）。
 _STRATEGY_SIGNATURE_FIELDS = tuple(dict.fromkeys(
     field
     for fields in _STRATEGY_RELEVANT_FORM_FIELDS.values()
@@ -163,6 +166,9 @@ def snapshot_strategy_signature(snapshot):
     return freeze_snapshot_value(signature)
 
 
+# 一次对比里可以变化的五组属性。控制变量的道理：只有一组不同，差异才
+# 归得到那一组头上；同时变两组以上，看到的差就说不清是谁造成的。
+# (属性键, 中文名, 取值函数)
 _COMPARISON_ASPECTS = (
     ("market", "行情", lambda s: getattr(s, "market_key", ())),
     # 这一组统辖的是「是哪一种期权」外加它的全部合约参数，组名必须把两
@@ -179,6 +185,9 @@ _COMPARISON_ASPECTS = (
 )
 
 
+# 字段级差异的中文名。签名保留了键名，所以能说到具体是哪一项不同，
+# 而不只是"期权不同"。期权合约参数的标签直接取自 OPTION_CLASSES 的
+# 定义，新增期权类型时不必在这里补一遍。
 _COMPARISON_FIELD_LABELS = {
     "source": "行情来源", "seed": "随机种子", "csv_path": "CSV 文件",
     "csv_col": "CSV 列", "wind_code": "标的代码",
@@ -267,6 +276,7 @@ def flatten_signature(value, prefix=()):
     return flat
 
 
+# 取值的中文回译：差异串里写 "close_to_close vs hedge_band" 没人看得舒服。
 _COMPARISON_VALUE_LABELS = {
     "position": {-1: "买入", 1: "卖出"},
     "strategy_name": STRATEGY_DISPLAY,
@@ -348,9 +358,16 @@ def differing_field_names(values):
     return [(label, shown) for _rank, label, shown in changed]
 
 
+# 详情窗里不列的字段。行情数据摘要是一串 sha256：在差异串里它至少还回答
+# 了"这两条确实不是同一段数据"，单看一条时一个哈希什么也没说。
 _SNAPSHOT_DETAIL_HIDDEN_FIELDS = frozenset({"data_digest"})
 
 
+# 行情组按来源只列本次真正用到的那几项。三种来源的字段互斥，但
+# market_key 恒定记全部键（键集合恒定是差异比对的要求），未用到的那几项
+# 存的是**左侧控件当时的值**——不是空值，所以"渲染成 — 就跳过"拦不住：
+# 模拟跑出来的快照照样会列出「CSV 列 close」「标的代码 510050.SH」，那是
+# Wind 代码框里恰好还留着的内容，这次回测根本没碰过它。
 _MARKET_DETAIL_FIELDS = {
     "simulate": ("source", "seed"),
     "csv": ("source", "csv_path", "csv_col"),
@@ -398,6 +415,9 @@ def intraday_steps_detail_text(snapshot, declared):
     return "未记录（旧快照存的是占位值）"
 
 
+# 展示层要覆盖签名取值的那几项：签名记的是「当时传给引擎的输入」，而这
+# 两项的输入是占位或待解析的，人要看的是「实际跑的是什么」。收成一张表
+# 而不是在渲染循环里堆 if——第三项迟早会来。
 _DETAIL_VALUE_OVERRIDES = {
     ("market", "wind_bar_size"): (
         lambda snapshot, value: bar_size_detail_text(
