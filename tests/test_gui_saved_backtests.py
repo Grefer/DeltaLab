@@ -1748,6 +1748,47 @@ def test_variable_card_states_the_variable_and_the_caveats():
         app.destroy()
 
 
+def test_caveats_stay_visible_when_the_card_collapses_its_details():
+    """说明卡收起明细时，看数告警条不能跟着消失。
+
+    告警条说的是「这几条数字不能直接横着比」——交易日数不同、买卖方向混
+    在一起。这两种情况几乎必然带来三项以上差异，正好落在折叠区默认收起的
+    那一档；把它挂在折叠区里，等于最该提醒的时候不提醒。
+
+    腾高度这件事由字段网格那两道封顶负责
+    （``_COMPARISON_FIELD_ROW_LIMIT`` / ``_COMPARISON_FIELD_COLUMN_LIMIT``），
+    而告警条本身封了顶：``saved_comparison_warnings`` 的产出就是写死的两
+    条，实测一条 25px、两条 34px，放出来不会把膨胀问题带回来。
+    """
+    app = _comparison_app()
+    try:
+        BacktestApp._build_comparison_variable_card(app, app._compare_container)
+
+        # 三项以上差异 => 自动折叠那一档。
+        BacktestApp._fill_comparison_field_grid(
+            app, [(f"字段{index}", ["A", "B"]) for index in range(4)])
+        app._comparison_caveat_var.set("· 各条的交易日数不同：曲线按序号对齐。")
+        app._comparison_caveat_frame.grid()
+        app._comparison_card_expanded = False
+        BacktestApp._sync_comparison_card_expansion(app)
+        app.update_idletasks()
+
+        # grid_remove() 会清空 grid_info()，是收起与否的判据。
+        assert not app._comparison_expandable_container.grid_info()
+        assert "展开明细" in app._comparison_toggle_btn.cget("text")
+        # 折叠区收起了，告警条照样在——它压根不是折叠区的子控件。
+        assert app._comparison_caveat_frame.grid_info()
+        assert app._comparison_caveat_frame.winfo_parent() != str(
+            app._comparison_expandable_container)
+
+        # 没有告警时才收起来，这条不变。
+        app._comparison_caveat_var.set("")
+        app._comparison_caveat_frame.grid_remove()
+        assert not app._comparison_caveat_frame.grid_info()
+    finally:
+        app.destroy()
+
+
 def _card_grid_rows(app):
     """说明卡字段网格当前实际占了几行（含折叠行）。"""
     grid = app._comparison_field_grid

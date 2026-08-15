@@ -1014,8 +1014,8 @@ class BacktestApp(panel_form.FormPanelMixin,
             ("dist",    " 🎲 盈亏分布 ",
              "盈亏分布", "在模拟模式下运行多路径回测后，此处将展示蒙特卡洛盈亏分布"),
             ("compare", BacktestApp._COMPARE_TAB_TITLE,
-             "已保存回测结果对比",
-             "回测完成后点击『保留当前结果到对比』；换策略或参数继续回测，再到此页勾选结果"),
+             "结果对比",
+             "回测完成后点击『＋ 保留当前结果到对比』，即可在此跨策略与参数勾选对比"),
             ("history", " 🎯 策略优选 ",
              "策略优选",
              "使用 CSV / Wind 真实历史行情搜索已勾选周期的领先对冲方案"),
@@ -1060,7 +1060,7 @@ class BacktestApp(panel_form.FormPanelMixin,
             desc_lbl = tk.Label(placeholder, text=ph_desc,
                                 font=(_UI_FONT_FAMILY, 10),
                                 bg=PALETTE["surface"], fg=PALETTE["text_muted"],
-                                wraplength=360, justify="center")
+                                wraplength=620, justify="center")
             desc_lbl.pack(pady=(0, 0))
 
         # 摘要 Tab 特有: 预创建 Text 控件 (初始隐藏, 占位符可见)

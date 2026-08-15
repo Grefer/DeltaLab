@@ -107,7 +107,6 @@ class ComparisonMixin:
         header = ttk.Frame(container, style="Surface.TFrame")
         header.pack(fill="x", padx=8, pady=(8, 3))
         header.columnconfigure(0, weight=1)
-        self._saved_pool_count_var = tk.StringVar()
 
         title_row = tk.Frame(header, bg=PALETTE["surface"])
         title_row.grid(row=0, column=0, sticky="ew")
@@ -117,9 +116,12 @@ class ComparisonMixin:
             font=(_UI_FONT_FAMILY, 12, "bold"),
         ).pack(side="left")
 
+        # 初值与 _refresh_saved_pool_tree 里的刷新文案同一个模子，免得首帧
+        # 先闪一下另一种格式；上限也从 store 取，不再写死。
         self._saved_pool_badge = tk.Label(
-            title_row, text="0 / 20 条",
-            bg=PALETTE["primary_light"], fg=PALETTE["primary"],
+            title_row,
+            text=f"0 显示 / 0 保留 (上限 {backtest_pool_store.MAX_RESULTS})",
+            bg=PALETTE["surface_alt"], fg=PALETTE["text_muted"],
             font=(_UI_FONT_FAMILY, 9, "bold"),
             padx=8, pady=1,
             highlightbackground=PALETTE["border_soft"], highlightthickness=1,
@@ -209,6 +211,9 @@ class ComparisonMixin:
         tree.configure(yscrollcommand=scrollbar.set)
         tree.pack(side="left", fill="x", expand=True)
         scrollbar.pack(side="right", fill="y")
+        # 隔行底色，与指标表、优选排名表同一条规则。少了这一行，插入时打的
+        # "even" tag 就只是个没配过样式的名字，一点效果都没有。
+        tree.tag_configure("even", background=PALETTE["surface_alt"])
         tree.bind("<Button-1>", self._toggle_saved_backtest_click)
         tree.bind("<space>", self._toggle_focused_saved_backtest)
         # 「删除选中」的文案与启停跟着行选择走，而行选择的变化不经过结果池
@@ -307,12 +312,8 @@ class ComparisonMixin:
             tree.selection_set(survivors)
             # 焦点优先留在原处：打勾不该把焦点拽到选区的第一行去。
             tree.focus(focus if focus in children else survivors[0])
-        count_var = getattr(self, "_saved_pool_count_var", None)
         pooled = len(self._saved_backtests)
         shown = len(self._saved_comparison_selection)
-        if count_var is not None:
-            count_var.set(
-                f"已保留结果对比 · 已保存 {pooled} 条 · 当前显示 {shown} 条")
         badge = getattr(self, "_saved_pool_badge", None)
         if badge is not None:
             badge.configure(
@@ -782,42 +783,45 @@ class ComparisonMixin:
         self._comparison_toggle_btn = None
         self._comparison_caveat_frame = None
 
-    def _render_saved_comparison_empty(self, title, detail, *args, **kwargs):
-        """把内容区换成居中的空状态说明，并释放上一张图表。"""
+    def _render_saved_comparison_empty(self, title, detail):
+        """把内容区换成居中的空状态说明，并释放上一张图表。
+
+        图标由标题反推，不做成参数：四个调用点各自的标题就是这三种状态，
+        多一个参数只会让调用处多写一份跟标题重复的信息。
+        """
         content = self._saved_comparison_content
         ComparisonMixin._discard_comparison_frame(self)
         for widget in content.winfo_children():
             widget.destroy()
-        empty_card = tk.Frame(
-            content, bg=PALETTE["surface"],
-            highlightbackground=PALETTE["border_soft"], highlightthickness=1,
-            padx=36, pady=26,
+        placeholder = tk.Frame(content, bg=PALETTE["surface"])
+        placeholder.place(relx=0.5, rely=0.45, anchor="center")
+
+        if "没有显示" in str(title):
+            icon = "🔍"
+        elif "无法" in str(title):
+            icon = "⚠"
+        else:
+            icon = "🆚"
+
+        icon_lbl = ttk.Label(
+            placeholder, text=icon, style="Surface.TLabel",
+            font=(_UI_FONT_FAMILY, 42),
         )
-        empty_card.place(relx=0.5, rely=0.45, anchor="center")
+        icon_lbl.pack(pady=(0, 10))
 
-        icon = kwargs.get("icon") or (args[0] if args else None)
-        if not icon:
-            if "没有显示" in str(title):
-                icon = "🔍"
-            elif "无法" in str(title):
-                icon = "⚠"
-            else:
-                icon = "📂"
+        title_lbl = ttk.Label(
+            placeholder, text=title, style="Surface.TLabel",
+            font=(_UI_FONT_FAMILY, 16, "bold"),
+        )
+        title_lbl.pack(pady=(0, 6))
 
-        ttk.Label(
-            empty_card, text=icon, style="Surface.TLabel",
-            font=(_UI_FONT_FAMILY, 28),
-        ).pack(pady=(0, 8))
-        ttk.Label(
-            empty_card, text=title, style="Surface.TLabel",
-            font=(_UI_FONT_FAMILY, 13, "bold"),
-        ).pack(pady=(0, 6))
-        ttk.Label(
-            empty_card, text=detail, style="SurfaceMuted.TLabel", justify="center",
-            font=(_UI_FONT_FAMILY, 9),
+        desc_lbl = ttk.Label(
+            placeholder, text=detail, style="SurfaceMuted.TLabel",
+            font=(_UI_FONT_FAMILY, 10), justify="center",
             # 这里也会显示异常原文，长度不可控，必须折行。
-            wraplength=440,
-        ).pack()
+            wraplength=600,
+        )
+        desc_lbl.pack(pady=(0, 0))
 
     def _refresh_saved_comparison_view(self):
         # 出错不弹模态框：这条链路每次勾选都会走，弹窗会把人挡在页面外。
@@ -833,16 +837,14 @@ class ComparisonMixin:
                 if pooled:
                     self._render_saved_comparison_empty(
                         "当前没有显示任何结果",
-                        f"已保留的 {pooled} 条都在上方结果池里，"
-                        "点「显示」列勾选框或按「全选」即可放上来对比。")
+                        f"已保留的 {pooled} 条结果都在上方列表，勾选「显示」框或按「全选」即可放上来对比。")
                 elif load_error:
                     self._render_saved_comparison_empty(
                         "没有可显示的结果", load_error)
                 else:
                     self._render_saved_comparison_empty(
-                        "尚未保留任何结果",
-                        "先在左侧配置参数并运行回测，再点击『＋ 保留当前结果到对比』。"
-                        "保留的结果会自动保存在本机，重开程序后仍在。")
+                        "结果对比",
+                        "回测完成后点击『＋ 保留当前结果到对比』，即可在此跨策略与参数勾选对比。")
                 return
             content = self._saved_comparison_content
             summary, daily_curves = self._saved_comparison_payload(snapshots)
@@ -978,9 +980,15 @@ class ComparisonMixin:
         self._comparison_same_label.grid(row=1, column=0, sticky="ew", pady=(4, 0))
         widgets.track_wraplength(self._comparison_same_label)
 
-        # 看数限制/警告条 (Caveats Banner)
+        # 看数限制/警告条：挂在 body 上而不是折叠区里。它说的是「这几条数
+        # 字不能直接横着比」（交易日数不同、买卖方向混在一起），而这两种情
+        # 况几乎必然带来三项以上差异——正好是折叠区默认收起的那一档，藏进
+        # 去等于最该提醒的时候不提醒。
+        # 放出来不会把膨胀问题带回来：saved_comparison_warnings 的产出就是
+        # 写死的那两条，实测一条 25px、两条 34px 封顶；真正会涨的是字段网
+        # 格，那道闸由 _COMPARISON_FIELD_ROW_LIMIT / _COLUMN_LIMIT 单独把着。
         self._comparison_caveat_frame = tk.Frame(
-            expandable, bg=PALETTE["warning_light"],
+            body, bg=PALETTE["warning_light"],
             highlightbackground=PALETTE["warning"], highlightthickness=1,
             padx=10, pady=4,
         )
@@ -992,6 +1000,7 @@ class ComparisonMixin:
         )
         self._comparison_caveat_label.pack(side="left", fill="x", expand=True)
         widgets.track_wraplength(self._comparison_caveat_label)
+        # row 2 = 折叠区（row 1）之下，与 top_bar 同属 body，收起明细带不走它。
         self._comparison_caveat_frame.grid(row=2, column=0, sticky="ew", pady=(6, 0))
         self._comparison_caveat_frame.grid_remove()
 
@@ -1010,10 +1019,10 @@ class ComparisonMixin:
         toggle_btn = getattr(self, "_comparison_toggle_btn", None)
         if container is None or toggle_btn is None:
             return
+        # 折叠区里只剩字段网格与「其余一致」，告警条已挂到 body 上，它的显
+        # 隐由 _refresh_comparison_variable_card 直接管，不进这道判断。
         fields = getattr(self, "_comparison_field_rows", [])
-        caveats = bool(getattr(self, "_comparison_caveat_var", tk.StringVar()).get())
-        has_content = bool(fields or caveats)
-        if not has_content:
+        if not fields:
             toggle_btn.pack_forget()
             container.grid_remove()
             return
@@ -1169,7 +1178,8 @@ class ComparisonMixin:
             accent.configure(bg=PALETTE["border_soft"])
             if status_pill is not None:
                 status_pill.configure(
-                    text="ℹ 等待选择", bg=PALETTE["surface"], fg=PALETTE["text_muted"])
+                    text="ℹ 等待选择", bg=PALETTE["surface_alt"],
+                    fg=PALETTE["text_muted"])
             if caveat_frame is not None:
                 caveat_frame.grid_remove()
             ComparisonMixin._fill_comparison_field_grid(self, [])
