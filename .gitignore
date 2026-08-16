@@ -46,8 +46,11 @@ data/backtest_pool/
 
 # Marketing / promo assets (not part of the product)
 tools/make_xhs_cards.py
+tools/make_xhs_cards_v2.py
 assets/xhs_dark/
 assets/xhs_light/
+assets/xhs_v2_dark/
+assets/xhs_v2_light/
 
 # AI assistants
 .gemini/
