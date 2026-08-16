@@ -426,7 +426,7 @@ class BacktestApp(panel_form.FormPanelMixin,
                         lightcolor=PALETTE["surface"],
                         darkcolor=PALETTE["surface"],
                         focusthickness=0,
-                        padding=(10, 6),
+                        padding=(10, 5),
                         relief="flat")
         style.map("Danger.TButton",
                   background=[("active", PALETTE["danger_light"]),

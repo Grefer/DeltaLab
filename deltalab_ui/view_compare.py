@@ -169,7 +169,7 @@ class ComparisonMixin:
         # 条数写进按钮文案，这样"要删几条"在点下去之前就已经在屏幕上；宽度
         # 按带条数时的最长文案定死，免得每次改选都抖一下版面。
         self._saved_pool_delete_btn = ttk.Button(
-            toolbar, text="🗑 删除", width=10, style="Danger.TButton",
+            toolbar, text="🗑 删除", width=7, style="Danger.TButton",
             command=self._prompt_delete_saved_backtest,
         )
         self._saved_pool_delete_btn.pack(side="left", padx=(14, 0))
