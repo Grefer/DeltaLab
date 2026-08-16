@@ -84,6 +84,9 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     steps:
+      # 需要仓库内容才能读 CHANGELOG.md 与 tools/release_notes.py
+      - uses: actions/checkout@v5
+
       - uses: actions/download-artifact@v6
         with:
           path: artifacts
@@ -91,10 +94,24 @@ jobs:
       - name: List downloaded artifacts
         run: find artifacts -maxdepth 3 -type f
 
+      # 版本说明只维护 CHANGELOG.md 一份, 由脚本抽出本次 tag 的小节。
+      # 抽不到 (忘了写 CHANGELOG) 就置空, 下一步退回 generate_release_notes。
+      - name: Extract release notes from CHANGELOG
+        id: notes
+        run: |
+          if python3 tools/release_notes.py "${GITHUB_REF_NAME}" -o release-notes.md; then
+            echo "found=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::CHANGELOG.md 缺少 ${GITHUB_REF_NAME} 小节, 退回自动生成的说明"
+            echo "found=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Create / Update GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           files: artifacts/**/*.zip
           draft: false
           prerelease: false
-          generate_release_notes: true
+          # 两者互斥: 有手写说明就用它, 没有才让 GitHub 按提交自动生成。
+          body_path: ${{ steps.notes.outputs.found == 'true' && 'release-notes.md' || '' }}
+          generate_release_notes: ${{ steps.notes.outputs.found != 'true' }}
