@@ -123,7 +123,7 @@ python tools/make_workflow.py  # 生成 assets/workflow.png (工作流示意图)
 
 ```bash
 pip install pytest
-pytest                    # 全部（918 条：399 纯逻辑 + 519 GUI）
+pytest                    # 全部（945 条：416 纯逻辑 + 529 GUI）
 pytest -m "not gui" -q    # 只跑纯逻辑，不需要窗口服务器
 ```
 
@@ -207,15 +207,15 @@ python gui_app.py
 | `大类` | `香草期权 (Vanilla)` / `累计期权 (Decumulator)` / `亚式期权 (Asian)` / `气囊期权 (Airbag)` / `雪球期权 (Snowball)` | `香草期权 (Vanilla)` | 见 `OPTION_CLASSES` |
 | `子类型` | 跟随大类切换 | 各大类的第一个 | 子类型驱动 `optiontype` 字段，决定走哪一种 payoff |
 
-各大类的子类型集（见 `gui_app.py:OPTION_CLASSES`）：
+各大类的子类型集共 18 种（见 `deltalab_ui/constants.py:OPTION_CLASSES`）：
 
-- **Vanilla**：`Eu`
-- **Decumulator**：`Opt_Decumulator_Back` / `Opt_Decumulator_Fix` / `Opt_EnDecumulator` / `Opt_EnDecumulator_Fix` / `Opt_ASGQ_call_put` / `Opt_ASGQ_EP` / `Opt_ASGQ_EF` / `Opt_ASGQ_DP` / `Opt_ASGQ_DF`
-- **Asian**：`Asian` / `EnhanceAsian`
-- **Airbag**：`Opt_Airbag`
-- **Snowball**：`Opt_Snowball`
+- **Vanilla**（1）：`Eu`
+- **Decumulator**（13）：`Opt_Decumulator` / `Opt_Decumulator_Back` / `Opt_Decumulator_Fix` / `Opt_Decumulator_Fix_E` / `Opt_EnDecumulator` / `Opt_EnDecumulator_Fix` / `Opt_ASGQ_call_put` / `Opt_ASGQ_EP` / `Opt_ASGQ_EF` / `Opt_ASGQ_EFF` / `Opt_ASGQ_DP` / `Opt_ASGQ_DF` / `Opt_ASGQ_DFF`
+- **Asian**（2）：`Asian` / `EnhanceAsian`
+- **Airbag**（1）：`Opt_Airbag`
+- **Snowball**（1）：`Opt_Snowball`
 
-每个子类型的 payoff 公式见 `gui_app.py:STRUCTURE_DOCS`，也会在「结构分析」Tab 顶部展示。
+每个子类型的 payoff 公式见 `deltalab_ui/structure_docs.py:STRUCTURE_DOCS`（18 种全部有条目），也会在「结构分析」Tab 顶部展示。两个常量都由 `gui_app` re-export，写 `gui_app.OPTION_CLASSES` 同样有效。
 
 ### 4.2 期权参数（按大类分组）
 

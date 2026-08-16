@@ -2,6 +2,7 @@
 
 ![DeltaLab](assets/banner.png)
 
+[![Release](https://img.shields.io/github/v/release/Grefer/DeltaLab)](https://github.com/Grefer/DeltaLab/releases/latest)
 [![Python](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 [![Tests](https://github.com/Grefer/DeltaLab/actions/workflows/tests.yml/badge.svg)](https://github.com/Grefer/DeltaLab/actions/workflows/tests.yml)
@@ -14,7 +15,7 @@
 
 ## ✨ 功能特性
 
-- **5 大类期权** —— 香草 (Vanilla)、累计 (Decumulator)、亚式 (Asian)、气囊 (Airbag)、雪球 (Snowball)，共 14 种子类型
+- **5 大类期权** —— 香草 (Vanilla)、累计 (Decumulator)、亚式 (Asian)、气囊 (Airbag)、雪球 (Snowball)，共 18 种子类型
 - **3 种数据源** —— 蒙特卡洛模拟 / CSV 历史行情 / Wind API
 - **3 种对冲触发方式** —— 每日收盘、每日固定时刻、固定价格间隔（绝对价格、相对价格、日波动 σ 三种口径可在参考点互相换算），外加一个全局的每日收盘兜底开关
 - **智能行情粒度** —— 真实行情的每日 bar 数由时间索引与交易 session 自动推导，Wind 请求粒度按策略自动选择，不提供手工调粗（调粗只会静默漏掉 bar 内触发，让结论偏乐观）
@@ -77,7 +78,7 @@ Windows / macOS (Apple Silicon) 用户可直接从 [Releases](https://github.com
 | 大类 | 子类型数 | 定价方式 |
 |---|---|---|
 | 香草期权 (Vanilla) | 1（欧式） | Black-Scholes 封闭解 |
-| 累计期权 (Decumulator) | 9（回归 / 增强 / 固赔 等系列） | 蒙特卡洛 |
+| 累计期权 (Decumulator) | 13（回归 / 增强 / 固赔 / 熔断 等系列） | 蒙特卡洛 |
 | 亚式期权 (Asian) | 2（亚式, 增强亚式） | 蒙特卡洛 |
 | 气囊期权 (Airbag) | 1（气囊） | 蒙特卡洛 |
 | 雪球期权 (Snowball) | 1（雪球 / 反雪球） | 蒙特卡洛 |
@@ -98,7 +99,8 @@ Windows / macOS (Apple Silicon) 用户可直接从 [Releases](https://github.com
 
 ```
 DeltaLab/
-├── gui_app.py              # GUI 入口 (tkinter + matplotlib)
+├── gui_app.py              # GUI 入口 + 兼容 re-export (tkinter + matplotlib)
+├── deltalab_ui/            # 界面层，按功能域拆分 (主题 / 表单 / 各结果页 / 落盘)
 ├── history_selection.py    # 策略优选纯逻辑 (候选空间 / 校验 / 排名与图表模型)
 ├── history_store.py        # 策略优选结果包的落盘存取
 ├── backtest_pool_store.py  # 回测结果池的落盘存取
@@ -112,6 +114,8 @@ DeltaLab/
 ```
 
 `data/` 下具体写了哪些东西、哪些能随便删，见 [使用文档 §1.6](docs/GUI_USAGE.md#16-数据与结果落在哪里)；`pricing/` 各文件的职责见使用文档末尾的「相关源码」。
+
+`deltalab_ui/` 的拆分有两条硬规则：**依赖方向单向**（`gui_app` → `deltalab_ui`，包内模块一律不 import `gui_app`），**包级不做 re-export**（`__init__` 保持空壳，避免 `theme` 的 import 期副作用在意想不到的时机触发）。`gui_app.py` 保留为兼容入口，外部与测试继续写 `gui_app.XXX` 即可。
 
 ## 🔧 技术栈
 
@@ -130,6 +134,8 @@ pytest -m "not gui" -q
 README 只讲这个工具是什么、怎么装、怎么跑起来。**每个参数的含义、单位、默认值，各页面的计算口径与取舍，以及常见报错的成因**，都在使用文档里：
 
 👉 [**docs/GUI_USAGE.md**](docs/GUI_USAGE.md)
+
+每个版本改了什么、有没有需要迁移的东西，见 [**CHANGELOG.md**](CHANGELOG.md)。
 
 ## 💬 反馈与贡献
 
