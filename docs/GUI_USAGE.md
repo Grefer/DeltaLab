@@ -45,7 +45,7 @@
 
 | 库 | 触发条件 | 不装时的影响 |
 |---|---|---|
-| `WindPy` | 在「数据来源」选 `Wind` | 选 Wind 模式运行时会抛 `ImportError`（提示见 [`pricing/wind_data.py`](../pricing/wind_data.py) 的 `_ensure_wind`），需安装 Wind 终端 + Python 插件，并已登录 |
+| `WindPy` | 在「数据来源」选 `Wind` | 选 Wind 模式运行时会抛 `ImportError`（提示见 [`pricing/wind_data.py`](../pricing/wind_data.py) 的 `_ensure_wind`），需安装 Wind 终端 + Python 插件，并已登录。免安装版不内置 WindPy，靠运行时扫描本机 Wind 安装，见下方[发布包怎么连上 Wind](#发布包怎么连上-wind) |
 | `akshare` | 交易日历 `data/tradingday.csv` 缺失或不够新 | 沿用仓库预置的日历文件（已覆盖至 2026 年底）并告警。仅当到期日超出文件范围又无法联网时才会影响倒推与雪球观察日换算 |
 | `Pillow` (`PIL`) | 跑 `tools/make_icon.py` / `make_banner.py` / `make_workflow.py` | 不影响 GUI 运行，只是无法重新生成图标、banner 与工作流示意图 |
 
@@ -53,24 +53,43 @@ CSV 与模拟模式无 Wind 依赖，可在普通环境下完整使用。交易�
 「本地文件 → akshare（免费公开源，非 Wind 接口）→ WindPy」，联网取到后会回写
 本地文件，之后即可纯离线运行（见 [`pricing/trade_calendar.py`](../pricing/trade_calendar.py)）。
 
-#### 让 PyInstaller 发布包支持 Wind
+#### 发布包怎么连上 Wind
 
-默认 CI 产出的 zip 不带 WindPy（GitHub runners 上没有 Wind 终端）。若要让发布包支持 Wind 数据源，需要**在装有 Wind 终端且能 `python -c "import WindPy"` 的机器上本地打包**：
+CI 产出的 zip 里没有 WindPy（GitHub runners 上没有 Wind 终端），但**不需要**为此重新打包：`_ensure_wind()` 在 `import WindPy` 失败后会调
+[`pricing/windpy_locator.py`](../pricing/windpy_locator.py) 扫描本机的 Wind 安装，找到后接进当前进程再重试。所以只要运行这台机器装了 Wind 终端、并在终端里设置过 Python 接口，下载版就能直连。
+
+扫描顺序（先命中先用）：
+
+1. 环境变量 `DELTALAB_WIND_DIR` / `WINDPY_DIR`
+2. `sys.path` 上现有 `site-packages` 里的 `WindPy.pth`
+3. 本机各 Python 安装（Windows 走注册表 + 常见路径）的 `site-packages`，看 `WindPy.pth` 也看目录自身
+4. Wind 的常见安装目录（Windows 的 `…\Wind.NET.Client\WindNET\x64`、macOS 的 `/Applications/Wind API.app/Contents/python`）
+
+只取与当前进程**同位数**的那一档：x86/x64 挑错边会以 `WinError 193` 失败，看起来像"没装 Wind"，实则装了。找到目录后除了插 `sys.path`，还会登记 DLL 搜索目录，并在 `~/.deltalab/windpy/site-packages/` 写一份 `WindPy.pth`——Wind 自带的 `WindPy.py` 在 import 阶段要靠它定位 `WindPy.dll`，而冻结进程里没有真正的 `site-packages`。
+
+自动扫描落空时，把 Wind 目录（含 `WindPy.py`）指给环境变量再启动：
 
 ```bash
-# 确认 WindPy 可用
-python -c "import WindPy; print(WindPy.__file__)"
+# Windows (PowerShell)
+$env:DELTALAB_WIND_DIR = "C:\Wind\Wind.NET.Client\WindNET\x64"; .\DeltaLab.exe
+```
 
-# 本地打包
+两条路都失败时，`_ensure_wind()` 抛出的 `ImportError` 会列出扫过的位置、逐条标注是"目录不存在"还是"文件齐全但加载失败"，并附上原始异常——足以区分 DLL 丢了、位数挑错了，还是终端没登录。
+
+#### 把 WindPy 打进发布包（可选）
+
+在装有 Wind 终端且能 `python -c "import WindPy"` 的机器上打包，可以让发布包自带 WindPy，不依赖运行机的扫描：
+
+```bash
 pyinstaller --noconfirm deltalab.spec
 ```
 
 [deltalab.spec](../deltalab.spec) 的 WindPy 段会自动探测：
 
 - import 成功 → 打印 `[deltalab.spec] WindPy 已安装, 打入发布包`，并通过 `collect_submodules / collect_dynamic_libs / collect_data_files` 把 WindPy 一并收入 `dist/DeltaLab/`
-- import 失败 → 打印跳过原因，发布包仍可产出，只是 Wind 模式运行时会在 `_ensure_wind()` 里报错
+- import 失败 → 打印跳过原因，发布包仍可产出，Wind 模式改走上面的运行时扫描
 
-冻结构建运行时，`_ensure_wind()` 会把原始 ImportError / DLL 加载错误拼进异常文本，并在 `sys.frozen=True` 时追加一句"请在装有 Wind 终端的机器上重新打包"的提示，方便定位到底是 DLL 丢了还是终端没登录。
+注意这样打出来的包绑定了打包机那份 Wind 的版本与位数；运行机的 Wind 版本不同导致 DLL 加载失败时，locator 会接管并改用运行机自己的那份。
 
 ### 1.4 字体
 
@@ -123,7 +142,7 @@ python tools/make_workflow.py  # 生成 assets/workflow.png (工作流示意图)
 
 ```bash
 pip install pytest
-pytest                    # 全部（945 条：416 纯逻辑 + 529 GUI）
+pytest                    # 全部（969 条：440 纯逻辑 + 529 GUI）
 pytest -m "not gui" -q    # 只跑纯逻辑，不需要窗口服务器
 ```
 

@@ -37,7 +37,10 @@ import sys
 
 if getattr(sys, "frozen", False):
     _mei = getattr(sys, "_MEIPASS", None)
-    if _mei:
+    # 只有包里确实带了原生库才写这份 .pth: 指向一个没有 WindPy.dll 的目录
+    # 会让 WindPy.py 的 bootstrap 死在 LoadLibrary 上, 反而盖掉
+    # pricing.windpy_locator 运行时找到的本机 Wind 目录.
+    if _mei and os.path.isfile(os.path.join(_mei, "WindPy.dll")):
         _sp = os.path.join(_mei, "site-packages")
         try:
             os.makedirs(_sp, exist_ok=True)

@@ -69,7 +69,7 @@ Windows / macOS (Apple Silicon) 用户可直接从 [Releases](https://github.com
 >
 > Intel Mac 用户请从源码运行（见上方"安装并启动"）。
 >
-> CI 产出的发布包不带 WindPy（GitHub runners 上没有 Wind 终端）。要让发布包支持 Wind，需在装有 Wind 终端的机器上本地打包，见 [使用文档 §1.3](docs/GUI_USAGE.md#13-可选依赖)。
+> CI 产出的发布包不内置 WindPy（GitHub runners 上没有 Wind 终端），改为**运行时自动发现本机 Wind 安装**：只要这台机器装了 Wind 金融终端并在终端里设置过 Python 接口，选 Wind 数据源即可直连。装在非常规位置时，用环境变量 `DELTALAB_WIND_DIR` 指向含 `WindPy.py` 的目录。详见 [使用文档 §1.3](docs/GUI_USAGE.md#13-可选依赖)。
 
 ## 📊 支持的期权类型
 

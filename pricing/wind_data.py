@@ -429,27 +429,48 @@ def get_trading_bars_per_day(code: str, bar_size) -> int | None:
 def _ensure_wind():
     """启动 Wind 连接，若未安装则抛出提示
 
-    在 PyInstaller 冻结构建里 WindPy 的导入报错往往是 DLL 加载失败
-    (Windows) 或 dylib 找不到 (macOS), 而非"模块缺失". 把原始异常接进
-    提示文本里, 让用户 / 开发者能直接看到底层错误再对症处理.
+    直接 ``import WindPy`` 失败时先做一次**本机发现**再重试: 发布包由没有
+    Wind 终端的 CI 构建, 包里不含 WindPy, 但用户机器上装了 Wind 终端就一定
+    有一份 —— :mod:`pricing.windpy_locator` 负责把它接进当前进程。
+
+    两次都失败才报错。冻结构建里的失败往往是 DLL 加载 (Windows) 或 dylib
+    找不到 (macOS), 而非单纯"模块缺失", 所以把原始异常和扫描过的路径一并
+    写进提示, 让用户能直接对症处理。
     """
     frozen = bool(getattr(sys, "frozen", False))
     try:
         from WindPy import w
     except Exception as e:
-        frozen_hint = ""
-        if frozen:
-            frozen_hint = (
-                "\n  [frozen build] 此发布包在构建时未成功打入 WindPy, 或者"
-                "运行机上缺少 Wind 终端 / 原生动态库. 请在装有 Wind 终端 + "
-                "`pip install WindPy` 的机器上重新执行 `pyinstaller "
-                "--noconfirm deltalab.spec`."
+        from . import windpy_locator
+
+        module = windpy_locator.bootstrap()
+        if module is not None and hasattr(module, "w"):
+            w = module.w
+        else:
+            located = windpy_locator.last_error()
+            detail = f"{type(e).__name__}: {e}"
+            if located is not None:
+                detail += f"\n  本机 WindPy 加载失败: {type(located).__name__}: {located}"
+            # 限 6 条: 这段文本最终进的是 GUI 弹窗, 后面还要接一整段
+            # traceback, 全量候选(二三十条)会把对话框撑爆屏幕.
+            hint = (
+                "\n  已扫描以下位置但未找到可用的 WindPy:\n"
+                f"{windpy_locator.describe_search(limit=6)}"
+                "\n  若 Wind 终端装在别处, 可设环境变量 DELTALAB_WIND_DIR "
+                "指向含 WindPy.py / WindPy.dll 的目录 (形如 "
+                r"C:\Wind\Wind.NET.Client\WindNET\x64) 后重启本程序。"
             )
-        raise ImportError(
-            "未安装 WindPy，请安装 Wind 金融终端并配置 Python 插件。\n"
-            "  pip install WindPy  或在 Wind 终端中设置 Python 接口。"
-            f"{frozen_hint}\n  原始错误: {type(e).__name__}: {e}"
-        ) from e
+            if frozen:
+                hint += (
+                    "\n  [frozen build] 本发布包未内置 WindPy, 运行时依赖本机的"
+                    " Wind 金融终端; 请确认终端已安装、已登录, 并在终端里执行过"
+                    "「设置 Python 接口 / 修复」。"
+                )
+            raise ImportError(
+                "未安装 WindPy，请安装 Wind 金融终端并配置 Python 插件。\n"
+                "  pip install WindPy  或在 Wind 终端中设置 Python 接口。"
+                f"{hint}\n  原始错误: {detail}"
+            ) from e
     if not w.isconnected():
         result = w.start()
         if getattr(result, "ErrorCode", -1) != 0:

@@ -6,9 +6,9 @@
 
 ---
 
-## [2.0.0] - 2026-08-15
+## [2.0.0] - 2026-08-16
 
-把 DeltaLab 从「跑一次回测看结果」变成「把多次回测横向比出结论」：新增 **🆚 结果对比** 与 **🎯 策略优选** 两个页面，并把 `gui_app.py` 拆成分层的 `deltalab_ui/` 包。相对 v1.1.0 共 39 个提交、约 +39,400 行。
+把 DeltaLab 从「跑一次回测看结果」变成「把多次回测横向比出结论」：新增 **🆚 结果对比** 与 **🎯 策略优选** 两个页面，并把 `gui_app.py` 拆成分层的 `deltalab_ui/` 包。相对 v1.1.0 共 42 个提交、约 +39,500 行。
 
 ### 新增
 
@@ -27,6 +27,8 @@
 
 ### 修复
 
+- **免安装版在装有 Wind 终端的 Windows 上仍报 `No module named 'WindPy'`**：发布包由没有 Wind 终端的 CI 构建，包里不含 WindPy，而运行机上明明装着。现在 `_ensure_wind()` 在 import 失败后会调新增的 `pricing/windpy_locator.py` 扫描本机 Wind 安装（环境变量 → `site-packages` 里的 `WindPy.pth` → 各 Python 安装 → Wind 常见安装目录），接进进程后重试；只取与当前进程同位数的那一档，避免 x86/x64 挑错边的 `WinError 193` 伪装成"没装 Wind"。macOS 的 `/Applications/Wind API.app` 同样覆盖。两条路都失败时的报错会列出扫过的位置，并区分"目录不存在"与"文件齐全但加载失败"；也可用 `DELTALAB_WIND_DIR` 手工指定 Wind 目录。
+  > 与 v1.1.0 那条「PyInstaller 打包支持 WindPy」不是同一个问题，是同一条链路的相邻两环：v1.1.0 修的是**包里有 WindPy 但加载不到 DLL**（本地打包场景，靠 runtime hook 在 `_MEIPASS/site-packages/` 伪造 `WindPy.pth`），这次修的是**包里压根没有 WindPy**（CI 打包场景）——那个 hook 只在构建机检测到 WindPy 时才会被打进包，对 CI 包不生效。两者叠起来覆盖两种发布方式；locator 定位 DLL 的手法沿用了 hook 对 `WindPy.py` bootstrap 的分析。
 - **内容寻址缓存的键计算缺陷**：不同输入可能命中同一份缓存，会串用别的段的 bar 明细。
 - **品种池模式未显式降级排名口径**：跨合约金额被直接相加。
 - 策略优选校验的 `UnboundLocalError`，以及排序键混用不同量纲导致的排名错误。
@@ -34,14 +36,14 @@
 
 ### 测试与 CI
 
-测试从 23 条（2 个文件）扩到 945 条（12 个文件：416 纯逻辑 + 529 GUI）。CI 在 ubuntu × Python 3.10 / 3.13 上跑全量，GUI 批用 `xvfb-run`。
+测试从 23 条（2 个文件）扩到 969 条（13 个文件：440 纯逻辑 + 529 GUI）。CI 在 ubuntu × Python 3.10 / 3.13 上跑全量，GUI 批用 `xvfb-run`。
 
 ### 升级说明
 
 - **无需迁移**：结果池与策略优选结果包都是本版新增，v1.x 不存在这两类文件。
 - 两类结果包各带 `schema_version`，**版本不符时拒绝载入而不是硬渲染** —— 字段口径改过不止一次，用新代码渲染旧包会静默给出错误结论。
 - 三个运行时目录（`data/cache/`、`data/backtest_pool/`、`data/history_results/`）已写进 `.gitignore`：结果池包内含 `csv_path` 全路径与 `wind_code`。
-- CI 产出的发布包不带 WindPy（GitHub runners 上没有 Wind 终端），见[使用文档 §1.3](docs/GUI_USAGE.md#13-可选依赖)。
+- CI 产出的发布包不内置 WindPy（GitHub runners 上没有 Wind 终端），改为运行时扫描本机 Wind 安装：装了 Wind 终端并设置过 Python 接口的机器可直连，装在非常规位置时用 `DELTALAB_WIND_DIR` 指定。见[使用文档 §1.3](docs/GUI_USAGE.md#13-可选依赖)。
 
 各页面的完整口径、参数含义与常见报错见 [使用文档](docs/GUI_USAGE.md)。
 
