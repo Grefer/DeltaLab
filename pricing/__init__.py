@@ -18,6 +18,7 @@ from .hedge_backtest import (
     HedgeBandStrategy,
 )
 from .hedge_analysis import (
+    SelectionCancelled,
     StrategyCase,
     ContractHistoryPool,
     HistoryReplaySpec,

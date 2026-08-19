@@ -13,12 +13,17 @@
 """
 
 import os
+import threading
 import warnings
 
 import numpy as np
 import pandas as pd
 
 _CACHE = None  # 进程内缓存：升序 datetime64[D] 数组
+# 定价路径上会读它（Option_SNB 解析敲出观察日），而策略优选现在会并行跑
+# 多个分段。加载可能落到联网抓取与写本地文件，两个线程同时进来会重复抓、
+# 也可能把 data/tradingday.csv 写坏。
+_CACHE_LOCK = threading.RLock()
 
 
 def _norm(x):
@@ -93,6 +98,17 @@ def _covers(arr, start, end):
 def load_calendar(start=None, end=None):
     """返回完整交易日 datetime64[D] 升序数组（按离线优先顺序解析）。"""
     global _CACHE
+    # 快路径无锁：_CACHE 的重绑定是原子的，命中时读到的要么是旧数组要么是
+    # 新数组，两者都是完整可用的。只有需要加载时才进锁。
+    if _covers(_CACHE, start, end):
+        return _CACHE
+    with _CACHE_LOCK:
+        return _load_calendar_locked(start, end)
+
+
+def _load_calendar_locked(start, end):
+    global _CACHE
+    # 进锁后重查：可能已被另一个线程填好了。
     if _covers(_CACHE, start, end):
         return _CACHE
 

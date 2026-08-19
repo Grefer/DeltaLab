@@ -1408,12 +1408,27 @@ class HistorySetupMixin:
                 self, require_one=False))
         except (AttributeError, tk.TclError):
             has_period = True      # 控件还没建好时不误禁
-        enabled = (
+        # 优选跑起来之后这个按钮改当"停止"用：一轮优选要跑十几分钟，
+        # 此前它只是变灰，用户除了等就只能杀进程。中止请求在段/候选边界
+        # 生效，已跑完的部分照常释放资源。
+        running = getattr(self, "_active_job", None) == "history"
+        cancelling = running and bool(
+            getattr(self, "_history_cancel_event", None) is not None
+            and self._history_cancel_event.is_set())
+        enabled = (running and not cancelling) or (
             getattr(self, "_active_job", None) is None
             and source_var.get() in ("csv", "wind")
             and has_period
         )
         state = "normal" if enabled else "disabled"
+        if running:
+            btn_text = "■ 停止优选"
+            btn_command = getattr(
+                self, "_cancel_history_recommendation", None)
+        else:
+            btn_text = "▶ 开始优选"
+            btn_command = getattr(
+                self, "_run_history_recommendation", None)
         for attr in ("_history_btn",):
             button = getattr(self, attr, None)
             if button is None:
@@ -1423,7 +1438,9 @@ class HistorySetupMixin:
                 if exists is not None and not exists():
                     setattr(self, attr, None)
                     continue
-                button.configure(state=state)
+                button.configure(state=state, text=btn_text)
+                if btn_command is not None:
+                    button.configure(command=btn_command)
             except tk.TclError:
                 # 容忍窗口销毁期间的延迟来源联动。
                 setattr(self, attr, None)

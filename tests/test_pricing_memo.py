@@ -1,5 +1,5 @@
 # _*_ coding: utf-8 _*_
-"""bar 级定价记忆化 / 轻量 bump copy / 优选进度回调的回归测试。
+"""bar 级定价记忆化 / 轻量 bump copy / 优选进度与中止的回归测试。
 
 这三样都是**纯加速与纯可观测性**的改动，共同的验收标准只有一条：
 输出必须逐位不变。所以这里的断言几乎全是 ``array_equal`` 与 ``==``，
@@ -595,3 +595,207 @@ def test_memo_key_changes_when_any_public_field_changes(make_option):
         other = make_option()
         setattr(other, name, mutated)
         assert _memo_key(other) != key0, f"改了 {name} 但 key 没变"
+
+
+# --------------------------------------------------------------------------
+#  6. 优选可中断
+# --------------------------------------------------------------------------
+
+def test_cancel_event_stops_selection_promptly():
+    """置位中止标志后，优选必须在下一个单元边界抛 SelectionCancelled。
+
+    "边界"是段与候选的交界——那里没有半写完的累加器。单个
+    HedgeBacktest.run() 内部不检查：中断会留下半截状态，而一个单元最多
+    几秒。所以判据是"很快停"，不是"立刻停"。
+    """
+    import threading
+
+    from pricing.hedge_analysis import SelectionCancelled
+
+    history = _history_frame(n=140)
+    cases = _selection_cases()
+    cancel = threading.Event()
+    seen = []
+
+    def cb(done, total, label, case):
+        seen.append(done)
+        if done == 3:                 # 跑够 3 个单元后请求停止
+            cancel.set()
+
+    with pytest.raises(SelectionCancelled):
+        recommend_by_rolling_history(
+            _airbag(npath=200), history, cases, dict(_SELECTION_KWARGS),
+            lookbacks={"week": 5, "month": 20, "quarter": 61},
+            steps_per_day=1, progress_callback=cb, cancel_event=cancel)
+
+    # 置位后最多再跑一个单元就该停：advance 在单元开头查标志。
+    assert max(seen) <= 4, f"置位后又跑了 {max(seen) - 3} 个单元"
+
+
+def test_cancel_event_set_upfront_stops_immediately():
+    import threading
+
+    from pricing.hedge_analysis import SelectionCancelled
+
+    cancel = threading.Event()
+    cancel.set()
+    with pytest.raises(SelectionCancelled):
+        recommend_by_rolling_history(
+            _airbag(npath=200), _history_frame(n=140), _selection_cases(),
+            dict(_SELECTION_KWARGS), lookbacks={"month": 20},
+            steps_per_day=1, cancel_event=cancel)
+
+
+def test_selection_without_cancel_event_is_unaffected():
+    """不传 cancel_event 时行为完全不变。"""
+    _recs, ranking, _w = recommend_by_rolling_history(
+        _airbag(npath=200), _history_frame(n=140), _selection_cases(),
+        dict(_SELECTION_KWARGS), lookbacks={"month": 20}, steps_per_day=1)
+    assert not ranking.empty
+
+
+def test_worker_treats_cancel_as_non_error():
+    """worker 收到 SelectionCancelled 要走中止收尾，不能弹错误框。"""
+    from types import SimpleNamespace
+
+    from deltalab_ui import runner as runner_mod
+    from deltalab_ui.runner import RunnerMixin
+
+    calls = {"cancelled": 0, "failed": []}
+
+    def cancel_now(*_args, **_kwargs):
+        raise runner_mod.SelectionCancelled("stop")
+
+    fake = SimpleNamespace(
+        # 用户在取行情阶段就按了停止。
+        _build_backtest=cancel_now,
+        _history_cancel_event=None,
+        after=lambda _delay, callback: callback(),
+        _finish_job=lambda *a, **k: calls.__setitem__(
+            "cancelled", calls["cancelled"] + 1),
+        _fail_history_recommendation=calls["failed"].append,
+        _make_history_progress_callback=lambda *a: None,
+    )
+    state = {
+        "source": "csv", "csv_path": "x.csv", "csv_col": "close",
+        "cfg": {"build": lambda _st, _p: SimpleNamespace(_time_remaining=2)},
+        "subtype": "t", "params": {},
+        "history_lookbacks": {"month": 20},
+    }
+
+    RunnerMixin._history_recommendation_worker(fake, state)
+
+    assert calls["failed"] == [], "中止被当成了错误"
+    assert calls["cancelled"] == 1, "没有走中止收尾"
+
+
+# --------------------------------------------------------------------------
+#  7. 分段并行
+# --------------------------------------------------------------------------
+
+def test_parallel_segments_match_serial_bit_for_bit():
+    """并行与串行的排名表必须逐位相同。
+
+    归并按 plan 顺序串行做，所以 strategy_types 的后写覆盖、
+    failure_reasons 的顺序、label_results 的插入顺序都不受调度影响。
+    """
+    import pricing.hedge_analysis as ha
+
+    history = _history_frame(n=170)
+    cases = _selection_cases()
+    lookbacks = {"week": 5, "month": 20, "quarter": 61}
+
+    def run():
+        return ha.recommend_by_rolling_history(
+            _airbag(npath=400), history, cases, dict(_SELECTION_KWARGS),
+            lookbacks=lookbacks, steps_per_day=1)[1]
+
+    parallel = run()
+    real = ha._selection_max_workers
+    ha._selection_max_workers = lambda option, n_units: 1
+    try:
+        serial = run()
+    finally:
+        ha._selection_max_workers = real
+
+    assert list(serial.columns) == list(parallel.columns)
+    numeric = serial.select_dtypes(include=[np.number]).columns
+    assert np.array_equal(serial[numeric].to_numpy(),
+                          parallel[numeric].to_numpy(), equal_nan=True)
+    other = [c for c in serial.columns if c not in numeric]
+    assert serial[other].equals(parallel[other])
+
+
+def test_map_segments_preserves_plan_order():
+    """先算完的不能先归并——顺序是归并语义的前提。"""
+    import time
+
+    from pricing.hedge_analysis import _map_segments
+
+    def run_one(plan):
+        # 故意让后面的先算完
+        time.sleep(0.02 * (3 - plan))
+        return plan
+
+    got = _map_segments(run_one, [1, 2, 3], _airbag(npath=200))
+    assert got == [1, 2, 3]
+
+
+def test_map_segments_propagates_first_failure():
+    """异常按 plan 顺序抛，与串行执行一致。"""
+    from pricing.hedge_analysis import _map_segments
+
+    def run_one(plan):
+        if plan in (2, 3):
+            raise ValueError(f"boom-{plan}")
+        return plan
+
+    with pytest.raises(ValueError, match="boom-2"):
+        _map_segments(run_one, [1, 2, 3], _airbag(npath=200))
+
+
+def test_worker_count_backs_off_on_memory():
+    """线程数按单次定价峰值内存收敛，不是按核数开满。
+
+    累计期权 nPath=1e5、T=243 一次定价峰值约 0.8 GB，开满会把机器拖垮
+    ——实测 10 线程比串行还慢 2.5 倍。
+    """
+    from pricing.hedge_analysis import _selection_max_workers
+
+    # 不跟机器核数较劲：把预算调到只够一个线程，验的是"内存这一维真的在
+    # 参与决策"，而不是本机恰好有几个核。
+    light = _decumulator(npath=2000, t_days=20)
+    heavy = _decumulator(npath=100000, t_days=61)
+    assert _selection_max_workers(heavy, 8) <= _selection_max_workers(light, 8)
+
+    monkeypatch = pytest.MonkeyPatch()
+    try:
+        monkeypatch.setenv("DELTALAB_SELECTION_MEM_BUDGET_MB", "64")
+        assert _selection_max_workers(heavy, 8) == 1, "内存预算没有生效"
+        monkeypatch.setenv("DELTALAB_SELECTION_MEM_BUDGET_MB", "65536")
+        assert _selection_max_workers(heavy, 8) > 1, "预算放宽后仍不并行"
+        # 旋钮写坏了要退回默认并发，而不是把整轮优选炸掉。
+        for bad in ("2g", "", "-1"):
+            monkeypatch.setenv("DELTALAB_SELECTION_MEM_BUDGET_MB", bad)
+            assert _selection_max_workers(heavy, 8) >= 1
+    finally:
+        monkeypatch.undo()
+
+    assert _selection_max_workers(light, 1) == 1, "只有一段时不该起线程池"
+
+
+def test_progress_total_still_exact_under_parallelism():
+    """并行下 done 的自增有竞态；加锁后仍必须恰好走满。"""
+    history = _history_frame(n=170)
+    cases = _selection_cases()
+    lookbacks = {"week": 5, "month": 20, "quarter": 61}
+    seen = []
+
+    recommend_by_rolling_history(
+        _airbag(npath=300), history, cases, dict(_SELECTION_KWARGS),
+        lookbacks=lookbacks, steps_per_day=1,
+        progress_callback=lambda d, t, l, c: seen.append((d, t)))
+
+    total = seen[-1][1]
+    assert sorted(d for d, _ in seen) == list(range(1, total + 1)), (
+        "并行下丢了进度计数")

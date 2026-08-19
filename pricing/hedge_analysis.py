@@ -4,7 +4,10 @@
 from __future__ import annotations
 
 import copy
+import os
+import threading
 from collections.abc import Mapping
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -1431,6 +1434,14 @@ def _strict_lookback_segment_lengths(evidence_days, maturity_days):
     return tuple(lengths)
 
 
+class SelectionCancelled(Exception):
+    """用户中止了策略优选。
+
+    专门一个类型，是为了让 worker 能把"用户主动停下"和"真的出错了"分开
+    收尾——前者不该弹错误框，也不该把状态栏写成失败。
+    """
+
+
 class _ProgressReporter:
     """把 (段 × 候选) 的推进情况报给调用方；``callback`` 为 None 时是空操作。
 
@@ -1440,17 +1451,52 @@ class _ProgressReporter:
 
     回调在 worker 线程里被调用，实现方必须自己回投 GUI 线程。单元总数是
     百量级（一次典型优选约 200 个），不需要节流。
+
+    分段并行时回调来自多个线程，但**保证按 done 递增的顺序发出**（见
+    __init__ 里对锁的说明），因此实现方可以直接把 done 当进度值用，不必
+    自己做单调过滤。
     """
 
-    __slots__ = ("_callback", "total", "done")
+    __slots__ = ("_callback", "_cancel_event", "_lock", "total", "done")
 
-    def __init__(self, callback, total):
+    def __init__(self, callback, total, cancel_event=None):
         self._callback = callback
+        self._cancel_event = cancel_event
+        # 分段并行跑，done 的自增是读—改—写。当前 CPython（3.13，带 GIL）
+        # 实测不会丢计数——LOAD_ATTR→STORE_ATTR 之间不轮询 eval breaker——
+        # 但这是实现细节，自由线程构建下不成立，不能靠。
+        #
+        # 锁同时还管着**回调的调用顺序**：回调必须在锁内发出，否则两个线程
+        # 可能先后拿到 done=7、done=8，却按 8、7 的顺序调进 GUI，进度条会
+        # 回退。回调本身已按 120 ms 去抖、且有 try 兜底，锁内多待几十微秒
+        # 没有代价。顺带也让 runner 那边的去抖 state 字典无需自己加锁。
+        self._lock = threading.Lock()
         self.total = int(total)
         self.done = 0
 
+    def raise_if_cancelled(self):
+        """在单元边界检查中止请求。
+
+        段与候选的交界是唯一安全的中断点：此处没有半写完的累加器，
+        已完成的周期结果仍然完整。单个 HedgeBacktest.run() 内部不检查——
+        那里中断会留下半截状态，而一个单元最多几秒。
+        """
+        if self._cancel_event is not None and self._cancel_event.is_set():
+            raise SelectionCancelled("策略优选已被用户中止")
+
+    def _bump(self, count, label, case_name):
+        with self._lock:
+            self.done += count
+            if self._callback is None:
+                return
+            try:
+                self._callback(self.done, self.total, label, case_name)
+            except Exception:                          # noqa: BLE001
+                # 进度回调只是显示用；它出问题不该把整轮优选带下水。
+                self._callback = None
+
     def skip(self, count, label=None):
-        """跳过 ``count​`` 个不会真正跑的单元。
+        """跳过 ``count`` 个不会真正跑的单元。
 
         分母是按"分段计划里的段数 × 候选数"预算的，但有两类段会在进入候选
         循环**之前**被 continue 掉：entry 自带 error（品种池里历史不足的档
@@ -1458,26 +1504,82 @@ class _ProgressReporter:
         就永远停在某个百分比上——比没有进度条更糟。
         """
         count = int(count)
-        if count <= 0:
-            return
-        self.done += count
-        if self._callback is None:
-            return
-        try:
-            self._callback(self.done, self.total, label, "")
-        except Exception:                              # noqa: BLE001
-            self._callback = None
+        if count > 0:
+            self._bump(count, label, "")
 
     def advance(self, label, case_name):
         """开始处理一个单元。先自增再上报，显示的是"正在跑第 N 个"。"""
-        self.done += 1
-        if self._callback is None:
-            return
-        try:
-            self._callback(self.done, self.total, label, case_name)
-        except Exception:                              # noqa: BLE001
-            # 进度回调只是显示用；它出问题不该把整轮优选带下水。
-            self._callback = None
+        self.raise_if_cancelled()
+        self._bump(1, label, case_name)
+
+
+def _map_segments(run_one, plans, option):
+    """并行跑各分段，**按 plans 顺序**逐个交回结果。
+
+    顺序是硬要求：调用方的归并里有后写覆盖（strategy_types）和列表追加
+    （两个 failure_reasons），乱序合并会改变输出。所以这里不用
+    ``as_completed``，而是按提交顺序取 ``future.result()``——先算完的先等着。
+
+    异常也按顺序抛：第一个失败的分段决定整轮的异常，与串行执行一致。
+    单段时直接串行调用，省掉线程池的创建开销。
+    """
+    plans = list(plans)
+    if not plans:
+        return []
+    workers = _selection_max_workers(option, len(plans))
+    if workers <= 1:
+        return [run_one(plan) for plan in plans]
+    pool = ThreadPoolExecutor(max_workers=workers)
+    try:
+        futures = [pool.submit(run_one, plan) for plan in plans]
+        return [future.result() for future in futures]
+    finally:
+        # cancel_futures=True 是关键：``with`` 块的默认 shutdown(wait=True)
+        # 会把**排队中**的任务全部照常跑完，于是某一段抛异常之后剩下的段还要
+        # 白烧一遍机时才把错误弹出来。取消路径不受影响——_run_segment 段头就
+        # 查中止标志，排队段一出队即秒抛。
+        pool.shutdown(wait=True, cancel_futures=True)
+
+
+def _selection_max_workers(option, n_units):
+    """分段并行的线程数。**按内存定，不是按核数定。**
+
+    单次 MC 定价的峰值内存是结果矩阵的约 4.5 倍（McGbmQ 里 W1/W/dlogS/
+    cumsum/exp 五份同时存活），累计期权 nPath=1e5、T=243 时一次就要 1.2 GB。
+    实测按核数开满（10 线程）比串行还慢 2.5 倍——越过内存压力阈值之后系统
+    开始压缩换页，拐点在 4~6 线程之间。
+
+    numpy 的逐元素运算与 RNG 都释放 GIL，所以线程是有效的；不用进程池是因为
+    本仓打包成 PyInstaller 的 .app（deltalab.spec）且全仓没有 freeze_support，
+    macOS 默认 spawn 会让子进程重新执行入口、递归拉起 GUI 窗口。
+
+    **上限 4 是量出来的，不是猜的。** 气囊 nPath=1e5 实测标度曲线：
+
+        1 线程 1.00x   2 线程 1.27x   3 线程 1.28x
+        4 线程 1.38x   6 线程 1.41x   8 线程 1.37x
+
+    4 之后就平了——这活是内存带宽受限而不是算力受限，单线程已经吃掉大部分
+    带宽。取 4 而不是 6：速度差在噪声内（2%），内存少占三分之一，也离曲线
+    由正转负的那一段更远。想真正突破得先把带宽流量本身砍下来（分块生成、
+    避免整条路径矩阵落地），那是另一件事。
+    """
+    n_units = int(n_units)
+    if n_units <= 1:
+        return 1
+    workers = max(1, min((os.cpu_count() or 4) - 2, 4, n_units))
+    npath = getattr(option, "nPath", None)
+    steps = getattr(option, "_time_remaining", None)
+    try:
+        peak = float(npath) * float(steps) * 8.0 * 4.5
+        # 这个环境变量只是调优旋钮，写坏了该退回默认并发，而不是把整轮
+        # 优选炸掉——它没有任何界面入口，用户改错了也看不到提示。
+        budget = float(os.environ.get(
+            "DELTALAB_SELECTION_MEM_BUDGET_MB", 2048))
+    except (TypeError, ValueError):
+        return workers
+    if peak <= 0 or budget <= 0:
+        return workers
+    return max(1, min(workers, int((budget * 1024 * 1024) // peak)))
 
 
 def _rolling_progress_total(windows, maturity_days, n_history_groups, n_cases):
@@ -1533,6 +1635,7 @@ def recommend_by_rolling_history(
     steps_per_day=None,
     objective=DEFAULT_SELECTION_OBJECTIVE,
     progress_callback=None,
+    cancel_event=None,
 ):
     """在截至最新完整交易日的严格连续 ``L`` 日区间比较策略。
 
@@ -1627,6 +1730,7 @@ def recommend_by_rolling_history(
         progress_callback,
         _rolling_progress_total(
             windows, maturity_days, n_history_groups, len(cases)),
+        cancel_event,
     )
 
     rows = []
@@ -1693,7 +1797,42 @@ def recommend_by_rolling_history(
                 "_window_error_meta": {"position": batch_position},
             }
 
-        for plan in segment_plans:
+        def _run_segment(plan):
+            """跑完一个分段的全部候选，返回可顺序归并的记录。
+
+            段之间彼此独立：各自有自己的行情切片、自己的 Day 0 锚点、
+            自己的定价缓存作用域，互不读写对方的状态。抽成函数是为了让
+            这些累加器变成**函数局部变量**——同名不改代码，Python 的赋值
+            即声明局部，函数体内的每一处引用自动落到这份局部上。
+
+            归并由调用方按 plan 顺序串行做，因此
+            strategy_types 的后写覆盖、两个 reasons 列表的顺序、
+            label_results 的插入顺序都与串行执行完全一致。
+            """
+            label_results = {}
+            collected = {case.name: {} for case in cases}
+            observed_days = {case.name: {} for case in cases}
+            case_failures = {case.name: 0 for case in cases}
+            case_failure_reasons = {case.name: [] for case in cases}
+            strategy_types = {}
+            endpoint_failures = 0
+            endpoint_failure_reasons = []
+            warmup_eligible_segment_count = 0
+
+            def _record():
+                return {
+                    "label_results": label_results,
+                    "collected": collected,
+                    "observed_days": observed_days,
+                    "case_failures": case_failures,
+                    "case_failure_reasons": case_failure_reasons,
+                    "strategy_types": strategy_types,
+                    "endpoint_failures": endpoint_failures,
+                    "endpoint_failure_reasons": endpoint_failure_reasons,
+                    "warmup_eligible_segment_count": (
+                        warmup_eligible_segment_count),
+                }
+            progress.raise_if_cancelled()
             window_id = plan["window_id"]
             segment_days = plan["evaluation_days"]
             path = plan["path"]
@@ -1732,7 +1871,7 @@ def recommend_by_rolling_history(
                     }
                     # 这一段不会进入候选循环；补记单元数，否则进度走不满。
                     progress.skip(len(cases), label)
-                    continue
+                    return _record()
 
             replay_option = None
             replay_strategies = {}
@@ -1853,6 +1992,25 @@ def recommend_by_rolling_history(
                 )
             label_results[window_id] = per_case
 
+            return _record()
+
+        # 分段并行。归并仍按 plan 顺序串行做，因此 strategy_types 的后写
+        # 覆盖、两个 reasons 列表的顺序、label_results 的插入顺序都与串行
+        # 执行逐位一致——线程只改变谁先算完，不改变谁先合并。
+        for record in _map_segments(_run_segment, segment_plans, option):
+            label_results.update(record["label_results"])
+            for name in collected:
+                collected[name].update(record["collected"][name])
+                observed_days[name].update(record["observed_days"][name])
+                case_failures[name] += record["case_failures"][name]
+                case_failure_reasons[name].extend(
+                    record["case_failure_reasons"][name])
+            strategy_types.update(record["strategy_types"])
+            endpoint_failures += record["endpoint_failures"]
+            endpoint_failure_reasons.extend(
+                record["endpoint_failure_reasons"])
+            warmup_eligible_segment_count += record[
+                "warmup_eligible_segment_count"]
         window_results[label] = label_results
         history_complete = bool(
             history_complete
@@ -2095,7 +2253,8 @@ def recommend_by_rolling_history(
 
 def _recommend_from_explicit_history_plans(
         option, cases, kwargs, spd, baseline_case, plans,
-        objective=DEFAULT_SELECTION_OBJECTIVE, progress_callback=None):
+        objective=DEFAULT_SELECTION_OBJECTIVE, progress_callback=None,
+        cancel_event=None):
     """运行已经按具体合约边界切好的严格连续历史分段计划。"""
     batch_position = _backtest_batch_position(
         kwargs, context="跨合约历史择优")
@@ -2103,6 +2262,7 @@ def _recommend_from_explicit_history_plans(
     progress = _ProgressReporter(
         progress_callback,
         sum(len(plan["entries"]) for plan in plans) * len(cases),
+        cancel_event,
     )
     rows = []
     window_results = {}
@@ -2118,6 +2278,7 @@ def _recommend_from_explicit_history_plans(
         contract_by_window = {}
 
         for entry in plan["entries"]:
+            progress.raise_if_cancelled()
             window_id = entry["window_id"]
             contract_code = str(entry.get("contract_code", ""))
             contract_by_window[window_id] = contract_code
@@ -2486,7 +2647,8 @@ def _recommend_from_explicit_history_plans(
 def recommend_by_contract_history_pool(
         option, pool, cases, backtest_kwargs=None, *, lookbacks=None,
         step_days=5, target_endpoints=None, steps_per_day=None,
-        objective=DEFAULT_SELECTION_OBJECTIVE, progress_callback=None):
+        objective=DEFAULT_SELECTION_OBJECTIVE, progress_callback=None,
+        cancel_event=None):
     """在最近连续 ``L`` 个主力映射日上按具体合约边界比较策略。
 
     证据区间中的主力换月会强制切段；同一具体合约的连续区间再按不重叠
@@ -2909,4 +3071,5 @@ def recommend_by_contract_history_pool(
         })
     return _recommend_from_explicit_history_plans(
         option, cases, kwargs, default_spd, baseline_case, plans,
-        objective=objective, progress_callback=progress_callback)
+        objective=objective, progress_callback=progress_callback,
+        cancel_event=cancel_event)

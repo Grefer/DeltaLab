@@ -29,6 +29,7 @@ from pricing import ContractHistoryPool, HedgeBacktest, StrategyCase
 from pricing.hedge_analysis import (
     DEFAULT_SELECTION_OBJECTIVE,
     SELECTION_OBJECTIVES,
+    SelectionCancelled,
     recommend_by_contract_history_pool,
     recommend_by_rolling_history,
 )
@@ -88,6 +89,12 @@ class RunnerMixin:
             key: label for key, label in HISTORY_PERIOD_DEFS}
         selected_text = "、".join(
             period_labels[key] for key in selected_lookbacks)
+        # 中止标志必须在 _begin_job **之前**换新：_begin_job 内部会调
+        # _sync_history_button_state，那一刻若 self._history_cancel_event 还挂着
+        # 上一轮已 set() 的 Event，按钮会被判成"正在中止"而写成禁用态——本轮
+        # 之后不再有 sync，于是整轮都停不掉。上面的 _active_job 检查保证此刻
+        # 没有任务在跑，换掉它不会误伤。
+        self._history_cancel_event = threading.Event()
         if not self._begin_job(
                 "history",
                 f"正在使用真实历史行情执行批量优选（{selected_text}）…"):
@@ -101,6 +108,21 @@ class RunnerMixin:
             target=self._history_recommendation_worker,
             args=(history_state,), daemon=True,
         ).start()
+        return True
+
+    def _cancel_history_recommendation(self):
+        """请求中止正在跑的策略优选。只置标志，收尾仍由 worker 走完。"""
+        event = getattr(self, "_history_cancel_event", None)
+        if event is None or event.is_set():
+            return False
+        event.set()
+        self._set_status("正在中止策略优选…  |  会在当前候选跑完后停下")
+        button = getattr(self, "_history_btn", None)
+        if button is not None:
+            try:
+                button.configure(state="disabled")
+            except Exception:                          # noqa: BLE001
+                pass
         return True
 
     @staticmethod
@@ -429,6 +451,8 @@ class RunnerMixin:
                         lookbacks=history_lookbacks,
                         objective=objective,
                         progress_callback=progress_cb,
+                        cancel_event=getattr(
+                            self, "_history_cancel_event", None),
                     )
                 )
             else:
@@ -447,6 +471,8 @@ class RunnerMixin:
                         steps_per_day=base_bt.steps_per_day,
                         objective=objective,
                         progress_callback=progress_cb,
+                        cancel_event=getattr(
+                            self, "_history_cancel_event", None),
                     )
                 )
             history_selection.validate_payload(
@@ -464,6 +490,10 @@ class RunnerMixin:
                     recommendations, ranking, notes, window_results,
                     source_label, gs),
             )
+        except SelectionCancelled:
+            # 用户按了停止：不是错误，不弹框，也不写成失败。
+            self.after(0, RunnerMixin._cancelled_history_recommendation.__get__(
+                self, type(self)))
         except Exception:
             import traceback
             err_msg = traceback.format_exc()
@@ -494,6 +524,14 @@ class RunnerMixin:
             messagebox.showerror("历史择优展示失败", err_msg)
         finally:
             self._finish_history_recommendation(success)
+
+    def _cancelled_history_recommendation(self):
+        """用户中止后的收尾：走同一条 _finish_job，只是文案不同。"""
+        self._finish_job(
+            "history", success=False,
+            success_text="",
+            failure_text="策略优选已中止  |  未产生结果，可改参数后重跑",
+        )
 
     def _fail_history_recommendation(self, message):
         messagebox.showerror("历史择优失败", message)
