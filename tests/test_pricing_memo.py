@@ -916,32 +916,32 @@ def test_decumulator_discount_factor_broadcasts(subtype):
 # 动到任何一个已经能算出来的价格。EP / EF 的看跌组合不在表里——它们
 # 改动前直接抛广播错误，根本没有"原值"可对。
 _DE_GOLDEN = {
-    "Opt_ASGQ_DFF|-1|0|0": 29.961143897874987,
+    "Opt_ASGQ_DFF|-1|0|0": 29.996296524910573,
     "Opt_ASGQ_DFF|-1|5|5": 37.5,
-    "Opt_ASGQ_DFF|1|0|0": 39.27622646414116,
-    "Opt_ASGQ_DFF|1|5|5": 49.27622646414113,
-    "Opt_ASGQ_DF|-1|0|0": 29.961143897874987,
+    "Opt_ASGQ_DFF|1|0|0": 39.276396706790784,
+    "Opt_ASGQ_DFF|1|5|5": 49.276396706790756,
+    "Opt_ASGQ_DF|-1|0|0": 29.996296524910573,
     "Opt_ASGQ_DF|-1|5|5": 37.5,
-    "Opt_ASGQ_DF|1|0|0": 194.0961383570785,
-    "Opt_ASGQ_DF|1|5|5": 249.0961383570785,
+    "Opt_ASGQ_DF|1|0|0": 194.09630859972813,
+    "Opt_ASGQ_DF|1|5|5": 249.09630859972813,
     "Opt_ASGQ_DP|-1|0|0": -99.9903979595688,
     "Opt_ASGQ_DP|-1|5|5": -125.0,
     "Opt_ASGQ_DP|1|0|0": 198.20825019793935,
     "Opt_ASGQ_DP|1|5|5": 253.20825019793935,
-    "Opt_ASGQ_EFF|-1|0|0": 29.961143897874987,
+    "Opt_ASGQ_EFF|-1|0|0": 29.996296524910573,
     "Opt_ASGQ_EFF|-1|5|5": 37.5,
-    "Opt_ASGQ_EFF|1|0|0": 38.874744419737056,
-    "Opt_ASGQ_EFF|1|5|5": 48.73781075410039,
+    "Opt_ASGQ_EFF|1|0|0": 38.874914662386686,
+    "Opt_ASGQ_EFF|1|5|5": 48.73798099675001,
     "Opt_ASGQ_EF|-1|5|5": 37.5,
-    "Opt_ASGQ_EF|1|0|0": 193.6946563126744,
-    "Opt_ASGQ_EF|1|5|5": 248.55772264703774,
+    "Opt_ASGQ_EF|1|0|0": 193.69482655532406,
+    "Opt_ASGQ_EF|1|5|5": 248.5578928896874,
     "Opt_ASGQ_EP|-1|5|5": -125.0,
     "Opt_ASGQ_EP|1|0|0": 197.80676815353524,
     "Opt_ASGQ_EP|1|5|5": 252.66983448789856,
     "Opt_ASGQ_call_put|-1|0|0": -99.9903979595688,
     "Opt_ASGQ_call_put|-1|5|5": -125.0,
-    "Opt_ASGQ_call_put|1|0|0": 197.9351066908258,
-    "Opt_ASGQ_call_put|1|5|5": 247.83880259028248,
+    "Opt_ASGQ_call_put|1|0|0": 197.72752246535975,
+    "Opt_ASGQ_call_put|1|5|5": 247.52191628001697,
     "Opt_Decumulator_Back|-1|0|0": -399.8348821130444,
     "Opt_Decumulator_Back|-1|5|5": -509.8348821130444,
     "Opt_Decumulator_Back|1|0|0": 195.38495290788086,
@@ -1363,7 +1363,12 @@ def test_direction_change_mirrors_untouched_defaults(
 #  12. 熔断当天直接结算
 # --------------------------------------------------------------------------
 
-_KO_SETTLED_SUBTYPES = ("Opt_ASGQ_EP", "Opt_ASGQ_DP", "Opt_ASGQ_call_put")
+# 七个熔断结构全在内。此前这张表只列了三个「熔断后结算依赖价格」的，
+# 另外四个被判为"付常数 amount，不受影响"——那只说对了**金额**，没说**结算日**，
+# 于是它们的熔断腿一直逐日铺开贴现，与早退分支矛盾了整整一轮。
+_KO_SETTLED_SUBTYPES = ("Opt_ASGQ_EP", "Opt_ASGQ_DP", "Opt_ASGQ_call_put",
+                        "Opt_ASGQ_EF", "Opt_ASGQ_DF",
+                        "Opt_ASGQ_EFF", "Opt_ASGQ_DFF")
 
 
 @pytest.mark.parametrize("subtype", _KO_SETTLED_SUBTYPES)
@@ -1408,7 +1413,8 @@ def test_knockout_settlement_is_split_invariant(subtype, cp):
                 subtype, float(path[total - simulated - 1]),
                 list(path[:total - simulated]),
                 K, total - simulated, simulated, list(range(1, total + 1)),
-                0.18, H, 2, cp, nPath=4, r=0.0, q=0.0, P=P)
+                0.18, H, 2, cp, nPath=4, r=0.0, q=0.0,
+                P=P, amount=3.0, fix=2.0)
             prices.append(round(float(option.get_price()), 9))
     finally:
         de_mod.McGbmQ = real_mc
@@ -1418,11 +1424,21 @@ def test_knockout_settlement_is_split_invariant(subtype, cp):
         f"{sorted(set(prices))}")
 
 
+# 熔断后按「熔断日价格 − 保障价格」结算的（金额依赖价格）
+_KO_PRICE_LINKED = ("Opt_ASGQ_EP", "Opt_ASGQ_DP", "Opt_ASGQ_call_put")
+# 熔断后按常数「熔断赔付」结算的（金额与价格无关）
+_KO_FIXED_AMOUNT = ("Opt_ASGQ_EF", "Opt_ASGQ_DF",
+                    "Opt_ASGQ_EFF", "Opt_ASGQ_DFF")
+
+
 @pytest.mark.parametrize("subtype", _KO_SETTLED_SUBTYPES)
 def test_knockout_amount_is_frozen_at_the_barrier_day(subtype):
     """熔断后的每日收益是常数，与熔断之后标的怎么走无关。
 
-    只改熔断日之后的价格，价格不能变；改熔断日**当天**的价格，价格必须变。
+    改熔断日**之后**的价格，定价一律不能变。改熔断日**当天**的价格：
+    保障价族（金额 = 熔断日价格 − 保障价）必须变；
+    熔断赔付族（金额是常数 amount）必须不变——两族的断言方向相反，
+    合起来才说明"冻结"这件事真的落到了正确的量上。
     """
     de_mod = sys.modules["pricing.Option_DE"]
     K, H, P = 95.0, 105.0, 100.0
@@ -1436,7 +1452,8 @@ def test_knockout_amount_is_frozen_at_the_barrier_day(subtype):
             return float(de_mod.Option_DE(
                 subtype, float(path[0]), [], K, 0, len(path),
                 list(range(1, len(path) + 1)), 0.18, H, 2, 1,
-                nPath=4, r=0.0, q=0.0, P=P).get_price())
+                nPath=4, r=0.0, q=0.0,
+                P=P, amount=3.0, fix=2.0).get_price())
         finally:
             de_mod.McGbmQ = real_mc
 
@@ -1445,4 +1462,296 @@ def test_knockout_amount_is_frozen_at_the_barrier_day(subtype):
     on_day = base.copy(); on_day[2] = 120.                # 动熔断当天
 
     assert _price(base) == _price(after), "熔断之后的走势竟然影响了价格"
-    assert _price(base) != _price(on_day), "熔断当天的价格没有进入结算"
+    if subtype in _KO_PRICE_LINKED:
+        assert _price(base) != _price(on_day), "熔断当天的价格没有进入结算"
+    else:
+        assert _price(base) == _price(on_day), (
+            "熔断赔付是常数，不该受熔断当天价格影响")
+
+
+@pytest.mark.parametrize("subtype", _KO_SETTLED_SUBTYPES)
+@pytest.mark.parametrize("r", [0.03, 0.05])
+def test_knockout_leg_discounts_from_the_barrier_day(subtype, r):
+    """r>0 下的**精确**不变量，比 r=0 的切分不变量强得多。
+
+    取同一条确定性路径，比较「熔断日是模拟段第一天」与「熔断日已进 sr」
+    两种摆法。两者的已实现现金流完全相同（``observ <= T_over`` 的贴现因子
+    恒为 1），所以价差**必须恰好**等于熔断腿隔一天的贴现：
+
+        逐日结算族   V(j+1) − V(j) = 熔断腿名义 × (1 − e^(−r·dt))
+        到期一次结算 V(j+1)        = V(j) × e^(r·dt)
+
+    r=0 时两边都是 0，所以那条测试对"贴现口径漏改"结构性失明——
+    ``EF``/``DF``/``EFF``/``DFF`` 就是这么漏过去的。这条不留那个口子。
+    """
+    de_mod = sys.modules["pricing.Option_DE"]
+    path = np.array([100., 101., 103., 106., 112., 108.,
+                     104., 102., 99., 97., 95., 93.])
+    le, ko_at = len(path), 4                  # 第 4 天穿越 H=110
+    K, H, P, amount, fix, N = 100.0, 110.0, 104.0, 3.0, 2.0, 3
+    real_mc = de_mod.McGbmQ
+
+    def _price(elapsed):
+        def _fixed(_s0, _r, _sigma, _T, n_path, n_step, seed=20):
+            return np.tile(path[le - n_step:], (n_path, 1))
+        de_mod.McGbmQ = _fixed
+        try:
+            return float(de_mod.Option_DE(
+                subtype, float(path[elapsed - 1]), list(path[:elapsed]),
+                K, elapsed, le - elapsed, list(range(1, le + 1)),
+                0.20, H, N, 1, r=r, q=0.0, nPath=4,
+                P=P, amount=amount, fix=fix).get_price())
+        finally:
+            de_mod.McGbmQ = real_mc
+
+    before, after = _price(ko_at), _price(ko_at + 1)
+    one_day = 1.0 - np.exp(-r / 243.0)
+    n_ko = le - ko_at
+    if subtype == "Opt_ASGQ_call_put":
+        expected = before * (np.exp(r / 243.0) - 1.0)
+    elif subtype in ("Opt_ASGQ_EP", "Opt_ASGQ_DP"):
+        expected = (path[ko_at] - P) * n_ko * one_day
+    else:
+        expected = amount * n_ko * one_day
+
+    assert after - before == pytest.approx(expected, abs=1e-9), (
+        f"熔断腿的贴现日不对：实际差 {after - before:.9f}，"
+        f"应有 {expected:.9f}")
+
+
+def test_cache_key_tracks_the_pricer_version():
+    """定价口径一改，旧缓存必须失效。
+
+    key material 的其余各项刻画的都是**输入**（期权属性、行情切片、策略、
+    回测参数），没有一项能察觉「定价代码换了口径」。熔断结算口径改过之后，
+    盘上的逐 bar 缓存全是旧口径算的，而 ``_digest_object`` 对新旧两版
+    Option_DE 算出的摘要**完全相同**——不加这个版本号，旧结果会被当成有效
+    命中原样读回，不报错也不告警。
+    """
+    import history_bar_cache as cache
+
+    assert isinstance(cache.PRICER_VERSION, int)
+    assert cache.PRICER_VERSION >= 2, "口径改过就要 +1"
+
+    import inspect
+    source = inspect.getsource(cache.key_for)
+    assert "PRICER_VERSION" in source, "版本号没有进 key material"
+
+
+@pytest.mark.parametrize("subtype", _KO_SETTLED_SUBTYPES)
+@pytest.mark.parametrize("r", [0.03, 0.05])
+def test_no_artificial_jump_across_the_barrier(subtype, r):
+    """标的擦着障碍过去与恰好触碰，价差只能是**真实经济差**。
+
+    熔断的只有末日那一天，所以两种情形的差别就该只是那一天收什么：
+    保障价族收 (S−P) 而非 (S−K)、熔断赔付族收 amount 而非当日累计。
+
+    此前 ``call_put`` 在这里凭空跳 1.49%：熔断腿改成「熔断日一次结算」之后，
+    未熔断腿仍留在「逐日结算」，于是跨越障碍的一瞬间**全部 le 天**的折现
+    口径一起翻面，多出 (S_T−K)·(Σdf_j − le·df_T)。现在两侧统一按到期一次
+    折现（期权按保证金逐日盯市估值，但现金流当作到期一次结清）。
+
+    这一项在 r=0 时恒为 0，所以必须在 r>0 下测。
+    """
+    de_mod = sys.modules["pricing.Option_DE"]
+    le, K, H, P, amount, fix, N = 243, 95.0, 110.0, 105.0, 3.0, 2.0, 3
+    real_mc = de_mod.McGbmQ
+
+    def _price(terminal):
+        path = np.full(le, 100.0)
+        path[-1] = terminal
+
+        def _fixed(_s0, _r, _sigma, _T, n_path, n_step, seed=20):
+            return np.tile(path[le - n_step:], (n_path, 1))
+
+        de_mod.McGbmQ = _fixed
+        try:
+            return float(de_mod.Option_DE(
+                subtype, 100.0, [], K, 0, le, list(range(1, le + 1)),
+                0.20, H, N, 1, r=r, q=0.0, nPath=4,
+                P=P, amount=amount, fix=fix).get_price())
+        finally:
+            de_mod.McGbmQ = real_mc
+
+    df_expiry = np.exp(-r * le / 243.0)
+    if subtype in _KO_PRICE_LINKED:
+        economic = (K - P) * df_expiry            # (S−P) 取代 (S−K)
+    elif subtype in ("Opt_ASGQ_EF", "Opt_ASGQ_DF"):
+        economic = (amount - (H - K)) * df_expiry  # amount 取代 (S−K)
+    else:
+        economic = (amount - fix) * df_expiry      # amount 取代区间赔付 fix
+
+    jump = _price(H) - _price(H - 1e-9)
+    assert jump == pytest.approx(economic, abs=1e-5), (
+        f"障碍处有人造跳变 {jump - economic:+.6f}"
+        f"（实际 {jump:+.6f}，应有 {economic:+.6f}）")
+
+
+# --------------------------------------------------------------------------
+#  13. 已过天数 × 已实现序列
+# --------------------------------------------------------------------------
+
+def test_realized_series_field_is_paired_with_elapsed_days():
+    """「已过天数」必须有配对的「已实现序列」输入，否则它是条死路。
+
+    此前建构闭包把已实现序列硬编码成空，而「已过天数」是可编辑字段：
+    一填非 0 就必崩（13 个子类型无一幸免），界面上又无处补那几天的收盘价。
+    """
+    from deltalab_ui.constants import OPTION_CLASSES
+
+    params = OPTION_CLASSES["累计期权 (Decumulator)"]["params"]
+    names = [spec[0] for spec in params]
+    assert "sr" in names, "缺少已实现序列字段"
+    assert names.index("sr") == names.index("T_over") + 1, (
+        "已实现序列应当紧跟在已过天数后面")
+    sr_spec = next(s for s in params if s[0] == "sr")
+    assert sr_spec[2] is list and sr_spec[3] == "", "默认应当是空序列"
+
+
+@pytest.mark.parametrize("raw,expected", [
+    (None, []),
+    ("", []),
+    ("   ", []),
+    ("100", [100.0]),
+    ("100,101.5", [100.0, 101.5]),
+    ("100 101.5", [100.0, 101.5]),
+    ("100，101.5", [100.0, 101.5]),      # 中文逗号
+    ("100;101.5", [100.0, 101.5]),
+    ([100.0, 101.5], [100.0, 101.5]),   # 快照重放直接传列表
+    ((100.0, 101.5), [100.0, 101.5]),
+])
+def test_realized_series_parsing(raw, expected):
+    from deltalab_ui.constants import _parse_number_sequence
+
+    assert _parse_number_sequence(raw, "已实现序列") == expected
+
+
+def test_realized_series_parsing_accepts_ndarray():
+    from deltalab_ui.constants import _parse_number_sequence
+
+    assert _parse_number_sequence(
+        np.array([100.0, 101.5]), "已实现序列") == [100.0, 101.5]
+
+
+@pytest.mark.parametrize("bad", ["abc", "100,abc", "100,-5", "100,0", "100,nan"])
+def test_realized_series_rejects_bad_input(bad):
+    from deltalab_ui.constants import _parse_number_sequence
+
+    with pytest.raises(ValueError):
+        _parse_number_sequence(bad, "已实现序列")
+
+
+@pytest.mark.parametrize("subtype", _DE_SUBTYPES)
+def test_elapsed_days_with_realized_series_prices(subtype):
+    """填齐两项之后，13 个子类型都要能定价。"""
+    from deltalab_ui.constants import OPTION_CLASSES
+
+    cfg = OPTION_CLASSES["累计期权 (Decumulator)"]
+    params = {name: default
+              for name, _label, _dtype, default, *_ in cfg["params"]}
+    params.update(s0=100.0, T_over=3, sr="100,101,99.5",
+                  fix=2.0, P=95.0, amount=1.5)
+    option = cfg["build"](subtype, params)
+    option.nPath = 400
+    assert np.isfinite(option.get_price())
+
+
+def test_elapsed_days_default_is_unchanged():
+    """默认 0 / 空时行为与从前完全一致——这是不回归的底线。"""
+    from deltalab_ui.constants import OPTION_CLASSES
+
+    cfg = OPTION_CLASSES["累计期权 (Decumulator)"]
+    params = {name: default
+              for name, _label, _dtype, default, *_ in cfg["params"]}
+    params["s0"] = 100.0
+    option = cfg["build"]("Opt_Decumulator", params)
+    assert option.sr == []
+    assert option.T_over == 0
+    assert len(option.observ) == option.T_days
+
+
+def test_mismatched_realized_series_names_both_fields():
+    from deltalab_ui.constants import OPTION_CLASSES
+
+    cfg = OPTION_CLASSES["累计期权 (Decumulator)"]
+    params = {name: default
+              for name, _label, _dtype, default, *_ in cfg["params"]}
+    params.update(s0=100.0, T_over=3, sr="100,101")
+    with pytest.raises(ValueError, match="必须等于已过天数"):
+        cfg["build"]("Opt_Decumulator", params)
+
+
+# --------------------------------------------------------------------------
+#  14. 构造期的 **kwargs 不再静默吞参数
+# --------------------------------------------------------------------------
+
+def _all_option_factories():
+    """五个大类各一个可调用的构造器，只差 **kwargs。"""
+    from pricing.Option_AS import Option_AS
+    from pricing.Option_SNB import Option_SNB
+    from pricing.Option_Vanilla import Option_Vanilla
+
+    return {
+        "Option_AB": lambda **k: Option_AB(
+            "Opt_Airbag", 100.0, [], 100.0, 90.0, 20, list(range(1, 21)),
+            0.20, 0.8, 1.0, 1, nPath=400, **k),
+        "Option_AS": lambda **k: Option_AS(
+            "Asian", 100.0, [], 100.0, 100.0, 22, 22, 0.15, 1,
+            0.0, 999999.0, nPath=400, **k),
+        "Option_DE": lambda **k: Option_DE(
+            "Opt_Decumulator", 100.0, [], 90.0, 0, 20, list(range(1, 21)),
+            0.18, 110.0, 2, 1, nPath=400, **k),
+        "Option_SNB": lambda **k: Option_SNB(
+            "Opt_Snowball", 100.0, 100.0, 100.0, 80.0, 103.0, 40,
+            0.18, 0.15, 0.15, 0.2, 1, -1, sr=[], ko_observ=[20, 40],
+            nPath=400, margin_call=False, **k),
+        "Option_Vanilla": lambda **k: Option_Vanilla(
+            "Eu", 100.0, [], 100.0, 20, 0.20, 1, **k),
+    }
+
+
+@pytest.mark.parametrize("name", sorted(_all_option_factories()))
+def test_mc_seed_can_be_set_at_construction(name):
+    """``mc_seed=`` 必须真的生效。
+
+    它是 OptionBase 的**类属性**、不是各子类 __init__ 的形参，此前会掉进
+    ``**kwargs`` 里被静默吞掉——不报错也不生效，所有实例继续共用同一批随机
+    数。写"不同 seed 跑多次取标准差"的脚本最容易在这里翻车：标准差恒为 0，
+    看着像是定价稳得离谱。
+    """
+    make = _all_option_factories()[name]
+    first, second = make(mc_seed=1), make(mc_seed=2)
+    assert (first.mc_seed, second.mc_seed) == (1, 2)
+    if name == "Option_Vanilla":
+        pytest.skip("解析定价，与随机数无关")
+    assert first.get_price() != second.get_price(), (
+        "换了 mc_seed 价格却一模一样——种子没有落到实例上")
+
+
+@pytest.mark.parametrize("name", sorted(_all_option_factories()))
+def test_greeks_npath_can_be_set_at_construction(name):
+    make = _all_option_factories()[name]
+    assert make(greeks_nPath=100).greeks_nPath == 100
+
+
+@pytest.mark.parametrize("name", sorted(_all_option_factories()))
+def test_unknown_keyword_is_rejected(name):
+    """拼错的参数名要报错，而不是被 ``**kwargs`` 悄悄丢掉。"""
+    make = _all_option_factories()[name]
+    with pytest.raises(TypeError, match="无法识别的参数"):
+        make(mc_sed=7)          # 少一个 e
+    with pytest.raises(TypeError, match="typo_param"):
+        make(typo_param=1)
+
+
+def test_run_multi_still_varies_seed_per_path():
+    """run_multi 的 per-path seed 是构造后赋属性，不受这次改动影响。"""
+    prices = _path(n=12, seed=3)
+    paths = np.tile(prices, (6, 1))
+    result = HedgeBacktest(
+        _airbag(npath=600, t_days=12), prices,
+        strategy=CloseToCloseStrategy(),
+    ).run_multi(paths, base_seed=100)
+    errors = result["errors"][np.isfinite(result["errors"])]
+    assert errors.size >= 2
+    assert float(np.std(errors)) > 0, "各路径的 MC 采样没有拉开"

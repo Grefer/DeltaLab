@@ -8,6 +8,7 @@
 ``OPTION_CLASSES`` 几乎被界面每个角落引用，它一旦反向依赖就必然成环。
 """
 
+import numpy as np
 import history_store
 from pricing import Option_AB, Option_AS, Option_DE, Option_SNB, Option_Vanilla
 
@@ -44,6 +45,39 @@ def _build_snowball(st, p):
         r=p["r"], q=p["q"], sr=[], ko_observ=ko_observ, nPath=p["nPath"],
         margin_call=bool(p["margin_call"]),
     )
+
+
+def _parse_number_sequence(raw, label):
+    """把「1, 2.5, 3」这样的输入解析成 float 列表；留空即空列表。
+
+    逗号、空格、中文逗号都当分隔符——用户从行情软件复制出来的价格串
+    什么分隔符都可能有，为此报错没有意义。
+    """
+    if raw is None:
+        return []
+    # 已经是序列就逐项校验，不要先 str() 再拆——那会把 "[100.0, 101.0]"
+    # 拆成 "[100.0" 这种碎片。快照重放与测试都是直接传列表进来的。
+    if isinstance(raw, (list, tuple, np.ndarray)):
+        tokens = [str(item) for item in raw]
+        return _validated_numbers(tokens, label)
+    text = str(raw).replace("，", ",").replace(";", ",")
+    tokens = [t for t in text.replace(",", " ").split() if t]
+    return _validated_numbers(tokens, label)
+
+
+def _validated_numbers(tokens, label):
+    values = []
+    for token in tokens:
+        try:
+            value = float(token)
+        except ValueError:
+            raise ValueError(f"{label} 含无法解析为数值的项: {token!r}") from None
+        if not np.isfinite(value):
+            raise ValueError(f"{label} 含非有限数值: {token!r}")
+        if value <= 0:
+            raise ValueError(f"{label} 的价格必须为正: {token!r}")
+        values.append(value)
+    return values
 
 
 # 方向敏感的价格档位。障碍类结构的触发条件会随 cp 翻转方向——例如累计期权
@@ -109,6 +143,9 @@ OPTION_CLASSES = {
             ("K",      "行权价",        float, 90.0),
             ("T_days", "剩余期限(交易日)", int, 20),
             ("T_over", "已过天数",       int,   0),
+            # 与「已过天数」配对：这几天的收盘价。两者必须等长——已实现的天数
+            # 决定了模拟段从哪一天接上。默认都是 0 / 空，此时行为与从前完全一致。
+            ("sr",     "已实现序列(逗号分隔)", list,  ""),
             ("sigma",  "波动率",        float, 0.18),
             ("H",      "障碍价格",       float, 110.0),
             ("N",      "杠杆倍数",       int,   2),
@@ -121,7 +158,8 @@ OPTION_CLASSES = {
             ("nPath",  "定价路径数 (MC)", int,   100000),
         ],
         "build": lambda st, p: Option_DE(
-            st, p["s0"], [], p["K"], p["T_over"], p["T_days"],
+            st, p["s0"], _parse_number_sequence(p["sr"], "已实现序列"),
+            p["K"], p["T_over"], p["T_days"],
             list(range(1, p["T_days"] + p["T_over"] + 1)),
             p["sigma"], p["H"], p["N"], p["cp"],
             r=p["r"], q=p["q"], nPath=p["nPath"],

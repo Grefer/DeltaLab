@@ -160,6 +160,7 @@ class Option_SNB(OptionBase):
         self.datenow = datenow
         self.nPath = nPath
         self.trading_calendar = trading_calendar
+        self._apply_extra_options(kwargs)
 
     @staticmethod
     def _to_bool(value):

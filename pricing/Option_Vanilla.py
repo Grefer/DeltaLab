@@ -39,6 +39,7 @@ class Option_Vanilla(OptionBase):
         self.r = r
         self.q = q
         self.exe_mode = exe_mode
+        self._apply_extra_options(kwargs)
 
     def get_price(self):
         # intraday 衰减：T 单位是整数日，bump copy 通过 _intraday_elapsed 在

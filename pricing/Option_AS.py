@@ -50,6 +50,7 @@ class Option_AS(OptionBase):
         self.r = r
         self.q = q
         self.nPath = nPath
+        self._apply_extra_options(kwargs)
 
     def _payoff_from_observations(self, observations):
         obs = np.asarray(observations, dtype=float)

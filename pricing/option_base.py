@@ -215,6 +215,28 @@ class OptionBase:
     # 这里允许外部覆盖为更小值（例如 max(nPath//4, 5000)），以换取性能。
     greeks_nPath = None
 
+    # 可以在构造期覆盖的基类级选项。它们是 OptionBase 的**类属性**，不是各
+    # 子类 __init__ 的形参，所以 ``Option_DE(..., mc_seed=7)`` 会掉进
+    # ``**kwargs`` 里被静默吞掉——不报错、也不生效，所有实例继续共用同一批
+    # 随机数。写"不同 seed 跑多次取标准差"的脚本最容易在这里翻车：标准差
+    # 恒为 0，看着像是定价稳得离谱。
+    _BASE_OVERRIDES = ("mc_seed", "greeks_nPath")
+
+    def _apply_extra_options(self, options):
+        """消化各子类 ``__init__`` 的 ``**kwargs``。
+
+        认识的落到实例上，不认识的报错——这个 ``**kwargs`` 此前从未被读过，
+        纯粹是个静默丢弃口，连参数名拼错都不会有任何提示。用 ``TypeError``
+        是为了与 Python 自己对多余关键字参数的反应一致。
+        """
+        for name in self._BASE_OVERRIDES:
+            if name in options:
+                setattr(self, name, options.pop(name))
+        if options:
+            raise TypeError(
+                f"{type(self).__name__} 收到无法识别的参数: "
+                + "、".join(sorted(options)))
+
     @property
     def _time_remaining(self):
         raise NotImplementedError

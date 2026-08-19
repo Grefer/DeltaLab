@@ -172,6 +172,17 @@ def _digest_path(path):
     return f"{len(values)}|{head}|{tail}|{body}"
 
 
+# 定价口径版本。key material 的其余各项刻画的都是**输入**（期权属性、行情
+# 切片、策略、回测参数），没有一项能察觉「定价代码换了口径」——于是内核一改，
+# 旧缓存会被当成有效命中原样读回，不报错也不告警。
+#
+# 改动定价数值时必须 +1。已发生过的：
+#   1 → 2  熔断当天直接结算：熔断日及之后按「熔断日价格 − 保障价格」恒定结算，
+#          整笔按熔断当日的因子折回 0 时刻（ASGQ 七个熔断结构）；
+#          ASGQ_call_put 的未熔断腿改为到期一次折现，消除障碍处的人造跳变。
+PRICER_VERSION = 2
+
+
 def key_for(spec, strategy_name):
     """把一次重放的全部输入压成一个 key；无法完整刻画时返回 ``None``。
 
@@ -193,6 +204,7 @@ def key_for(spec, strategy_name):
     if kwargs_digest is _GIVE_UP or warmup_digest is _GIVE_UP:
         return None
     material = "\n".join([
+        f"pricer={PRICER_VERSION}",
         option_digest,
         _digest_path(spec.external_path),
         f"eval={int(spec.evaluation_days)}",

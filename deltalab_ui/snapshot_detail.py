@@ -459,9 +459,10 @@ def snapshot_detail_sections(snapshot):
     ``snapshot_strategy_signature``），会给与本条无关的项填 ``None``——
     每日收盘的快照带着 ``fixed_times=None``，Wind 行情的快照带着
     ``csv_path=None``。差异比对需要这些占位，人看的详情不需要，列出来只
-    会让真正有值的那几行更难找。合约参数不会因此漏项：它们全是数值型，
-    取不到值的情况不存在，所以每种期权定义了几项就列几项（香草 7、累计
-    14、亚式 12、气囊 11、雪球 18）。
+    会让真正有值的那几行更难找。**合约参数组豁免这条规则**：详情窗是照着
+    它重建合约的依据，少一项就重建不出来。「已实现序列」留空是合法取值
+    （= 没有已过的日子）而不是缺失，渲染成 ``—`` 也要留在表里。每种期权
+    定义了几项就列几项（香草 7、累计 15、亚式 12、气囊 11、雪球 18）。
 
     标签、取值回译和**行序**都按这条快照自己的期权大类取：``param_labels``
     把该大类的参数排在最前，于是详情里的参数顺序就是左侧表单里的定义顺序。
@@ -492,7 +493,11 @@ def snapshot_detail_sections(snapshot):
                 override(snapshot, value) if override
                 else format_detail_value(
                     field, value, cls_name))
-            if shown == "—":
+            # 合约参数一项都不能少：详情窗是照着它重建合约的依据，
+            # 「已实现序列」留空是合法取值（= 没有已过的日子），不是缺失。
+            # 略过空值这条规则是为签名占位（fixed_times=None 之类）设的，
+            # 不该把真实的期权参数一起吞掉。
+            if shown == "—" and aspect != "contract":
                 continue
             rows.append((
                 order.index(field) if field in order else len(order),

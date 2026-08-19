@@ -36,6 +36,7 @@ from pricing.hedge_backtest import _infer_intraday_steps, _validate_fixed_time_d
 from deltalab_ui import wind_resolve
 from deltalab_ui.constants import (
     DIRECTIONAL_LEVELS,
+    _parse_number_sequence,
     OPTION_CLASSES,
     SIGMA_SOURCE_FROM_DISPLAY,
     STRATEGY_DISPLAY,
@@ -564,6 +565,11 @@ class FormPanelMixin:
         param_labels = {spec[0]: spec[1] for spec in cfg["params"]}
         for key, (var, dtype, choices) in self._param_entries.items():
             val_str = var.get().strip()
+            if dtype is list:
+                # 序列型字段（已实现序列）：留空是常态，表示还没有已实现的日子。
+                params[key] = _parse_number_sequence(
+                    val_str, param_labels.get(key, key))
+                continue
             if not val_str:
                 raise ValueError(f"{param_labels.get(key, key)} 不能为空。")
             if choices and val_str in choices:

@@ -51,6 +51,7 @@ class Option_AB(OptionBase):
         self.r = r
         self.q = q
         self.nPath = nPath
+        self._apply_extra_options(kwargs)
 
     def get_price(self):
 

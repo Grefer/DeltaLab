@@ -71,6 +71,7 @@ class Option_DE(OptionBase):
         self.fix = fix
         self.P = P
         self.amount = amount
+        self._apply_extra_options(kwargs)
         self._validate_required_params()
         self._validate_dimensions()
 
@@ -143,31 +144,23 @@ class Option_DE(OptionBase):
         应当用熔断当日的贴现因子折回 0 时刻，而不是各天用各天的因子。
         早退分支不贴现是对的——那种情形下熔断确实发生在今天。
 
+        此前 MC 分支不是这么算的：``EP``/``DP`` 用的是**当天**价格、
+        ``call_put`` 用的是**到期**价格，而 ``EF``/``DF``/``EFF``/``DFF``
+        虽然金额是常数，却把它逐日铺开贴现——四种写法都与早退分支（熔断已经
+        发生在真实历史里的情形）矛盾。同一条路径，只把熔断日从模拟段挪进
+        已实现段，价格就会跳；而对冲回测每天都在往已实现段追加收盘价，标的
+        一穿越障碍，当天估值就从一条路径跳到另一条。
+
         整段保持向量化：``np.argmax`` 一次取出所有路径的首个触发列，
-        再用花式索引取价格与因子，不需要按路径循环。
+        再用花式索引取价格与因子，不需要按路径循环。整行都没触发时
+        ``argmax`` 返回 0，但那一行的 ``condition_ko`` 全为 False、
+        ``n_ko`` 为 0，取到的值不会进入结果。
+
+        前置条件：``discount_factor`` 必须是一维的（长度 = 观察日数）。
         """
         idx = np.argmax(breached, axis=1)
         rows = np.arange(ss.shape[0])
         return ss[rows, idx][:, None], discount_factor[idx][:, None]
-
-    @staticmethod
-    def _knockout_price(ss, breached):
-        """按路径取出熔断当日的价格，广播成一列。
-
-        实务口径：**熔断当天直接结算**——熔断日及之后每天的收益都等于
-        「熔断日价格 − 保障价格」这个常数，期权随即终止。
-
-        此前 MC 分支不是这么算的：``EP``/``DP`` 用的是**当天**价格，
-        ``call_put`` 用的是**到期**价格，两者都与早退分支（熔断已经发生在
-        真实历史里的情形）互相矛盾。同一条路径，只把熔断日从模拟段挪进
-        已实现段，价格能差十倍——而对冲回测每天都在往已实现段追加收盘价，
-        标的一穿越障碍，当天估值就从一条路径跳到另一条。
-
-        ``np.argmax`` 取首个 True；整行都没触发时返回 0，但那一行的
-        ``condition_ko`` 全为 False，取到的值不会进入结果。
-        """
-        idx = np.argmax(breached, axis=1)
-        return ss[np.arange(ss.shape[0]), idx][:, None]
 
     # 定价整合函数
     def get_price(self):
@@ -572,9 +565,15 @@ class Option_DE(OptionBase):
                 # (S_ko-K)*idx + (S_ko-P)*(le-idx) 完全同形）。
                 ko_total = ((s_term - self.K) * (le - n_ko)
                             + (s_term - self.P) * n_ko) * df_ko
+                # 本结构是**到期日一次结算**：期权按保证金逐日盯市估值，
+                # 但现金流当作到期一次结清处理，所以整条腿按到期因子折现，
+                # 而不是各天用各天的。逐日折会让跨越障碍的那一瞬间凭空跳一下
+                # ——熔断的只有一天，换掉折现口径的却是全部 le 天。
+                # 杠杆腿本来就只落在最后一列，改成标量后逐位不变。
                 cashflow = ((s_term - self.K) * ~condition_ko
                             + (ss[:, -1] - self.K).reshape(self.nPath, 1) * le * (
-                                    flag_N * self.N + ~flag_N * 1 - 1)) * discount_factor
+                                    flag_N * self.N + ~flag_N * 1 - 1)
+                            ) * discount_factor[-1]
             else:
                 breached = ss <= self.H
                 condition_ko[np.cumsum(breached, axis=1) > 0] = 1
@@ -584,9 +583,15 @@ class Option_DE(OptionBase):
                 flag_N[(ss[:, -1] >= self.K) & (np.all(condition_ko == 0, axis=1)), -1] = 1
                 ko_total = ((self.K - s_term) * (le - n_ko)
                             + (self.P - s_term) * n_ko) * df_ko
+                # 本结构是**到期日一次结算**：期权按保证金逐日盯市估值，
+                # 但现金流当作到期一次结清处理，所以整条腿按到期因子折现，
+                # 而不是各天用各天的。逐日折会让跨越障碍的那一瞬间凭空跳一下
+                # ——熔断的只有一天，换掉折现口径的却是全部 le 天。
+                # 杠杆腿本来就只落在最后一列，改成标量后逐位不变。
                 cashflow = ((self.K - s_term) * ~condition_ko
                             + (self.K - ss[:, -1]).reshape(self.nPath, 1) * le * (
-                                    flag_N * self.N + ~flag_N * 1 - 1)) * discount_factor
+                                    flag_N * self.N + ~flag_N * 1 - 1)
+                            ) * discount_factor[-1]
 
             price_ls = np.where(condition_ko[:, -1],
                                 ko_total[:, 0], np.sum(cashflow, 1))
@@ -715,18 +720,32 @@ class Option_DE(OptionBase):
                 # 对逻辑值累加以实现找到第一个满足条件的值后，之后的条件全为True
                 # 现实意义：对于路径依赖的熔断累计期权，熔断日及之后都采用保障价格结算
                 condition_ko[np.cumsum(ss >= self.H, axis=1) > 0] = 1
+                _, df_ko = self._knockout_state(
+                    ss, ss >= self.H, discount_factor)
+                n_ko = condition_ko.sum(axis=1, keepdims=True)
+                # 熔断腿：整笔在熔断当日结算，按当日因子折回 0 时刻。
+                # 金额是常数 amount，与熔断后价格无关，但**结算日**同样要对齐——
+                # 早退分支写的是 amount*(le-idx) 且不贴现（钱当天就到手）。
+                ko_leg = self.amount * n_ko * df_ko
                 flag_N[(ss[:, -1] <= self.K) & (np.all(condition_ko == 0, axis=1)), -1] = 1
-                cashflow = ((self.amount * condition_ko + (ss - self.K) * ~condition_ko) +
+                cashflow = (((ss - self.K) * ~condition_ko) +
                             (ss[:, -1] - self.K).reshape(self.nPath, 1) * le * (
                                     flag_N * self.N + ~flag_N * 1 - 1)) * discount_factor
             else:
                 condition_ko[np.cumsum(ss <= self.H, axis=1) > 0] = 1
+                _, df_ko = self._knockout_state(
+                    ss, ss <= self.H, discount_factor)
+                n_ko = condition_ko.sum(axis=1, keepdims=True)
+                # 熔断腿：整笔在熔断当日结算，按当日因子折回 0 时刻。
+                # 金额是常数 amount，与熔断后价格无关，但**结算日**同样要对齐——
+                # 早退分支写的是 amount*(le-idx) 且不贴现（钱当天就到手）。
+                ko_leg = self.amount * n_ko * df_ko
                 flag_N[(ss[:, -1] >= self.K) & (np.all(condition_ko == 0, axis=1)), -1] = 1
-                cashflow = ((self.amount * condition_ko + (self.K - ss) * ~condition_ko) +
+                cashflow = (((self.K - ss) * ~condition_ko) +
                             (self.K - ss[:, -1]).reshape(self.nPath, 1) * le * (
                                     flag_N * self.N + ~flag_N * 1 - 1)) * discount_factor
 
-            price_ls = np.sum(cashflow, 1)
+            price_ls = np.sum(cashflow, 1) + ko_leg[:, 0]
             price = np.mean(price_ls, 0)
 
         return price
@@ -850,16 +869,30 @@ class Option_DE(OptionBase):
                 # 对逻辑值累加以实现找到第一个满足条件的值后，之后的条件全为True
                 # 现实意义：对于路径依赖的熔断累计期权，熔断日及之后都采用保障价格结算
                 condition_ko[np.cumsum(ss >= self.H, axis=1) > 0] = 1
+                _, df_ko = self._knockout_state(
+                    ss, ss >= self.H, discount_factor)
+                n_ko = condition_ko.sum(axis=1, keepdims=True)
+                # 熔断腿：整笔在熔断当日结算，按当日因子折回 0 时刻。
+                # 金额是常数 amount，与熔断后价格无关，但**结算日**同样要对齐——
+                # 早退分支写的是 amount*(le-idx) 且不贴现（钱当天就到手）。
+                ko_leg = self.amount * n_ko * df_ko
                 flag_N[(ss <= self.K) * ~condition_ko] = 1
-                cashflow = ((self.amount * condition_ko + (ss - self.K) * ~condition_ko) * (
+                cashflow = (((ss - self.K) * ~condition_ko) * (
                         flag_N * self.N + ~flag_N * 1)) * discount_factor
             else:
                 condition_ko[np.cumsum(ss <= self.H, axis=1) > 0] = 1
+                _, df_ko = self._knockout_state(
+                    ss, ss <= self.H, discount_factor)
+                n_ko = condition_ko.sum(axis=1, keepdims=True)
+                # 熔断腿：整笔在熔断当日结算，按当日因子折回 0 时刻。
+                # 金额是常数 amount，与熔断后价格无关，但**结算日**同样要对齐——
+                # 早退分支写的是 amount*(le-idx) 且不贴现（钱当天就到手）。
+                ko_leg = self.amount * n_ko * df_ko
                 flag_N[(ss >= self.K) * ~condition_ko] = 1
-                cashflow = ((self.amount * condition_ko + (self.K - ss) * ~condition_ko) * (
+                cashflow = (((self.K - ss) * ~condition_ko) * (
                         flag_N * self.N + ~flag_N * 1)) * discount_factor
 
-            price_ls = np.sum(cashflow, 1)
+            price_ls = np.sum(cashflow, 1) + ko_leg[:, 0]
             price = np.mean(price_ls, 0)
 
         return price
@@ -912,18 +945,28 @@ class Option_DE(OptionBase):
             ss = np.c_[np.tile(sr, (self.nPath, 1)), S]
             if self.cp == 1:
                 condition_ko[np.cumsum(ss >= self.H, axis=1) > 0] = 1
+                _, df_ko = self._knockout_state(
+                    ss, ss >= self.H, discount_factor)
+                n_ko = condition_ko.sum(axis=1, keepdims=True)
+                # 熔断腿：金额是常数 amount，但**结算日**同样要对齐——
+                # 整笔在熔断当日付清，按当日因子折回 0 时刻。
+                ko_leg = self.amount * n_ko * df_ko
                 flag_N = (ss <= self.K) & ~condition_ko
                 cashflow = ((ss - self.K) * flag_N * self.N
-                            + self.fix * ~flag_N * ~condition_ko
-                            + self.amount * condition_ko) * discount_factor
+                            + self.fix * ~flag_N * ~condition_ko) * discount_factor
             else:
                 condition_ko[np.cumsum(ss <= self.H, axis=1) > 0] = 1
+                _, df_ko = self._knockout_state(
+                    ss, ss <= self.H, discount_factor)
+                n_ko = condition_ko.sum(axis=1, keepdims=True)
+                # 熔断腿：金额是常数 amount，但**结算日**同样要对齐——
+                # 整笔在熔断当日付清，按当日因子折回 0 时刻。
+                ko_leg = self.amount * n_ko * df_ko
                 flag_N = (ss >= self.K) & ~condition_ko
                 cashflow = ((self.K - ss) * flag_N * self.N
-                            + self.fix * ~flag_N * ~condition_ko
-                            + self.amount * condition_ko) * discount_factor
+                            + self.fix * ~flag_N * ~condition_ko) * discount_factor
 
-            price_ls = np.sum(cashflow, 1)
+            price_ls = np.sum(cashflow, 1) + ko_leg[:, 0]
             price = np.mean(price_ls, 0)
 
         return price
@@ -982,23 +1025,33 @@ class Option_DE(OptionBase):
             ss = np.c_[np.tile(sr, (self.nPath, 1)), S]
             if self.cp == 1:
                 condition_ko[np.cumsum(ss >= self.H, axis=1) > 0] = 1
+                _, df_ko = self._knockout_state(
+                    ss, ss >= self.H, discount_factor)
+                n_ko = condition_ko.sum(axis=1, keepdims=True)
+                # 熔断腿：金额是常数 amount，但**结算日**同样要对齐——
+                # 整笔在熔断当日付清，按当日因子折回 0 时刻。
+                ko_leg = self.amount * n_ko * df_ko
                 # 未熔断且到期收盘 <= K 的路径，到期日结算杠杆腿
                 flag_N[(ss[:, -1] <= self.K) & (np.all(condition_ko == 0, axis=1)), -1] = 1
                 # 注意：MATLAB 原版杠杆腿误用剩余天数 T_Days（到期分支恒为 0），
                 # 此处按代码注释「累计天数」及同族 Opt_ASGQ_EF/EP 的口径改用 le。
                 cashflow = (self.fix * ((ss > self.K) & (ss < self.H)) * ~condition_ko
                             + (ss - self.K) * (ss <= self.K) * ~condition_ko
-                            + self.amount * condition_ko
                             + (ss[:, -1] - self.K).reshape(self.nPath, 1) * le * (self.N - 1) * flag_N) * discount_factor
             else:
                 condition_ko[np.cumsum(ss <= self.H, axis=1) > 0] = 1
+                _, df_ko = self._knockout_state(
+                    ss, ss <= self.H, discount_factor)
+                n_ko = condition_ko.sum(axis=1, keepdims=True)
+                # 熔断腿：金额是常数 amount，但**结算日**同样要对齐——
+                # 整笔在熔断当日付清，按当日因子折回 0 时刻。
+                ko_leg = self.amount * n_ko * df_ko
                 flag_N[(ss[:, -1] >= self.K) & (np.all(condition_ko == 0, axis=1)), -1] = 1
                 cashflow = (self.fix * ((ss < self.K) & (ss > self.H)) * ~condition_ko
                             + (self.K - ss) * (ss >= self.K) * ~condition_ko
-                            + self.amount * condition_ko
                             + (self.K - ss[:, -1]).reshape(self.nPath, 1) * le * (self.N - 1) * flag_N) * discount_factor
 
-            price_ls = np.sum(cashflow, 1)
+            price_ls = np.sum(cashflow, 1) + ko_leg[:, 0]
             price = np.mean(price_ls, 0)
 
         return price

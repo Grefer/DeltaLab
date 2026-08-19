@@ -5659,7 +5659,8 @@ _HISTORY_RUN_STATE = {
     "cls_name": "累计期权 (Decumulator)",
     "subtype": "Opt_Decumulator_Back",
     "params": {
-        "s0": 100.0, "K": 90.0, "T_days": 20, "T_over": 0, "sigma": 0.18,
+        "s0": 100.0, "K": 90.0, "T_days": 20, "T_over": 0, "sr": "",
+        "sigma": 0.18,
         "H": 110.0, "N": 2, "cp": 1, "fix": 0.0, "P": 0.0, "amount": 0.0,
         "r": 0.03, "q": 0.03, "nPath": 100000,
     },
