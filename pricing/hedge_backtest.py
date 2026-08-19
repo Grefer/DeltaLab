@@ -1425,6 +1425,17 @@ class HedgeBacktest:
         pos = self.position
         warmup_log_returns = self.sigma_warmup_log_returns
         path_log_returns = np.log(S[1:] / S[:-1])
+        # 预热收益 + 全路径收益只拼一次，每根 bar 交给策略的是它的前缀视图。
+        # 原先是每根 bar 现拼一个新数组，长度随 i 线性增长 → 整条回测 O(n²)
+        # 次元素拷贝。消费方（SigmaBandStrategy._sigma_ref）只读：asarray 不
+        # 复制、布尔掩码索引另建新数组，交出视图不会被改写。
+        _warmup_bars = len(warmup_log_returns)
+        full_log_returns = np.concatenate(
+            (warmup_log_returns, path_log_returns))
+        # 交给策略的是这块 buffer 的视图，且各 bar 共享同一块。改动前每根
+        # bar 是独立副本，第三方策略原地写只弄脏自己那份；设成只读，把
+        # "ctx 是只读的"从约定变成强制，免得将来有人写出跨 bar 的污染。
+        full_log_returns.flags.writeable = False
 
         # ---- 敲出提前了结：路径已知时把存续期截断到敲出日 ----
         # 仅当期权实现了 knockout_event 且检测到敲出时生效（默认 None=不截断），
@@ -1500,7 +1511,7 @@ class HedgeBacktest:
             return _round_to_lots(raw), 0.0, 0
 
         # ---- Day 0: 建仓 ----
-        V[0] = option.get_price() or 0.0
+        V[0] = option.priced() or 0.0
         greeks = option.get_greeks()
         delta[0], gamma[0], vega[0], theta[0], rho[0] = greeks
 
@@ -1580,7 +1591,7 @@ class HedgeBacktest:
 
             # 期权价值每根 bar 都要：它进入净值曲线与盈亏分解。
             if time_left >= 0:
-                val = eval_opt.get_price()
+                val = eval_opt.priced()
                 V[i] = val if val is not None else 0.0
             else:
                 V[i] = 0.0
@@ -1607,11 +1618,8 @@ class HedgeBacktest:
                     "next_timestamp": next_timestamp,
                     "sigma_impl": float(option.sigma),
                     # 对数收益历史（到当前 bar 为止），仅 realized σ 时用到
-                    "log_ret_hist": np.concatenate((
-                        warmup_log_returns,
-                        path_log_returns[:i],
-                    )),
-                    "log_ret_warmup_bars": len(warmup_log_returns),
+                    "log_ret_hist": full_log_returns[:_warmup_bars + i],
+                    "log_ret_warmup_bars": _warmup_bars,
                     "strict_realized_sigma": self.strict_sigma_warmup,
                 }
                 # 原策略无论兜底是否开启都只评估一次，确保固定时刻等

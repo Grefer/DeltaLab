@@ -186,7 +186,9 @@ def main() -> None:
     ASSETS.mkdir(parents=True, exist_ok=True)
 
     # PNG: 主图 512, 附加 256 / 128 / 64 作为备用
-    sizes_png = [512, 256, 128, 64]
+    # 32 是 GUI 左上角品牌标的实际尺寸: Tk 的 PhotoImage 只会整数抽样缩小
+    # (最近邻), 从 64 缩到 32 边缘会发毛, 所以按目标尺寸单独渲染一张。
+    sizes_png = [512, 256, 128, 64, 32]
     main_png = ASSETS / "deltalab.png"
     render_icon(512).save(main_png, format="PNG")
     for s in sizes_png[1:]:

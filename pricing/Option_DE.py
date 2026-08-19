@@ -60,6 +60,41 @@ class Option_DE(OptionBase):
         self.fix = fix
         self.P = P
         self.amount = amount
+        self._validate_required_params()
+
+    # 各子类型必需的"可选"参数。缺了会在定价深处炸成
+    # ``TypeError: unsupported operand type(s) for *: 'NoneType' and 'int'``，
+    # 看不出是哪个字段没填——GUI 把这三项的默认值设为 0.0，而 0.0 是 falsy，
+    # 建构闭包的 ``p["fix"] if p["fix"] else None`` 会把它悄悄转成 None，
+    # 于是 13 个子类型里有 10 个开箱即崩。在构造期挡下来并点名字段。
+    _REQUIRED_PARAMS = {
+        "Opt_Decumulator_Fix":   ("fix",),
+        "Opt_Decumulator_Fix_E": ("fix",),
+        "Opt_EnDecumulator_Fix": ("fix",),
+        "Opt_ASGQ_call_put":     ("P",),
+        "Opt_ASGQ_EP":           ("P",),
+        "Opt_ASGQ_DP":           ("P",),
+        "Opt_ASGQ_EF":           ("amount",),
+        "Opt_ASGQ_DF":           ("amount",),
+        "Opt_ASGQ_EFF":          ("amount", "fix"),
+        "Opt_ASGQ_DFF":          ("amount", "fix"),
+    }
+
+    _PARAM_LABELS = {
+        "fix": "固定赔付", "P": "保障价格", "amount": "固定金额",
+    }
+
+    def _validate_required_params(self):
+        missing = [
+            name for name in self._REQUIRED_PARAMS.get(self.optiontype, ())
+            if getattr(self, name) is None
+        ]
+        if missing:
+            fields = "、".join(
+                f"{self._PARAM_LABELS[n]}({n})" for n in missing)
+            raise ValueError(
+                f"结构 {self.optiontype} 必须提供 {fields}；"
+                f"该字段留空或填 0 都会被当作未填写。")
 
     # 定价整合函数
     def get_price(self):

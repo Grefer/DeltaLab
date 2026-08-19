@@ -11,6 +11,7 @@ import numpy as np
 import pandas as pd
 
 from .constants import ANNUAL_DAYS
+from .option_base import price_memo
 from .hedge_backtest import (
     FixedTimeStrategy,
     HedgeBacktest,
@@ -1430,6 +1431,74 @@ def _strict_lookback_segment_lengths(evidence_days, maturity_days):
     return tuple(lengths)
 
 
+class _ProgressReporter:
+    """把 (段 × 候选) 的推进情况报给调用方；``callback`` 为 None 时是空操作。
+
+    计费单元取一次 ``HedgeBacktest.run()``——它是这条链路上唯一的天然原子
+    边界。分母在开跑前就能精确算出（分段长度是纯函数、候选表已构造好），
+    因此不需要估计，也不会出现进度条走到 90% 再回退。
+
+    回调在 worker 线程里被调用，实现方必须自己回投 GUI 线程。单元总数是
+    百量级（一次典型优选约 200 个），不需要节流。
+    """
+
+    __slots__ = ("_callback", "total", "done")
+
+    def __init__(self, callback, total):
+        self._callback = callback
+        self.total = int(total)
+        self.done = 0
+
+    def skip(self, count, label=None):
+        """跳过 ``count​`` 个不会真正跑的单元。
+
+        分母是按"分段计划里的段数 × 候选数"预算的，但有两类段会在进入候选
+        循环**之前**被 continue 掉：entry 自带 error（品种池里历史不足的档
+        会被合成这样一条），以及段终端完整性校验失败。不在这里补记，进度条
+        就永远停在某个百分比上——比没有进度条更糟。
+        """
+        count = int(count)
+        if count <= 0:
+            return
+        self.done += count
+        if self._callback is None:
+            return
+        try:
+            self._callback(self.done, self.total, label, "")
+        except Exception:                              # noqa: BLE001
+            self._callback = None
+
+    def advance(self, label, case_name):
+        """开始处理一个单元。先自增再上报，显示的是"正在跑第 N 个"。"""
+        self.done += 1
+        if self._callback is None:
+            return
+        try:
+            self._callback(self.done, self.total, label, case_name)
+        except Exception:                              # noqa: BLE001
+            # 进度回调只是显示用；它出问题不该把整轮优选带下水。
+            self._callback = None
+
+
+def _rolling_progress_total(windows, maturity_days, n_history_groups, n_cases):
+    """预算严格区间模式的单元总数；纯计数，不跑任何回测。
+
+    与主循环共用 ``_strict_lookback_segment_lengths`` 和同一条证据是否充足
+    的判据（``n_history_groups - days - 1 >= 0``），因此分母与实际会跑的
+    段数恒等——两边任何一边改了规则，另一边必须同步。
+    """
+    total = 0
+    for label, days_value in windows.items():
+        # 与主循环用同一个 _positive_int：非法输入两边一样地炸，
+        # 不能在这里吞掉异常，否则分母会比实际跑的段数少。
+        days = _positive_int(days_value, f"lookbacks[{label!r}]")
+        if n_history_groups - days - 1 < 0:
+            continue          # 证据不足：这一档不会跑任何段
+        total += len(
+            _strict_lookback_segment_lengths(days, maturity_days)) * n_cases
+    return total
+
+
 def _legacy_target_endpoint_value(target_endpoints, label):
     """保留旧参数的可观察值；严格区间模式不会据此抽样。"""
     if target_endpoints is None:
@@ -1463,6 +1532,7 @@ def recommend_by_rolling_history(
     target_endpoints=None,
     steps_per_day=None,
     objective=DEFAULT_SELECTION_OBJECTIVE,
+    progress_callback=None,
 ):
     """在截至最新完整交易日的严格连续 ``L`` 日区间比较策略。
 
@@ -1552,6 +1622,12 @@ def recommend_by_rolling_history(
     ].astype(int)
     n_history_groups = len(group_ids)
     available_scored_days = max(0, n_history_groups - 1)
+
+    progress = _ProgressReporter(
+        progress_callback,
+        _rolling_progress_total(
+            windows, maturity_days, n_history_groups, len(cases)),
+    )
 
     rows = []
     window_results = {}
@@ -1654,102 +1730,109 @@ def recommend_by_rolling_history(
                             "position": batch_position,
                         },
                     }
+                    # 这一段不会进入候选循环；补记单元数，否则进度走不满。
+                    progress.skip(len(cases), label)
                     continue
 
             replay_option = None
             replay_strategies = {}
             replay_warmup = {}
-            for case in cases:
-                case_warmup_days = _realized_sigma_window_days(case.strategy)
-                if case_warmup_days and warmup_error:
-                    case_failures[case.name] += 1
-                    case_failure_reasons[case.name].append(warmup_error)
-                    strategy_types[case.name] = getattr(
-                        case.strategy, "name", "sigma_band")
-                    per_case[case.name] = {
-                        "error": warmup_error,
-                        "strategy_name": strategy_types[case.name],
-                        "position": batch_position,
-                        "history_segment_no": plan["segment_no"],
-                        "history_segment_days": segment_days,
-                    }
-                    continue
+            # 同一段行情上，各候选策略的 bar 级定价完全相同（定价只是
+            # (option, S[0..i], spd) 的纯函数，策略只决定哪些 bar 额外要
+            # Greeks）。作用域内记忆化，数值不变，段结束即释放。
+            with price_memo():
+                for case in cases:
+                    progress.advance(label, case.name)
+                    case_warmup_days = _realized_sigma_window_days(case.strategy)
+                    if case_warmup_days and warmup_error:
+                        case_failures[case.name] += 1
+                        case_failure_reasons[case.name].append(warmup_error)
+                        strategy_types[case.name] = getattr(
+                            case.strategy, "name", "sigma_band")
+                        per_case[case.name] = {
+                            "error": warmup_error,
+                            "strategy_name": strategy_types[case.name],
+                            "position": batch_position,
+                            "history_segment_no": plan["segment_no"],
+                            "history_segment_days": segment_days,
+                        }
+                        continue
 
-                scaled_option, rescale_info = _rescale_option_to_real_s0(
-                    option, float(path.iloc[0]))
-                scaled_strategy = _rescale_strategy_to_real_s0(
-                    case.strategy, rescale_info["ratio"])
-                try:
-                    warmup_kwargs = ({
-                        "sigma_warmup_log_returns": warmup_log_returns,
-                        "strict_sigma_warmup": True,
-                    } if case_warmup_days else {})
-                    result = HedgeBacktest(
-                        scaled_option,
-                        path_source="historical",
-                        external_path=external_path,
-                        evaluation_days=segment_days,
-                        strategy=scaled_strategy,
-                        steps_per_day=spd,
-                        **warmup_kwargs,
-                        **kwargs,
-                    ).run()
-                except ValueError as exc:
-                    if (not isinstance(case.strategy, FixedTimeStrategy)
-                            and not case_warmup_days):
-                        raise
-                    case_failures[case.name] += 1
-                    case_failure_reasons[case.name].append(str(exc))
-                    strategy_types[case.name] = getattr(
-                        case.strategy, "name", "fixed_times")
-                    per_case[case.name] = {
-                        "error": str(exc),
-                        "strategy_name": strategy_types[case.name],
-                        "position": batch_position,
-                        "history_segment_no": plan["segment_no"],
-                        "history_segment_days": segment_days,
-                    }
-                    continue
+                    scaled_option, rescale_info = _rescale_option_to_real_s0(
+                        option, float(path.iloc[0]))
+                    scaled_strategy = _rescale_strategy_to_real_s0(
+                        case.strategy, rescale_info["ratio"])
+                    try:
+                        warmup_kwargs = ({
+                            "sigma_warmup_log_returns": warmup_log_returns,
+                            "strict_sigma_warmup": True,
+                        } if case_warmup_days else {})
+                        result = HedgeBacktest(
+                            scaled_option,
+                            path_source="historical",
+                            external_path=external_path,
+                            evaluation_days=segment_days,
+                            strategy=scaled_strategy,
+                            steps_per_day=spd,
+                            **warmup_kwargs,
+                            **kwargs,
+                        ).run()
+                    except ValueError as exc:
+                        if (not isinstance(case.strategy, FixedTimeStrategy)
+                                and not case_warmup_days):
+                            raise
+                        case_failures[case.name] += 1
+                        case_failure_reasons[case.name].append(str(exc))
+                        strategy_types[case.name] = getattr(
+                            case.strategy, "name", "fixed_times")
+                        per_case[case.name] = {
+                            "error": str(exc),
+                            "strategy_name": strategy_types[case.name],
+                            "position": batch_position,
+                            "history_segment_no": plan["segment_no"],
+                            "history_segment_days": segment_days,
+                        }
+                        continue
 
-                _validate_result_matches_batch_position(
-                    result,
-                    batch_position,
-                    context=f"{label}/{window_id}/{case.name}",
-                )
-                if _positive_int(
-                    result.get("steps_per_day"),
-                    f"{label}/{window_id}/{case.name} steps_per_day",
-                ) != spd:
-                    raise ValueError(
-                        "严格区间回测返回了不一致的 steps_per_day")
-                returned_evaluation_days = _positive_int(
-                    result.get("evaluation_days", segment_days),
-                    f"{label}/{window_id}/{case.name} evaluation_days",
-                )
-                if returned_evaluation_days != segment_days:
-                    raise ValueError(
-                        "严格区间回测返回了不一致的 evaluation_days: "
-                        f"{returned_evaluation_days} != {segment_days}"
+                    _validate_result_matches_batch_position(
+                        result,
+                        batch_position,
+                        context=f"{label}/{window_id}/{case.name}",
                     )
+                    if _positive_int(
+                        result.get("steps_per_day"),
+                        f"{label}/{window_id}/{case.name} steps_per_day",
+                    ) != spd:
+                        raise ValueError(
+                            "严格区间回测返回了不一致的 steps_per_day")
+                    returned_evaluation_days = _positive_int(
+                        result.get("evaluation_days", segment_days),
+                        f"{label}/{window_id}/{case.name} evaluation_days",
+                    )
+                    if returned_evaluation_days != segment_days:
+                        raise ValueError(
+                            "严格区间回测返回了不一致的 evaluation_days: "
+                            f"{returned_evaluation_days} != {segment_days}"
+                        )
 
-                result["history_segment_no"] = plan["segment_no"]
-                result["history_segment_days"] = segment_days
-                result["history_evidence_days"] = days
-                result["history_segment_terminal_mode"] = plan["terminal_mode"]
-                daily, actually_observed = _strict_scored_daily_frame(
-                    result, spd, segment_days)
-                collected[case.name][window_id] = daily
-                observed_days[case.name][window_id] = actually_observed
-                strategy_types[case.name] = result.get(
-                    "strategy_name", "unknown")
-                per_case[case.name] = result
-                # 只记录构造参数：同段候选共享行情切片与缩放后的期权，无需长期
-                # 保留 bar 级结果数组。展示层正常读 history_bar_cache，读不到时
-                # 才据此重算单段。
-                replay_option = scaled_option
-                replay_strategies[case.name] = scaled_strategy
-                if warmup_kwargs:
-                    replay_warmup[case.name] = warmup_kwargs
+                    result["history_segment_no"] = plan["segment_no"]
+                    result["history_segment_days"] = segment_days
+                    result["history_evidence_days"] = days
+                    result["history_segment_terminal_mode"] = plan["terminal_mode"]
+                    daily, actually_observed = _strict_scored_daily_frame(
+                        result, spd, segment_days)
+                    collected[case.name][window_id] = daily
+                    observed_days[case.name][window_id] = actually_observed
+                    strategy_types[case.name] = result.get(
+                        "strategy_name", "unknown")
+                    per_case[case.name] = result
+                    # 只记录构造参数：同段候选共享行情切片与缩放后的期权，无需长期
+                    # 保留 bar 级结果数组。展示层正常读 history_bar_cache，读不到时
+                    # 才据此重算单段。
+                    replay_option = scaled_option
+                    replay_strategies[case.name] = scaled_strategy
+                    if warmup_kwargs:
+                        replay_warmup[case.name] = warmup_kwargs
             if replay_strategies:
                 per_case["_window_replay"] = HistoryReplaySpec(
                     lookback=str(label),
@@ -2012,10 +2095,15 @@ def recommend_by_rolling_history(
 
 def _recommend_from_explicit_history_plans(
         option, cases, kwargs, spd, baseline_case, plans,
-        objective=DEFAULT_SELECTION_OBJECTIVE):
+        objective=DEFAULT_SELECTION_OBJECTIVE, progress_callback=None):
     """运行已经按具体合约边界切好的严格连续历史分段计划。"""
     batch_position = _backtest_batch_position(
         kwargs, context="跨合约历史择优")
+    # 分段计划此时已完全定好，分母直接由它数出来。
+    progress = _ProgressReporter(
+        progress_callback,
+        sum(len(plan["entries"]) for plan in plans) * len(cases),
+    )
     rows = []
     window_results = {}
     for plan in plans:
@@ -2045,6 +2133,9 @@ def _recommend_from_explicit_history_plans(
                         "position": batch_position,
                     },
                 }
+                # 历史不足的档会被合成这样一条 error entry；分母算了它，
+                # 主循环却直接跳过，不补记进度就永远到不了 100%。
+                progress.skip(len(cases), label)
                 continue
 
             path = entry["path"]
@@ -2072,102 +2163,108 @@ def _recommend_from_explicit_history_plans(
                         "position": batch_position,
                     },
                 }
+                progress.skip(len(cases), label)
                 continue
 
             replay_option = None
             replay_strategies = {}
             replay_warmup = {}
-            for case in cases:
-                case_warmup_days = _realized_sigma_window_days(case.strategy)
-                warmup_error = str(entry.get("warmup_error", "") or "")
-                if case_warmup_days and warmup_error:
-                    case_failures[case.name] += 1
-                    case_failure_reasons[case.name].append(warmup_error)
-                    strategy_types[case.name] = getattr(
-                        case.strategy, "name", "sigma_band")
-                    per_case[case.name] = {
-                        "error": warmup_error,
-                        "strategy_name": strategy_types[case.name],
-                        "history_contract_code": contract_code,
-                        "history_endpoint_date": entry.get("endpoint_date"),
-                        "position": batch_position,
-                    }
-                    continue
-                scaled_option, rescale_info = _rescale_option_to_real_s0(
-                    option, float(path.iloc[0]))
-                scaled_strategy = _rescale_strategy_to_real_s0(
-                    case.strategy, rescale_info["ratio"])
-                # 品种历史池中的每个窗口都属于一个明确的具体合约；固定
-                # 时刻策略必须使用该合约自己的交易时段，不能沿用产品代码
-                # 或上一个历史合约的 session 判断。
-                if (isinstance(scaled_strategy, FixedTimeStrategy)
-                        and "trading_sessions" in entry):
-                    scaled_strategy.set_trading_sessions(
-                        entry.get("trading_sessions"))
-                try:
-                    warmup_kwargs = ({
-                        "sigma_warmup_log_returns": entry.get(
-                            "warmup_log_returns", np.array([], dtype=float)),
-                        "strict_sigma_warmup": True,
-                    } if case_warmup_days else {})
-                    result = HedgeBacktest(
-                        scaled_option,
-                        path_source="historical",
-                        external_path=external_path,
-                        evaluation_days=evaluation_days,
-                        strategy=scaled_strategy,
-                        steps_per_day=entry_spd,
-                        **warmup_kwargs,
-                        **kwargs,
-                    ).run()
-                except ValueError as exc:
-                    if (not isinstance(case.strategy, FixedTimeStrategy)
-                            and not case_warmup_days):
-                        raise
-                    case_failures[case.name] += 1
-                    case_failure_reasons[case.name].append(str(exc))
-                    strategy_types[case.name] = getattr(
-                        case.strategy, "name", "fixed_times")
-                    per_case[case.name] = {
-                        "error": str(exc),
-                        "strategy_name": strategy_types[case.name],
-                        "history_contract_code": contract_code,
-                        "history_endpoint_date": entry.get("endpoint_date"),
-                        "position": batch_position,
-                    }
-                    continue
-                _validate_result_matches_batch_position(
-                    result,
-                    batch_position,
-                    context=f"{label}/{window_id}/{case.name}",
-                )
-                if _positive_int(
-                    result.get("steps_per_day"),
-                    f"{label}/{window_id}/{case.name} steps_per_day",
-                ) != entry_spd:
-                    raise ValueError("滚动回测返回了不一致的 steps_per_day")
-                result["history_contract_code"] = contract_code
-                result["history_endpoint_date"] = entry.get("endpoint_date")
-                result["history_segment_no"] = entry.get("segment_no")
-                result["history_segment_days"] = evaluation_days
-                result["history_evidence_days"] = plan.get("evidence_days")
-                result["history_segment_terminal_mode"] = entry.get(
-                    "terminal_mode",
-                    "expiry" if evaluation_days == plan["maturity_days"]
-                    else "mark_to_market",
-                )
-                daily, _observed = _strict_scored_daily_frame(
-                    result, entry_spd, evaluation_days)
-                collected[case.name][window_id] = daily
-                strategy_types[case.name] = result.get(
-                    "strategy_name", "unknown")
-                per_case[case.name] = result
-                # 具体合约段同样只记录构造参数；固定时刻策略已绑定该合约
-                # 自己的交易时段，重放时不会退回品种代码的默认 session。
-                replay_option = scaled_option
-                replay_strategies[case.name] = scaled_strategy
-                if warmup_kwargs:
-                    replay_warmup[case.name] = warmup_kwargs
+            # 同一段行情上，各候选策略的 bar 级定价完全相同（定价只是
+            # (option, S[0..i], spd) 的纯函数，策略只决定哪些 bar 额外要
+            # Greeks）。作用域内记忆化，数值不变，段结束即释放。
+            with price_memo():
+                for case in cases:
+                    progress.advance(label, case.name)
+                    case_warmup_days = _realized_sigma_window_days(case.strategy)
+                    warmup_error = str(entry.get("warmup_error", "") or "")
+                    if case_warmup_days and warmup_error:
+                        case_failures[case.name] += 1
+                        case_failure_reasons[case.name].append(warmup_error)
+                        strategy_types[case.name] = getattr(
+                            case.strategy, "name", "sigma_band")
+                        per_case[case.name] = {
+                            "error": warmup_error,
+                            "strategy_name": strategy_types[case.name],
+                            "history_contract_code": contract_code,
+                            "history_endpoint_date": entry.get("endpoint_date"),
+                            "position": batch_position,
+                        }
+                        continue
+                    scaled_option, rescale_info = _rescale_option_to_real_s0(
+                        option, float(path.iloc[0]))
+                    scaled_strategy = _rescale_strategy_to_real_s0(
+                        case.strategy, rescale_info["ratio"])
+                    # 品种历史池中的每个窗口都属于一个明确的具体合约；固定
+                    # 时刻策略必须使用该合约自己的交易时段，不能沿用产品代码
+                    # 或上一个历史合约的 session 判断。
+                    if (isinstance(scaled_strategy, FixedTimeStrategy)
+                            and "trading_sessions" in entry):
+                        scaled_strategy.set_trading_sessions(
+                            entry.get("trading_sessions"))
+                    try:
+                        warmup_kwargs = ({
+                            "sigma_warmup_log_returns": entry.get(
+                                "warmup_log_returns", np.array([], dtype=float)),
+                            "strict_sigma_warmup": True,
+                        } if case_warmup_days else {})
+                        result = HedgeBacktest(
+                            scaled_option,
+                            path_source="historical",
+                            external_path=external_path,
+                            evaluation_days=evaluation_days,
+                            strategy=scaled_strategy,
+                            steps_per_day=entry_spd,
+                            **warmup_kwargs,
+                            **kwargs,
+                        ).run()
+                    except ValueError as exc:
+                        if (not isinstance(case.strategy, FixedTimeStrategy)
+                                and not case_warmup_days):
+                            raise
+                        case_failures[case.name] += 1
+                        case_failure_reasons[case.name].append(str(exc))
+                        strategy_types[case.name] = getattr(
+                            case.strategy, "name", "fixed_times")
+                        per_case[case.name] = {
+                            "error": str(exc),
+                            "strategy_name": strategy_types[case.name],
+                            "history_contract_code": contract_code,
+                            "history_endpoint_date": entry.get("endpoint_date"),
+                            "position": batch_position,
+                        }
+                        continue
+                    _validate_result_matches_batch_position(
+                        result,
+                        batch_position,
+                        context=f"{label}/{window_id}/{case.name}",
+                    )
+                    if _positive_int(
+                        result.get("steps_per_day"),
+                        f"{label}/{window_id}/{case.name} steps_per_day",
+                    ) != entry_spd:
+                        raise ValueError("滚动回测返回了不一致的 steps_per_day")
+                    result["history_contract_code"] = contract_code
+                    result["history_endpoint_date"] = entry.get("endpoint_date")
+                    result["history_segment_no"] = entry.get("segment_no")
+                    result["history_segment_days"] = evaluation_days
+                    result["history_evidence_days"] = plan.get("evidence_days")
+                    result["history_segment_terminal_mode"] = entry.get(
+                        "terminal_mode",
+                        "expiry" if evaluation_days == plan["maturity_days"]
+                        else "mark_to_market",
+                    )
+                    daily, _observed = _strict_scored_daily_frame(
+                        result, entry_spd, evaluation_days)
+                    collected[case.name][window_id] = daily
+                    strategy_types[case.name] = result.get(
+                        "strategy_name", "unknown")
+                    per_case[case.name] = result
+                    # 具体合约段同样只记录构造参数；固定时刻策略已绑定该合约
+                    # 自己的交易时段，重放时不会退回品种代码的默认 session。
+                    replay_option = scaled_option
+                    replay_strategies[case.name] = scaled_strategy
+                    if warmup_kwargs:
+                        replay_warmup[case.name] = warmup_kwargs
             if replay_strategies:
                 per_case["_window_replay"] = HistoryReplaySpec(
                     lookback=str(label),
@@ -2389,7 +2486,7 @@ def _recommend_from_explicit_history_plans(
 def recommend_by_contract_history_pool(
         option, pool, cases, backtest_kwargs=None, *, lookbacks=None,
         step_days=5, target_endpoints=None, steps_per_day=None,
-        objective=DEFAULT_SELECTION_OBJECTIVE):
+        objective=DEFAULT_SELECTION_OBJECTIVE, progress_callback=None):
     """在最近连续 ``L`` 个主力映射日上按具体合约边界比较策略。
 
     证据区间中的主力换月会强制切段；同一具体合约的连续区间再按不重叠
@@ -2812,4 +2909,4 @@ def recommend_by_contract_history_pool(
         })
     return _recommend_from_explicit_history_plans(
         option, cases, kwargs, default_spd, baseline_case, plans,
-        objective=objective)
+        objective=objective, progress_callback=progress_callback)

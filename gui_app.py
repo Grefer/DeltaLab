@@ -183,8 +183,7 @@ class BacktestApp(panel_form.FormPanelMixin,
 
         base_font    = (_UI_FONT_FAMILY, 10)
         small_font   = (_UI_FONT_FAMILY, 9)
-        title_font   = (_UI_FONT_FAMILY, 18, "bold")
-        subtitle_font = (_UI_FONT_FAMILY, 10)
+        brand_font   = (_UI_FONT_FAMILY, 12, "bold")
         header_font  = (_UI_FONT_FAMILY, 10, "bold")
         group_font   = (_UI_FONT_FAMILY, 10, "bold")
         tab_font     = (_UI_FONT_FAMILY, 12, "bold")
@@ -217,14 +216,11 @@ class BacktestApp(panel_form.FormPanelMixin,
                         background=PALETTE["surface"],
                         foreground=PALETTE["text_muted"],
                         font=small_font)
-        style.configure("Title.TLabel",
+        # 左上角品牌标 (与右侧页签行同处一条水平带, 不再单独占一条横幅)
+        style.configure("Brand.TLabel",
                         background=PALETTE["bg"],
                         foreground=PALETTE["text"],
-                        font=title_font)
-        style.configure("Subtitle.TLabel",
-                        background=PALETTE["bg"],
-                        foreground=PALETTE["text_muted"],
-                        font=subtitle_font)
+                        font=brand_font)
         style.configure("Header.TLabel",
                         background=PALETTE["bg"],
                         foreground=PALETTE["text"],
@@ -516,20 +512,39 @@ class BacktestApp(panel_form.FormPanelMixin,
         style.configure("TSeparator", background=PALETTE["border"])
 
     # ---- 界面构建 ----
+    def _build_brand_row(self, parent):
+        """左侧参数栏正上方的品牌标 (图标 + 名称 + 副标题).
+
+        高度按右侧页签行配平 (图标 32px + 上下各 8px 留白), 于是窗口顶部
+        这条水平带左右两侧都有内容, 宽屏下不会再空出一整条横幅.
+        """
+        row = ttk.Frame(parent)
+        # padx=0: 图标左边缘与下方各 LabelFrame 的左边缘对齐 (Canvas 也在 x=0)
+        row.pack(side="top", fill="x", padx=0, pady=8)
+
+        # Tk 的 PhotoImage 只能按整数倍抽样缩小 (最近邻, 圆角会发毛), 所以
+        # 直接读按尺寸渲染好的 32px 图. 缺图/解码失败时只是没有图标, 不影响文字.
+        icon_path = _resource_path("assets", "deltalab_32.png")
+        self._brand_photo = None
+        if os.path.exists(icon_path):
+            try:
+                self._brand_photo = tk.PhotoImage(file=icon_path)
+            except tk.TclError:
+                pass
+            else:
+                ttk.Label(row, image=self._brand_photo,
+                          style="Brand.TLabel").pack(side="left")
+
+        text_col = ttk.Frame(row)
+        text_col.pack(side="left", padx=(8, 0))
+        ttk.Label(text_col, text="DeltaLab", style="Brand.TLabel").pack(anchor="w")
+        ttk.Label(text_col, text="期权动态对冲回测系统",
+                  style="Muted.TLabel").pack(anchor="w")
+
     def _build_ui(self):
-        # 顶部标题条 (带底部分隔线)
-        header = ttk.Frame(self)
-        header.pack(fill="x", padx=0, pady=0)
-
-        title_row = ttk.Frame(header)
-        title_row.pack(fill="x", padx=18, pady=(14, 4))
-        ttk.Label(title_row, text="DeltaLab",
-                  style="Title.TLabel").pack(side="left")
-        ttk.Label(title_row,
-                  text="期权动态对冲回测系统",
-                  style="Subtitle.TLabel").pack(side="left", padx=(12, 0), pady=(8, 0))
-
-        ttk.Separator(header, orient="horizontal").pack(fill="x", padx=0, pady=(6, 0))
+        # 品牌标不再单独占一条通栏横幅：窗口标题栏已经写着同一句话，通栏
+        # 只是在宽屏上留出一条几乎全空的白带。改放到左侧参数栏正上方
+        # （见下面的 _build_brand_row），与右侧页签行同处一条水平带。
 
         # 底部状态栏
         # 必须排在 body 之前 pack：pack 按调用顺序分配空间，body 带 expand=True
@@ -551,6 +566,10 @@ class BacktestApp(panel_form.FormPanelMixin,
         # ─── 左侧面板 (整体包一层 Canvas + Scrollbar, 解决低分辨率/高 DPI 下底部按钮被裁) ───
         left_outer = ttk.Frame(body)
         body.add(left_outer, weight=1)
+
+        # 品牌标：必须先 pack, 才能拿到 left_outer 顶部这条; 之后的滚动条与
+        # Canvas 分掉剩下的空腔。它不进 Canvas —— 进去会跟着参数一起滚走。
+        self._build_brand_row(left_outer)
 
         # 外层 Canvas 横向充满, Scrollbar 靠右
         # width 仅作为 PanedWindow 初始 sash 位置的参考, 不阻止后续缩放;

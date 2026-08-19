@@ -17,6 +17,7 @@ import datetime
 import os
 import sys
 import threading
+import time
 from types import SimpleNamespace
 from tkinter import messagebox
 
@@ -326,6 +327,67 @@ class RunnerMixin:
             f"{gs.get('wind_bar_size', '日频')}"
         )
 
+    def _make_history_progress_callback(self, period_labels):
+        """造一个进度回调：worker 线程调用，内部回投主线程更新进度条。
+
+        计费单元是一次 ``HedgeBacktest.run()``（一段 × 一个候选）。各段长度
+        基本都等于合约期限 T（只有最老那一段可能是残段），因此单元之间工作
+        量近似相等，剩余时间按"已完成单元的平均耗时 × 剩余单元数"线性外推
+        是站得住的。
+
+        节流：一次典型优选约 200 个单元、跑十几分钟，本来就稀疏；这里再按
+        120 ms 去抖，防止候选表或分段数将来变大时把 tk 事件队列灌满。末尾
+        单元不去抖，保证进度条能走到满格。
+        """
+        state = {"started": None, "last_emit": 0.0, "switched": False}
+
+        def _callback(done, total, label, case_name):
+            now = time.monotonic()
+            if state["started"] is None:
+                state["started"] = now
+            if not state["switched"]:
+                state["switched"] = True
+
+                def _to_determinate(t=total):
+                    self._progress.stop()
+                    self._progress.configure(
+                        mode="determinate", maximum=max(1, t), value=0)
+                    self._progress_label.pack(fill="x")
+                self.after(0, _to_determinate)
+            if done < total and now - state["last_emit"] < 0.12:
+                return
+            state["last_emit"] = now
+
+            elapsed = now - state["started"]
+            # done 是"正在跑第 done 个"，已完成的是 done-1 个。
+            finished = max(0, done - 1)
+            if finished >= 2 and elapsed > 0:
+                remain = (elapsed / finished) * (total - finished)
+                eta = (f"  ·  预计剩余 "
+                       f"{RunnerMixin._format_duration(remain)}")
+            else:
+                eta = ""
+            text = (f"策略优选  {period_labels.get(label, label)}  "
+                    f"{done}/{total}{eta}")
+            self.after(0, lambda d=done, s=text: (
+                self._progress.configure(value=d),
+                self._progress_label.configure(text=s),
+            ))
+
+        return _callback
+
+    @staticmethod
+    def _format_duration(seconds):
+        """把秒数说成人话；进度条旁边不该出现 '183.4s'。"""
+        seconds = int(max(0, seconds))
+        if seconds < 60:
+            return f"{seconds} 秒"
+        minutes, secs = divmod(seconds, 60)
+        if minutes < 60:
+            return f"{minutes} 分 {secs:02d} 秒"
+        hours, minutes = divmod(minutes, 60)
+        return f"{hours} 小时 {minutes:02d} 分"
+
     def _history_recommendation_worker(self, gs):
         try:
             history_selection.validate_source(gs)
@@ -336,6 +398,12 @@ class RunnerMixin:
                 "history_objective", DEFAULT_SELECTION_OBJECTIVE)
             if objective not in SELECTION_OBJECTIVES:
                 raise ValueError(f"未知排名依据: {objective!r}")
+            # 类级派发：本模块的 worker 在测试里是拿 SimpleNamespace 当
+            # self 调的（见 tests/test_gui_strategy_state.py 的
+            # _history_worker_fixture），假 self 上没有这个方法。回调体只在
+            # 真 App 里被触发，因此把 self 传进闭包即可。
+            progress_cb = RunnerMixin._make_history_progress_callback(
+                self, {key: label for key, label in HISTORY_PERIOD_DEFS})
             original_option = gs["cfg"]["build"](gs["subtype"], gs["params"])
             is_product_pool = False
             if gs.get("source") == "wind":
@@ -360,6 +428,7 @@ class RunnerMixin:
                         original_option, history, cases, kwargs,
                         lookbacks=history_lookbacks,
                         objective=objective,
+                        progress_callback=progress_cb,
                     )
                 )
             else:
@@ -377,6 +446,7 @@ class RunnerMixin:
                         lookbacks=history_lookbacks,
                         steps_per_day=base_bt.steps_per_day,
                         objective=objective,
+                        progress_callback=progress_cb,
                     )
                 )
             history_selection.validate_payload(

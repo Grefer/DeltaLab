@@ -109,6 +109,8 @@ GUI 启动时会通过 `BacktestApp._apply_window_icon()` 自动加载 [assets/]
 - macOS / Linux 或 Windows 上 `.ico` 加载失败时，回退到 `assets/deltalab.png` + `iconphoto()`。
 - 两个文件都缺失时静默跳过，不影响主流程。
 
+左侧参数栏正上方的品牌标另外读 `assets/deltalab_32.png`（按 32px 单独渲染，Tk 只能整数抽样缩小，从大图缩会发毛）；缺失时只是不显示图标，文字照常。
+
 图标、banner、工作流示意图都是用 [tools/](../tools/) 下的脚本生成的（依赖 Pillow），可随时重跑调整外观：
 
 ```bash
