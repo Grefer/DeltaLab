@@ -484,6 +484,18 @@ class RunnerMixin:
             source_label = RunnerMixin._history_recommendation_source_label(
                 gs, history)
 
+            # 投递前先把结果扣在 self 上。此前它只活在下面这个 lambda 的
+            # 闭包里：渲染一抛异常，十几分钟的计算连同 gzip 后仅 137 KB 的
+            # 结果包一起没了，只能重跑。留一份的成本可以忽略。
+            self._history_pending_result = {
+                "recommendations": recommendations,
+                "ranking": ranking,
+                "notes": notes,
+                "window_results": window_results,
+                "source_label": source_label,
+                "history_state": gs,
+                "objective": objective,
+            }
             self.after(
                 0,
                 lambda: self._deliver_history_recommendation(
@@ -516,14 +528,70 @@ class RunnerMixin:
                 snapshot_detail.copy_snapshot_gui_state(history_state)
                 if history_state is not None else None)
             self._latest_history_source_label = source_label
+            self._history_pending_result = None
             success = True
         except Exception:
             import traceback
             err_msg = traceback.format_exc()
             print(err_msg, file=sys.stderr)
-            messagebox.showerror("历史择优展示失败", err_msg)
+            RunnerMixin._offer_to_rescue_history_result(self, err_msg)
         finally:
             self._finish_history_recommendation(success)
+
+    def _offer_to_rescue_history_result(self, err_msg):
+        """渲染失败时，把还在内存里的结果提议存盘，而不是直接丢掉。
+
+        这轮优选可能跑了十几分钟，而结果包 gzip 后只有一百多 KB。渲染出错
+        多半是展示层的问题，数字本身是好的——至少要给用户一条不重跑的路。
+        """
+        pending = getattr(self, "_history_pending_result", None)
+        if not pending:
+            messagebox.showerror("历史择优展示失败", err_msg)
+            return
+        rescued = messagebox.askyesno(
+            "展示失败，是否保存原始结果？",
+            "渲染这轮优选结果时出错，但计算已经完成、数字还在内存里。\n\n"
+            "要把它存成结果包吗？存下来之后可以在「载入」里打开，"
+            "不必重跑。\n\n"
+            f"错误详情：\n{str(err_msg).strip().splitlines()[-1][:200]}",
+            parent=self)
+        if not rescued:
+            self._history_pending_result = None
+            return
+        try:
+            path = RunnerMixin._save_rescued_history_result(self, pending)
+        except Exception as exc:                       # noqa: BLE001
+            messagebox.showerror(
+                "抢救保存失败", f"{exc}\n\n原始错误：\n{err_msg}")
+            return
+        finally:
+            self._history_pending_result = None
+        messagebox.showinfo(
+            "已保存", f"原始结果已存为 {os.path.basename(path)}，"
+            "可在「载入」里打开。")
+
+    @staticmethod
+    def _save_rescued_history_result(app, pending):
+        """把 worker 留下的结果直接组包落盘，不经过展示层。
+
+        ``window_summary`` 与 ``replay_index`` 是渲染过程中派生的，这里没有，
+        传 None——包本身仍可载入，只是少了那两项派生信息。
+        """
+        import history_store
+
+        payload = history_store.build_payload(
+            ranking=pending["ranking"],
+            window_summary=None,
+            history_state=pending["history_state"],
+            source_label=pending["source_label"],
+            objective=pending["objective"],
+            notes=pending["notes"],
+            label="渲染失败抢救",
+            replay_index=None,
+        )
+        path = history_store.save_result(payload, enforce=False)
+        history_store.enforce_limit()
+        return path
 
     def _cancelled_history_recommendation(self):
         """用户中止后的收尾：走同一条 _finish_job，只是文案不同。"""

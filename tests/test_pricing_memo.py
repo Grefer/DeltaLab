@@ -1402,7 +1402,7 @@ def test_knockout_settlement_is_split_invariant(subtype, cp):
 
     real_mc = de_mod.McGbmQ
 
-    def _fixed(_s0, _r, _sigma, _T, n_path, n_step, seed=20):
+    def _fixed(_s0, _r, _sigma, _T, n_path, n_step, seed=20, **_kw):
         return np.tile(path[total - n_step:], (n_path, 1))
 
     de_mod.McGbmQ = _fixed
@@ -1445,7 +1445,7 @@ def test_knockout_amount_is_frozen_at_the_barrier_day(subtype):
     real_mc = de_mod.McGbmQ
 
     def _price(path):
-        def _fixed(_s0, _r, _sigma, _T, n_path, n_step, seed=20):
+        def _fixed(_s0, _r, _sigma, _T, n_path, n_step, seed=20, **_kw):
             return np.tile(path[len(path) - n_step:], (n_path, 1))
         de_mod.McGbmQ = _fixed
         try:
@@ -1492,7 +1492,7 @@ def test_knockout_leg_discounts_from_the_barrier_day(subtype, r):
     real_mc = de_mod.McGbmQ
 
     def _price(elapsed):
-        def _fixed(_s0, _r, _sigma, _T, n_path, n_step, seed=20):
+        def _fixed(_s0, _r, _sigma, _T, n_path, n_step, seed=20, **_kw):
             return np.tile(path[le - n_step:], (n_path, 1))
         de_mod.McGbmQ = _fixed
         try:
@@ -1561,7 +1561,7 @@ def test_no_artificial_jump_across_the_barrier(subtype, r):
         path = np.full(le, 100.0)
         path[-1] = terminal
 
-        def _fixed(_s0, _r, _sigma, _T, n_path, n_step, seed=20):
+        def _fixed(_s0, _r, _sigma, _T, n_path, n_step, seed=20, **_kw):
             return np.tile(path[le - n_step:], (n_path, 1))
 
         de_mod.McGbmQ = _fixed
@@ -1755,3 +1755,207 @@ def test_run_multi_still_varies_seed_per_path():
     errors = result["errors"][np.isfinite(result["errors"])]
     assert errors.size >= 2
     assert float(np.std(errors)) > 0, "各路径的 MC 采样没有拉开"
+
+
+# --------------------------------------------------------------------------
+#  15. theta 的 CRN
+# --------------------------------------------------------------------------
+
+def test_mcgbmq_draw_steps_defaults_to_bit_identical():
+    """不传 draw_steps 时必须与从前逐位相同。"""
+    from pricing.mc_engine import McGbmQ
+
+    args = (100.0, 0.03, 0.2, 20 / 243, 1000, 20)
+    assert np.array_equal(McGbmQ(*args, seed=20),
+                          McGbmQ(*args, seed=20, draw_steps=20))
+
+
+def test_mcgbmq_draw_steps_shares_the_underlying_normals():
+    """按 T 抽、切前 T−1 列，底层标准正态必须与按 T 抽的前 T−1 列逐位相同。
+
+    行优先填充下 ``(n, T)`` 的前 T−1 列 ≠ ``(n, T−1)``，所以 theta 的 bump
+    必须显式按 T 抽——这正是 draw_steps 存在的理由。
+    """
+    from pricing.mc_engine import McGbmQ
+
+    s0, r, sigma, n_path = 100.0, 0.03, 0.2, 2000
+    full = McGbmQ(s0, r, sigma, 20 / 243, n_path, 20, seed=20)
+    bumped = McGbmQ(s0, r, sigma, 19 / 243, n_path, 19, seed=20, draw_steps=20)
+    naive = McGbmQ(s0, r, sigma, 19 / 243, n_path, 19, seed=20)
+
+    def _normals(paths, n_step, horizon):
+        h = horizon / n_step
+        logs = np.diff(np.log(np.c_[np.full((len(paths), 1), s0), paths]),
+                       axis=1)
+        return (logs - (r - 0.5 * sigma ** 2) * h) / (sigma * np.sqrt(h))
+
+    shared = _normals(full, 20, 20 / 243)[:, :19]
+    assert np.allclose(shared, _normals(bumped, 19, 19 / 243), atol=1e-12)
+    assert not np.allclose(shared, _normals(naive, 19, 19 / 243), atol=1e-9)
+
+
+def test_mcgbmq_rejects_draw_steps_below_nstep():
+    from pricing.mc_engine import McGbmQ
+
+    with pytest.raises(ValueError, match="draw_steps"):
+        McGbmQ(100.0, 0.03, 0.2, 0.1, 100, 20, draw_steps=19)
+
+
+def _naive_theta(option):
+    """还原改动前的 theta：bump 不锁定抽样步数，两次定价各抽各的随机数。"""
+    from pricing.constants import ANNUAL_DAYS
+
+    price0 = option.priced()
+    bumped = option._bumped_copy(**option._theta_overrides(1))
+    return (bumped.get_price() - price0) / (1 / ANNUAL_DAYS)
+
+
+@pytest.mark.parametrize("make_option", [_airbag, _snowball, _decumulator])
+def test_theta_crn_leaves_other_greeks_untouched(make_option):
+    """只有 theta 的 bump 该拿到 mc_draw_steps。
+
+    delta / gamma / vega / rho 的 bump 都不改 nStep，本来就共享随机数。
+    把 mc_draw_steps 设到期权本体上（相当于全局施加）会让它们全都变——
+    这条正是用来挡住那种改法的。
+    """
+    baseline = make_option().get_greeks()
+
+    globally_forced = make_option()
+    globally_forced.mc_draw_steps = int(globally_forced._time_remaining) + 5
+    forced = globally_forced.get_greeks()
+
+    for idx, name in ((0, "delta"), (1, "gamma"), (2, "vega"), (4, "rho")):
+        assert baseline[idx] != forced[idx], (
+            f"{name} 对 mc_draw_steps 无反应——注入点可能写错了位置")
+
+
+@pytest.mark.parametrize("make_option", [_airbag, _snowball, _decumulator])
+def test_theta_noise_is_reduced_by_crn(make_option):
+    """CRN 下的 theta 噪声必须显著小于 bump 自己重抽的版本。
+
+    此前 theta 是两次**相互独立**的 MC 估计之差——实测标准差比修复后大
+    1.8~11.6 倍，气囊与雪球连正负号都是错的。
+    """
+    crn, naive = [], []
+    for seed in range(8):
+        option = make_option()
+        option.mc_seed = seed
+        crn.append(option.get_greeks()[3])
+
+        other = make_option()
+        other.mc_seed = seed
+        naive.append(_naive_theta(other))
+
+    assert np.std(crn, ddof=1) < np.std(naive, ddof=1), (
+        f"CRN 没有降低 theta 噪声: {np.std(crn, ddof=1):.4f} "
+        f"vs {np.std(naive, ddof=1):.4f}")
+
+
+# --------------------------------------------------------------------------
+#  16. 渲染失败不该丢掉整轮计算
+# --------------------------------------------------------------------------
+
+_WINDOWS = {"month": {"segment_1": {"daily": {}}}}
+
+
+def _rescue_fake(tmp_path, monkeypatch, answer):
+    """造一个能跑 _deliver_history_recommendation 的假 self。"""
+    from types import SimpleNamespace
+
+    import history_store
+    from deltalab_ui import runner as runner_mod
+
+    monkeypatch.setattr(history_store, "results_dir", lambda: str(tmp_path))
+    monkeypatch.setattr(runner_mod.messagebox, "showerror",
+                        lambda *a, **k: None)
+    monkeypatch.setattr(runner_mod.messagebox, "showinfo",
+                        lambda *a, **k: None)
+    monkeypatch.setattr(runner_mod.messagebox, "askyesno",
+                        lambda *a, **k: answer)
+
+    ranking = pd.DataFrame([{
+        "lookback": "month", "strategy": "daily", "complete_window": True,
+        "rolling_windows": 1, "daily_net_pnl_rms": 2.0,
+    }])
+    finished = []
+
+    def _boom(*_a, **_k):
+        raise RuntimeError("渲染炸了")
+
+    fake = SimpleNamespace(
+        _history_pending_result={
+            "recommendations": pd.DataFrame(),
+            "ranking": ranking,
+            "notes": None,
+            "window_results": _WINDOWS,
+            "source_label": "CSV · x.csv · close",
+            "history_state": {"source": "csv", "csv_path": "x.csv"},
+            "objective": "incremental_pnl",
+        },
+        _show_history_recommendation=_boom,
+        _finish_history_recommendation=finished.append,
+    )
+    return fake, finished, ranking
+
+
+def test_render_failure_keeps_the_result_and_offers_to_save(
+        tmp_path, monkeypatch):
+    """渲染出错时结果不能丢：用户同意就落盘，之后可以载入。
+
+    此前结果只活在 ``after`` 那个 lambda 的闭包里，渲染一抛异常，十几分钟
+    的计算连同 gzip 后仅一百多 KB 的结果包一起没了，只能重跑。
+    """
+    import history_store
+    from deltalab_ui.runner import RunnerMixin
+
+    fake, finished, ranking = _rescue_fake(tmp_path, monkeypatch, answer=True)
+    RunnerMixin._deliver_history_recommendation(
+        fake, pd.DataFrame(), ranking, None, _WINDOWS,
+        "CSV · x.csv · close", {"source": "csv"})
+
+    assert finished == [False], "失败应当如实收尾"
+    saved = history_store.list_results()
+    assert len(saved) == 1, "同意抢救后没有落盘"
+    assert saved[0]["label"] == "渲染失败抢救"
+    assert fake._history_pending_result is None, "抢救后没有清掉暂存"
+
+
+def test_render_failure_respects_a_declined_rescue(tmp_path, monkeypatch):
+    """用户拒绝就不写盘，但暂存同样要清掉，免得下一轮读到旧结果。"""
+    import history_store
+    from deltalab_ui.runner import RunnerMixin
+
+    fake, finished, ranking = _rescue_fake(tmp_path, monkeypatch, answer=False)
+    RunnerMixin._deliver_history_recommendation(
+        fake, pd.DataFrame(), ranking, None, _WINDOWS,
+        "CSV · x.csv · close", {"source": "csv"})
+
+    assert finished == [False]
+    assert history_store.list_results() == []
+    assert fake._history_pending_result is None
+
+
+def test_successful_render_clears_the_pending_result(tmp_path, monkeypatch):
+    """渲染成功后暂存必须清掉——留着会让下一轮的失败抢救出旧数据。"""
+    from types import SimpleNamespace
+
+    from deltalab_ui.runner import RunnerMixin
+
+    finished = []
+    fake = SimpleNamespace(
+        _history_pending_result={"ranking": "旧的"},
+        _show_history_recommendation=lambda *a, **k: None,
+        _finish_history_recommendation=finished.append,
+        _latest_history_state=None,
+        _latest_history_source_label=None,
+    )
+    ranking = pd.DataFrame([{
+        "lookback": "month", "strategy": "daily", "complete_window": True,
+        "rolling_windows": 1, "daily_net_pnl_rms": 2.0,
+    }])
+    RunnerMixin._deliver_history_recommendation(
+        fake, pd.DataFrame(), ranking, None, _WINDOWS, "label",
+        {"source": "csv"})
+
+    assert finished == [True]
+    assert fake._history_pending_result is None

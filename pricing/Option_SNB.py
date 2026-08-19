@@ -273,7 +273,7 @@ class Option_SNB(OptionBase):
         # 模拟资产价格序列：列 = [已实现 sr | 自 s0 模拟的未来 T 日]
         if T > 0:
             S = McGbmQ(self.s0, self.r - self.q, self.sigma, T * dT,
-                       nPath, T, seed=self.mc_seed)
+                       nPath, T, seed=self.mc_seed, draw_steps=self.mc_draw_steps)
             ss = np.c_[np.tile(sr, (nPath, 1)), S] if nsr > 0 else S
         else:
             ss = np.tile(sr, (nPath, 1))

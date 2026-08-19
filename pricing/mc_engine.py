@@ -13,7 +13,8 @@ def McGbmQ(
         T: float,
         nPath: int,
         nStep: int,
-        seed=20
+        seed=20,
+        draw_steps=None
 ):
     """
     GBM 蒙特卡洛路径生成（含对偶变量方差缩减）
@@ -29,6 +30,16 @@ def McGbmQ(
     seed : int | None
         随机数种子：传 int 时走确定性序列（CRN / 可复现）；
         传 None 时用操作系统熵，彻底独立采样。默认 20（历史行为）。
+    draw_steps : int | None
+        **抽样时的步数**，默认与 nStep 相同。给得比 nStep 大时，先抽
+        ``(nPath/2, draw_steps)``，再只用前 nStep 列。
+
+        这是给 theta 用的：theta 的 bump 把剩余期限减一天，nStep 从 T 变成
+        T−1，于是 ``standard_normal`` 换了形状、抽出**完全不同**的一批随机
+        数——theta 就成了两次相互独立的 MC 估计之差，噪声被放大一个数量级。
+        让 bump 也按 T 抽、再切前 T−1 列，两边就共享同一批随机数，CRN 成立。
+        （行优先填充下，``(n, T)`` 的前 T−1 列 ≠ ``(n, T−1)``，所以必须让
+        两边都按 T 抽，不能指望切片自动对上。）
 
     Returns
     -------
@@ -38,6 +49,10 @@ def McGbmQ(
         raise ValueError(f"nPath must be a positive even integer, got {nPath}")
     if nStep <= 0:
         raise ValueError(f"nStep must be positive, got {nStep}")
+    draw = nStep if draw_steps is None else int(draw_steps)
+    if draw < nStep:
+        raise ValueError(
+            f"draw_steps must be >= nStep, got {draw} < {nStep}")
 
     # seed=None 由 np.random.default_rng 自动走 OS 熵，保证每次采样独立。
     rng = np.random.default_rng(seed)
@@ -59,9 +74,12 @@ def McGbmQ(
     #   * 最后的 s *= s0 与原来的 s0 * exp(...) 同理。
     # tests/test_pricing_memo.py 有一条把两种写法钉在一起的回归测试。
     half = nPath // 2
-    s = np.empty((nPath, nStep), dtype=np.float64)
-    rng.standard_normal((half, nStep), out=s[:half])
-    np.negative(s[:half], out=s[half:])   # 对偶变量方差缩减
+    buf = np.empty((nPath, draw), dtype=np.float64)
+    rng.standard_normal((half, draw), out=buf[:half])
+    np.negative(buf[:half], out=buf[half:])   # 对偶变量方差缩减
+    # draw == nStep 时这就是整块缓冲；更大时是它的前 nStep 列视图，
+    # 后面的原地运算照常作用在视图上。
+    s = buf[:, :nStep]
 
     h = T / nStep
     s *= sigma * np.sqrt(h)

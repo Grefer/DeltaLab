@@ -92,7 +92,7 @@ class Option_AS(OptionBase):
             return float(self._payoff_from_observations(observations))
 
         S = McGbmQ(self.s0, self.r - self.q, self.sigma, self.T * dt, self.nPath, nStep,
-                   seed=self.mc_seed)
+                   seed=self.mc_seed, draw_steps=self.mc_draw_steps)
         ss = np.c_[np.tile(sr, (self.nPath, 1)), S]
         cashflow = self._payoff_from_observations(ss) * np.exp(-self.r * self.T * dt)
         price = np.mean(cashflow, 0)
