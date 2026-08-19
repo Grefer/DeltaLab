@@ -1544,10 +1544,13 @@ def _map_segments(run_one, plans, option):
 def _selection_max_workers(option, n_units):
     """分段并行的线程数。**按内存定，不是按核数定。**
 
-    单次 MC 定价的峰值内存是结果矩阵的约 4.5 倍（McGbmQ 里 W1/W/dlogS/
-    cumsum/exp 五份同时存活），累计期权 nPath=1e5、T=243 时一次就要 1.2 GB。
-    实测按核数开满（10 线程）比串行还慢 2.5 倍——越过内存压力阈值之后系统
-    开始压缩换页，拐点在 4~6 线程之间。
+    单次定价的峰值内存按「路径矩阵 × 系数」估。McGbmQ 本身现在是原地推进、
+    只占 1 份，但各结构的 payoff 还会自己开大矩阵（累计期权的
+    condition_ko / flag_N / discount_factor 都是 nPath × 观察日）。实测各结构的
+    实际峰值 ÷ 路径矩阵：雪球 1.13、亚式 2.14、气囊 3.13、累计 6.25——取
+    累计那档再留点余量。累计 nPath=1e5、T=243 时一次定价仍要 1.2 GB。
+    实测按核数开满（10 线程）比串行还慢 2.5 倍：越过内存压力阈值之后系统
+    开始压缩换页。
 
     numpy 的逐元素运算与 RNG 都释放 GIL，所以线程是有效的；不用进程池是因为
     本仓打包成 PyInstaller 的 .app（deltalab.spec）且全仓没有 freeze_support，
@@ -1570,7 +1573,7 @@ def _selection_max_workers(option, n_units):
     npath = getattr(option, "nPath", None)
     steps = getattr(option, "_time_remaining", None)
     try:
-        peak = float(npath) * float(steps) * 8.0 * 4.5
+        peak = float(npath) * float(steps) * 8.0 * 5.5
         # 这个环境变量只是调优旋钮，写坏了该退回默认并发，而不是把整轮
         # 优选炸掉——它没有任何界面入口，用户改错了也看不到提示。
         budget = float(os.environ.get(

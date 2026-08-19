@@ -3475,3 +3475,62 @@ def test_nothing_evicted_means_no_status_noise():
     assert BacktestApp._forget_evicted_snapshots(
         fake, ["/tmp/pool/别的.json.gz"]) == ""
     assert list(fake._saved_backtests) == [kept.result_id]
+
+
+# --------------------------------------------------------------------------
+#  结构改名后，盘上的老结果包也要跟着改名
+# --------------------------------------------------------------------------
+
+def _decumulator_snapshot(subtype="Opt_ASGQ_DFF"):
+    state = dict(_state())
+    state.update({"cls_name": "累计期权 (Decumulator)", "subtype": subtype})
+    return _snapshot(state=state)
+
+
+def test_pool_pack_relabels_the_option_from_the_replay_recipe():
+    """``option_label`` 落了盘，但载入时要按当前的 SUBTYPE_DISPLAY 重算。
+
+    它是**显示名**：结构一改名，老包会一直显示旧名，同一张表里新旧两套名字
+    并存，而这正是「结构名不能改」这个结论当初的由来。可重放配方里存着内部键
+    （``replay["subtype"]``），据此现算就行——盘上不需要任何迁移。
+    """
+    snapshot = _decumulator_snapshot()
+    current = gui_app.SUBTYPE_DISPLAY["Opt_ASGQ_DFF"]
+    assert snapshot.option_label == current
+
+    payload = BacktestApp._snapshot_to_payload(snapshot)
+    # 模拟一个改名前写下的包。
+    payload["snapshot"]["option_label"] = "每日熔断双固赔累计"
+
+    restored = BacktestApp._payload_to_snapshot(payload)
+
+    assert restored.option_label == current
+    assert restored.replay["subtype"] == "Opt_ASGQ_DFF"
+
+
+def test_pool_pack_without_a_replay_recipe_keeps_its_stored_label():
+    """配方为空的包没有内部键可依，那时才退回落盘的那份。
+
+    ``_snapshot_replay_recipe`` 在 ``prices.size < 2`` 时返回 ``{}``；这种包
+    重放不了，也就无从重算，硬塞一个空字符串会让整列变成空白。
+    """
+    payload = BacktestApp._snapshot_to_payload(_decumulator_snapshot())
+    payload["snapshot"]["option_label"] = "每日熔断双固赔累计"
+    payload["snapshot"]["replay"] = backtest_pool_store.encode({})
+
+    restored = BacktestApp._payload_to_snapshot(payload)
+
+    assert restored.option_label == "每日熔断双固赔累计"
+
+
+def test_saved_history_listing_needs_no_migration_at_all():
+    """已保存的优选结果本来就是读盘时现算，改名对它零成本。
+
+    ``history_store._peek`` 存的是内部键、显示名由注入的映射当场派生——与结果
+    池那条不同，这里没有任何落盘的显示名需要迁移。
+    """
+    import history_store
+
+    assert history_store._subtype_label(
+        {"subtype": "Opt_ASGQ_DFF"}, gui_app.SUBTYPE_DISPLAY) == (
+        gui_app.SUBTYPE_DISPLAY["Opt_ASGQ_DFF"])

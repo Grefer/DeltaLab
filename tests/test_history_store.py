@@ -603,8 +603,8 @@ def test_default_label_appends_a_serial_when_the_name_is_taken():
 
 @pytest.mark.parametrize(("subtype", "expected"), [
     ("Eu", "欧式"),
-    ("Opt_EnDecumulator_Fix", "固定赔付增强累计"),
-    ("Opt_ASGQ_EFF", "熔断每日双固赔累计"),
+    ("Opt_EnDecumulator_Fix", "敲出增强·区间固赔累计"),
+    ("Opt_ASGQ_EFF", "熔断赔付·区间固赔·到期杠杆累计"),
     ("Opt_Snowball", "雪球"),
     ("EnhanceAsian", "增强亚式"),
 ])

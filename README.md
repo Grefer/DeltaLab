@@ -78,7 +78,7 @@ Windows / macOS (Apple Silicon) 用户可直接从 [Releases](https://github.com
 | 大类 | 子类型数 | 定价方式 |
 |---|---|---|
 | 香草期权 (Vanilla) | 1（欧式） | Black-Scholes 封闭解 |
-| 累计期权 (Decumulator) | 13（回归 / 增强 / 固赔 / 熔断 等系列） | 蒙特卡洛 |
+| 累计期权 (Decumulator) | 13（敲出终止 / 计零 / 增强 + 熔断保障 / 熔断赔付 两族） | 蒙特卡洛 |
 | 亚式期权 (Asian) | 2（亚式, 增强亚式） | 蒙特卡洛 |
 | 气囊期权 (Airbag) | 1（气囊） | 蒙特卡洛 |
 | 雪球期权 (Snowball) | 1（雪球 / 反雪球） | 蒙特卡洛 |

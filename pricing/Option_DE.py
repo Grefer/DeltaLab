@@ -21,7 +21,18 @@ except ImportError:
 
 
 class Option_DE(OptionBase):
-    # 累计期权大类
+    # 累计期权大类。13 个结构按三个正交维度区分，中文名见
+    # ``deltalab_ui.constants.SUBTYPE_DISPLAY``：
+    #   ① 触碰障碍 H 之后：敲出终止 / 敲出计零 / 敲出增强 /
+    #      熔断保障（改按 P 结算）/ 熔断赔付（改付 amount）
+    #   ② 区间 (K, H)：线性 (S−K) 或按 `fix` 固赔
+    #   ③ 杠杆腿 (S ≤ K)：每日观察逐日乘 N，或到期观察一次性结算
+    #
+    # ``ASGQ_E*`` 与 ``ASGQ_D*`` 的差别**只有 ③**。这两组的注释此前
+    # 写作「到期观察熔断」与「每日观察熔断」，是错的：七个 ASGQ 的熔断
+    # 判定都是同一行 ``np.cumsum(ss >= H, axis=1) > 0``，逐日路径依赖、
+    # 完全一致。E 只在到期日看 S_T ≤ K 并按累计天数一次性补 (N−1) 倍，
+    # D 则逐日看 S ≤ K、当日乘 N。
 
     def __init__(self,
                  optiontype: str,
@@ -61,6 +72,7 @@ class Option_DE(OptionBase):
         self.P = P
         self.amount = amount
         self._validate_required_params()
+        self._validate_dimensions()
 
     # 各子类型必需的"可选"参数。缺了会在定价深处炸成
     # ``TypeError: unsupported operand type(s) for *: 'NoneType' and 'int'``，
@@ -81,8 +93,35 @@ class Option_DE(OptionBase):
     }
 
     _PARAM_LABELS = {
-        "fix": "固定赔付", "P": "保障价格", "amount": "固定金额",
+        "fix": "区间赔付", "P": "保障价格", "amount": "熔断赔付",
     }
+
+    def _validate_dimensions(self):
+        """已实现前缀 + 剩余期限必须正好铺满观察日。
+
+        ``ss`` 是 ``sr``（已实现）与 ``S``（模拟 ``T_days`` 步）横向拼出来的，
+        而各类掩码矩阵按 ``len(observ)`` 开。三者对不上就会在定价深处炸成
+        ``IndexError: boolean index did not match indexed array``——只报出两个
+        数字，看不出是哪个字段填错了。
+
+        更糟的是 ``len(observ) == 1`` 那档：形状 ``(nPath,)`` 与 ``(nPath, 1)``
+        能广播成 ``(nPath, nPath)``，**不报错**，价格直接放大 ``nPath`` 倍。
+
+        这条不变量在所有状态转移下都守恒：``step_forward`` 给 sr 加一项、
+        ``_decrement_time`` 给 T_days 减一天，``_theta_overrides`` 同理。
+        """
+        n_realized = len(self.sr) if self.sr is not None else 0
+        n_observ = len(self.observ) if self.observ is not None else 0
+        if n_realized != self.T_over:
+            raise ValueError(
+                f"已实现价格序列长度（{n_realized}）必须等于已过天数"
+                f"（{self.T_over}）：sr 就是这 {self.T_over} 天的收盘价。")
+        if n_realized + self.T_days != n_observ:
+            raise ValueError(
+                f"观察日数量对不上：已实现 {n_realized} 天 + 剩余 "
+                f"{self.T_days} 天 = {n_realized + self.T_days}，"
+                f"但 observ 有 {n_observ} 项。"
+                f"「已过天数」不为 0 时必须同时提供这些天的已实现价格。")
 
     def _validate_required_params(self):
         missing = [
@@ -95,6 +134,40 @@ class Option_DE(OptionBase):
             raise ValueError(
                 f"结构 {self.optiontype} 必须提供 {fields}；"
                 f"该字段留空或填 0 都会被当作未填写。")
+
+    @staticmethod
+    def _knockout_state(ss, breached, discount_factor):
+        """熔断当日的价格与贴现因子，按路径取出、形状 (nPath, 1)。
+
+        熔断当天直接结算，所以熔断日及之后那一整笔在**熔断当日**一次付清，
+        应当用熔断当日的贴现因子折回 0 时刻，而不是各天用各天的因子。
+        早退分支不贴现是对的——那种情形下熔断确实发生在今天。
+
+        整段保持向量化：``np.argmax`` 一次取出所有路径的首个触发列，
+        再用花式索引取价格与因子，不需要按路径循环。
+        """
+        idx = np.argmax(breached, axis=1)
+        rows = np.arange(ss.shape[0])
+        return ss[rows, idx][:, None], discount_factor[idx][:, None]
+
+    @staticmethod
+    def _knockout_price(ss, breached):
+        """按路径取出熔断当日的价格，广播成一列。
+
+        实务口径：**熔断当天直接结算**——熔断日及之后每天的收益都等于
+        「熔断日价格 − 保障价格」这个常数，期权随即终止。
+
+        此前 MC 分支不是这么算的：``EP``/``DP`` 用的是**当天**价格，
+        ``call_put`` 用的是**到期**价格，两者都与早退分支（熔断已经发生在
+        真实历史里的情形）互相矛盾。同一条路径，只把熔断日从模拟段挪进
+        已实现段，价格能差十倍——而对冲回测每天都在往已实现段追加收盘价，
+        标的一穿越障碍，当天估值就从一条路径跳到另一条。
+
+        ``np.argmax`` 取首个 True；整行都没触发时返回 0，但那一行的
+        ``condition_ko`` 全为 False，取到的值不会进入结果。
+        """
+        idx = np.argmax(breached, axis=1)
+        return ss[np.arange(ss.shape[0]), idx][:, None]
 
     # 定价整合函数
     def get_price(self):
@@ -118,7 +191,7 @@ class Option_DE(OptionBase):
         self.T_days -= 1
         self.T_over += 1
 
-    # 普通累计（非回归，敲出即终止存续）
+    # 敲出终止累计：首次 S ≥ H 后当日及之后均停止累计
     def Opt_Decumulator(self) -> float:
 
         T = self.T_days / annual_days
@@ -145,7 +218,11 @@ class Option_DE(OptionBase):
         else:
             condition_ko = np.zeros([self.nPath, le], dtype=bool)
             flag_N = np.ones([self.nPath, le], dtype=int)
-            discount_factor = np.tile(np.exp(-self.r * (np.maximum(observ - self.T_over, 0)) * dt), (self.nPath, 1))
+            # 只沿观察日变化，对路径是常数：直接靠广播参与后面的逐元素
+            # 乘法，不必物化成 nPath × le 的矩阵。nPath=1e5、le=243 时
+            # 这一个 tile 就是 194 MB，而它每一行都一模一样。
+            discount_factor = np.exp(
+                -self.r * (np.maximum(observ - self.T_over, 0)) * dt)
             S = McGbmQ(self.s0, self.r - self.q, self.sigma, T, self.nPath, nStep,
                        seed=self.mc_seed)
             ss = np.c_[np.tile(sr, (self.nPath, 1)), S]
@@ -163,7 +240,7 @@ class Option_DE(OptionBase):
 
         return price
 
-    # 回归累计
+    # 敲出计零累计：仅 S ≥ H 的当日计 0，之后仍继续观察
     def Opt_Decumulator_Back(self) -> float:
 
         T = self.T_days / annual_days
@@ -187,7 +264,11 @@ class Option_DE(OptionBase):
 
         else:
             flag_N = np.ones([self.nPath, le], dtype=int)
-            discount_factor = np.tile(np.exp(-self.r * (np.maximum(observ - self.T_over, 0)) * dt), (self.nPath, 1))
+            # 只沿观察日变化，对路径是常数：直接靠广播参与后面的逐元素
+            # 乘法，不必物化成 nPath × le 的矩阵。nPath=1e5、le=243 时
+            # 这一个 tile 就是 194 MB，而它每一行都一模一样。
+            discount_factor = np.exp(
+                -self.r * (np.maximum(observ - self.T_over, 0)) * dt)
             S = McGbmQ(self.s0, self.r - self.q, self.sigma, T, self.nPath, nStep,
                        seed=self.mc_seed)
             ss = np.c_[np.tile(sr, (self.nPath, 1)), S]
@@ -205,7 +286,7 @@ class Option_DE(OptionBase):
 
         return price
 
-    # 区间内固定赔付回归累计
+    # 敲出计零·区间固赔累计（K~H 区间按 fix 结算）
     def Opt_Decumulator_Fix(self) -> float:
 
         T = self.T_days / annual_days
@@ -233,7 +314,11 @@ class Option_DE(OptionBase):
         else:
             flag_N = np.ones([self.nPath, le], dtype=int)
             idx_N = np.zeros((self.nPath, le), dtype=bool)
-            discount_factor = np.tile(np.exp(-self.r * (np.maximum(observ - self.T_over, 0)) * dt), (self.nPath, 1))
+            # 只沿观察日变化，对路径是常数：直接靠广播参与后面的逐元素
+            # 乘法，不必物化成 nPath × le 的矩阵。nPath=1e5、le=243 时
+            # 这一个 tile 就是 194 MB，而它每一行都一模一样。
+            discount_factor = np.exp(
+                -self.r * (np.maximum(observ - self.T_over, 0)) * dt)
             S = McGbmQ(self.s0, self.r - self.q, self.sigma, T, self.nPath, nStep,
                        seed=self.mc_seed)
             ss = np.c_[np.tile(sr, (self.nPath, 1)), S]
@@ -253,7 +338,8 @@ class Option_DE(OptionBase):
 
         return price
 
-    # 区间固定赔付回归累计（杠杆腿到期日观察、到期结算）
+    # 敲出计零·区间固赔·到期杠杆累计
+    # （K~H 区间按 fix 结算；杠杆腿到期日观察、到期结算）
     def Opt_Decumulator_Fix_E(self) -> float:
 
         T = self.T_days / annual_days
@@ -281,7 +367,11 @@ class Option_DE(OptionBase):
         else:
             flag = np.ones([self.nPath, le])
             flag_ki = np.zeros([self.nPath, le])
-            discount_factor = np.tile(np.exp(-self.r * (np.maximum(observ - self.T_over, 0)) * dt), (self.nPath, 1))
+            # 只沿观察日变化，对路径是常数：直接靠广播参与后面的逐元素
+            # 乘法，不必物化成 nPath × le 的矩阵。nPath=1e5、le=243 时
+            # 这一个 tile 就是 194 MB，而它每一行都一模一样。
+            discount_factor = np.exp(
+                -self.r * (np.maximum(observ - self.T_over, 0)) * dt)
             S = McGbmQ(self.s0, self.r - self.q, self.sigma, T, self.nPath, nStep,
                        seed=self.mc_seed)
             ss = np.c_[np.tile(sr, (self.nPath, 1)), S]
@@ -305,7 +395,7 @@ class Option_DE(OptionBase):
 
         return price
 
-    # 增强回归累计
+    # 敲出增强累计：S ≥ H 的当日仍付 (S − H)，保留敲出后的上行
     def Opt_EnDecumulator(self) -> float:
 
         T = self.T_days / annual_days
@@ -336,7 +426,11 @@ class Option_DE(OptionBase):
             condition_k = np.zeros([self.nPath, le], dtype=int)
             condition_ki = np.zeros([self.nPath, le], dtype=int)
             condition_ko = np.zeros([self.nPath, le], dtype=int)
-            discount_factor = np.tile(np.exp(-self.r * (np.maximum(observ - self.T_over, 0)) * dt), (self.nPath, 1))
+            # 只沿观察日变化，对路径是常数：直接靠广播参与后面的逐元素
+            # 乘法，不必物化成 nPath × le 的矩阵。nPath=1e5、le=243 时
+            # 这一个 tile 就是 194 MB，而它每一行都一模一样。
+            discount_factor = np.exp(
+                -self.r * (np.maximum(observ - self.T_over, 0)) * dt)
             S = McGbmQ(self.s0, self.r - self.q, self.sigma, T, self.nPath, nStep,
                        seed=self.mc_seed)
             ss = np.c_[np.tile(sr, (self.nPath, 1)), S]
@@ -358,7 +452,7 @@ class Option_DE(OptionBase):
 
         return price
 
-    # 固定赔付增强回归累计
+    # 敲出增强·区间固赔累计（K~H 区间按 fix 结算）
     def Opt_EnDecumulator_Fix(self) -> float:
 
         T = self.T_days / annual_days
@@ -389,7 +483,11 @@ class Option_DE(OptionBase):
             condition_k = np.zeros([self.nPath, le], dtype=int)
             condition_ki = np.zeros([self.nPath, le], dtype=int)
             condition_ko = np.zeros([self.nPath, le], dtype=int)
-            discount_factor = np.tile(np.exp(-self.r * (np.maximum(observ - self.T_over, 0)) * dt), (self.nPath, 1))
+            # 只沿观察日变化，对路径是常数：直接靠广播参与后面的逐元素
+            # 乘法，不必物化成 nPath × le 的矩阵。nPath=1e5、le=243 时
+            # 这一个 tile 就是 194 MB，而它每一行都一模一样。
+            discount_factor = np.exp(
+                -self.r * (np.maximum(observ - self.T_over, 0)) * dt)
             S = McGbmQ(self.s0, self.r - self.q, self.sigma, T, self.nPath, nStep,
                        seed=self.mc_seed)
             ss = np.c_[np.tile(sr, (self.nPath, 1)), S]
@@ -411,7 +509,8 @@ class Option_DE(OptionBase):
 
         return price
 
-    # 到期观察熔断保障价格累计（到期日结算）
+    # 熔断保障·到期结算累计：主项只用到期收盘价，
+    # 是 13 个结构里唯一不逐日结算的一个（其余熔断族均每日结算）
     def Opt_ASGQ_call_put(self) -> float:
 
         T = self.T_days / annual_days
@@ -449,33 +548,53 @@ class Option_DE(OptionBase):
         else:
             condition_ko = np.zeros([self.nPath, le], dtype=bool)
             flag_N = np.zeros([self.nPath, le], dtype=bool)
-            discount_factor = np.tile(np.exp(-self.r * (np.maximum(observ - self.T_over, 0)) * dt), (self.nPath, 1))
+            # 只沿观察日变化，对路径是常数：直接靠广播参与后面的逐元素
+            # 乘法，不必物化成 nPath × le 的矩阵。nPath=1e5、le=243 时
+            # 这一个 tile 就是 194 MB，而它每一行都一模一样。
+            discount_factor = np.exp(
+                -self.r * (np.maximum(observ - self.T_over, 0)) * dt)
             S = McGbmQ(self.s0, self.r - self.q, self.sigma, T, self.nPath, nStep,
                        seed=self.mc_seed)
             ss = np.c_[np.tile(sr, (self.nPath, 1)), S]
             if self.cp == 1:
                 # 对逻辑值累加以实现找到第一个满足条件的值后，之后的条件全为True
                 # 现实意义：对于路径依赖的熔断累计期权，熔断日及之后都采用保障价格结算
-                condition_ko[np.cumsum(ss >= self.H, axis=1) > 0] = 1
+                breached = ss >= self.H
+                condition_ko[np.cumsum(breached, axis=1) > 0] = 1
+                # 熔断即终止：这条路径的"终值"就是熔断日价格，熔断前后
+                # 各日都据此结算（与早退分支的 (S_ko-K)*idx + (S_ko-P)*(le-idx) 同形）。
+                s_ko, df_ko = self._knockout_state(ss, breached, discount_factor)
+                n_ko = condition_ko.sum(axis=1, keepdims=True)
+                s_term = np.where(condition_ko[:, -1:], s_ko, ss[:, -1:])
                 flag_N[(ss[:, -1] <= self.K) & (np.all(condition_ko == 0, axis=1)), -1] = 1
-                cashflow = (((ss[:, -1] - self.P).reshape(self.nPath, 1) * condition_ko + (ss[:, -1] - self.K).reshape(
-                    self.nPath, 1) * ~condition_ko)
+                # 本结构到期日一次结算：熔断路径整条改在熔断当日结算，
+                # 因此熔断前后各日一律按熔断当日的因子折回（与早退分支
+                # (S_ko-K)*idx + (S_ko-P)*(le-idx) 完全同形）。
+                ko_total = ((s_term - self.K) * (le - n_ko)
+                            + (s_term - self.P) * n_ko) * df_ko
+                cashflow = ((s_term - self.K) * ~condition_ko
                             + (ss[:, -1] - self.K).reshape(self.nPath, 1) * le * (
                                     flag_N * self.N + ~flag_N * 1 - 1)) * discount_factor
             else:
-                condition_ko[np.cumsum(ss <= self.H, axis=1) > 0] = 1
+                breached = ss <= self.H
+                condition_ko[np.cumsum(breached, axis=1) > 0] = 1
+                s_ko, df_ko = self._knockout_state(ss, breached, discount_factor)
+                n_ko = condition_ko.sum(axis=1, keepdims=True)
+                s_term = np.where(condition_ko[:, -1:], s_ko, ss[:, -1:])
                 flag_N[(ss[:, -1] >= self.K) & (np.all(condition_ko == 0, axis=1)), -1] = 1
-                cashflow = (((self.P - ss[:, -1]).reshape(self.nPath, 1) * condition_ko + (self.K - ss[:, -1]).reshape(
-                    self.nPath, 1) * ~condition_ko)
+                ko_total = ((self.K - s_term) * (le - n_ko)
+                            + (self.P - s_term) * n_ko) * df_ko
+                cashflow = ((self.K - s_term) * ~condition_ko
                             + (self.K - ss[:, -1]).reshape(self.nPath, 1) * le * (
                                     flag_N * self.N + ~flag_N * 1 - 1)) * discount_factor
 
-            price_ls = np.sum(cashflow, 1)
+            price_ls = np.where(condition_ko[:, -1],
+                                ko_total[:, 0], np.sum(cashflow, 1))
             price = np.mean(price_ls, 0)
 
         return price
 
-    # 到期观察熔断保障价格累计（每日结算）
+    # 熔断保障·到期杠杆累计（每日结算；杠杆腿只在到期日观察）
     def Opt_ASGQ_EP(self) -> float:
 
         T = self.T_days / annual_days
@@ -513,30 +632,45 @@ class Option_DE(OptionBase):
         else:
             condition_ko = np.zeros([self.nPath, le], dtype=bool)
             flag_N = np.zeros([self.nPath, le], dtype=bool)
-            discount_factor = np.tile(np.exp(-self.r * (np.maximum(observ - self.T_over, 0)) * dt), (self.nPath, 1))
+            # 只沿观察日变化，对路径是常数：直接靠广播参与后面的逐元素
+            # 乘法，不必物化成 nPath × le 的矩阵。nPath=1e5、le=243 时
+            # 这一个 tile 就是 194 MB，而它每一行都一模一样。
+            discount_factor = np.exp(
+                -self.r * (np.maximum(observ - self.T_over, 0)) * dt)
             S = McGbmQ(self.s0, self.r - self.q, self.sigma, T, self.nPath, nStep,
                        seed=self.mc_seed)
             ss = np.c_[np.tile(sr, (self.nPath, 1)), S]
             if self.cp == 1:
                 # 对逻辑值累加以实现找到第一个满足条件的值后，之后的条件全为True
                 # 现实意义：对于路径依赖的熔断累计期权，熔断日及之后都采用保障价格结算
-                condition_ko[np.cumsum(ss >= self.H, axis=1) > 0] = 1
+                breached = ss >= self.H
+                condition_ko[np.cumsum(breached, axis=1) > 0] = 1
+                s_ko, df_ko = self._knockout_state(ss, breached, discount_factor)
+                n_ko = condition_ko.sum(axis=1, keepdims=True)
                 flag_N[(ss[:, -1] <= self.K) & (np.all(condition_ko == 0, axis=1)), -1] = 1
-                cashflow = (((ss - self.P) * condition_ko + (ss - self.K) * ~condition_ko) +
+                # 累计腿：每日结算，各天用各天的贴现因子。
+                cashflow = ((ss - self.K) * ~condition_ko +
                             (ss[:, -1] - self.K).reshape(self.nPath, 1) * le * (
                                     flag_N * self.N + ~flag_N * 1 - 1)) * discount_factor
+                # 熔断腿：整笔在熔断当日结算，按当日因子折回 0 时刻。
+                ko_leg = (s_ko - self.P) * n_ko * df_ko
             else:
-                condition_ko[np.cumsum(ss <= self.H, axis=1) > 0] = 1
+                breached = ss <= self.H
+                condition_ko[np.cumsum(breached, axis=1) > 0] = 1
+                s_ko, df_ko = self._knockout_state(ss, breached, discount_factor)
+                n_ko = condition_ko.sum(axis=1, keepdims=True)
                 flag_N[(ss[:, -1] >= self.K) & (np.all(condition_ko == 0, axis=1)), -1] = 1
-                cashflow = (((self.P - ss) * condition_ko + (self.K - ss) * ~condition_ko) +
-                            (self.K - ss[:, -1]) * le * (flag_N * self.N + ~flag_N * 1 - 1)) * discount_factor
+                cashflow = ((self.K - ss) * ~condition_ko +
+                            (self.K - ss[:, -1]).reshape(self.nPath, 1) * le * (
+                                    flag_N * self.N + ~flag_N * 1 - 1)) * discount_factor
+                ko_leg = (self.P - s_ko) * n_ko * df_ko
 
-            price_ls = np.sum(cashflow, 1)
+            price_ls = np.sum(cashflow, 1) + ko_leg[:, 0]
             price = np.mean(price_ls, 0)
 
         return price
 
-    # 到期观察熔断后固定赔付累计（每日结算）
+    # 熔断赔付·到期杠杆累计（每日结算；杠杆腿只在到期日观察）
     def Opt_ASGQ_EF(self) -> float:
 
         T = self.T_days / annual_days
@@ -569,7 +703,11 @@ class Option_DE(OptionBase):
         else:
             condition_ko = np.zeros([self.nPath, le], dtype=bool)
             flag_N = np.zeros([self.nPath, le], dtype=bool)
-            discount_factor = np.tile(np.exp(-self.r * (np.maximum(observ - self.T_over, 0)) * dt), (self.nPath, 1))
+            # 只沿观察日变化，对路径是常数：直接靠广播参与后面的逐元素
+            # 乘法，不必物化成 nPath × le 的矩阵。nPath=1e5、le=243 时
+            # 这一个 tile 就是 194 MB，而它每一行都一模一样。
+            discount_factor = np.exp(
+                -self.r * (np.maximum(observ - self.T_over, 0)) * dt)
             S = McGbmQ(self.s0, self.r - self.q, self.sigma, T, self.nPath, nStep,
                        seed=self.mc_seed)
             ss = np.c_[np.tile(sr, (self.nPath, 1)), S]
@@ -585,14 +723,15 @@ class Option_DE(OptionBase):
                 condition_ko[np.cumsum(ss <= self.H, axis=1) > 0] = 1
                 flag_N[(ss[:, -1] >= self.K) & (np.all(condition_ko == 0, axis=1)), -1] = 1
                 cashflow = ((self.amount * condition_ko + (self.K - ss) * ~condition_ko) +
-                            (self.K - ss[:, -1]) * le * (flag_N * self.N + ~flag_N * 1 - 1)) * discount_factor
+                            (self.K - ss[:, -1]).reshape(self.nPath, 1) * le * (
+                                    flag_N * self.N + ~flag_N * 1 - 1)) * discount_factor
 
             price_ls = np.sum(cashflow, 1)
             price = np.mean(price_ls, 0)
 
         return price
 
-    # 每日观察熔断后保障价格累计（每日结算）
+    # 熔断保障·每日杠杆累计（每日结算；杠杆腿逐日观察，S ≤ K 当日乘 N）
     def Opt_ASGQ_DP(self) -> float:
 
         T = self.T_days / annual_days
@@ -629,29 +768,42 @@ class Option_DE(OptionBase):
         else:
             condition_ko = np.zeros([self.nPath, le], dtype=bool)
             flag_N = np.zeros([self.nPath, le], dtype=bool)
-            discount_factor = np.tile(np.exp(-self.r * (np.maximum(observ - self.T_over, 0)) * dt), (self.nPath, 1))
+            # 只沿观察日变化，对路径是常数：直接靠广播参与后面的逐元素
+            # 乘法，不必物化成 nPath × le 的矩阵。nPath=1e5、le=243 时
+            # 这一个 tile 就是 194 MB，而它每一行都一模一样。
+            discount_factor = np.exp(
+                -self.r * (np.maximum(observ - self.T_over, 0)) * dt)
             S = McGbmQ(self.s0, self.r - self.q, self.sigma, T, self.nPath, nStep,
                        seed=self.mc_seed)
             ss = np.c_[np.tile(sr, (self.nPath, 1)), S]
             if self.cp == 1:
                 # 对逻辑值累加以实现找到第一个满足条件的值后，之后的条件全为True
                 # 现实意义：对于路径依赖的熔断累计期权，熔断日及之后都采用保障价格结算
-                condition_ko[np.cumsum(ss >= self.H, axis=1) > 0] = 1
+                breached = ss >= self.H
+                condition_ko[np.cumsum(breached, axis=1) > 0] = 1
+                s_ko, df_ko = self._knockout_state(ss, breached, discount_factor)
+                n_ko = condition_ko.sum(axis=1, keepdims=True)
                 flag_N[(ss <= self.K) * ~condition_ko] = 1
-                cashflow = (((ss - self.P) * condition_ko + (ss - self.K) * ~condition_ko) * (
+                cashflow = ((ss - self.K) * ~condition_ko * (
                         flag_N * self.N + ~flag_N * 1)) * discount_factor
+                # 熔断日之后 flag_N 恒为 False，杠杆系数恒为 1，故不出现在熔断腿里。
+                ko_leg = (s_ko - self.P) * n_ko * df_ko
             else:
-                condition_ko[np.cumsum(ss <= self.H, axis=1) > 0] = 1
+                breached = ss <= self.H
+                condition_ko[np.cumsum(breached, axis=1) > 0] = 1
+                s_ko, df_ko = self._knockout_state(ss, breached, discount_factor)
+                n_ko = condition_ko.sum(axis=1, keepdims=True)
                 flag_N[(ss >= self.K) * ~condition_ko] = 1
-                cashflow = (((self.P - ss) * condition_ko + (self.K - ss) * ~condition_ko) * (
+                cashflow = ((self.K - ss) * ~condition_ko * (
                         flag_N * self.N + ~flag_N * 1)) * discount_factor
+                ko_leg = (self.P - s_ko) * n_ko * df_ko
 
-            price_ls = np.sum(cashflow, 1)
+            price_ls = np.sum(cashflow, 1) + ko_leg[:, 0]
             price = np.mean(price_ls, 0)
 
         return price
 
-    # 每日观察熔断后固定赔付累计（每日结算）
+    # 熔断赔付·每日杠杆累计（每日结算；杠杆腿逐日观察，S ≤ K 当日乘 N）
     def Opt_ASGQ_DF(self) -> float:
 
         T = self.T_days / annual_days
@@ -686,7 +838,11 @@ class Option_DE(OptionBase):
         else:
             condition_ko = np.zeros([self.nPath, le], dtype=bool)
             flag_N = np.zeros([self.nPath, le], dtype=bool)
-            discount_factor = np.tile(np.exp(-self.r * (np.maximum(observ - self.T_over, 0)) * dt), (self.nPath, 1))
+            # 只沿观察日变化，对路径是常数：直接靠广播参与后面的逐元素
+            # 乘法，不必物化成 nPath × le 的矩阵。nPath=1e5、le=243 时
+            # 这一个 tile 就是 194 MB，而它每一行都一模一样。
+            discount_factor = np.exp(
+                -self.r * (np.maximum(observ - self.T_over, 0)) * dt)
             S = McGbmQ(self.s0, self.r - self.q, self.sigma, T, self.nPath, nStep,
                        seed=self.mc_seed)
             ss = np.c_[np.tile(sr, (self.nPath, 1)), S]
@@ -709,9 +865,10 @@ class Option_DE(OptionBase):
         return price
 
 
-    # 每日观察熔断·区间固定赔付 + 熔断后固定赔付累计（每日结算）
-    # fix    : 区间内（K~H）每日固定赔付
-    # amount : 熔断后每日固定赔付
+    # 熔断赔付·区间固赔·每日杠杆累计（每日结算）
+    # fix    : 区间赔付——标的落在 K~H 区间时每日结算的金额
+    # amount : 熔断赔付——熔断日起每日结算的金额
+    # 两者曾经都叫「固定赔付」，读代码时分不出说的是哪一个。
     def Opt_ASGQ_DFF(self) -> float:
 
         T = self.T_days / annual_days
@@ -745,7 +902,11 @@ class Option_DE(OptionBase):
 
         else:
             condition_ko = np.zeros([self.nPath, le], dtype=bool)
-            discount_factor = np.tile(np.exp(-self.r * (np.maximum(observ - self.T_over, 0)) * dt), (self.nPath, 1))
+            # 只沿观察日变化，对路径是常数：直接靠广播参与后面的逐元素
+            # 乘法，不必物化成 nPath × le 的矩阵。nPath=1e5、le=243 时
+            # 这一个 tile 就是 194 MB，而它每一行都一模一样。
+            discount_factor = np.exp(
+                -self.r * (np.maximum(observ - self.T_over, 0)) * dt)
             S = McGbmQ(self.s0, self.r - self.q, self.sigma, T, self.nPath, nStep,
                        seed=self.mc_seed)
             ss = np.c_[np.tile(sr, (self.nPath, 1)), S]
@@ -767,9 +928,9 @@ class Option_DE(OptionBase):
 
         return price
 
-    # 到期观察熔断·区间固定赔付 + 熔断后固定赔付累计（每日结算）
-    # fix    : 区间内（K~H）每日固定赔付（fixed_payout1）
-    # amount : 熔断后每日固定赔付（fixed_payout2）
+    # 熔断赔付·区间固赔·到期杠杆累计（每日结算）
+    # fix    : 区间赔付——标的落在 K~H 区间时每日结算的金额
+    # amount : 熔断赔付——熔断日起每日结算的金额
     # 杠杆腿到期日观察：到期收盘价穿越执行价时，按累计天数 le 结算 (N-1) 倍杠杆
     def Opt_ASGQ_EFF(self) -> float:
 
@@ -811,7 +972,11 @@ class Option_DE(OptionBase):
         else:
             flag_N = np.zeros([self.nPath, le], dtype=bool)
             condition_ko = np.zeros([self.nPath, le], dtype=bool)
-            discount_factor = np.tile(np.exp(-self.r * (np.maximum(observ - self.T_over, 0)) * dt), (self.nPath, 1))
+            # 只沿观察日变化，对路径是常数：直接靠广播参与后面的逐元素
+            # 乘法，不必物化成 nPath × le 的矩阵。nPath=1e5、le=243 时
+            # 这一个 tile 就是 194 MB，而它每一行都一模一样。
+            discount_factor = np.exp(
+                -self.r * (np.maximum(observ - self.T_over, 0)) * dt)
             S = McGbmQ(self.s0, self.r - self.q, self.sigma, T, self.nPath, nStep,
                        seed=self.mc_seed)
             ss = np.c_[np.tile(sr, (self.nPath, 1)), S]

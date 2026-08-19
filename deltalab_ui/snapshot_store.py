@@ -641,6 +641,17 @@ class SnapshotStoreMixin:
             key: backtest_pool_store.decode(body[key])
             for key in SnapshotStoreMixin._POOL_FIELDS if key in body
         }
+        # 结构中文名跟着 SUBTYPE_DISPLAY 重算，不用包里那份。``option_label``
+        # 是**显示名**却落了盘，于是结构一改名，老包会一直显示旧名，同一张表
+        # 里新旧两套名字并存——而重放配方里正好存着内部键，据此现算即可。
+        # 配方为空的包（``prices.size < 2``，见 _snapshot_replay_recipe）没有
+        # 内部键可依，那时才退回落盘的那份。
+        replay = values.get("replay")
+        subtype = str((replay or {}).get("subtype") or "") if isinstance(
+            replay, dict) else ""
+        if subtype in SUBTYPE_DISPLAY:
+            values["option_label"] = SUBTYPE_DISPLAY[subtype]
+
         saved_at = values.get("saved_at")
         if not isinstance(saved_at, datetime.datetime):
             values["saved_at"] = datetime.datetime.fromisoformat(

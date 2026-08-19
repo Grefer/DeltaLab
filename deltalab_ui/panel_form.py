@@ -35,6 +35,7 @@ from pricing.hedge_backtest import _infer_intraday_steps, _validate_fixed_time_d
 
 from deltalab_ui import wind_resolve
 from deltalab_ui.constants import (
+    DIRECTIONAL_LEVELS,
     OPTION_CLASSES,
     SIGMA_SOURCE_FROM_DISPLAY,
     STRATEGY_DISPLAY,
@@ -91,6 +92,10 @@ class FormPanelMixin:
                 if key == "margin_call":
                     cb.bind("<<ComboboxSelected>>",
                             lambda _event: self._sync_snowball_margin_controls())
+                if key == "cp":
+                    cb.bind("<<ComboboxSelected>>",
+                            lambda _event:
+                            self._mirror_levels_on_direction_change())
             else:
                 var = tk.StringVar(value=str(default))
                 entry = ttk.Entry(self._param_frame, textvariable=var,
@@ -467,6 +472,87 @@ class FormPanelMixin:
         state = FormPanelMixin._collect_gui_state_for_strategy(self)
         return wind_resolve.resolve_single_wind_state(state)
 
+    @staticmethod
+    def _validate_barrier_direction(cls_name, params):
+        """障碍必须摆在标的价的正确一侧，否则首日就必然触发。
+
+        触发条件随 cp 翻转（累计期权看涨 ``S >= H`` 熔断、看跌 ``S <= H``），
+        而默认值只朝一个方向摆。切到另一方向后不改档位的话，算出来的是一串
+        「第一天就敲掉」的退化值——数字看着正常，其实没有任何信息量。
+        """
+        spec = DIRECTIONAL_LEVELS.get(cls_name)
+        if spec is None:
+            return
+        try:
+            s0 = float(params["s0"])
+        except (KeyError, TypeError, ValueError):
+            return
+        if not np.isfinite(s0) or s0 <= 0:
+            return
+        cp = int(params.get("cp", 1))
+        # 雪球的 cp=-1 才是"正向"（敲入在下、敲出在上），与另外两类相反。
+        is_forward = (cp == -1) if spec.get("call_is_reversed") else (cp == 1)
+        for field, side_when_forward, label in spec["barriers"]:
+            try:
+                level = float(params[field])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if not np.isfinite(level):
+                continue
+            want_above = (side_when_forward == "above") == is_forward
+            if want_above and level <= s0:
+                raise ValueError(
+                    f"{label} {level:g} 必须高于初始价格 {s0:g}，"
+                    f"否则第一天就会触发。切换看涨/看跌之后，"
+                    f"障碍档位需要摆到标的价的另一侧。")
+            if not want_above and level >= s0:
+                raise ValueError(
+                    f"{label} {level:g} 必须低于初始价格 {s0:g}，"
+                    f"否则第一天就会触发。切换看涨/看跌之后，"
+                    f"障碍档位需要摆到标的价的另一侧。")
+
+    def _mirror_levels_on_direction_change(self):
+        """切换方向时，把仍是默认值的价格档位绕 s0 镜像到另一侧。
+
+        只在这些档位**没有被改过**时动手：值等于本类默认值就镜像过去，
+        等于镜像后的默认值就镜像回来，其余一律不碰——用户自己填的数字不该
+        被静默改写，那种情况交给 _validate_barrier_direction 提示。
+        """
+        cls_name = self._class_var.get()
+        spec = DIRECTIONAL_LEVELS.get(cls_name)
+        if spec is None:
+            return
+        cfg = OPTION_CLASSES.get(cls_name)
+        if not cfg:
+            return
+        defaults = {name: default
+                    for name, _label, _dtype, default, *_ in cfg["params"]}
+        try:
+            s0 = float(defaults["s0"])
+        except (KeyError, TypeError, ValueError):
+            return
+
+        pending = {}
+        for field in spec["mirror"]:
+            entry = self._param_entries.get(field)
+            if entry is None or field not in defaults:
+                return
+            var = entry[0]
+            try:
+                current = float(var.get().strip())
+            except (TypeError, ValueError):
+                return
+            base = float(defaults[field])
+            mirrored = 2.0 * s0 - base
+            if abs(current - base) < 1e-9:
+                pending[field] = (var, mirrored)
+            elif abs(current - mirrored) < 1e-9:
+                pending[field] = (var, base)
+            else:
+                return          # 有人改过，整组都不动
+        for var, value in pending.values():
+            var.set(f"{value:g}")
+
     def _collect_gui_state_for_strategy(self, strategy_name=None):
         """收集公共回测环境，并只读取指定策略的专属参数。"""
         cls_name = self._class_var.get()
@@ -494,6 +580,8 @@ class FormPanelMixin:
 
         wind_resolve.validate_sigma_input(
             params.get("sigma"), param_labels.get("sigma", "波动率"))
+
+        FormPanelMixin._validate_barrier_direction(cls_name, params)
 
         if cls_name == "雪球期权 (Snowball)":
             margin = float(params.get("margin", 0.0))

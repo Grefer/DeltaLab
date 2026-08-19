@@ -304,10 +304,12 @@ def test_option_subtypes_do_not_share_a_key():
     assert len(subtypes) > 1, subtypes
     digests = {}
     for subtype in subtypes:
+        # observ 必须铺满「已实现 + 剩余」——本用例只算摘要不定价，此前随手
+        # 传了空 observ，而那是个维度自相矛盾的合约（定价时会炸 IndexError）。
         option = Option_DE(
-            subtype, s0=100.0, sr=[], K=100.0, T_over=20, T_days=20,
-            observ=[], sigma=0.18, H=110.0, N=1, cp=1, r=0.03, q=0.03,
-            nPath=10, fix=0.0, P=100.0, amount=1)
+            subtype, s0=100.0, sr=[], K=100.0, T_over=0, T_days=20,
+            observ=list(range(1, 21)), sigma=0.18, H=110.0, N=1, cp=1,
+            r=0.03, q=0.03, nPath=10, fix=0.0, P=100.0, amount=1)
         digest = cache._digest_object(option)
         assert digest is not None, subtype
         digests[subtype] = digest

@@ -884,8 +884,11 @@ class HistorySetupMixin:
             "subtype": "子类型", "position": "头寸", "asof": "分析截至日",
             "span": "证据跨度", "verdict": "结论",
         }
-        # 子类型用中文名，最长「熔断每日双固赔累计」9 个汉字；列宽按它留。
-        widths = {"label": 170, "code": 92, "option": 92, "subtype": 150,
+        # 子类型用中文名，最长「敲出计零·区间固赔·到期杠杆累计」在这张表的
+        # TkDefaultFont 下实测 189px，加单元格内边距按 210 留（旧的 9 汉字名
+        # 只要 150）。八列之和 1029px，窗口 1180 扣掉 padding 与滚动条后还有
+        # 约 100px 富余，都归 stretch=True 的「名称」列。
+        widths = {"label": 170, "code": 92, "option": 92, "subtype": 210,
                   "position": 138, "asof": 98, "span": 74, "verdict": 155}
         # 动作行先占位（见下方 actions 的 pack）：树带 expand=True 会吃掉
         # 剩余空腔，排在它后面的按钮行会被压成 0 高度直接消失，而 tkinter

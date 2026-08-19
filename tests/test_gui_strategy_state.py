@@ -5759,7 +5759,7 @@ def test_history_params_detail_splits_shared_inputs_from_the_row_candidate():
         str(spec[1])
         for spec in gui_app.OPTION_CLASSES["累计期权 (Decumulator)"]["params"]]
     assert [n for n, _v in grouped["期权类型与参数"]][2:] == declared
-    assert contract["期权类型"] == "回归累计"
+    assert contract["期权类型"] == "敲出计零累计"
     # 大类专属标签：累计的 T_days 是「剩余期限」，不是香草的「期限」。
     assert "剩余期限(交易日)" in contract
 
@@ -5840,7 +5840,7 @@ def test_history_rank_rows_offer_a_params_detail_on_right_click():
         walk(window)
         assert len(texts) == 1
         body = texts[0]
-        assert "期权类型与参数" in body and "回归累计" in body
+        assert "期权类型与参数" in body and "敲出计零累计" in body
         # 参考值那句限定必须在，否则用户会拿这个行权价去对账。
         assert "参考值" in body and "加载明细" in body
         window.destroy()

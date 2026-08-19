@@ -231,10 +231,47 @@ python gui_app.py
 各大类的子类型集共 18 种（见 `deltalab_ui/constants.py:OPTION_CLASSES`）：
 
 - **Vanilla**（1）：`Eu`
-- **Decumulator**（13）：`Opt_Decumulator` / `Opt_Decumulator_Back` / `Opt_Decumulator_Fix` / `Opt_Decumulator_Fix_E` / `Opt_EnDecumulator` / `Opt_EnDecumulator_Fix` / `Opt_ASGQ_call_put` / `Opt_ASGQ_EP` / `Opt_ASGQ_EF` / `Opt_ASGQ_EFF` / `Opt_ASGQ_DP` / `Opt_ASGQ_DF` / `Opt_ASGQ_DFF`
+- **Decumulator**（13）：`Opt_Decumulator` / `Opt_Decumulator_Back` / `Opt_Decumulator_Fix` / `Opt_Decumulator_Fix_E` / `Opt_EnDecumulator` / `Opt_EnDecumulator_Fix` / `Opt_ASGQ_call_put` / `Opt_ASGQ_DP` / `Opt_ASGQ_EP` / `Opt_ASGQ_DF` / `Opt_ASGQ_EF` / `Opt_ASGQ_DFF` / `Opt_ASGQ_EFF`（下拉顺序即此，见下表）
 - **Asian**（2）：`Asian` / `EnhanceAsian`
 - **Airbag**（1）：`Opt_Airbag`
 - **Snowball**（1）：`Opt_Snowball`
+
+##### 累计期权 13 个结构的中文名怎么读
+
+名字按三个**正交维度**拼，顺序固定，取默认值的那一段省略不写：
+
+| 维度 | 取值 | 含义 |
+|---|---|---|
+| ① 触碰障碍 H 之后（必写） | `敲出终止` | 首次 `S ≥ H` 后当日及之后均停止累计 |
+| | `敲出计零` | 仅触碰当日计 0，之后继续观察 |
+| | `敲出增强` | 触碰当日仍付 `(S − H)`，保留敲出后的上行 |
+| | `熔断保障` | 熔断日起改按保障价 `P` 结算，跑到到期 |
+| | `熔断赔付` | 熔断日起改付熔断赔付 `amount`，跑到到期 |
+| ② 区间 `(K, H)` | *省略* | 线性 `(S − K)` |
+| | `区间固赔` | 按 `fix` 结算 |
+| ③ 杠杆腿 `S ≤ K` | `每日杠杆` | 逐日看 `S ≤ K`，当日乘 `N` |
+| | `到期杠杆` | 只看到期收盘价，一次性按累计天数补 `(N − 1)` 倍 |
+| | `到期结算` | 连主项也只用到期收盘价（仅 `ASGQ_call_put`） |
+
+| 内部键 | 中文名 |
+|---|---|
+| `Opt_Decumulator` | 敲出终止累计 |
+| `Opt_Decumulator_Back` | 敲出计零累计 |
+| `Opt_Decumulator_Fix` | 敲出计零·区间固赔累计 |
+| `Opt_Decumulator_Fix_E` | 敲出计零·区间固赔·到期杠杆累计 |
+| `Opt_EnDecumulator` | 敲出增强累计 |
+| `Opt_EnDecumulator_Fix` | 敲出增强·区间固赔累计 |
+| `Opt_ASGQ_call_put` | 熔断保障·到期结算累计 |
+| `Opt_ASGQ_DP` | 熔断保障·每日杠杆累计 |
+| `Opt_ASGQ_EP` | 熔断保障·到期杠杆累计 |
+| `Opt_ASGQ_DF` | 熔断赔付·每日杠杆累计 |
+| `Opt_ASGQ_EF` | 熔断赔付·到期杠杆累计 |
+| `Opt_ASGQ_DFF` | 熔断赔付·区间固赔·每日杠杆累计 |
+| `Opt_ASGQ_EFF` | 熔断赔付·区间固赔·到期杠杆累计 |
+
+「敲出」与「熔断」的分工是有意的：敲出族触碰后只影响赔付本身，熔断族触碰后**换一整套结算规则**跑到到期。`ASGQ_E*` 与 `ASGQ_D*` 的差别**只有 ③** —— 七个 ASGQ 的熔断判定是同一行 `np.cumsum(ss >= H, axis=1) > 0`，逐日路径依赖、完全一致。
+
+中文名的唯一来源是 `deltalab_ui/constants.py:SUBTYPE_DISPLAY`；说明卡的标题行由它生成，不再手抄。改名前的旧名（`普通累计`、`熔断每日双固赔累计` 等）仍能通过 `SUBTYPE_FROM_DISPLAY` 反查回内部键，但界面各处一律显示新名。
 
 每个子类型的 payoff 公式见 `deltalab_ui/structure_docs.py:STRUCTURE_DOCS`（18 种全部有条目），也会在「结构分析」Tab 顶部展示。两个常量都由 `gui_app` re-export，写 `gui_app.OPTION_CLASSES` 同样有效。
 
@@ -268,9 +305,9 @@ python gui_app.py
 | `H` | 障碍价格（敲出/熔断） | float | `110.0` |
 | `N` | 杠杆倍数（跌破 K 后） | int | `2` |
 | `cp` | 方向，下拉选择 `看涨 (Call)` / `看跌 (Put)`，内部映射为 `1` / `-1` | int | `1`（看涨） |
-| `fix` | 固定赔付（`*_Fix` 子类型用） | float | `0.0`，传 0 → 视为未设置（None） |
-| `P` | 保障价格（`ASGQ_*P` 用） | float | `0.0`，传 0 → None |
-| `amount` | 固定金额（`ASGQ_*F` 用） | float | `0.0`，传 0 → None |
+| `fix` | 区间赔付（`*_Fix` 子类型用）：标的落在 K~H 区间时每日结算的金额 | float | `0.0`，传 0 → 视为未设置（None） |
+| `P` | 保障价格（`ASGQ_*P` 用）：熔断日起改用该价格结算 | float | `100.0`（= 默认入场价），传 0 → None |
+| `amount` | 熔断赔付（`ASGQ_*F` 用）：熔断日起每日结算的金额 | float | `0.0`，传 0 → None |
 | `r` / `q` | 利率 / 分红 | float | `0.03` / `0.03` |
 | `nPath` | MC 路径数 | int | `100000` |
 
@@ -754,10 +791,11 @@ JSON 包，最多保留 20 条，超出按序号淘汰最旧的。包内带 `sch
   是一句话，固定间隔要写下绝对 / 相对 / σ 三种口径的等价换算；模拟只有一个 seed，
   Wind 是代码加起止日加频率）。每列按当前池子里最长的那格取宽，夹在一个基准宽与
   上限之间，长的快照删掉后又缩回去。余量仍由七列一起摊，不会被某一列独吞。
-- **期权类型**：`期权类型` 列显示这条快照测的是哪一种期权（`欧式`、`普通累计`、
-  `熔断每日双固赔累计`…），排在 `策略` 左边 —— 一条结果先是"测的哪一种期权"，
-  才轮到"用什么对冲它"。合约参数本身不上表（一条累计有十几项），走右键
-  `参数详情`。
+- **期权类型**：`期权类型` 列显示这条快照测的是哪一种期权（`欧式`、`敲出终止累计`、
+  `熔断赔付·区间固赔·每日杠杆累计`…），排在 `策略` 左边 —— 一条结果先是"测的哪一种
+  期权"，才轮到"用什么对冲它"。合约参数本身不上表（一条累计有十几项），走右键
+  `参数详情`。列里显示的名字是**载入时按当前 `SUBTYPE_DISPLAY` 现算的**（依据是
+  重放配方里的内部键），因此结构改名后盘上的老结果包会跟着改名，不会新旧两套并存。
 - **应用策略**：右键菜单的 `应用策略` 把当前聚焦结果的对冲策略输入写回左侧表单，按保存时的
   那一种带宽单位原样写回。**期权结构、头寸方向、成本与行情来源都不动**，因此
   它只是让你接着这条结果继续调对冲参数，而不是还原整次运行。本功能之前保留的

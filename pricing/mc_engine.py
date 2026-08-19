@@ -41,9 +41,32 @@ def McGbmQ(
 
     # seed=None 由 np.random.default_rng 自动走 OS 熵，保证每次采样独立。
     rng = np.random.default_rng(seed)
-    W1 = rng.standard_normal((nPath // 2, nStep))
-    W = np.r_[W1, -W1]  # 对偶变量方差缩减
+
+    # 全程在**一块**输出缓冲上原地推进。此前每一步都新建数组：
+    # W1、np.r_ 拼出的 W、两个算术临时、cumsum、exp，峰值是结果矩阵的
+    # 4.5 倍（nPath=1e5 / nStep=243 时 834 MB → 现在 185 MB）。
+    #
+    # **这是省内存，不是提速。** 完整优选链路上背靠背 A/B 七轮，
+    # 中位数之比 1.01x——落在噪声里。原因是原地版仍要对同一块数组做五趟
+    # 读写（乘、加、cumsum、exp、乘），带宽流量几乎没变，省掉的是分配。
+    # 收益在峰值占用：雪球这类 payoff 很轻的结构，单次定价峰值从约 167 MB
+    # 降到 42 MB，分段并行的内存预算因此宽裕得多。
+    #
+    # 每一步都与原写法逐位等价，随机流也没变：
+    #   * standard_normal(out=) 只决定写到哪里，抽样序列不受影响；
+    #   * 先乘 vol 再加 drift，与原来的 drift + vol*W 是同一组 IEEE754 运算
+    #     （加法可交换，逐位相同）；
+    #   * 最后的 s *= s0 与原来的 s0 * exp(...) 同理。
+    # tests/test_pricing_memo.py 有一条把两种写法钉在一起的回归测试。
+    half = nPath // 2
+    s = np.empty((nPath, nStep), dtype=np.float64)
+    rng.standard_normal((half, nStep), out=s[:half])
+    np.negative(s[:half], out=s[half:])   # 对偶变量方差缩减
+
     h = T / nStep
-    dlogS = (r - 0.5 * sigma ** 2) * h + sigma * np.sqrt(h) * W
-    s = s0 * np.exp(np.cumsum(dlogS, 1))
+    s *= sigma * np.sqrt(h)
+    s += (r - 0.5 * sigma ** 2) * h
+    np.cumsum(s, axis=1, out=s)
+    np.exp(s, out=s)
+    s *= s0
     return s

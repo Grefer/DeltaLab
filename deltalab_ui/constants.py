@@ -46,6 +46,31 @@ def _build_snowball(st, p):
     )
 
 
+# 方向敏感的价格档位。障碍类结构的触发条件会随 cp 翻转方向——例如累计期权
+# 看涨时 `S >= H` 熔断、看跌时 `S <= H` 熔断——所以同一个 H 在两个方向上要摆在
+# 标的价的两侧才有意义。默认值只朝一个方向摆着，切到另一方向就会「首日必触发」，
+# 算出来是一串退化值，界面上却看不出异常。
+#
+# 每一项给出：(需要绕 s0 镜像的档位字段, 用于判定是否已被触发的规则)。
+# 规则是 (字段, 看涨时该在 s0 的哪一侧) —— "above" 表示看涨时必须高于 s0。
+DIRECTIONAL_LEVELS = {
+    "累计期权 (Decumulator)": {
+        "mirror": ("K", "H"),
+        "barriers": (("H", "above", "熔断价格"),),
+    },
+    "气囊期权 (Airbag)": {
+        "mirror": ("K", "KI"),
+        "barriers": (("KI", "below", "敲入价格"),),
+    },
+    "雪球期权 (Snowball)": {
+        # 雪球默认 cp=-1，方向语义与另外两类相反：cp=-1 时敲入在下、敲出在上。
+        "mirror": ("K", "KI", "KO"),
+        "barriers": (("KI", "below", "敲入价格"), ("KO", "above", "敲出价格")),
+        "call_is_reversed": True,
+    },
+}
+
+
 OPTION_CLASSES = {
     "香草期权 (Vanilla)": {
         "class": Option_Vanilla,
@@ -67,12 +92,17 @@ OPTION_CLASSES = {
     },
     "累计期权 (Decumulator)": {
         "class": Option_DE,
+        # 顺序即下拉顺序：先按「触碰障碍之后怎么办」分成敲出族 / 熔断族，族
+        # 内让 D/E（杠杆腿每日观察 vs 到期观察）两两相邻——这一对正是最容易
+        # 选错的地方，隔开摆就得在下拉里来回翻着比。
         "subtypes": [
             "Opt_Decumulator", "Opt_Decumulator_Back",
             "Opt_Decumulator_Fix", "Opt_Decumulator_Fix_E",
             "Opt_EnDecumulator", "Opt_EnDecumulator_Fix",
-            "Opt_ASGQ_call_put", "Opt_ASGQ_EP", "Opt_ASGQ_EF", "Opt_ASGQ_EFF",
-            "Opt_ASGQ_DP", "Opt_ASGQ_DF", "Opt_ASGQ_DFF",
+            "Opt_ASGQ_call_put",
+            "Opt_ASGQ_DP", "Opt_ASGQ_EP",
+            "Opt_ASGQ_DF", "Opt_ASGQ_EF",
+            "Opt_ASGQ_DFF", "Opt_ASGQ_EFF",
         ],
         "params": [
             ("s0",     "初始价格 S0",    float, 100.0),
@@ -83,9 +113,9 @@ OPTION_CLASSES = {
             ("H",      "障碍价格",       float, 110.0),
             ("N",      "杠杆倍数",       int,   2),
             ("cp",     "方向",          int,   1, {"看涨 (Call)": 1, "看跌 (Put)": -1}),
-            ("fix",    "固定赔付(部分结构必填)", float, 0.0),
-            ("P",      "保障价格(部分结构必填)", float, 0.0),
-            ("amount", "固定金额(部分结构必填)", float, 0.0),
+            ("fix",    "区间赔付(部分结构必填)", float, 0.0),
+            ("P",      "保障价格(部分结构必填)", float, 100.0),
+            ("amount", "熔断赔付(部分结构必填)", float, 0.0),
             ("r",      "无风险利率",     float, 0.03),
             ("q",      "分红率",        float, 0.03),
             ("nPath",  "定价路径数 (MC)", int,   100000),
@@ -189,8 +219,53 @@ OPTION_CLASSES = {
 #  还原为内部键再传给后端。
 # ============================================================
 
+# 累计期权 13 个结构的中文名按三个**正交维度**拼，顺序固定，取默认值的那一
+# 段省略不写：
+#
+#   ① 触碰障碍 H 之后怎么办（必写）
+#        敲出终止 / 敲出计零 / 敲出增强 / 熔断保障 / 熔断赔付
+#      「敲出」与「熔断」的分工是有意的：敲出族触碰后只影响赔付本身（永久
+#      归零、当日归零、或仍付 S−H），熔断族触碰后**换一整套结算规则**跑到
+#      到期（改按保障价 P，或改付熔断赔付 amount）。
+#   ② 区间 (K, H) 怎么赔：线性 (S−K) 省略不写；按 `fix` 结算写「区间固赔」
+#   ③ 杠杆腿 (S ≤ K) 怎么观察：「每日杠杆」逐日乘 N；「到期杠杆」只看到期
+#      收盘价，一次性按累计天数结算
+#
+# 这一版之前，③ 这个维度的中文名全是错的：`ASGQ_E*` 与 `ASGQ_D*` 被写成
+# 「到期观察熔断」与「每日观察熔断」，但七个 ASGQ 结构的熔断判定是同一行
+# ``np.cumsum(ss >= H, axis=1) > 0``，逐日路径依赖、没有任何差别——E/D 的
+# 真实差别只在杠杆腿。于是「熔断每日保障累计」(EP) 与「每日熔断保障累计」
+# (DP) 不但只差两字语序、在下拉里认不出，两个还都指错了对象。
+#
+# 另外 fix 与 amount 曾共用「固赔」二字（`Decumulator_Fix` 的固赔是 fix、
+# `ASGQ_EF` 的固赔是 amount、`*FF` 的「双固赔」是两个都有），同一个下拉里
+# 三种含义。现在「区间固赔」只指 fix，amount 由 ① 的「熔断赔付」承担。
 SUBTYPE_DISPLAY = {
     "Eu":                    "欧式",
+    "Opt_Decumulator":       "敲出终止累计",
+    "Opt_Decumulator_Back":  "敲出计零累计",
+    "Opt_Decumulator_Fix":   "敲出计零·区间固赔累计",
+    "Opt_Decumulator_Fix_E": "敲出计零·区间固赔·到期杠杆累计",
+    "Opt_EnDecumulator":     "敲出增强累计",
+    "Opt_EnDecumulator_Fix": "敲出增强·区间固赔累计",
+    # 到期结算：主项也只用到期收盘价，是 13 个里唯一不逐日结算的。
+    "Opt_ASGQ_call_put":     "熔断保障·到期结算累计",
+    "Opt_ASGQ_DP":           "熔断保障·每日杠杆累计",
+    "Opt_ASGQ_EP":           "熔断保障·到期杠杆累计",
+    "Opt_ASGQ_DF":           "熔断赔付·每日杠杆累计",
+    "Opt_ASGQ_EF":           "熔断赔付·到期杠杆累计",
+    "Opt_ASGQ_DFF":          "熔断赔付·区间固赔·每日杠杆累计",
+    "Opt_ASGQ_EFF":          "熔断赔付·区间固赔·到期杠杆累计",
+    "Asian":                 "标准亚式",
+    "EnhanceAsian":          "增强亚式",
+    "Opt_Airbag":            "气囊",
+    "Opt_Snowball":          "雪球",
+}
+
+# 改名前的旧显示名。只并进反向映射，不参与正向显示——界面各处一律显示新名，
+# 但用旧名（手输、脚本、外部表格粘贴）仍能还原成内部键。落盘的结果里存的是
+# 内部键，所以这张表不参与任何迁移，纯粹兜住输入侧。
+_LEGACY_SUBTYPE_DISPLAY = {
     "Opt_Decumulator":       "普通累计",
     "Opt_Decumulator_Back":  "回归累计",
     "Opt_Decumulator_Fix":   "固定赔付回归累计",
@@ -204,12 +279,11 @@ SUBTYPE_DISPLAY = {
     "Opt_ASGQ_DP":           "每日熔断保障累计",
     "Opt_ASGQ_DF":           "每日熔断固赔累计",
     "Opt_ASGQ_DFF":          "每日熔断双固赔累计",
-    "Asian":                 "标准亚式",
-    "EnhanceAsian":          "增强亚式",
-    "Opt_Airbag":            "气囊",
-    "Opt_Snowball":          "雪球",
 }
-SUBTYPE_FROM_DISPLAY = {v: k for k, v in SUBTYPE_DISPLAY.items()}
+
+# 旧名先铺底，新名后覆盖：万一某个旧名与新名撞车，赢的必须是新名。
+SUBTYPE_FROM_DISPLAY = {v: k for k, v in _LEGACY_SUBTYPE_DISPLAY.items()}
+SUBTYPE_FROM_DISPLAY.update({v: k for k, v in SUBTYPE_DISPLAY.items()})
 
 # 已保存结果列表要显示子类型的中文名。history_store 保持纯逻辑、不反
 # 向依赖 GUI，所以由这里把映射注入进去。

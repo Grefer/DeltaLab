@@ -799,3 +799,650 @@ def test_progress_total_still_exact_under_parallelism():
     total = seen[-1][1]
     assert sorted(d for d, _ in seen) == list(range(1, total + 1)), (
         "并行下丢了进度计数")
+
+
+# --------------------------------------------------------------------------
+#  8. MC 内核的原地改写
+# --------------------------------------------------------------------------
+
+def _mcgbmq_reference(s0, r, sigma, T, nPath, nStep, seed=20):
+    """改写前的写法，逐字保留，作为逐位比对的黄金基准。
+
+    McGbmQ 现在全程在一块缓冲上原地推进（省 4.5 倍峰值内存）。它必须与这个
+    参考实现**逐位相同**——随机流、浮点运算顺序都不能变。
+    """
+    rng = np.random.default_rng(seed)
+    W1 = rng.standard_normal((nPath // 2, nStep))
+    W = np.r_[W1, -W1]
+    h = T / nStep
+    dlogS = (r - 0.5 * sigma ** 2) * h + sigma * np.sqrt(h) * W
+    return s0 * np.exp(np.cumsum(dlogS, 1))
+
+
+@pytest.mark.parametrize("nPath,nStep", [
+    (2, 1), (10, 3), (1000, 20), (2000, 61), (4000, 243),
+])
+@pytest.mark.parametrize("seed", [20, 0, 12345])
+def test_mcgbmq_inplace_matches_reference(nPath, nStep, seed):
+    from pricing.mc_engine import McGbmQ
+
+    args = (100.0, 0.03, 0.2, nStep / 243, nPath, nStep)
+    assert np.array_equal(
+        _mcgbmq_reference(*args, seed=seed), McGbmQ(*args, seed=seed)), (
+        "原地改写改变了数值")
+
+
+def test_mcgbmq_keeps_antithetic_structure():
+    """对偶变量：上下两半的对数收益必须严格相反。"""
+    from pricing.mc_engine import McGbmQ
+
+    nPath, nStep = 1000, 12
+    s = McGbmQ(100.0, 0.0, 0.2, nStep / 243, nPath, nStep, seed=7)
+    half = nPath // 2
+    up = np.diff(np.log(s[:half]), axis=1, prepend=np.log(100.0))
+    dn = np.diff(np.log(s[half:]), axis=1, prepend=np.log(100.0))
+    # 两半的漂移项相同、随机项相反 → 和恒为 2*drift
+    assert np.allclose(up + dn, (up + dn)[0, 0], atol=1e-12)
+
+
+def test_mcgbmq_still_validates_inputs():
+    from pricing.mc_engine import McGbmQ
+
+    with pytest.raises(ValueError, match="even"):
+        McGbmQ(100.0, 0.03, 0.2, 0.1, nPath=999, nStep=5)
+    with pytest.raises(ValueError, match="nStep"):
+        McGbmQ(100.0, 0.03, 0.2, 0.1, nPath=100, nStep=0)
+
+
+def test_mcgbmq_seed_none_still_independent():
+    """原地缓冲不能把 seed=None 的独立采样语义弄丢。"""
+    from pricing.mc_engine import McGbmQ
+
+    a = McGbmQ(100.0, 0.03, 0.2, 0.1, 1000, 10, seed=None)
+    b = McGbmQ(100.0, 0.03, 0.2, 0.1, 1000, 10, seed=None)
+    assert not np.array_equal(a, b)
+
+
+# --------------------------------------------------------------------------
+#  9. 累计期权 payoff 的两处修正
+# --------------------------------------------------------------------------
+
+_DE_SUBTYPES = (
+    "Opt_Decumulator", "Opt_Decumulator_Back", "Opt_Decumulator_Fix",
+    "Opt_Decumulator_Fix_E", "Opt_EnDecumulator", "Opt_EnDecumulator_Fix",
+    "Opt_ASGQ_call_put", "Opt_ASGQ_EP", "Opt_ASGQ_EF", "Opt_ASGQ_EFF",
+    "Opt_ASGQ_DP", "Opt_ASGQ_DF", "Opt_ASGQ_DFF",
+)
+
+
+def _de(subtype, cp=1, npath=2000, t_days=20, t_over=0, sr=()):
+    return Option_DE(subtype, 100.0, list(sr), 90.0, t_over, t_days,
+                     list(range(1, t_days + t_over + 1)), 0.18, 110.0, 2, cp,
+                     nPath=npath, r=0.03, q=0.03,
+                     fix=2.0, P=95.0, amount=1.5)
+
+
+@pytest.mark.parametrize("subtype", _DE_SUBTYPES)
+@pytest.mark.parametrize("cp", [1, -1])
+def test_decumulator_prices_in_both_directions(subtype, cp):
+    """13 个子类型 × 看涨/看跌都必须能定价。
+
+    此前 Opt_ASGQ_EP 与 Opt_ASGQ_EF 的看跌分支漏了 .reshape(nPath, 1)，
+    直接抛 numpy 广播错误——而 GUI 的方向选项就摆着「看跌 (Put)」，
+    选中即崩。看涨分支一直是对的，修法就是照抄它。
+    """
+    assert np.isfinite(_de(subtype, cp=cp).get_price())
+
+
+@pytest.mark.parametrize("subtype", _DE_SUBTYPES)
+def test_decumulator_discount_factor_broadcasts(subtype):
+    """贴现因子只沿观察日变化，必须是一维的。
+
+    它原本被 np.tile 成 nPath × le 的矩阵，而每一行都一模一样——
+    nPath=1e5、le=243 时白占 194 MB。改成广播后数值逐位不变
+    （见 test_decumulator_matches_tiled_discount_reference）。
+    """
+    import inspect
+
+    source = inspect.getsource(getattr(Option_DE, subtype))
+    if "discount_factor" not in source:
+        pytest.skip("该子类型不使用贴现因子")
+    assert "np.tile(np.exp(" not in source, "贴现因子又被物化成矩阵了"
+
+
+
+
+# 黄金值。贴现因子广播化 + 看跌分支补 reshape 都不该
+# 动到任何一个已经能算出来的价格。EP / EF 的看跌组合不在表里——它们
+# 改动前直接抛广播错误，根本没有"原值"可对。
+_DE_GOLDEN = {
+    "Opt_ASGQ_DFF|-1|0|0": 29.961143897874987,
+    "Opt_ASGQ_DFF|-1|5|5": 37.5,
+    "Opt_ASGQ_DFF|1|0|0": 39.27622646414116,
+    "Opt_ASGQ_DFF|1|5|5": 49.27622646414113,
+    "Opt_ASGQ_DF|-1|0|0": 29.961143897874987,
+    "Opt_ASGQ_DF|-1|5|5": 37.5,
+    "Opt_ASGQ_DF|1|0|0": 194.0961383570785,
+    "Opt_ASGQ_DF|1|5|5": 249.0961383570785,
+    "Opt_ASGQ_DP|-1|0|0": -99.9903979595688,
+    "Opt_ASGQ_DP|-1|5|5": -125.0,
+    "Opt_ASGQ_DP|1|0|0": 198.20825019793935,
+    "Opt_ASGQ_DP|1|5|5": 253.20825019793935,
+    "Opt_ASGQ_EFF|-1|0|0": 29.961143897874987,
+    "Opt_ASGQ_EFF|-1|5|5": 37.5,
+    "Opt_ASGQ_EFF|1|0|0": 38.874744419737056,
+    "Opt_ASGQ_EFF|1|5|5": 48.73781075410039,
+    "Opt_ASGQ_EF|-1|5|5": 37.5,
+    "Opt_ASGQ_EF|1|0|0": 193.6946563126744,
+    "Opt_ASGQ_EF|1|5|5": 248.55772264703774,
+    "Opt_ASGQ_EP|-1|5|5": -125.0,
+    "Opt_ASGQ_EP|1|0|0": 197.80676815353524,
+    "Opt_ASGQ_EP|1|5|5": 252.66983448789856,
+    "Opt_ASGQ_call_put|-1|0|0": -99.9903979595688,
+    "Opt_ASGQ_call_put|-1|5|5": -125.0,
+    "Opt_ASGQ_call_put|1|0|0": 197.9351066908258,
+    "Opt_ASGQ_call_put|1|5|5": 247.83880259028248,
+    "Opt_Decumulator_Back|-1|0|0": -399.8348821130444,
+    "Opt_Decumulator_Back|-1|5|5": -509.8348821130444,
+    "Opt_Decumulator_Back|1|0|0": 195.38495290788086,
+    "Opt_Decumulator_Back|1|5|5": 250.38495290788086,
+    "Opt_Decumulator_Fix_E|-1|0|0": -400.21587267167934,
+    "Opt_Decumulator_Fix_E|-1|5|5": -500.2698408395993,
+    "Opt_Decumulator_Fix_E|1|0|0": 38.22602029428241,
+    "Opt_Decumulator_Fix_E|1|5|5": 47.952152963009084,
+    "Opt_Decumulator_Fix|-1|0|0": -399.8348821130444,
+    "Opt_Decumulator_Fix|-1|5|5": -509.8348821130444,
+    "Opt_Decumulator_Fix|1|0|0": 39.0289843830906,
+    "Opt_Decumulator_Fix|1|5|5": 49.028984383090574,
+    "Opt_Decumulator|-1|0|0": 0.0,
+    "Opt_Decumulator|-1|5|5": 0.0,
+    "Opt_Decumulator|1|0|0": 193.6612927617474,
+    "Opt_Decumulator|1|5|5": 248.6612927617474,
+    "Opt_EnDecumulator_Fix|-1|0|0": -199.80607512901065,
+    "Opt_EnDecumulator_Fix|-1|5|5": -264.80607512901065,
+    "Opt_EnDecumulator_Fix|1|0|0": 39.34706116717105,
+    "Opt_EnDecumulator_Fix|1|5|5": 49.34706116717102,
+    "Opt_EnDecumulator|-1|0|0": -199.80607512901065,
+    "Opt_EnDecumulator|-1|5|5": -264.80607512901065,
+    "Opt_EnDecumulator|1|0|0": 195.7030296919613,
+    "Opt_EnDecumulator|1|5|5": 250.7030296919613,
+}
+
+
+@pytest.mark.parametrize("key", sorted(_DE_GOLDEN))
+def test_decumulator_prices_unchanged_by_payoff_cleanup(key):
+    """贴现因子改成广播之后，价格必须与改动前逐位相同。
+
+    ``np.tile(v, (nPath, 1)) * X`` 与 ``v * X`` 是同一组逐元素乘法，
+    结果应当逐位一致——这条把它钉死，免得将来有人"顺手"改成近似写法。
+    """
+    subtype, cp, t_over, nsr = key.split("|")
+    sr = [100.0 + i * 0.5 for i in range(int(nsr))]
+    price = _de(subtype, cp=int(cp), t_over=int(t_over), sr=sr).get_price()
+    assert float(price) == _DE_GOLDEN[key], f"{key} 的价格变了"
+
+
+# --------------------------------------------------------------------------
+#  10. 累计期权三个赔付类参数的命名与默认值
+# --------------------------------------------------------------------------
+
+def test_decumulator_param_labels_are_distinguishable():
+    """fix 与 amount 是两笔不同的钱，界面上不能用同一个词。
+
+    它们此前叫「固定赔付」和「固定金额」，代码注释里更是两个都写成
+    「固定赔付」——读的人分不出说的是哪一个。现在：
+      fix    = 区间赔付（标的在 K~H 区间时每日结算）
+      amount = 熔断赔付（熔断日起每日结算）
+    """
+    from deltalab_ui.constants import OPTION_CLASSES
+
+    params = dict(
+        (name, label)
+        for name, label, *_ in OPTION_CLASSES["累计期权 (Decumulator)"]["params"]
+    )
+    assert params["fix"].startswith("区间赔付")
+    assert params["amount"].startswith("熔断赔付")
+    assert params["P"].startswith("保障价格")
+
+    labels = {Option_DE._PARAM_LABELS[k] for k in ("fix", "P", "amount")}
+    assert len(labels) == 3, "三个参数的中文名撞车了"
+    # 谁也不能是谁的前缀——「固定赔付」/「固定金额」当年就是这么混起来的。
+    for a in labels:
+        for b in labels:
+            if a is not b:
+                assert not a.startswith(b), f"{a!r} 与 {b!r} 仍不好区分"
+
+
+def test_protection_price_defaults_to_entry_price():
+    """保障价格默认取入场价，让三个 *P 结构开箱可用。
+
+    它此前默认 0，而 0 会被建构闭包当成「未填写」→ 构造期报错。
+    """
+    from deltalab_ui.constants import OPTION_CLASSES
+
+    cfg = OPTION_CLASSES["累计期权 (Decumulator)"]
+    defaults = {name: default for name, _label, _t, default, *_ in cfg["params"]}
+    assert defaults["P"] == defaults["s0"] == 100.0
+
+    params = dict(defaults)
+    for subtype in ("Opt_ASGQ_call_put", "Opt_ASGQ_EP", "Opt_ASGQ_DP"):
+        for cp in (1, -1):
+            params["cp"] = cp
+            option = cfg["build"](subtype, params)
+            option.nPath = 400
+            assert np.isfinite(option.get_price()), (
+                f"{subtype} cp={cp} 在默认参数下仍不能定价")
+
+
+def test_structure_docs_do_not_conflate_fix_and_amount():
+    """结构说明里也不能再把两笔赔付都写成同一个词。"""
+    from deltalab_ui import structure_docs
+
+    text = "\n".join(
+        str(v) for v in vars(structure_docs).values() if isinstance(v, dict)
+        for v in v.values()
+    )
+    assert "固定金额" not in text, "结构说明里仍有含糊的「固定金额」"
+    assert "双固定赔付" not in text, "结构说明里仍有含糊的「双固定赔付」"
+
+
+def test_decumulator_rejects_mismatched_observation_days():
+    """已实现天数 + 剩余期限必须正好铺满观察日。
+
+    GUI 的建构闭包把 sr 硬编码成 []，observ 却按 T_days + T_over 生成——
+    「已过天数」一填非 0，13 个子类型全部在定价深处炸 IndexError，
+    报错只给两个数字，看不出是哪个字段的问题。
+    """
+    # sr 空、已过天数 3：先命中"长度必须等于已过天数"这条更具体的
+    with pytest.raises(ValueError, match="必须等于已过天数"):
+        Option_DE("Opt_Decumulator", 100.0, [], 90.0, 3, 20,
+                  list(range(1, 24)), 0.18, 110.0, 2, 1, nPath=200)
+    # sr 长度对但观察日不够：命中总数那条
+    with pytest.raises(ValueError, match="观察日数量对不上"):
+        Option_DE("Opt_Decumulator", 100.0, [100.0] * 3, 90.0, 3, 20,
+                  list(range(1, 20)), 0.18, 110.0, 2, 1, nPath=200)
+    # 补上对应的已实现价格就合法了
+    Option_DE("Opt_Decumulator", 100.0, [100.0] * 3, 90.0, 3, 20,
+              list(range(1, 24)), 0.18, 110.0, 2, 1, nPath=200).get_price()
+
+
+@pytest.mark.parametrize("cp", [1, -1])
+def test_single_day_option_is_not_inflated_by_npath(cp):
+    """le == 1 时形状 (nPath,) 与 (nPath, 1) 会广播成 (nPath, nPath)。
+
+    改动前这条路径**不报错**，价格直接放大 nPath 倍——GUI 默认
+    nPath=100000，也就是错 10 万倍，同时还要申请一块 80 GB 的数组。
+    价格必须与 nPath 无关（只在 MC 噪声范围内变动）。
+    """
+    prices = [
+        _de("Opt_ASGQ_EP", cp=cp, npath=n, t_days=1).get_price()
+        for n in (200, 2000, 20000)
+    ]
+    spread = max(prices) - min(prices)
+    scale = max(1.0, max(abs(p) for p in prices))
+    assert spread / scale < 0.5, f"价格随 nPath 漂移过大: {prices}"
+
+
+# --------------------------------------------------------------------------
+#  11. 累计期权 13 个结构的中文名
+# --------------------------------------------------------------------------
+#
+# 名字按三个正交维度拼，顺序固定，取默认值的那一段省略不写：
+#   ① 触碰障碍 H 之后怎么办（必写）
+#   ② 区间 (K, H) 怎么赔（线性省略，按 fix 结算写「区间固赔」）
+#   ③ 杠杆腿 (S ≤ K) 怎么观察
+# 词表定在这里而不是从 constants import：这几条测试要拦的正是「有人顺手加了
+# 第四个说法」，跟着源码走的词表拦不住它。
+
+_BARRIER_WORDS = frozenset({
+    "敲出终止", "敲出计零", "敲出增强", "熔断保障", "熔断赔付"})
+_BAND_WORDS = frozenset({"区间固赔"})
+_LEVERAGE_WORDS = frozenset({"每日杠杆", "到期杠杆", "到期结算"})
+
+
+def _decumulator_display_names():
+    from deltalab_ui.constants import OPTION_CLASSES, SUBTYPE_DISPLAY
+
+    return {
+        subtype: SUBTYPE_DISPLAY[subtype]
+        for subtype in OPTION_CLASSES["累计期权 (Decumulator)"]["subtypes"]
+    }
+
+
+@pytest.mark.parametrize("subtype", sorted(_decumulator_display_names()))
+def test_decumulator_name_decomposes_into_the_declared_dimensions(subtype):
+    """每个名字都必须解析成 ①[·②][·③]累计，且分词全部出自受控词表。
+
+    这是「乱」的根因：此前的名字是历史叫法的堆叠，修饰语想放哪放哪——
+    「固定赔付回归累计」前置、「固赔到期结算累计」中置、「熔断每日保障累计」
+    夹在中间，排序后同族的结构根本排不到一起。
+    """
+    name = _decumulator_display_names()[subtype]
+    assert name.endswith("累计"), name
+
+    tokens = name[:-len("累计")].split("·")
+    assert tokens[0] in _BARRIER_WORDS, f"{name}: ① 用了词表外的说法"
+
+    rest = tokens[1:]
+    assert len(rest) <= 2, f"{name}: 维度多于三个"
+    if len(rest) == 2:
+        assert rest[0] in _BAND_WORDS and rest[1] in _LEVERAGE_WORDS, (
+            f"{name}: ② 必须排在 ③ 前面")
+    elif rest:
+        assert rest[0] in _BAND_WORDS | _LEVERAGE_WORDS, (
+            f"{name}: ②/③ 用了词表外的说法")
+
+
+def test_the_leverage_dimension_marks_exactly_the_e_and_d_variants():
+    """③ 必须与 ``ASGQ_E*`` / ``ASGQ_D*`` 的真实语义对上。
+
+    这是改名前**唯一真错**的一条：``E`` 与 ``D`` 曾被写成「到期观察熔断」与
+    「每日观察熔断」，但七个 ASGQ 的熔断判定都是同一行
+    ``np.cumsum(ss >= H, axis=1) > 0``——逐日路径依赖、完全一致。差别只在杠杆
+    腿：E 只在到期日看 S_T ≤ K，D 逐日看 S ≤ K。所以那两个名字修饰错了对象，
+    而且「熔断每日保障累计」(EP) 与「每日熔断保障累计」(DP) 只差两字语序。
+    """
+    names = _decumulator_display_names()
+
+    for subtype, name in names.items():
+        if subtype.startswith("Opt_ASGQ_E") and subtype != "Opt_ASGQ_EFF":
+            assert "到期杠杆" in name, f"{subtype} 是到期观察杠杆腿"
+        if subtype.startswith("Opt_ASGQ_D"):
+            assert "每日杠杆" in name, f"{subtype} 是每日观察杠杆腿"
+        # 熔断观察频率不是维度，任何名字都不该再声称它是。
+        assert "熔断每日" not in name and "每日熔断" not in name, name
+
+    assert "到期杠杆" in names["Opt_ASGQ_EFF"]
+    # 主项结算频率只区分出这一个结构，用「到期结算」而不是「到期杠杆」。
+    assert names["Opt_ASGQ_call_put"] == "熔断保障·到期结算累计"
+
+
+def test_leveraged_pairs_differ_only_in_the_leverage_segment():
+    """D/E 成对的三组，除 ③ 之外必须逐字相同——否则名字看不出它们是一对。"""
+    names = _decumulator_display_names()
+
+    for d_key, e_key in (("Opt_ASGQ_DP", "Opt_ASGQ_EP"),
+                         ("Opt_ASGQ_DF", "Opt_ASGQ_EF"),
+                         ("Opt_ASGQ_DFF", "Opt_ASGQ_EFF")):
+        assert (names[d_key].replace("每日杠杆", "〇")
+                == names[e_key].replace("到期杠杆", "〇")), (
+            f"{names[d_key]} 与 {names[e_key]} 的差别不止杠杆腿")
+
+
+def test_the_word_gupei_names_only_the_fix_payment():
+    """「固赔」只许指 `fix`（区间赔付），不许再兼指 `amount`。
+
+    它曾在同一个下拉里指三样东西：``Decumulator_Fix`` 的固赔是 fix、
+    ``ASGQ_EF`` 的固赔是 amount、``*FF`` 的「双固赔」是两个都有。
+    """
+    from deltalab_ui.constants import OPTION_CLASSES
+
+    names = _decumulator_display_names()
+    needs_fix = {
+        subtype
+        for subtype in OPTION_CLASSES["累计期权 (Decumulator)"]["subtypes"]
+        if "fix" in Option_DE._REQUIRED_PARAMS.get(subtype, ())
+    }
+
+    for subtype, name in names.items():
+        assert ("区间固赔" in name) == (subtype in needs_fix), (
+            f"{subtype} 的「区间固赔」与是否真需要 fix 对不上：{name}")
+        assert "双固赔" not in name, name
+
+
+def test_no_display_name_is_a_prefix_of_another():
+    """任何一个显示名都不能是另一个的前缀。
+
+    下拉是等宽截断的，前缀关系意味着窄列下两条会显示成同一串字符。
+    「固定赔付」/「固定金额」当年就是这么混起来的。
+    """
+    from deltalab_ui.constants import SUBTYPE_DISPLAY
+
+    names = sorted(SUBTYPE_DISPLAY.values())
+    assert len(set(names)) == len(names), "有重名"
+    for a in names:
+        for b in names:
+            if a != b:
+                assert not b.startswith(a), f"{a!r} 是 {b!r} 的前缀"
+
+
+def test_structure_doc_titles_are_generated_from_the_display_names():
+    """说明页的标题行必须与显示名逐字相同。
+
+    此前它是手抄的第二份副本，13 条累计结构已经漂开 5 条——``ASGQ_call_put``
+    显示名写「到期熔断保障累计」而说明页写「到期观察熔断保障累计」。现在标题
+    由 ``SUBTYPE_DISPLAY`` 生成，这条测试保证没人再把它抄回正文里。
+    """
+    from deltalab_ui.constants import OPTION_CLASSES, SUBTYPE_DISPLAY
+    from deltalab_ui.structure_docs import STRUCTURE_DOCS
+
+    expected_keys = {
+        (cls_name, subtype)
+        for cls_name, cfg in OPTION_CLASSES.items()
+        for subtype in cfg["subtypes"]
+    }
+    assert set(STRUCTURE_DOCS) == expected_keys, "说明与注册表对不上"
+
+    for (_cls_name, subtype), text in STRUCTURE_DOCS.items():
+        head = text.splitlines()[0]
+        assert head == f"【{SUBTYPE_DISPLAY[subtype]} {subtype}】", head
+
+
+def test_old_display_names_still_resolve_to_their_internal_keys():
+    """旧名走反向映射仍能还原；撞车时赢的必须是新名。
+
+    落盘的数据存的是内部键，所以这张别名表不参与迁移——它兜的是输入侧：
+    手输、脚本、从旧文档粘过来的名字。
+    """
+    from deltalab_ui.constants import (
+        SUBTYPE_DISPLAY, SUBTYPE_FROM_DISPLAY, _LEGACY_SUBTYPE_DISPLAY,
+    )
+
+    for subtype, legacy in _LEGACY_SUBTYPE_DISPLAY.items():
+        assert SUBTYPE_FROM_DISPLAY[legacy] == subtype
+    for subtype, current in SUBTYPE_DISPLAY.items():
+        assert SUBTYPE_FROM_DISPLAY[current] == subtype
+
+
+# --------------------------------------------------------------------------
+#  11. 障碍档位必须随方向摆到标的价的另一侧
+# --------------------------------------------------------------------------
+
+_BARRIER_CLASSES = [
+    ("累计期权 (Decumulator)", 1, -1),      # (类名, 正常方向, 反方向)
+    ("气囊期权 (Airbag)", 1, -1),
+    ("雪球期权 (Snowball)", -1, 1),          # 雪球默认 cp=-1
+]
+
+
+def _class_defaults(cls_name):
+    from deltalab_ui.constants import OPTION_CLASSES
+
+    return {name: default
+            for name, _label, _dtype, default, *_ in
+            OPTION_CLASSES[cls_name]["params"]}
+
+
+@pytest.mark.parametrize("cls_name,forward,reverse", _BARRIER_CLASSES)
+def test_default_direction_passes_validation(cls_name, forward, reverse):
+    from deltalab_ui.panel_form import FormPanelMixin
+
+    params = _class_defaults(cls_name)
+    assert params["cp"] == forward
+    FormPanelMixin._validate_barrier_direction(cls_name, params)
+
+
+@pytest.mark.parametrize("cls_name,forward,reverse", _BARRIER_CLASSES)
+def test_flipping_direction_without_moving_barriers_is_rejected(
+        cls_name, forward, reverse):
+    """只改方向不动障碍 = 第一天就触发，实测触发概率 1.0000。
+
+    此前这种配置照常算出一串数字，看着正常，其实全是"首日敲掉"的退化值。
+    """
+    from deltalab_ui.panel_form import FormPanelMixin
+
+    params = _class_defaults(cls_name)
+    params["cp"] = reverse
+    with pytest.raises(ValueError, match="第一天就会触发"):
+        FormPanelMixin._validate_barrier_direction(cls_name, params)
+
+
+@pytest.mark.parametrize("cls_name,forward,reverse", _BARRIER_CLASSES)
+def test_mirrored_barriers_pass_in_the_reverse_direction(
+        cls_name, forward, reverse):
+    """把档位绕 s0 镜像到另一侧之后，反方向就合法了。"""
+    from deltalab_ui.constants import DIRECTIONAL_LEVELS
+    from deltalab_ui.panel_form import FormPanelMixin
+
+    params = _class_defaults(cls_name)
+    s0 = float(params["s0"])
+    for field in DIRECTIONAL_LEVELS[cls_name]["mirror"]:
+        params[field] = 2.0 * s0 - float(params[field])
+    params["cp"] = reverse
+    FormPanelMixin._validate_barrier_direction(cls_name, params)
+
+
+def test_validation_skips_classes_without_barriers():
+    """香草与亚式没有障碍，不该被这条校验波及。"""
+    from deltalab_ui.panel_form import FormPanelMixin
+
+    for cls_name in ("香草期权 (Vanilla)", "亚式期权 (Asian)"):
+        for cp in (1, -1):
+            params = _class_defaults(cls_name)
+            params["cp"] = cp
+            FormPanelMixin._validate_barrier_direction(cls_name, params)
+
+
+@pytest.mark.parametrize("cls_name,forward,reverse", _BARRIER_CLASSES)
+def test_direction_change_mirrors_untouched_defaults(
+        cls_name, forward, reverse):
+    """切换方向时，仍是默认值的档位自动镜像；改过的一律不碰。"""
+    from types import SimpleNamespace
+
+    from deltalab_ui.constants import DIRECTIONAL_LEVELS
+    from deltalab_ui.panel_form import FormPanelMixin
+
+    class _Var:
+        def __init__(self, v): self._v = str(v)
+        def get(self): return self._v
+        def set(self, v): self._v = str(v)
+
+    defaults = _class_defaults(cls_name)
+    fields = DIRECTIONAL_LEVELS[cls_name]["mirror"]
+    s0 = float(defaults["s0"])
+
+    def _fake(overrides=None):
+        entries = {f: (_Var((overrides or {}).get(f, defaults[f])), float, None)
+                   for f in fields}
+        return SimpleNamespace(
+            _class_var=SimpleNamespace(get=lambda: cls_name),
+            _param_entries=entries), entries
+
+    # 未改动 → 镜像
+    fake, entries = _fake()
+    FormPanelMixin._mirror_levels_on_direction_change(fake)
+    for f in fields:
+        assert float(entries[f][0].get()) == pytest.approx(
+            2.0 * s0 - float(defaults[f])), f"{f} 没有被镜像"
+
+    # 再切一次 → 镜像回原值（镜像是对合）
+    FormPanelMixin._mirror_levels_on_direction_change(fake)
+    for f in fields:
+        assert float(entries[f][0].get()) == pytest.approx(float(defaults[f]))
+
+    # 用户改过其中一项 → 整组都不动
+    custom = {fields[0]: float(defaults[fields[0]]) + 3.0}
+    fake, entries = _fake(custom)
+    before = {f: entries[f][0].get() for f in fields}
+    FormPanelMixin._mirror_levels_on_direction_change(fake)
+    assert {f: entries[f][0].get() for f in fields} == before, (
+        "用户改过的档位被静默改写了")
+
+
+# --------------------------------------------------------------------------
+#  12. 熔断当天直接结算
+# --------------------------------------------------------------------------
+
+_KO_SETTLED_SUBTYPES = ("Opt_ASGQ_EP", "Opt_ASGQ_DP", "Opt_ASGQ_call_put")
+
+
+@pytest.mark.parametrize("subtype", _KO_SETTLED_SUBTYPES)
+@pytest.mark.parametrize("cp", [1, -1])
+def test_knockout_settlement_is_split_invariant(subtype, cp):
+    """熔断日落在已实现段还是模拟段，价格必须一样。
+
+    实务口径：熔断当天直接结算——熔断日及之后每天的收益都等于
+    「熔断日价格 − 保障价格」这个常数，期权随即终止。
+
+    早退分支一直是这么写的，MC 分支却不是：``EP``/``DP`` 用当天价格、
+    ``call_put`` 用到期价格。于是同一条路径，只把熔断日从模拟段挪进已实现段，
+    价格能差十倍——而对冲回测每天都往已实现段追加收盘价，标的一穿越障碍，
+    当天估值就从一条路径跳到另一条。
+
+    这条把两支钉在一起：给定同一条确定性路径，无论怎么切分都必须同价。
+
+    用 r=0 是有意的：每换一个切分点，"现在"这个估值时点也跟着移动，
+    r>0 时贴现距离本来就不同，价格**应该**不一样。r=0 把贴现摘掉，
+    剩下的就纯粹是金额口径——那正是这条要钉的东西。
+    """
+    de_mod = sys.modules["pricing.Option_DE"]
+
+    if cp == 1:
+        path = np.array([100., 102., 104., 108., 103., 106., 99., 97.])
+        K, H, P = 95.0, 105.0, 100.0
+    else:
+        path = np.array([100., 98., 94., 90., 95., 92., 101., 103.])
+        K, H, P = 105.0, 95.0, 100.0
+    total = len(path)
+
+    real_mc = de_mod.McGbmQ
+
+    def _fixed(_s0, _r, _sigma, _T, n_path, n_step, seed=20):
+        return np.tile(path[total - n_step:], (n_path, 1))
+
+    de_mod.McGbmQ = _fixed
+    try:
+        prices = []
+        for simulated in range(1, total):
+            option = de_mod.Option_DE(
+                subtype, float(path[total - simulated - 1]),
+                list(path[:total - simulated]),
+                K, total - simulated, simulated, list(range(1, total + 1)),
+                0.18, H, 2, cp, nPath=4, r=0.0, q=0.0, P=P)
+            prices.append(round(float(option.get_price()), 9))
+    finally:
+        de_mod.McGbmQ = real_mc
+
+    assert len(set(prices)) == 1, (
+        f"同一条路径按不同方式切分算出了 {len(set(prices))} 个价格: "
+        f"{sorted(set(prices))}")
+
+
+@pytest.mark.parametrize("subtype", _KO_SETTLED_SUBTYPES)
+def test_knockout_amount_is_frozen_at_the_barrier_day(subtype):
+    """熔断后的每日收益是常数，与熔断之后标的怎么走无关。
+
+    只改熔断日之后的价格，价格不能变；改熔断日**当天**的价格，价格必须变。
+    """
+    de_mod = sys.modules["pricing.Option_DE"]
+    K, H, P = 95.0, 105.0, 100.0
+    real_mc = de_mod.McGbmQ
+
+    def _price(path):
+        def _fixed(_s0, _r, _sigma, _T, n_path, n_step, seed=20):
+            return np.tile(path[len(path) - n_step:], (n_path, 1))
+        de_mod.McGbmQ = _fixed
+        try:
+            return float(de_mod.Option_DE(
+                subtype, float(path[0]), [], K, 0, len(path),
+                list(range(1, len(path) + 1)), 0.18, H, 2, 1,
+                nPath=4, r=0.0, q=0.0, P=P).get_price())
+        finally:
+            de_mod.McGbmQ = real_mc
+
+    base = np.array([100., 102., 108., 103., 99., 97.])   # 第 2 天熔断
+    after = base.copy(); after[3:] = [130., 140., 150.]   # 只动熔断之后
+    on_day = base.copy(); on_day[2] = 120.                # 动熔断当天
+
+    assert _price(base) == _price(after), "熔断之后的走势竟然影响了价格"
+    assert _price(base) != _price(on_day), "熔断当天的价格没有进入结算"
