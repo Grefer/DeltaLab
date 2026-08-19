@@ -71,6 +71,10 @@ from deltalab_ui.theme import PALETTE, _MONO_FONT_FAMILY, _UI_FONT_FAMILY
 # theme 在模块顶部选定 matplotlib 后端，pyplot 必须晚于它 import。
 import matplotlib.pyplot as plt
 
+import deltalab_log
+
+_log = deltalab_log.get_logger(__name__.rsplit('.', 1)[-1])
+
 
 class HistoryViewMixin:
     """策略优选结果页；混入 ``BacktestApp``，不单独实例化。"""
@@ -1766,7 +1770,7 @@ class HistoryViewMixin:
         except Exception:
             import traceback
             err_msg = traceback.format_exc()
-            print(err_msg, file=sys.stderr)
+            _log.error(err_msg)
             self.after(
                 0,
                 lambda message=err_msg: self._fail_history_replay(message))
@@ -1866,7 +1870,7 @@ class HistoryViewMixin:
         except Exception:
             import traceback
             err_msg = traceback.format_exc()
-            print(err_msg, file=sys.stderr)
+            _log.error(err_msg)
             messagebox.showerror("历史分段加载失败", err_msg)
         finally:
             self._finish_history_replay(

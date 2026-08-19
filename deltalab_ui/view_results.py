@@ -37,6 +37,10 @@ from pricing.hedge_backtest import histogram_bin_edges, padded_histogram_range
 from deltalab_ui import formatting
 from deltalab_ui.constants import SUBTYPE_DISPLAY
 from deltalab_ui.structure_docs import STRUCTURE_DOCS
+
+import deltalab_log
+
+_log = deltalab_log.get_logger(__name__.rsplit('.', 1)[-1])
 from deltalab_ui.theme import (
     PALETTE,
     _MONO_FONT_FAMILY,
@@ -919,7 +923,7 @@ class ResultsMixin:
         except Exception as e:
             import traceback
             err_msg = traceback.format_exc()
-            print(err_msg, file=sys.stderr)
+            _log.error(err_msg)
             self.after(0, lambda: messagebox.showerror("结构分析失败", err_msg))
         finally:
             self.after(0, lambda ok=success: self._finish_structure(ok))

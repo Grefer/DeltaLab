@@ -41,6 +41,10 @@ from pricing.hedge_backtest import (
 from deltalab_ui import snapshot_detail, wind_resolve
 from deltalab_ui.view_history import HistoryViewMixin
 
+import deltalab_log
+
+_log = deltalab_log.get_logger(__name__.rsplit('.', 1)[-1])
+
 
 class RunnerMixin:
     """回测与策略优选的执行链路；混入 ``BacktestApp``，不单独实例化。"""
@@ -104,6 +108,18 @@ class RunnerMixin:
         self._progress.configure(mode="indeterminate")
         self._progress.pack(fill="x", pady=(6, 0))
         self._progress.start(15)
+        _log.info(
+            "策略优选开始 | 来源=%s 标的=%s 区间=%s~%s 粒度=%s | "
+            "结构=%s/%s | 周期=%s | 数量=%s 乘数=%s 成本率=%s 收盘兜底=%s",
+            history_state.get("source"), history_state.get("wind_code"),
+            history_state.get("wind_start"), history_state.get("wind_end"),
+            history_state.get("wind_bar_size"),
+            history_state.get("cls_name"), history_state.get("subtype"),
+            "、".join(selected_lookbacks),
+            history_state.get("quantity"), history_state.get("multiplier"),
+            history_state.get("tc_rate"),
+            history_state.get("force_day_close_hedge"))
+        self._history_started_at = time.monotonic()
         threading.Thread(
             target=self._history_recommendation_worker,
             args=(history_state,), daemon=True,
@@ -398,6 +414,41 @@ class RunnerMixin:
 
         return _callback
 
+    def _make_history_period_callback(self, period_labels):
+        """每跑完一档周期就把它的领先候选报到状态栏。
+
+        这一档的名次此后**不会再变**——名次按周期分组算，周期之间零耦合。
+        而五档是从便宜到贵跑的：近周只占 1.1% 的工作量、近月 5.5%、近季
+        19.1%、近半年 46.1%。也就是说跑完 5.5% 就已经有两档最终结论，
+        跑完 46% 有四档。一轮要十几分钟，把已成定局的部分早点交出去，
+        用户可以据此决定是不是还要等下去（不等就按「停止优选」）。
+        """
+        done = []
+
+        def _callback(label, ranking):
+            leader = RunnerMixin._leading_candidate(ranking)
+            if leader is None:
+                return
+            done.append(f"{period_labels.get(label, label)}：{leader}")
+            _log.info("周期完成 | %s 领先候选=%s | 已用 %.1f s",
+                      label, leader, RunnerMixin._elapsed_since_start(self))
+            text = "已出结果 —— " + "；".join(done)
+            self.after(0, lambda t=text: self._set_status(t))
+
+        return _callback
+
+    @staticmethod
+    def _leading_candidate(ranking):
+        """取一档排名里的头名；表为空或缺列时返回 None（只用于显示）。"""
+        if ranking is None or getattr(ranking, "empty", True):
+            return None
+        try:
+            table = (ranking.sort_values("rank")
+                     if "rank" in ranking.columns else ranking)
+            return str(table["strategy"].iloc[0])
+        except Exception:                              # noqa: BLE001
+            return None
+
     @staticmethod
     def _format_duration(seconds):
         """把秒数说成人话；进度条旁边不该出现 '183.4s'。"""
@@ -424,8 +475,11 @@ class RunnerMixin:
             # self 调的（见 tests/test_gui_strategy_state.py 的
             # _history_worker_fixture），假 self 上没有这个方法。回调体只在
             # 真 App 里被触发，因此把 self 传进闭包即可。
+            period_labels = {key: label for key, label in HISTORY_PERIOD_DEFS}
             progress_cb = RunnerMixin._make_history_progress_callback(
-                self, {key: label for key, label in HISTORY_PERIOD_DEFS})
+                self, period_labels)
+            period_cb = RunnerMixin._make_history_period_callback(
+                self, period_labels)
             original_option = gs["cfg"]["build"](gs["subtype"], gs["params"])
             is_product_pool = False
             if gs.get("source") == "wind":
@@ -473,6 +527,7 @@ class RunnerMixin:
                         progress_callback=progress_cb,
                         cancel_event=getattr(
                             self, "_history_cancel_event", None),
+                        period_callback=period_cb,
                     )
                 )
             history_selection.validate_payload(
@@ -509,7 +564,7 @@ class RunnerMixin:
         except Exception:
             import traceback
             err_msg = traceback.format_exc()
-            print(err_msg, file=sys.stderr)
+            _log.error(err_msg)
             self.after(0, lambda message=err_msg: self._fail_history_recommendation(
                 message))
 
@@ -533,7 +588,7 @@ class RunnerMixin:
         except Exception:
             import traceback
             err_msg = traceback.format_exc()
-            print(err_msg, file=sys.stderr)
+            _log.error(err_msg)
             RunnerMixin._offer_to_rescue_history_result(self, err_msg)
         finally:
             self._finish_history_recommendation(success)
@@ -593,8 +648,15 @@ class RunnerMixin:
         history_store.enforce_limit()
         return path
 
+    @staticmethod
+    def _elapsed_since_start(app):
+        started = getattr(app, "_history_started_at", None)
+        return (time.monotonic() - started) if started else float("nan")
+
     def _cancelled_history_recommendation(self):
         """用户中止后的收尾：走同一条 _finish_job，只是文案不同。"""
+        _log.info("策略优选已中止 | 已用 %.1f s",
+                  RunnerMixin._elapsed_since_start(self))
         self._finish_job(
             "history", success=False,
             success_text="",
@@ -606,6 +668,9 @@ class RunnerMixin:
         self._finish_history_recommendation(False)
 
     def _finish_history_recommendation(self, success=True):
+        _log.info("策略优选%s | 总耗时 %.1f s",
+                  "完成" if success else "失败",
+                  RunnerMixin._elapsed_since_start(self))
         self._finish_job(
             "history", success=success,
             success_text="策略优选完成  |  可在排名表选中策略后应用到左侧参数",
@@ -661,7 +726,7 @@ class RunnerMixin:
         except Exception:
             import traceback
             err_msg = traceback.format_exc()
-            print(err_msg, file=sys.stderr)
+            _log.error(err_msg)
             self.after(
                 0, lambda message=err_msg: self._fail_backtest(message))
 
@@ -678,7 +743,7 @@ class RunnerMixin:
         except Exception:
             import traceback
             err_msg = traceback.format_exc()
-            print(err_msg, file=sys.stderr)
+            _log.error(err_msg)
             messagebox.showerror("回测结果展示失败", err_msg)
         finally:
             self._finish_run(success)

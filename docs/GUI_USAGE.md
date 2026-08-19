@@ -131,8 +131,15 @@ python tools/make_workflow.py  # 生成 assets/workflow.png (工作流示意图)
 | 分段 bar 级明细缓存 | `data/cache/history_bars/` | `~/.deltalab/cache/history_bars/` | 可，删了下次「加载明细」按配方重算并补存 |
 | 回测结果池 | `data/backtest_pool/` | `~/.deltalab/pool/` | **不可**，是用户产出（见 [§7.12](#712-已保留结果存在哪里怎么清理)） |
 | 策略优选结果包 | `data/history_results/` | `~/.deltalab/results/` | **不可**，Wind 区间随分析截至日移动，同样参数换个月跑出来不是同一段数据 |
+| 运行日志 | `data/logs/deltalab.log` | `~/.deltalab/logs/deltalab.log` | 可，2 MB 滚动、留 3 份，封顶 8 MB |
 
 分界线是**能不能重建**：缓存能重建，所以删了无妨；结果包不可重建，所以必须留档。
+
+**报问题时请附上日志。** 免安装版是无终端窗口运行的（`console=False`），此前
+运行期诊断全靠 `print(..., file=sys.stderr)`——而冻结进程里 `sys.stderr` 是
+`None`，那句话不报错也什么都不写，现场等于零信息。现在启动、每一轮策略优选的
+全部输入、每档周期的领先候选与耗时、以及任何异常的完整 traceback 都会落到上表
+那个文件里。日志目录不可写时只是不记，不影响使用。
 两类结果包各带 `schema_version`，版本不符时拒绝载入而不是硬渲染——字段口径改过
 不止一次，用新代码渲染旧包会静默给出错误结论。两者都最多保留 20 条，超出按序号
 淘汰最旧的。

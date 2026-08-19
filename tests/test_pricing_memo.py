@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import os
+import pathlib
 import re
 import sys
 
@@ -1959,3 +1960,204 @@ def test_successful_render_clears_the_pending_result(tmp_path, monkeypatch):
 
     assert finished == [True]
     assert fake._history_pending_result is None
+
+
+# --------------------------------------------------------------------------
+#  17. 分周期增量出结果
+# --------------------------------------------------------------------------
+
+def _period_setup(n=160):
+    rng = np.random.default_rng(5)
+    history = pd.Series(
+        100 * np.exp(np.cumsum(rng.normal(0, 0.012, n))),
+        index=pd.bdate_range("2023-06-01", periods=n), name="close")
+    cases = [StrategyCase("c2c", CloseToCloseStrategy(), {})] + [
+        StrategyCase(f"b{k}", SigmaBandStrategy(k=k), {})
+        for k in (0.5, 1.0, 1.5)]
+    return history, cases
+
+
+def test_period_callback_fires_cheapest_first():
+    """回调顺序必须是从便宜到贵——这正是「早出结论」的价值来源。"""
+    history, cases = _period_setup()
+    seen = []
+    recommend_by_rolling_history(
+        _airbag(npath=400), history, cases, dict(_SELECTION_KWARGS),
+        lookbacks={"week": 5, "month": 20, "quarter": 61}, steps_per_day=1,
+        period_callback=lambda label, ranking: seen.append(label))
+    assert seen == ["week", "month", "quarter"]
+
+
+def test_period_ranking_is_already_final():
+    """每档回调给出的名次必须与最终全量排名的该档切片逐位相同。
+
+    这是「分周期增量出结果」的全部前提：名次按 lookback 分组算
+    （``_rank_rows`` 里的 ``groupby("lookback").cumcount()``），周期之间零
+    耦合，所以一档跑完它的名次就已成定局，可以立刻交给用户。
+    """
+    history, cases = _period_setup()
+    partial = {}
+    _recs, full, _windows = recommend_by_rolling_history(
+        _airbag(npath=400), history, cases, dict(_SELECTION_KWARGS),
+        lookbacks={"week": 5, "month": 20, "quarter": 61}, steps_per_day=1,
+        period_callback=lambda label, ranking: partial.__setitem__(
+            label, ranking))
+
+    assert set(partial) == {"week", "month", "quarter"}
+    for label, ranking in partial.items():
+        expected = full[full["lookback"] == label].reset_index(drop=True)
+        got = ranking.reset_index(drop=True)
+        assert list(got.columns) == list(expected.columns)
+        numeric = expected.select_dtypes(include=[np.number]).columns
+        assert np.array_equal(got[numeric].to_numpy(),
+                              expected[numeric].to_numpy(), equal_nan=True), (
+            f"{label} 的增量名次与最终不一致")
+        other = [c for c in expected.columns if c not in numeric]
+        assert got[other].equals(expected[other])
+
+
+def test_period_callback_failure_does_not_break_the_run():
+    """显示用的回调炸了不该把整轮优选带下水。"""
+    history, cases = _period_setup()
+
+    def boom(*_args):
+        raise RuntimeError("回调炸了")
+
+    _recs, ranking, _w = recommend_by_rolling_history(
+        _airbag(npath=400), history, cases, dict(_SELECTION_KWARGS),
+        lookbacks={"week": 5, "month": 20}, steps_per_day=1,
+        period_callback=boom)
+    assert not ranking.empty
+
+
+def test_selection_without_period_callback_is_unchanged():
+    history, cases = _period_setup()
+    kwargs = dict(_SELECTION_KWARGS)
+    lookbacks = {"week": 5, "month": 20}
+    with_cb = recommend_by_rolling_history(
+        _airbag(npath=400), history, cases, dict(kwargs),
+        lookbacks=lookbacks, steps_per_day=1,
+        period_callback=lambda *_a: None)[1]
+    without = recommend_by_rolling_history(
+        _airbag(npath=400), history, cases, dict(kwargs),
+        lookbacks=lookbacks, steps_per_day=1)[1]
+    numeric = without.select_dtypes(include=[np.number]).columns
+    assert np.array_equal(with_cb[numeric].to_numpy(),
+                          without[numeric].to_numpy(), equal_nan=True)
+
+
+def test_leading_candidate_is_read_defensively():
+    from deltalab_ui.runner import RunnerMixin
+
+    assert RunnerMixin._leading_candidate(None) is None
+    assert RunnerMixin._leading_candidate(pd.DataFrame()) is None
+    assert RunnerMixin._leading_candidate(
+        pd.DataFrame([{"nope": 1}])) is None
+    table = pd.DataFrame([{"strategy": "b1.0", "rank": 2},
+                          {"strategy": "c2c", "rank": 1}])
+    assert RunnerMixin._leading_candidate(table) == "c2c"
+
+
+# --------------------------------------------------------------------------
+#  18. 运行期日志
+# --------------------------------------------------------------------------
+
+@pytest.fixture
+def _fresh_log(tmp_path, monkeypatch):
+    """把日志目录指到临时目录，并复位模块状态。"""
+    import deltalab_log
+
+    monkeypatch.setattr(deltalab_log, "log_dir",
+                        lambda: str(tmp_path / "logs"))
+    monkeypatch.setattr(deltalab_log, "log_path",
+                        lambda: str(tmp_path / "logs" / "deltalab.log"))
+    logger = deltalab_log.get_logger()
+    saved = list(logger.handlers)
+    logger.handlers.clear()
+    monkeypatch.setattr(deltalab_log, "_configured", False)
+    yield deltalab_log
+    logger.handlers.clear()
+    logger.handlers.extend(saved)
+
+
+def test_logging_writes_to_a_file(_fresh_log):
+    """冻结包是 console=False，不落盘就等于什么都没记。"""
+    path = _fresh_log.setup(to_stderr=False)
+    assert path is not None
+    _fresh_log.get_logger("probe").info("启动 frozen=%s", False)
+    text = pathlib.Path(path).read_text(encoding="utf-8")
+    assert "启动 frozen=False" in text
+    assert "deltalab.probe" in text
+
+
+def test_logging_records_tracebacks(_fresh_log):
+    """异常现场要留全，这正是此前 print 到 None 丢掉的东西。"""
+    path = _fresh_log.setup(to_stderr=False)
+    try:
+        raise RuntimeError("模拟渲染失败")
+    except RuntimeError:
+        _fresh_log.get_logger("probe").exception("渲染失败")
+    text = pathlib.Path(path).read_text(encoding="utf-8")
+    assert "Traceback" in text and "模拟渲染失败" in text
+
+
+def test_logging_setup_is_idempotent(_fresh_log):
+    """GUI 入口与测试都可能各调一次，处理器不能叠加。"""
+    _fresh_log.setup(to_stderr=False)
+    first = len(_fresh_log.get_logger().handlers)
+    _fresh_log.setup(to_stderr=False)
+    assert len(_fresh_log.get_logger().handlers) == first
+
+
+def test_logging_degrades_quietly_when_undeletable(_fresh_log, monkeypatch):
+    """目录不可写只让日志退化成什么都不记，绝不能把主流程打断。"""
+    monkeypatch.setattr(_fresh_log, "log_dir", lambda: "/dev/null/nope")
+    monkeypatch.setattr(_fresh_log, "log_path", lambda: "/dev/null/nope/x.log")
+    assert _fresh_log.setup(to_stderr=False) is None
+    _fresh_log.get_logger("probe").info("这条会被静默丢弃")   # 不抛
+    assert "未启用" in _fresh_log.describe_target()
+
+
+def test_logging_does_not_propagate_to_root(_fresh_log):
+    """不往 root 冒泡，免得宿主程序被灌进本不属于它的记录。"""
+    _fresh_log.setup(to_stderr=False)
+    assert _fresh_log.get_logger().propagate is False
+
+
+def test_log_dir_follows_the_frozen_convention(monkeypatch):
+    """与结果池 / 逐 bar 缓存同一套：冻结写用户目录，开发写仓库内。"""
+    import deltalab_log
+
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    assert deltalab_log.log_dir().startswith(os.path.expanduser("~"))
+    monkeypatch.delattr(sys, "frozen", raising=False)
+    assert "data" in deltalab_log.log_dir()
+
+
+def test_no_silent_stderr_prints_remain():
+    """诊断不能再用 ``print(file=sys.stderr)``——冻结包里那是静默 no-op。
+
+    用 AST 判断**真实的调用**，不做文本匹配：说明这件事的注释与 docstring
+    里必然会出现这个写法，按文本扫会把它们一起报进来。
+    ``tools/`` 下的命令行脚本不在范围内，它们本来就跑在有终端的地方。
+    """
+    import ast
+
+    root = pathlib.Path(_REPO_ROOT)
+    offenders = []
+    files = list(root.glob("*.py")) + list((root / "deltalab_ui").glob("*.py"))
+    for path in files:
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if not (isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Name)
+                    and node.func.id == "print"):
+                continue
+            for kw in node.keywords:
+                if kw.arg != "file":
+                    continue
+                target = ast.unparse(kw.value)
+                if "stderr" in target or "stdout" in target:
+                    offenders.append(f"{path.name}:{node.lineno}")
+    assert not offenders, (
+        f"这些地方仍在往终端静默打印（冻结包里没有终端）: {offenders}")

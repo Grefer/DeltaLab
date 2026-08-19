@@ -60,6 +60,7 @@ from history_selection import (
     MAX_BAND_CANDIDATES,
     MAX_HISTORY_CHART_CANDIDATES,
 )
+import deltalab_log
 import history_store
 import history_bar_cache
 import backtest_pool_store
@@ -1708,8 +1709,20 @@ class BacktestApp(panel_form.FormPanelMixin,
 
 
 def main():
-    app = BacktestApp()
-    app.mainloop()
+    # 日志尽量早装：Wind 连接、行情加载、参数校验都可能在建窗口前就出问题，
+    # 而冻结包没有终端，不落盘就等于现场什么都没留下。
+    path = deltalab_log.setup()
+    log = deltalab_log.get_logger("app")
+    log.info("DeltaLab 启动  frozen=%s  日志=%s",
+             bool(getattr(sys, "frozen", False)), path or "未启用")
+    try:
+        app = BacktestApp()
+        app.mainloop()
+    except Exception:
+        log.exception("主循环异常退出")
+        raise
+    finally:
+        log.info("DeltaLab 退出")
 
 
 if __name__ == "__main__":

@@ -1639,6 +1639,7 @@ def recommend_by_rolling_history(
     objective=DEFAULT_SELECTION_OBJECTIVE,
     progress_callback=None,
     cancel_event=None,
+    period_callback=None,
 ):
     """在截至最新完整交易日的严格连续 ``L`` 日区间比较策略。
 
@@ -1739,6 +1740,7 @@ def recommend_by_rolling_history(
     rows = []
     window_results = {}
     for label, days_value in windows.items():
+        _rows_before = len(rows)
         days = _positive_int(days_value, f"lookbacks[{label!r}]")
         segment_lengths = _strict_lookback_segment_lengths(
             days, maturity_days)
@@ -2247,6 +2249,21 @@ def recommend_by_rolling_history(
                 **{f"meta_{key}": value
                    for key, value in case.metadata.items()},
             })
+
+        # 这一档跑完了，且它的名次**不会再变**：_rank_history_rows 按
+        # lookback 分组算名次，周期之间零耦合（tests 里有一条把「单档
+        # 排名 == 全量排名的该档切片」钉死）。而外层循环恰好从便宜到
+        # 贵——五档全选时跑完 5.5% 就有两档最终结果可看，46% 有四档。
+        # 一轮优选要十几分钟，早点把已成定局的部分交出去很值。
+        if period_callback is not None:
+            try:
+                period_callback(
+                    label,
+                    _rank_history_rows(
+                        rows[_rows_before:], objective=objective))
+            except Exception:                          # noqa: BLE001
+                # 与进度回调同一条纪律：显示用的东西不该把计算带下水。
+                period_callback = None
 
     ranking = _rank_history_rows(rows, objective=objective)
     if ranking.empty:
