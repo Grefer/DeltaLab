@@ -1,10 +1,13 @@
 # _*_ coding: utf-8 _*_
 """bar 级定价记忆化 / 轻量 bump copy / 优选进度与中止的回归测试。
 
-这三样都是**纯加速与纯可观测性**的改动，共同的验收标准只有一条：
-输出必须逐位不变。所以这里的断言几乎全是 ``array_equal`` 与 ``==``，
-而不是 ``pytest.approx``——一旦哪天出现 1e-16 的差，那就是真的有人
-把数值动了，不该被容差放过去。
+加速与可观测性的改动，共同的验收标准只有一条：输出必须逐位不变。
+所以**同一进程内**两种写法的对拍一律用 ``array_equal`` / ``==``——那里
+出现 1e-16 的差就是真的有人动了数值，不该被容差放过去。
+
+例外是钉在常量上的黄金值（``_DE_GOLDEN``）：它跨机器比对，而 numpy 的
+``exp`` / ``cumsum`` 在不同平台走不同的 SIMD 与 libm，末位会差 1~2 ULP。
+那一组用 1e-12 的相对容差，理由见该测试的 docstring。
 
 只用合成数据，不依赖 Wind 终端。
 """
@@ -275,10 +278,11 @@ def test_bumped_copy_prices_identically_to_deepcopy():
     ("Opt_ASGQ_DFF", "fix"),
 ])
 def test_decumulator_requires_its_optional_params(subtype, missing):
-    """缺参数要在构造期点名报错，而不是在 numpy 深处炸 TypeError。
+    """**真的省略**这些参数时要在构造期点名报错，而不是在 numpy 深处炸。
 
-    GUI 把 fix/P/amount 的默认值设成 0.0，而建构闭包用 ``if p[...]`` 判空，
-    0.0 是 falsy 会被转成 None——13 个子类型里 10 个因此开箱即崩。
+    注意判据是 ``is None``，不是 falsy：0 是合法取值（区间赔付 0 = 区间内
+    那几天不结算，熔断赔付 0 = 熔断后不再有现金流）。只有直接调用类却漏传
+    才会走到这里——GUI 表单里这三项恒有值。
     """
     # 必须匹配"(fix)"这样的括号形式：直接 match="P" 会被子类型名里的
     # "Opt_ASGQ_EP" / "_DP" 匹配上，把字段映射改错也照样绿。
@@ -972,15 +976,25 @@ _DE_GOLDEN = {
 
 @pytest.mark.parametrize("key", sorted(_DE_GOLDEN))
 def test_decumulator_prices_unchanged_by_payoff_cleanup(key):
-    """贴现因子改成广播之后，价格必须与改动前逐位相同。
+    """价格必须与基准值相符，容差 1e-12 相对。
 
-    ``np.tile(v, (nPath, 1)) * X`` 与 ``v * X`` 是同一组逐元素乘法，
-    结果应当逐位一致——这条把它钉死，免得将来有人"顺手"改成近似写法。
+    **这条不能用精确相等。** 黄金值是在一台机器上生成的常量，而 numpy 的
+    ``exp`` / ``cumsum`` 在不同平台走不同的 SIMD 与 libm，末位会差 1~2 ULP
+    （实测 macOS arm64 与 ubuntu x86_64 之间相对差 1.4e-16 ~ 2.9e-16）。
+    最初写成 ``==`` 的版本在 CI 上必红——本机全绿，推上去才发现。
+
+    1e-12 的取法：比平台噪声（~3e-16）高 4 个数量级，比这套测试要拦的最小
+    一次真实改动（熔断腿贴现口径，2e-4）低 8 个数量级。中间留着足够宽的
+    判别带，两头都不会误判。
+
+    同一进程内两种写法的对拍（``assert_results_identical`` 那一组）仍然用
+    精确相等——那里没有跨平台问题，一个 ULP 的差就是真的有人动了数值。
     """
     subtype, cp, t_over, nsr = key.split("|")
     sr = [100.0 + i * 0.5 for i in range(int(nsr))]
     price = _de(subtype, cp=int(cp), t_over=int(t_over), sr=sr).get_price()
-    assert float(price) == _DE_GOLDEN[key], f"{key} 的价格变了"
+    assert float(price) == pytest.approx(
+        _DE_GOLDEN[key], rel=1e-12, abs=1e-9), f"{key} 的价格变了"
 
 
 # --------------------------------------------------------------------------
@@ -2161,3 +2175,107 @@ def test_no_silent_stderr_prints_remain():
                     offenders.append(f"{path.name}:{node.lineno}")
     assert not offenders, (
         f"这些地方仍在往终端静默打印（冻结包里没有终端）: {offenders}")
+
+
+# --------------------------------------------------------------------------
+#  19. 左侧表单的等宽对齐
+# --------------------------------------------------------------------------
+
+@pytest.mark.gui
+def test_input_column_fits_the_longest_structure_name():
+    """输入列必须装得下最长的结构名，否则大类/子类型只能单独放宽。
+
+    打 ``gui`` 标记：要量字体宽度就得有真实 Tk 根窗口，而无窗口服务器时
+    建根会让**整个进程 abort**——``try/except TclError`` 挡不住，必须靠
+    分批（CI 的 GUI 批跑在 xvfb 下）。
+
+    此前输入列 168px 装不下「敲出计零·区间固赔·到期杠杆累计」，那两行被
+    做成跨两列——同一张表里出现两种宽度，看着就是没对齐。列宽是按字体实测
+    定的，换字体后这条会先红。
+    """
+    tk = pytest.importorskip("tkinter")
+    from tkinter import font as tkfont
+
+    from deltalab_ui.constants import OPTION_CLASSES, SUBTYPE_DISPLAY
+    from deltalab_ui.theme import FORM_INPUT_W
+
+    try:
+        root = tk.Tk()
+    except tk.TclError:
+        pytest.skip("无可用显示")
+    root.withdraw()
+    try:
+        metric = tkfont.nametofont("TkDefaultFont")
+        widest = max(
+            list(SUBTYPE_DISPLAY.values()) + list(OPTION_CLASSES),
+            key=metric.measure)
+        # Combobox 的箭头与内边距实测 26px
+        needed = metric.measure(widest) + 26
+    finally:
+        root.destroy()
+
+    assert FORM_INPUT_W >= needed, (
+        f"输入列 {FORM_INPUT_W}px 装不下 {widest!r}（需要 {needed}px）")
+
+
+def test_class_and_subtype_share_the_common_input_column():
+    """大类 / 子类型不能再跨列——它们要和下方各行等宽。"""
+    import inspect
+
+    import gui_app
+
+    source = inspect.getsource(gui_app.BacktestApp._build_ui)
+    for name in ("class_cb", "self._subtype_cb"):
+        placed = [line for line in source.splitlines()
+                  if f"_form_input({name}" in line]
+        assert placed, f"没找到 {name} 的布局调用"
+        assert not any("columnspan" in line for line in placed), (
+            f"{name} 又被放宽成跨列了——同一张表会出现两种输入宽度")
+
+
+@pytest.mark.parametrize("subtype", _DE_SUBTYPES)
+@pytest.mark.parametrize("cp", [1, -1])
+def test_zero_payouts_are_a_valid_contract(subtype, cp):
+    """区间赔付 / 熔断赔付填 0 必须能正常定价。
+
+    0 是真实条款：区间赔付 0 = 标的落在 K~H 区间那几天不结算，熔断赔付
+    0 = 熔断之后不再有现金流。建构闭包一度写成 ``p["fix"] if p["fix"]
+    else None``——0.0 是 falsy，被悄悄转成"未填写"，于是填 0 直接报错。
+    """
+    from deltalab_ui.constants import OPTION_CLASSES
+
+    cfg = OPTION_CLASSES["累计期权 (Decumulator)"]
+    params = {name: default
+              for name, _label, _dtype, default, *_ in cfg["params"]}
+    params.update(s0=100.0, cp=cp, fix=0.0, P=0.0, amount=0.0)
+    option = cfg["build"](subtype, params)
+    option.nPath = 400
+    assert np.isfinite(option.get_price())
+
+
+def test_default_params_price_every_decumulator_subtype():
+    """默认参数（区间赔付与熔断赔付都是 0）下 13 个子类型全部可定价。"""
+    from deltalab_ui.constants import OPTION_CLASSES
+
+    cfg = OPTION_CLASSES["累计期权 (Decumulator)"]
+    params = {name: default
+              for name, _label, _dtype, default, *_ in cfg["params"]}
+    params["s0"] = 100.0
+    assert params["fix"] == 0.0 and params["amount"] == 0.0
+    for subtype in cfg["subtypes"]:
+        option = cfg["build"](subtype, params)
+        option.nPath = 400
+        assert np.isfinite(option.get_price()), f"{subtype} 在默认参数下不能定价"
+
+
+def test_build_closure_does_not_coerce_falsy_payouts():
+    """守卫：建构闭包不能再把 0 当成"未填写"。"""
+    import inspect
+
+    from deltalab_ui import constants
+
+    source = inspect.getsource(constants)
+    for field in ("fix", "P", "amount"):
+        bad = f'{field}=p["{field}"] if p["{field}"] else None'
+        assert bad not in source, (
+            f"{field} 又被做了 falsy 转换——0 会被当成未填写")

@@ -75,11 +75,14 @@ class Option_DE(OptionBase):
         self._validate_required_params()
         self._validate_dimensions()
 
-    # 各子类型必需的"可选"参数。缺了会在定价深处炸成
+    # 各子类型必需的参数。缺了会在定价深处炸成
     # ``TypeError: unsupported operand type(s) for *: 'NoneType' and 'int'``，
-    # 看不出是哪个字段没填——GUI 把这三项的默认值设为 0.0，而 0.0 是 falsy，
-    # 建构闭包的 ``p["fix"] if p["fix"] else None`` 会把它悄悄转成 None，
-    # 于是 13 个子类型里有 10 个开箱即崩。在构造期挡下来并点名字段。
+    # 看不出是哪个字段没填，所以在构造期挡下来并点名。
+    #
+    # **0 是合法取值**：区间赔付 0 = 标的落在区间内那几天不结算，熔断赔付
+    # 0 = 熔断后不再有现金流，都是真实条款。只有 None（真的没传）才算缺。
+    # GUI 的建构闭包一度写成 ``p["fix"] if p["fix"] else None``，把 0.0 当
+    # falsy 转成了 None，于是填 0 直接报错——那是本条校验的误伤，不是它的本意。
     _REQUIRED_PARAMS = {
         "Opt_Decumulator_Fix":   ("fix",),
         "Opt_Decumulator_Fix_E": ("fix",),
@@ -133,8 +136,8 @@ class Option_DE(OptionBase):
             fields = "、".join(
                 f"{self._PARAM_LABELS[n]}({n})" for n in missing)
             raise ValueError(
-                f"结构 {self.optiontype} 必须提供 {fields}；"
-                f"该字段留空或填 0 都会被当作未填写。")
+                f"结构 {self.optiontype} 必须提供 {fields}。"
+                f"（0 是合法取值，只有真正省略这个参数才会报这个错。）")
 
     @staticmethod
     def _knockout_state(ss, breached, discount_factor):

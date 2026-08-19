@@ -578,7 +578,7 @@ class BacktestApp(panel_form.FormPanelMixin,
         # 文字不会被 sash 截断
         self._left_canvas = tk.Canvas(
             left_outer, highlightthickness=0, bd=0,
-            bg=PALETTE["surface"], width=480,
+            bg=PALETTE["surface"], width=544,
         )
         self._left_scrollbar = ttk.Scrollbar(
             left_outer, orient="vertical", command=self._left_canvas.yview
@@ -681,13 +681,10 @@ class BacktestApp(panel_form.FormPanelMixin,
         class_cb = ttk.Combobox(sec1, textvariable=self._class_var,
                                 width=FORM_ENTRY_CHARS,
                                 values=list(OPTION_CLASSES.keys()), state="readonly")
-        # 这两行没有右侧说明文字，让下拉溢出到空着的说明列（``_form_input``
-        # 的 columnspan=2 就是为此留的）。输入列的 168px 装不下最长的结构名：
-        # 「敲出计零·区间固赔·到期杠杆累计」在 STHeiti 10 下要 168px，加上下拉
-        # 箭头与内边距约 198px。改 FORM_INPUT_W 会连带压窄说明列——那一列最长
-        # 的「每个交易日等分的采样点数」要 105px，而输入列与说明列一共只有
-        # 294px 可分；只让这两行溢出，其余各行的等宽对齐一点不受影响。
-        _form_input(class_cb, 0, columnspan=2)
+        # 与下方各行同宽：输入列已加宽到 216px，装得下最长的结构名
+        # 「敲出计零·区间固赔·到期杠杆累计」（189px 文本 + 26px 箭头内边距）。
+        # 此前这两行单独跨两列去够那个宽度，结果同一张表里出现两种宽度。
+        _form_input(class_cb, 0)
         class_cb.current(0)
         class_cb.bind("<<ComboboxSelected>>", self._on_option_class_change)
 
@@ -695,7 +692,7 @@ class BacktestApp(panel_form.FormPanelMixin,
         self._subtype_var = tk.StringVar()
         self._subtype_cb = ttk.Combobox(sec1, textvariable=self._subtype_var,
                                         width=FORM_ENTRY_CHARS, state="readonly")
-        _form_input(self._subtype_cb, 1, columnspan=2)
+        _form_input(self._subtype_cb, 1)
         self._subtype_cb.bind(
             "<<ComboboxSelected>>", lambda _event: self._schedule_band_reference_sync())
 

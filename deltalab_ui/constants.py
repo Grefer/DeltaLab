@@ -163,9 +163,16 @@ OPTION_CLASSES = {
             list(range(1, p["T_days"] + p["T_over"] + 1)),
             p["sigma"], p["H"], p["N"], p["cp"],
             r=p["r"], q=p["q"], nPath=p["nPath"],
-            fix=p["fix"] if p["fix"] else None,
-            P=p["P"] if p["P"] else None,
-            amount=p["amount"] if p["amount"] else None,
+            # 原样传，不做 falsy 转换。这三项都是**可以为 0 的合法取值**：
+            # 区间赔付 0 = 标的落在区间内那几天不结算，熔断赔付 0 = 熔断后
+            # 不再有现金流——都是真实存在的条款。此前写的是
+            # ``p["fix"] if p["fix"] else None``，0.0 是 falsy，被悄悄转成
+            # "未填写"，于是填 0 直接报错。表单里这三项恒有值，不存在"未填"
+            # 这个状态；真正省略它们的只有直接调用类的代码，那种情况仍由
+            # Option_DE._validate_required_params 点名报错。
+            fix=p["fix"],
+            P=p["P"],
+            amount=p["amount"],
         ),
     },
     "亚式期权 (Asian)": {

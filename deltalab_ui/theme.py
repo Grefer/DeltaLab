@@ -112,7 +112,12 @@ PALETTE = {
 # 列宽, 输入框的左右边缘才能跨分组对齐; 列宽由 grid 的 minsize 强制, 各控件
 # 自己的 width= 只是字符数下限, 因此统一改这里就能整体调节表单尺寸。
 FORM_LABEL_W     = 144   # 标签列宽 (含标签右侧留白; 容得下最长的雪球保证金标签)
-FORM_INPUT_W     = 168   # 输入列宽: 所有 Entry / Combobox 等宽
+FORM_INPUT_W     = 216   # 输入列宽: 所有 Entry / Combobox 等宽
+# 216 是量出来的: 最长的结构名「敲出计零·区间固赔·到期杠杆累计」在
+# .AppleSystemUIFont 13 下占 189px, 加上 Combobox 的箭头与内边距 26px = 215。
+# 此前是 168, 装不下这一条, 于是大类/子类型两行被单独放宽成跨两列——同一
+# 张表里两种宽度, 看着就像没对齐。宽度统一之后左面板初始宽度也要同步加宽
+# (gui_app 里那个 Canvas width), 否则说明列会被挤掉 48px。
 FORM_LABEL_GAP   = 10    # 标签与输入框之间的留白
 FORM_HINT_GAP    = 8     # 输入框与右侧说明文字之间的留白
 FORM_ROW_PADY    = 4     # 每行上下留白 => 相邻控件间隔恒为 8
