@@ -8,12 +8,18 @@ Wind 数据接口模块
 
 import datetime as _datetime
 import functools
+import logging
 import os
 import re
 import sys
 
 import numpy as np
 import pandas as pd
+
+# 按名字取子 logger，不 import 根层的 deltalab_log：``pricing`` 是核心库，
+# 不该反向依赖上层模块。``deltalab_log.setup()`` 配好 "deltalab" 之后，
+# 这个子 logger 自动继承它的处理器；没配过就什么都不写，与从前一致。
+_log = logging.getLogger("deltalab.wind_data")
 
 
 # 缓存目录：开发态为 <repo>/data/cache; 打包后(PyInstaller 冻结)切换到
@@ -484,6 +490,23 @@ def _ensure_wind():
     return w
 
 
+def _daily_cache_path(code, start_date, end_date, adjust="F"):
+    """日频缓存文件路径。key 与日内那套同构，只是粒度标记不同。
+
+    ``adjust`` 必须进 key：F/B/'' 三种复权口径不能混用同一份缓存，否则读回
+    来的序列复权方式与调用方预期不符。空串固化成 'NA'，免得文件名里出现
+    连续下划线被误读。
+    """
+    start_ts, end_ts, _s_is_date, _e_is_date = _validate_intraday_range(
+        start_date, end_date)
+    os.makedirs(_CACHE_DIR, exist_ok=True)
+    safe_code = code.replace("/", "_").replace("\\", "_")
+    safe_adj = str(adjust).strip() or "NA"
+    fname = (f"{safe_code}_D{start_ts:%Y%m%d}_D{end_ts:%Y%m%d}_"
+             f"daily_v1_{safe_adj}.parquet")
+    return os.path.join(_CACHE_DIR, fname)
+
+
 def get_close_prices(code, start_date, end_date, adjust="F"):
     """
     获取标的收盘价序列
@@ -506,6 +529,18 @@ def get_close_prices(code, start_date, end_date, adjust="F"):
     """
     # 与分钟接口保持一致：无效范围在启动 / 连接 Wind 终端前暴露。
     _validate_intraday_range(start_date, end_date)
+
+    # 日频此前没有缓存，只有日内有。而策略优选的品种池模式会逐个具体合约
+    # 拉日线（deltalab_ui/runner.py 里那个 for 循环），换一次参数重跑就把
+    # 整串请求重来一遍——同一段历史日线是不会变的，没有理由每次都问 Wind。
+    path = _daily_cache_path(code, start_date, end_date, adjust=adjust)
+    if os.path.exists(path):
+        frame = pd.read_parquet(path)
+        cached = frame["close"] if "close" in frame.columns else frame.iloc[:, 0]
+        cached.index = pd.to_datetime(cached.index)
+        cached.name = code
+        return cached
+
     w = _ensure_wind()
     price_adj = f"PriceAdj={adjust}" if adjust else ""
     data = w.wsd(code, "close", start_date, end_date, price_adj)
@@ -515,6 +550,13 @@ def get_close_prices(code, start_date, end_date, adjust="F"):
 
     series = pd.Series(data.Data[0], index=pd.to_datetime(data.Times), name=code)
     series = series.dropna()
+
+    try:
+        series.to_frame(name="close").to_parquet(path)
+    except Exception as exc:                           # noqa: BLE001
+        # 与日内同一条纪律：缓存写不进去不影响本次取数，但要留痕——否则
+        # 「每次重拉」这件事会静默发生，只表现为「怎么又这么慢」。
+        _warn_daily_cache_unavailable(exc)
     return series
 
 
@@ -768,18 +810,32 @@ def get_intraday_bars(code, start_date, end_date, bar_size="60",
 _INTRADAY_CACHE_WARNED = False
 
 
+_DAILY_CACHE_WARNED = False
+
+
+def _warn_daily_cache_unavailable(exc):
+    """日频缓存不可用时提示一次，避免静默退化成每次重拉 Wind。"""
+    global _DAILY_CACHE_WARNED
+    if _DAILY_CACHE_WARNED:
+        return
+    _DAILY_CACHE_WARNED = True
+    _log.warning(
+        "日频行情缓存写入失败，本次运行每次取数都会重新请求 Wind"
+        "（品种池模式要逐合约拉日线，重跑同一区间会整串重来）。"
+        "原因: %s: %s。修复: pip install pyarrow", type(exc).__name__, exc)
+
+
 def _warn_intraday_cache_unavailable(exc):
     """日内缓存不可用时提示一次，避免静默退化成每次重拉 Wind。"""
     global _INTRADAY_CACHE_WARNED
     if _INTRADAY_CACHE_WARNED:
         return
     _INTRADAY_CACHE_WARNED = True
-    print(
-        "[wind_data] 警告：日内行情缓存写入失败，本次运行的每次取数都会重新"
-        "请求 Wind。1 分钟粒度下批量回测会慢一个数量级。\n"
-        f"  原因: {type(exc).__name__}: {exc}\n"
-        "  修复: pip install pyarrow（requirements.txt 已声明该依赖）"
-    )
+    _log.warning(
+        "行情缓存写入失败，本次运行每次取数都会重新请求 Wind"
+        "（1 分钟粒度下批量回测会慢一个数量级）。原因: %s: %s。"
+        "修复: pip install pyarrow（requirements.txt 已声明该依赖）",
+        type(exc).__name__, exc)
 
 
 def _intraday_cache_path(code, start, end, bar_size, adjust="F"):

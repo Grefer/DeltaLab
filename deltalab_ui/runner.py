@@ -177,8 +177,16 @@ class RunnerMixin:
         )
 
     @staticmethod
-    def _load_wind_contract_history_pool(gs):
-        """按分析截止日的历史主力映射加载同品种具体合约行情。"""
+    def _load_wind_contract_history_pool(gs, cancel_event=None,
+                                         on_progress=None):
+        """按分析截止日的历史主力映射加载同品种具体合约行情。
+
+        逐合约请求 Wind 是整轮里唯一一段**只等不算**的时间，短则几秒、长则
+        几分钟（合约多、粒度细时）。此前这段既不报进度也不看中止标志——而
+        按钮在 _begin_job 时就已经变成「■ 停止优选」，用户点下去毫无反应。
+        现在每个合约之间检查一次：Wind 的单次请求本身不可打断，所以中止的
+        粒度就是一个合约。
+        """
         import pandas as pd
         from pricing.wind_data import (
             get_close_prices,
@@ -208,7 +216,11 @@ class RunnerMixin:
         bar_label = gs.get("wind_bar_size", "日频")
         contract_prices = {}
         contract_load_errors = {}
-        for contract_code in contract_codes:
+        for loaded, contract_code in enumerate(contract_codes):
+            if cancel_event is not None and cancel_event.is_set():
+                raise SelectionCancelled("取数阶段被用户中止")
+            if on_progress is not None:
+                on_progress(loaded, len(contract_codes), contract_code)
             main_dates = evidence_mapping.index[
                 evidence_mapping.astype(str).eq(contract_code)]
             if not len(main_dates):
@@ -288,14 +300,23 @@ class RunnerMixin:
         )
 
     @staticmethod
-    def _load_full_history_for_recommendation(gs, base_bt):
-        """返回未被单个期权期限裁剪的完整历史价格。"""
+    def _load_full_history_for_recommendation(gs, base_bt, cancel_event=None,
+                                              on_progress=None):
+        """返回未被单个期权期限裁剪的完整历史价格。
+
+        ``cancel_event`` / ``on_progress`` 只透传给品种池那条——它是唯一会
+        发多次请求的路径。单序列只有一次 Wind 调用，请求本身不可打断，能做
+        的只是在发出之前再看一眼中止标志。
+        """
         history_selection.validate_source(gs)
+        if cancel_event is not None and cancel_event.is_set():
+            raise SelectionCancelled("取数阶段被用户中止")
         if gs.get("source") == "wind":
             from pricing.wind_data import classify_wind_history_code
             classification = classify_wind_history_code(gs.get("wind_code"))
             if classification["mode"] == "product_pool":
-                return RunnerMixin._load_wind_contract_history_pool(gs)
+                return RunnerMixin._load_wind_contract_history_pool(
+                    gs, cancel_event=cancel_event, on_progress=on_progress)
         retained_meta = getattr(base_bt, "_gui_meta", {}) or {}
         retained_source = retained_meta.get("source")
         if retained_source is not None and retained_source != gs.get("source"):
@@ -456,6 +477,26 @@ class RunnerMixin:
         except Exception:                              # noqa: BLE001
             return None
 
+    def _make_history_fetch_callback(self):
+        """取数阶段的进度：只更新状态栏文案，不动进度条。
+
+        这一段是「只等不算」——Wind 请求的耗时既不可预估也不可分割，做成
+        determinate 进度条只会给出一个假的百分比。报「第几个 / 共几个合约」
+        足以说明它在动、以及还剩多少，用户据此决定要不要按停止。
+        """
+        state = {"last_emit": 0.0}
+
+        def _callback(loaded, total, contract_code):
+            now = time.monotonic()
+            if loaded and now - state["last_emit"] < 0.2:
+                return
+            state["last_emit"] = now
+            text = (f"正在加载历史行情  {loaded + 1}/{total}  "
+                    f"（{contract_code}）…")
+            self.after(0, lambda t=text: self._set_status(t))
+
+        return _callback
+
     @staticmethod
     def _format_duration(seconds):
         """把秒数说成人话；进度条旁边不该出现 '183.4s'。"""
@@ -487,6 +528,7 @@ class RunnerMixin:
                 self, period_labels)
             period_cb = RunnerMixin._make_history_period_callback(
                 self, period_labels)
+            fetch_cb = RunnerMixin._make_history_fetch_callback(self)
             original_option = gs["cfg"]["build"](gs["subtype"], gs["params"])
             is_product_pool = False
             if gs.get("source") == "wind":
@@ -498,7 +540,10 @@ class RunnerMixin:
             if is_product_pool:
                 # 品种代码直接读取逐日主力映射和具体合约，不把连续合约行情
                 # 作为隐式前置依赖，也不重复下载整段连续分钟数据。
-                history = self._load_full_history_for_recommendation(gs, None)
+                history = self._load_full_history_for_recommendation(
+                    gs, None,
+                    cancel_event=getattr(self, "_history_cancel_event", None),
+                    on_progress=fetch_cb)
                 if not isinstance(history, ContractHistoryPool):
                     raise TypeError("期货品种代码未返回历史具体合约样本池")
                 base_bt = RunnerMixin._contract_pool_backtest_context(gs, history)
@@ -524,7 +569,10 @@ class RunnerMixin:
                 base_bt = self._build_backtest(base_state)
                 cases, notes = self._strategy_cases_for_history(gs, base_bt)
                 kwargs = self._comparison_backtest_kwargs(base_bt)
-                history = self._load_full_history_for_recommendation(gs, base_bt)
+                history = self._load_full_history_for_recommendation(
+                    gs, base_bt,
+                    cancel_event=getattr(self, "_history_cancel_event", None),
+                    on_progress=fetch_cb)
                 recommendations, ranking, window_results = (
                     recommend_by_rolling_history(
                         original_option, history, cases, kwargs,

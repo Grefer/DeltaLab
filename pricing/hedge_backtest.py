@@ -7,10 +7,14 @@ DeltaLab - 期权动态对冲回测框架
 """
 
 import copy
+import logging
 import os
 import datetime as _datetime
 import numpy as np
 import matplotlib.pyplot as plt
+
+# 按名字取子 logger，不 import 根层的 deltalab_log（见 wind_data 里同样的说明）。
+_log = logging.getLogger("deltalab.hedge_backtest")
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 try:
@@ -637,11 +641,12 @@ class SigmaBandStrategy(HedgeStrategy):
             self._legacy_window_bars = None
         elif window is not None:
             import warnings
-            warnings.warn(
-                "SigmaBandStrategy(window=...) 已弃用，请改用 window_days（单位=日）。"
-                "传入的 window 按 bar 粒度直接解释。",
-                DeprecationWarning, stacklevel=2,
-            )
+            message = (
+                "SigmaBandStrategy(window=...) 已弃用，请改用 window_days"
+                "（单位=日）。传入的 window 按 bar 粒度直接解释。")
+            warnings.warn(message, DeprecationWarning, stacklevel=2)
+            # 冻结包里 warnings 是静默的，再走一条日志才留得下痕迹。
+            _log.warning("%s", message)
             self.window_days = max(2, int(window))  # 保留一个 days 估计值兜底
             self._legacy_window_bars = max(2, int(window))
         else:

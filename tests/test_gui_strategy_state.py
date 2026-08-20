@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import datetime
 import os
+import threading
 from types import SimpleNamespace
 
 import numpy as np
@@ -13,6 +14,7 @@ import gui_app
 import history_selection
 from deltalab_ui import runner
 from pricing.hedge_analysis import (
+    SelectionCancelled,
     _aggregate_result_by_day as _agg_daily_frame)
 from gui_app import (
     BacktestApp,
@@ -1944,6 +1946,105 @@ def test_specific_futures_contract_history_never_enters_product_pool(
     assert result is not retained
 
 
+def _stub_wind_pool_fetch(monkeypatch, n_contracts=5, span=30):
+    """给品种池取数循环搭一套假 Wind，返回被实际请求到的合约代码清单。"""
+    import pricing.wind_data as wind_data
+
+    codes = [f"AU23{i + 1:02d}.SHF" for i in range(n_contracts)]
+    dates = pd.bdate_range("2023-01-02", periods=n_contracts * span)
+    mapping = pd.Series([codes[i // span] for i in range(len(dates))],
+                        index=dates)
+    fetched = []
+
+    def fake_close(code, start, end, adjust):
+        fetched.append(code)
+        idx = pd.bdate_range(start, end)
+        return pd.Series(100.0 + np.arange(len(idx)), index=idx)
+
+    monkeypatch.setattr(wind_data, "get_main_contract_history",
+                        lambda *a, **k: mapping)
+    monkeypatch.setattr(wind_data, "get_close_prices", fake_close)
+    monkeypatch.setattr(wind_data, "get_intraday_close", fake_close)
+    state = {
+        "source": "wind", "wind_code": "AU.SHF",
+        "wind_start": dates[0].date().isoformat(),
+        "wind_end": dates[-1].date().isoformat(),
+        "wind_bar_size": "日频",
+        # 证据窗要盖住全部合约，否则映射被截断、循环只剩最后一两个。
+        "history_lookbacks": {"half_year": len(dates)},
+    }
+    return state, codes, fetched
+
+
+def test_contract_pool_fetch_reports_progress_per_contract(monkeypatch):
+    """取数是整轮里唯一一段只等不算的时间，不报进度就只剩一个空窗。"""
+    state, codes, _fetched = _stub_wind_pool_fetch(monkeypatch)
+    seen = []
+    runner.RunnerMixin._load_wind_contract_history_pool(
+        state, on_progress=lambda i, n, code: seen.append((i, n, code)))
+
+    assert [c for _i, _n, c in seen] == codes
+    assert [i for i, _n, _c in seen] == list(range(len(codes)))
+    assert {n for _i, n, _c in seen} == {len(codes)}
+
+
+def test_contract_pool_fetch_stops_between_contracts_when_cancelled(
+        monkeypatch):
+    """按钮此前已显示「停止」，点下去却要等整段取数跑完才有反应。"""
+    state, codes, fetched = _stub_wind_pool_fetch(monkeypatch)
+    cancel = threading.Event()
+
+    with pytest.raises(SelectionCancelled, match="取数阶段"):
+        runner.RunnerMixin._load_wind_contract_history_pool(
+            state, cancel_event=cancel,
+            # 第 3 个合约开拉时置位；检查点在下一轮循环开头，所以正好拉满 3 个。
+            on_progress=lambda i, _n, _c: cancel.set() if i == 2 else None)
+
+    assert fetched == codes[:3]
+
+
+def test_contract_pool_fetch_cancelled_before_start_issues_no_request(
+        monkeypatch):
+    """开跑前就点停：一次 Wind 请求都不该发出去。"""
+    state, _codes, fetched = _stub_wind_pool_fetch(monkeypatch)
+    cancel = threading.Event()
+    cancel.set()
+
+    with pytest.raises(SelectionCancelled):
+        runner.RunnerMixin._load_wind_contract_history_pool(
+            state, cancel_event=cancel)
+
+    assert fetched == []
+
+
+def test_full_history_loader_forwards_cancel_and_progress_to_pool(monkeypatch):
+    """两个参数要一路穿到池加载器，否则上面那三条在真链路上都不生效。
+
+    刻意不预先置位——入口处本来就有一道早检查，预置位会被它拦下，转发有没
+    有做都看不出来。这里从**进度回调里**置位：只有 on_progress 真的传下去
+    了才会被调到，也只有 cancel_event 真的传下去了循环才会停。
+    """
+    state, codes, fetched = _stub_wind_pool_fetch(monkeypatch)
+    cancel = threading.Event()
+    seen = []
+    base_bt = SimpleNamespace(
+        _full_price_history=pd.Series([100.0, 101.0]),
+        _gui_meta={"source": "wind"},
+    )
+
+    def on_progress(i, n, code):
+        seen.append((i, n, code))
+        if i == 1:
+            cancel.set()
+
+    with pytest.raises(SelectionCancelled, match="取数阶段"):
+        BacktestApp._load_full_history_for_recommendation(
+            state, base_bt, cancel_event=cancel, on_progress=on_progress)
+
+    assert [c for _i, _n, c in seen] == codes[:2]
+    assert fetched == codes[:2]
+
+
 def test_product_code_history_prefers_contract_pool_over_retained_continuous(
         monkeypatch):
     mapping = pd.Series(
@@ -1962,7 +2063,9 @@ def test_product_code_history_prefers_contract_pool_over_retained_continuous(
     # 已随执行链路搬进 deltalab_ui/runner.py。补在 BacktestApp 上不会生效。
     monkeypatch.setattr(
         runner.RunnerMixin, "_load_wind_contract_history_pool",
-        staticmethod(lambda state: calls.append(state["wind_code"]) or pool),
+        # 池加载器现在还接 cancel_event / on_progress；本例不关心，吞掉。
+        staticmethod(
+            lambda state, **_kw: calls.append(state["wind_code"]) or pool),
     )
     base_bt = SimpleNamespace(
         _full_price_history=pd.Series([1.0, 2.0]),
@@ -3416,7 +3519,10 @@ def _history_worker_fixture(source, load_history):
         _build_backtest=lambda _state: base_bt,
         _strategy_cases_for_history=lambda _state, _bt: (cases, []),
         _comparison_backtest_kwargs=lambda _bt: {},
-        _load_full_history_for_recommendation=load_history,
+        # 加载器现在还接 cancel_event / on_progress（取数阶段可中止）。
+        # 夹具不关心它们，吞掉即可。
+        _load_full_history_for_recommendation=(
+            lambda _state, _bt, **_kw: load_history(_state, _bt)),
         _deliver_history_recommendation=lambda *args: delivered.append(args),
         _fail_history_recommendation=failed.append,
         after=lambda _delay, callback: callback(),

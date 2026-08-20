@@ -430,6 +430,81 @@ def test_intraday_cache_key_distinguishes_full_time_and_date_semantics(tmp_path)
     assert len({at_0930, at_1030, whole_dates, exact_midnight}) == 4
 
 
+class _FakeWindDaily:
+    """记下每一次 wsd 调用，好数清楚到底问了 Wind 几回。"""
+
+    def __init__(self):
+        self.calls = []
+
+    def wsd(self, code, fields, start, end, options):
+        self.calls.append((code, start, end, options))
+        idx = pd.bdate_range(start, end)
+        return SimpleNamespace(
+            ErrorCode=0,
+            Times=list(idx),
+            Data=[list(100.0 + np.arange(len(idx)))],
+        )
+
+
+def test_daily_cache_second_call_skips_wind_and_returns_identical_series(tmp_path):
+    """品种池模式要逐合约拉日线，换参数重跑不该把整串请求重来一遍。"""
+    fake = _FakeWindDaily()
+    with (
+        patch("pricing.wind_data._CACHE_DIR", str(tmp_path)),
+        patch("pricing.wind_data._ensure_wind", return_value=fake),
+    ):
+        first = wind_data.get_close_prices("AU2312.SHF", "2023-01-02", "2023-06-30")
+        second = wind_data.get_close_prices("AU2312.SHF", "2023-01-02", "2023-06-30")
+
+    assert len(fake.calls) == 1, "第二次不该再问 Wind"
+    # 缓存读回的必须与首次逐位一致——差一个 ULP 都会让定价结果对不上。
+    pd.testing.assert_series_equal(first, second)
+    assert second.name == "AU2312.SHF"
+
+
+def test_daily_cache_key_separates_adjust_and_range(tmp_path):
+    """复权口径混用会让读回的序列与调用方预期不符，必须进 key。"""
+    fake = _FakeWindDaily()
+    with (
+        patch("pricing.wind_data._CACHE_DIR", str(tmp_path)),
+        patch("pricing.wind_data._ensure_wind", return_value=fake),
+    ):
+        wind_data.get_close_prices("AU2312.SHF", "2023-01-02", "2023-06-30")
+        wind_data.get_close_prices(
+            "AU2312.SHF", "2023-01-02", "2023-06-30", adjust="B")
+        wind_data.get_close_prices(
+            "AU2312.SHF", "2023-01-02", "2023-06-30", adjust="")
+        # 区间不同也不能共用（哪怕是子区间）。
+        wind_data.get_close_prices("AU2312.SHF", "2023-01-02", "2023-03-31")
+
+    assert len(fake.calls) == 4
+    paths = {
+        wind_data._daily_cache_path(
+            "AU2312.SHF", "2023-01-02", "2023-06-30", adjust=a)
+        for a in ("F", "B", "")
+    }
+    assert len(paths) == 3
+
+
+def test_daily_cache_unwritable_dir_still_returns_data(tmp_path):
+    """缓存写不进去只该退化成每次都取，绝不能打断本次取数。"""
+    fake = _FakeWindDaily()
+    with (
+        patch("pricing.wind_data._CACHE_DIR", str(tmp_path)),
+        patch("pricing.wind_data._ensure_wind", return_value=fake),
+        patch("pandas.DataFrame.to_parquet",
+              side_effect=OSError("read-only file system")),
+    ):
+        series = wind_data.get_close_prices(
+            "AU2312.SHF", "2023-01-02", "2023-06-30")
+        again = wind_data.get_close_prices(
+            "AU2312.SHF", "2023-01-02", "2023-06-30")
+
+    assert not series.empty
+    pd.testing.assert_series_equal(series, again)
+    assert len(fake.calls) == 2, "写不进缓存时应每次都重新取"
+
+
 @pytest.mark.parametrize(
     ("classification", "expected_ranges"),
     [

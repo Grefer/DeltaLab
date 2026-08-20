@@ -17,12 +17,16 @@
 ~/.deltalab/data/tradingday.csv（.app 包只读）。读取时可写副本优先于随包那份。
 """
 
+import logging
 import os
 import sys
 import threading
 import warnings
 
 import numpy as np
+
+# 按名字取子 logger，不 import 根层的 deltalab_log（见 wind_data 里同样的说明）。
+_log = logging.getLogger("deltalab.trade_calendar")
 import pandas as pd
 
 _CACHE = None  # 进程内缓存：升序 datetime64[D] 数组
@@ -161,9 +165,13 @@ def _load_calendar_locked(start, end):
             # 磁盘满、权限不对）没有任何理由把这次成功的刷新一起作废——此前
             # 这句异常会一路冒出 load_calendar，把"已经拿到正确日历"变成一次
             # 彻底失败。
-            warnings.warn(
-                f"交易日历已刷新但未能写入本地缓存（{exc}），本次仍使用刷新结果；"
-                f"下次启动会再抓一遍。")
+            message = (
+                f"交易日历已刷新但未能写入本地缓存（{exc}），本次仍使用刷新"
+                f"结果；下次启动会再抓一遍。")
+            # 两条都发：warnings 给开发态与 pytest，日志给冻结包——后者
+            # 没有终端，warnings.warn 在那里是静默丢弃。
+            warnings.warn(message)
+            _log.warning("%s", message)
         _CACHE = fetched
         return fetched
 
