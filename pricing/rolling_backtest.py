@@ -117,6 +117,7 @@ def run_rolling_backtest(
     # 重建价格（此时 ratio≈1，等价于旧的 rebase_path 行为）。
     cfg_s0_for_recon = float(option_cfg["s0"])
     prices_arr = None
+    prices_index = None
     try:
         try:
             from .wind_data import load_history_cached
@@ -126,13 +127,21 @@ def run_rolling_backtest(
         candidate = np.asarray(prices_series.values, dtype=float)
         if len(candidate) >= len(log_ret) + 1:
             prices_arr = candidate[-(len(log_ret) + 1):]
+            prices_index = prices_series.index[-(len(log_ret) + 1):]
     except Exception:
         prices_arr = None
+        prices_index = None
 
     if prices_arr is None:
         # 退化路径：用 log_ret 重建价格，起点 = 配置 s0
         cum = np.concatenate([[0.0], np.cumsum(log_ret.values)])
         prices_arr = cfg_s0_for_recon * np.exp(cum)
+
+    if prices_index is None:
+        # 与 prices_arr 逐格对齐的日期轴。退化路径拿不到首个价格的真实日期
+        # （它落在 log_ret 首日的前一个交易日），补一个 NaT 占位即可——下面
+        # 只会用 t0 >= 1 的格子。
+        prices_index = log_ret.index.insert(0, pd.NaT)
 
     # ---- 期货 vs 权益：合约乘数与有效 q ----
     if asset_type == "future":
@@ -270,7 +279,12 @@ def run_rolling_backtest(
 
             rows.append(
                 {
-                    "start_date": log_ret.index[t0],
+                    # 建仓价是 prices_arr[t0]，建仓日就必须是它自己的日期。
+                    # 旧写法取 log_ret.index[t0]，而对齐关系是
+                    # log_ret.index[k] <-> prices_arr[k + 1]（见上面的说明），
+                    # 于是记录下来的日期整整晚了一个交易日：real_s0 是 T 日的
+                    # 收盘价，start_date 却写着 T+1 日。
+                    "start_date": prices_index[t0],
                     "position": position,
                     "position_label": "sell" if position == 1 else "buy",
                     "sigma_pre": sigma_pre,

@@ -975,7 +975,16 @@ class HistorySetupMixin:
                     "删除结果", f"删除「{name}」？此操作不可撤销。",
                     parent=window):
                 return
-            history_store.delete_result(item["path"])
+            # delete_result 对「本来就不存在」和「删不掉」都返回 False，真正
+            # 的失败判据是「没删成且文件还在」。refresh() 会把删不掉的那条重
+            # 新列出来，但列表里凭空多回一行不会被读成"删除失败"，得明说。
+            if (not history_store.delete_result(item["path"])
+                    and os.path.exists(item["path"])):
+                messagebox.showerror(
+                    "删除失败",
+                    f"删不掉「{name}」的结果文件（可能是目录只读，或文件正被"
+                    f"别的程序占用）：\n\n{item['path']}",
+                    parent=window)
             refresh()
 
         actions = ttk.Frame(body, style="Surface.TFrame")

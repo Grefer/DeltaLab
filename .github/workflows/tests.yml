@@ -1,12 +1,14 @@
 name: Tests
 
-# 触发条件：推主干、开 PR、以及手动触发。
-# 与 release.yml 分开：那条只在打 tag 时跑 PyInstaller 打包，不跑测试。
+# 触发条件：推主干、开 PR、手动触发，以及被 release.yml 以 workflow_call
+# 复用。复用而不是在 release.yml 里再抄一份 pytest 步骤：抄一份意味着两条
+# 流水线的测试范围会慢慢分叉，而发布这条恰恰是最不该跑得比主干松的。
 on:
   push:
     branches: ["master", "main"]
   pull_request:
   workflow_dispatch:
+  workflow_call:
 
 # 同一分支上新的推送取消尚未跑完的旧任务，省 runner 额度。
 concurrency:

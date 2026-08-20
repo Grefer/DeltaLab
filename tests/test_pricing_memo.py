@@ -32,6 +32,7 @@ from pricing.Option_DE import Option_DE
 from pricing.Option_SNB import Option_SNB
 from pricing.hedge_analysis import (
     _rolling_progress_total,
+    segment_cost_weight,
     _strict_lookback_segment_lengths,
     recommend_by_rolling_history,
 )
@@ -345,30 +346,38 @@ def test_progress_callback_is_monotonic_and_exact():
     recommend_by_rolling_history(
         option, history, cases, dict(_SELECTION_KWARGS),
         lookbacks=lookbacks, steps_per_day=1,
-        progress_callback=lambda d, t, label, case: seen.append(
-            (d, t, label, case)))
+        progress_callback=seen.append)
 
     assert seen, "进度回调一次都没被调用"
-    totals = {total for _, total, _, _ in seen}
+    totals = {p.total for p in seen}
     assert len(totals) == 1, "分母在中途变过"
     total = totals.pop()
-    assert [d for d, _, _, _ in seen] == list(range(1, total + 1))
+    assert [p.done for p in seen] == list(range(1, total + 1))
 
     expected = sum(
         len(_strict_lookback_segment_lengths(days, option.T_days)) * len(cases)
         for days in lookbacks.values()
         if len(history) - days - 1 >= 0)
     assert total == expected
-    assert {label for _, _, label, _ in seen} == set(lookbacks)
+    assert {p.label for p in seen} == set(lookbacks)
+
+    # 权重分母同样不能中途变；成本份额单调不减、终点恰好 1。
+    assert len({round(p.total_weight, 9) for p in seen}) == 1
+    fractions = [p.fraction for p in seen]
+    assert fractions == sorted(fractions), "成本份额出现回退"
+    assert fractions[-1] == pytest.approx(1.0, abs=1e-9)
 
 
 def test_progress_total_helper_matches_actual_units():
     """分母助手与主循环必须共用同一条证据充足判据。"""
     # 证据不足的档不参与计数：n_history_groups - days - 1 < 0
-    total = _rolling_progress_total(
+    total, weight = _rolling_progress_total(
         {"week": 5, "year": 243}, maturity_days=20,
         n_history_groups=100, n_cases=3)
-    assert total == len(_strict_lookback_segment_lengths(5, 20)) * 3
+    lengths = _strict_lookback_segment_lengths(5, 20)
+    assert total == len(lengths) * 3
+    assert weight == pytest.approx(
+        3 * sum(segment_cost_weight(x, 20) for x in lengths))
 
 
 def test_progress_callback_failure_does_not_break_selection():
@@ -525,22 +534,23 @@ def test_progress_reporter_reaches_total_with_skips():
     from pricing.hedge_analysis import _ProgressReporter
 
     seen = []
-    reporter = _ProgressReporter(
-        lambda d, t, label, case: seen.append((d, t, label, case)), 6)
+    reporter = _ProgressReporter(seen.append, 6)
     reporter.skip(3, "month")          # 一整段被跳过（3 个候选）
     for name in ("a", "b", "c"):
         reporter.advance("quarter", name)
 
     assert reporter.done == reporter.total == 6
-    assert [d for d, _, _, _ in seen] == [3, 4, 5, 6]
-    assert seen[-1][0] == seen[-1][1], "进度没走满"
+    assert [p.done for p in seen] == [3, 4, 5, 6]
+    assert seen[-1].done == seen[-1].total, "进度没走满"
+    # 不给权重时退回按单元数计，份额同样要走满。
+    assert seen[-1].fraction == pytest.approx(1.0)
 
 
 def test_progress_reporter_skip_ignores_non_positive():
     from pricing.hedge_analysis import _ProgressReporter
 
     seen = []
-    reporter = _ProgressReporter(lambda *a: seen.append(a), 2)
+    reporter = _ProgressReporter(seen.append, 2)
     reporter.skip(0)
     reporter.skip(-5)
     assert reporter.done == 0 and not seen
@@ -622,9 +632,9 @@ def test_cancel_event_stops_selection_promptly():
     cancel = threading.Event()
     seen = []
 
-    def cb(done, total, label, case):
-        seen.append(done)
-        if done == 3:                 # 跑够 3 个单元后请求停止
+    def cb(progress):
+        seen.append(progress.done)
+        if progress.done == 3:        # 跑够 3 个单元后请求停止
             cancel.set()
 
     with pytest.raises(SelectionCancelled):
@@ -799,7 +809,7 @@ def test_progress_total_still_exact_under_parallelism():
     recommend_by_rolling_history(
         _airbag(npath=300), history, cases, dict(_SELECTION_KWARGS),
         lookbacks=lookbacks, steps_per_day=1,
-        progress_callback=lambda d, t, l, c: seen.append((d, t)))
+        progress_callback=lambda p: seen.append((p.done, p.total)))
 
     total = seen[-1][1]
     assert sorted(d for d, _ in seen) == list(range(1, total + 1)), (
@@ -1548,9 +1558,41 @@ def test_cache_key_tracks_the_pricer_version():
     assert isinstance(cache.PRICER_VERSION, int)
     assert cache.PRICER_VERSION >= 2, "口径改过就要 +1"
 
+    # **两条 key 都要查**。它们写进同一个目录、共用 store_by_key /
+    # load_by_key，少一处版本号，那条路径上的旧口径缓存照样会被当成有效
+    # 命中——只查 key_for 的守卫正是这么漏掉 key_for_recipe 的。
     import inspect
-    source = inspect.getsource(cache.key_for)
-    assert "PRICER_VERSION" in source, "版本号没有进 key material"
+    for fn in (cache.key_for, cache.key_for_recipe):
+        assert "PRICER_VERSION" in inspect.getsource(fn), (
+            f"{fn.__name__} 的 key material 里没有版本号")
+
+
+def test_pricer_version_actually_invalidates_both_key_kinds(tmp_path):
+    """版本号一变，两条 key 都必须变——这是「旧口径缓存失效」的唯一保证。"""
+    import history_bar_cache as cache
+
+    from pricing import HistoryReplaySpec
+
+    recipe = {"prices": [100.0, 101.0], "strategy_name": "close_to_close"}
+    spec = HistoryReplaySpec(
+        lookback="month", window_id="segment_1", option=_airbag(npath=200),
+        external_path=np.array([100.0, 101.0, 102.0]),
+        evaluation_days=2, steps_per_day=1,
+        strategies={"close_to_close": CloseToCloseStrategy()},
+        backtest_kwargs={}, warmup_kwargs={}, metadata={})
+
+    before = (cache.key_for(spec, "close_to_close"),
+              cache.key_for_recipe(recipe))
+    saved = cache.PRICER_VERSION
+    cache.PRICER_VERSION = saved + 1
+    try:
+        after = (cache.key_for(spec, "close_to_close"),
+                 cache.key_for_recipe(recipe))
+    finally:
+        cache.PRICER_VERSION = saved
+
+    assert before[0] != after[0], "key_for 不随定价口径版本变化"
+    assert before[1] != after[1], "key_for_recipe 不随定价口径版本变化"
 
 
 @pytest.mark.parametrize("subtype", _KO_SETTLED_SUBTYPES)

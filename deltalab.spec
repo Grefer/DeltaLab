@@ -29,6 +29,40 @@ from PyInstaller.utils.hooks import (
 
 ROOT = Path(SPECPATH).resolve()
 
+
+def _resolve_version():
+    """本次构建的版本号，形如 ``2.0.0``。
+
+    优先级：``DELTALAB_VERSION`` 环境变量（release.yml 从 tag 注入）→ 本地
+    ``git describe`` 的最近 tag → ``0.0.0``。
+
+    此前 CFBundleShortVersionString 是写死的 "1.0.0"，而仓库当时已经打到
+    v2.0.0：用户在「关于本机 → 系统报告」或 Finder 简介里看到的版本，和他
+    下载的那个包对不上，报 bug 时给出的版本号也就没有意义。
+    """
+    import os
+    import re
+    import subprocess
+
+    raw = os.environ.get("DELTALAB_VERSION", "").strip()
+    if not raw:
+        try:
+            raw = subprocess.run(
+                ["git", "describe", "--tags", "--abbrev=0"],
+                cwd=str(ROOT), capture_output=True, text=True,
+                timeout=10, check=True).stdout.strip()
+        except Exception:
+            raw = ""
+    raw = raw.lstrip("vV")
+    # CFBundleShortVersionString 只接受 1~3 段数字；tag 上的后缀（-rc1 等）
+    # 要削掉，否则 Finder 与 codesign 会拒绝整个 plist。
+    match = re.match(r"^\d+(\.\d+){0,2}", raw)
+    return match.group(0) if match else "0.0.0"
+
+
+VERSION = _resolve_version()
+print(f"[deltalab.spec] build version = {VERSION}")
+
 datas = []
 datas += [(str(ROOT / "assets"), "assets")]
 # 离线交易日历, 供雪球(Option_SNB)自然日计息/日期换算使用, 避免运行时依赖 Wind/akshare.
@@ -231,7 +265,8 @@ if sys.platform == "darwin":
         info_plist={
             "CFBundleName": "DeltaLab",
             "CFBundleDisplayName": "DeltaLab",
-            "CFBundleShortVersionString": "1.0.0",
+            "CFBundleShortVersionString": VERSION,
+            "CFBundleVersion": VERSION,
             "NSHighResolutionCapable": True,
             "LSMinimumSystemVersion": "11.0",
         },

@@ -721,3 +721,49 @@ def test_get_main_contract_history_preserves_wind_error_code():
         with pytest.raises(RuntimeError, match="-40520007"):
             wind_data.get_main_contract_history(
                 "P.DCE", "2026-01-01", "2026-01-31")
+
+
+# ---------------------------------------------------------------------------
+# 5) 建仓日与建仓价必须来自同一格
+# ---------------------------------------------------------------------------
+
+def test_rolling_start_date_matches_the_bar_that_supplied_real_s0():
+    """``start_date`` 必须是 ``real_s0`` 自己那天，不能晚一个交易日。
+
+    对齐关系是 ``log_ret.index[k] <-> prices.index[k + 1]``（log_ret 比价格少
+    一行）。旧写法建仓价取 ``prices_arr[t0]``、建仓日却取
+    ``log_ret.index[t0]``，两者差一格：real_s0 是 T 日收盘价，start_date 却
+    写着 T+1 日。用「价格 = 100 + i」这种可辨认的序列能把它一眼钉住。
+    """
+    n_bars = 60
+    index = pd.bdate_range("2026-01-01", periods=n_bars)
+    prices = pd.Series(100.0 + np.arange(n_bars, dtype=float), index=index)
+    log_ret = np.log(prices / prices.shift(1)).dropna()
+
+    option_cfg = dict(
+        optiontype="Vanilla", s0=100.0, sr=[], K=100.0, T=5,
+        sigma=0.2, cp=1, r=0.03, q=0.03, exe_mode="Eu",
+    )
+
+    with (
+        patch("pricing.rolling_backtest.get_log_returns", return_value=log_ret),
+        patch("pricing.wind_data.load_history_cached",
+              side_effect=RuntimeError("offline unit test")),
+    ):
+        df = run_rolling_backtest(
+            option_cfg=option_cfg, option_class=Option_Vanilla,
+            code="FAKE.SH", start="2026-01-01", end="2026-12-31",
+            step=5, hv_window=4, asset_type="equity", r=0.03, q=0.03,
+            hedge_kwargs={"position": 1, "quantity": 1, "tc_rate": 0.0},
+        )
+
+    assert not df.empty
+    # 退化路径按 cfg s0=100 重建价格，因此 prices 与重建值同为 100 + i，
+    # 可以直接拿 real_s0 反查它应该属于哪一天。
+    by_date = {ts: value for ts, value in prices.items()}
+    for _, row in df.iterrows():
+        recorded = pd.Timestamp(row["start_date"])
+        assert recorded in by_date, f"{recorded} 不在价格索引里"
+        assert by_date[recorded] == pytest.approx(row["real_s0"]), (
+            f"start_date={recorded.date()} 记的是 {by_date[recorded]}，"
+            f"但 real_s0 是 {row['real_s0']}")

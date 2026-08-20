@@ -261,6 +261,10 @@ def key_for_recipe(recipe):
     if rest is _GIVE_UP:
         return None
     material = "\n".join([
+        # 与 key_for 同一道闸：两条 key 写进同一个目录、共用
+        # store_by_key / load_by_key，少一处版本号，那条路径上的旧口径缓存
+        # 就会被当成有效命中原样读回（快照页「加载明细」走的正是这条）。
+        f"pricer={PRICER_VERSION}",
         "recipe",
         f"{values.size}|{hashlib.sha1(values.tobytes()).hexdigest()}",
         stamps,

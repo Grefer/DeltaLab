@@ -3534,3 +3534,70 @@ def test_saved_history_listing_needs_no_migration_at_all():
     assert history_store._subtype_label(
         {"subtype": "Opt_ASGQ_DFF"}, gui_app.SUBTYPE_DISPLAY) == (
         gui_app.SUBTYPE_DISPLAY["Opt_ASGQ_DFF"])
+
+
+# --------------------------------------------------------------------------
+#  删不掉 / 写不进时不能报成功
+# --------------------------------------------------------------------------
+
+def test_undeletable_snapshot_stays_in_the_pool(monkeypatch):
+    """文件删不掉时这条结果必须原样留在池里。
+
+    旧写法是先把快照从内存池 ``pop`` 掉、再忽略文件删除的返回值：只读目录或
+    文件被占用时，这条结果从界面上消失、状态栏写着「已删除」，文件却还在盘
+    上，下次启动它自己又回来了——用户看到的是"删掉的东西自己回来了"。
+    """
+    app = _persisted_app()
+    try:
+        snapshot, _bt = _run_and_retain(app, "删不掉的")
+        assert os.path.exists(snapshot.store_path)
+        monkeypatch.setattr(
+            gui_app.backtest_pool_store, "delete_snapshot", lambda _path: False)
+
+        assert BacktestApp._delete_saved_backtest(app, snapshot.result_id) is None
+        assert snapshot.result_id in app._saved_backtests
+        assert os.path.exists(snapshot.store_path)
+    finally:
+        app.destroy()
+
+
+def test_missing_snapshot_file_still_leaves_the_pool():
+    """文件本来就不存在时照常出池——目标状态已经达成。
+
+    ``delete_snapshot`` 对「不存在」和「删不掉」都返回 False，两者对池子的
+    意义却正好相反，不能一视同仁地判成失败。
+    """
+    app = _persisted_app()
+    try:
+        snapshot, _bt = _run_and_retain(app, "文件已丢")
+        os.remove(snapshot.store_path)
+
+        removed = BacktestApp._delete_saved_backtest(app, snapshot.result_id)
+        assert removed is not None
+        assert snapshot.result_id not in app._saved_backtests
+    finally:
+        app.destroy()
+
+
+def test_rename_reports_when_it_cannot_reach_disk(monkeypatch):
+    """改名写盘失败要抛出去，而不是 ``except Exception: pass`` 全吞。
+
+    名字在本次会话里确实改好了（曲线、对比表、状态栏都会用新名字），但重启
+    会变回去，而旧写法中间没有任何一处提示过。
+    """
+    app = _persisted_app()
+    try:
+        snapshot, _bt = _run_and_retain(app, "原名")
+
+        def _boom(*_args, **_kwargs):
+            raise PermissionError("read-only file system")
+
+        monkeypatch.setattr(
+            gui_app.backtest_pool_store, "write_snapshot", _boom)
+
+        with pytest.raises(OSError, match="重启后会恢复为旧名称"):
+            BacktestApp._rename_saved_backtest(app, snapshot.result_id, "新名")
+        # 内存里的改名仍然生效：不该因为写不进磁盘就把本次会话也废掉。
+        assert app._saved_backtests[snapshot.result_id].name == "新名"
+    finally:
+        app.destroy()

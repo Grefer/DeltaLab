@@ -914,18 +914,37 @@ class SnapshotStoreMixin:
                 backtest_pool_store.write_snapshot(
                     SnapshotStoreMixin._snapshot_to_payload(snapshot),
                     path=snapshot.store_path, enforce=False)
-            except Exception:                                 # noqa: BLE001
-                # 改名失败只影响下次启动看到的名字，不该打断本次会话。
-                pass
+            except Exception as exc:                          # noqa: BLE001
+                # 改名失败确实不该打断本次会话——内存里的名字已经改好了，
+                # 曲线、对比表、状态栏都会用新名字。但也不能像以前那样一声
+                # 不吭：只读目录或文件被占用时，用户看到「已重命名」、重启
+                # 后却发现名字变了回去，而中间没有任何一处提示过。抛出去交
+                # 给调用方措辞，内存状态保持已改。
+                raise OSError(
+                    f"结果名已在本次会话生效，但没能写入结果文件"
+                    f"（{exc}）；重启后会恢复为旧名称。") from exc
         return snapshot
 
     def _delete_saved_backtest(self, result_id):
-        snapshot = self._saved_backtests.pop(result_id)
+        """删掉一条已保留结果；文件删不掉时原样保留并返回 None。
+
+        顺序是**先删文件、再动内存**。反过来（旧写法先 pop）在只读目录或
+        Windows 文件被占用时会走成最坏的一种：这条结果从界面上消失、状态栏
+        写着「已删除」，文件却还躺在盘上，下次启动它自己又回来了。删不掉就
+        当没删过，把这条留在池子里，由调用方说清楚。
+        """
+        snapshot = self._saved_backtests[result_id]
+        # ``delete_snapshot`` 对「本来就不存在」和「删不掉」都返回 False，而
+        # 这两件事对池子的意义正好相反：前者目标状态已经达成，该照常出池。
+        # 所以真正的失败判据是「没删成 **且** 文件还在」。
+        if (snapshot.store_path
+                and not backtest_pool_store.delete_snapshot(snapshot.store_path)
+                and os.path.exists(snapshot.store_path)):
+            return None
+        self._saved_backtests.pop(result_id)
         self._saved_comparison_selection.discard(result_id)
         if getattr(self, "_latest_retained_result_id", None) == result_id:
             self._latest_retained_result_id = None
-        if snapshot.store_path:
-            backtest_pool_store.delete_snapshot(snapshot.store_path)
         ComparisonMixin._persist_pool_view(self)
         SnapshotStoreMixin._update_saved_result_count(self)
         SnapshotStoreMixin._sync_retain_button_state(self)

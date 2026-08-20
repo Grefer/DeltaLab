@@ -830,14 +830,24 @@ class FormPanelMixin:
 
         self._validate_fixed_time_source_state(gs)
 
+        # 剩余期限必须为正，且三条数据来源共用同一把尺子。
+        #
+        # 此前只有 wind 分支会经过 ``resolve_single_wind_state`` ->
+        # ``maturity_days_from_params``（它拒绝 T <= 0），simulate / csv 直接
+        # 绕过去。绕过去的代价不是报错而是**假报告**：下面那句
+        # ``params.get("T_days") or params.get("T") or 20`` 里 0 是假值，会被
+        # 悄悄兜成 20，于是一个已到期的期权照样跑出 20 个回测日——每天的
+        # "期权价值"随价格跳动（那是内在价值）、Delta 恒 0、PnL 恒 0。看上去
+        # 一切正常，实际没有任何意义。所以校验必须落在来源分流之前。
+        maturity_days = wind_resolve.maturity_days_from_params(params)
+
         if src == "simulate":
             s0 = float(params["s0"])
             seed = int(gs["seed"])
 
             option = cfg["build"](subtype, params)
 
-            # 获取期限天数
-            T_days = params.get("T_days") or params.get("T") or 20
+            T_days = maturity_days
             sigma_impl = params.get("sigma", 0.18)
             r = params.get("r", 0.03)
             q = params.get("q", 0.03)

@@ -18,8 +18,16 @@ env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
+  # 打包之前先跑完整测试（含 GUI 那批）。此前 build 从 checkout 直接进
+  # PyInstaller、release 只 needs: build，于是一条测试全红的 tag 照样能发出
+  # 正式包——tests.yml 虽然存在，但它只在 push/PR 上跑，和 tag 发布毫无关系。
+  test:
+    name: Tests
+    uses: ./.github/workflows/tests.yml
+
   build:
     name: Build ${{ matrix.label }}
+    needs: test
     # PyInstaller 打包正常十几分钟；不设上限时卡住会烧满 6 小时。
     timeout-minutes: 45
     strategy:
@@ -52,6 +60,11 @@ jobs:
           pip install "pyinstaller>=6.14"
 
       - name: Build with PyInstaller
+        # 版本号从 tag 注入 .app 的 Info.plist（见 deltalab.spec 的
+        # _resolve_version）。手动触发时 ref_name 是分支名，解析不出版本就
+        # 退回 0.0.0——冒烟构建不该因为版本号失败。
+        env:
+          DELTALAB_VERSION: ${{ github.ref_name }}
         run: pyinstaller --noconfirm deltalab.spec
 
       # Windows: 压缩 dist/DeltaLab 整个目录为 zip

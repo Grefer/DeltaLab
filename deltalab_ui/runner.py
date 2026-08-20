@@ -379,36 +379,43 @@ class RunnerMixin:
         """
         state = {"started": None, "last_emit": 0.0, "switched": False}
 
-        def _callback(done, total, label, case_name):
+        def _callback(progress):
             now = time.monotonic()
             if state["started"] is None:
                 state["started"] = now
             if not state["switched"]:
                 state["switched"] = True
 
-                def _to_determinate(t=total):
+                def _to_determinate():
                     self._progress.stop()
+                    # 进度条按**成本份额**走，所以刻度取 1000 份而不是单元数。
                     self._progress.configure(
-                        mode="determinate", maximum=max(1, t), value=0)
+                        mode="determinate", maximum=1000, value=0)
                     self._progress_label.pack(fill="x")
                 self.after(0, _to_determinate)
-            if done < total and now - state["last_emit"] < 0.12:
+            last = progress.done >= progress.total
+            if not last and now - state["last_emit"] < 0.12:
                 return
             state["last_emit"] = now
 
+            # 进度与剩余时间都按成本权重算，不按单元数：单元之间的工作量能
+            # 差二十倍（段长越长、每次定价的剩余期限也越长）。按单元数算的
+            # 话，T=243 的五档各占进度条 1/5，而真实成本比接近 1:3.4:9:16:21
+            # ——进度条走到 80% 时其实只跑了一半墙钟，ETA 也随之低估四倍。
+            done_share = progress.fraction
             elapsed = now - state["started"]
-            # done 是"正在跑第 done 个"，已完成的是 done-1 个。
-            finished = max(0, done - 1)
-            if finished >= 2 and elapsed > 0:
-                remain = (elapsed / finished) * (total - finished)
+            finished_weight = max(0.0, progress.done_weight)
+            if progress.done > 2 and elapsed > 0 and finished_weight > 0:
+                remain = (elapsed / finished_weight) * max(
+                    0.0, progress.total_weight - finished_weight)
                 eta = (f"  ·  预计剩余 "
                        f"{RunnerMixin._format_duration(remain)}")
             else:
                 eta = ""
-            text = (f"策略优选  {period_labels.get(label, label)}  "
-                    f"{done}/{total}{eta}")
-            self.after(0, lambda d=done, s=text: (
-                self._progress.configure(value=d),
+            text = (f"策略优选  {period_labels.get(progress.label, progress.label)}  "
+                    f"{progress.done}/{progress.total}{eta}")
+            self.after(0, lambda v=int(done_share * 1000), s=text: (
+                self._progress.configure(value=v),
                 self._progress_label.configure(text=s),
             ))
 

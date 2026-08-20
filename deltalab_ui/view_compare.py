@@ -663,6 +663,11 @@ class ComparisonMixin:
                 break
             except ValueError as exc:
                 messagebox.showerror("名称无效", str(exc))
+            except OSError as exc:
+                # 名字在本次会话里已经改好了，重问一遍没有意义——问题不在
+                # 名字，而在写不进磁盘。说清楚"重启后会变回去"再收工。
+                messagebox.showwarning("重命名未写入结果文件", str(exc))
+                break
         self._refresh_saved_pool_tree()
         self._refresh_saved_comparison_view()
         self._set_status(f"已将回测结果重命名为『{snapshot.name}』")
@@ -715,14 +720,29 @@ class ComparisonMixin:
         # 确认框跑的是嵌套事件循环，开着的这段时间 after 回调照常执行，池子
         # 可能已经变了；_delete_saved_backtest 用的是无默认值的 pop，撞上已
         # 经不在的 id 会 KeyError，把批量删除停在半路且不报任何状态。
-        deleted = [
-            self._delete_saved_backtest(result_id)
-            for result_id in picked if result_id in self._saved_backtests
-        ]
+        deleted, failed = [], []
+        for result_id in picked:
+            if result_id not in self._saved_backtests:
+                continue
+            # 失败时 _delete_saved_backtest 返回 None 且什么都不动，所以要
+            # 先拿到快照才能报出是哪几条没删掉。
+            pending = self._saved_backtests[result_id]
+            removed = self._delete_saved_backtest(result_id)
+            (deleted if removed is not None else failed).append(pending)
         self._refresh_saved_pool_tree()
         self._refresh_saved_comparison_view()
+        if failed:
+            # 删除是不可逆操作，"没删成"必须弹框而不是只写状态栏——用户下一
+            # 步很可能就是关程序，状态栏那行他不一定看得到。
+            messagebox.showerror(
+                "部分结果未能删除",
+                f"以下结果的文件删不掉（可能是目录只读，或文件正被别的程序"
+                f"占用），已原样留在结果池里：\n\n"
+                f"{ComparisonMixin._saved_pool_name_digest(failed)}")
         if not deleted:
-            self._set_status("选中的结果已不在结果池里，未删除任何东西")
+            self._set_status(
+                "未删除任何东西" if failed
+                else "选中的结果已不在结果池里，未删除任何东西")
             return
         digest = ComparisonMixin._saved_pool_name_digest(deleted)
         # 删除不可逆，必须说出删了哪些而不只是几条。
@@ -749,10 +769,23 @@ class ComparisonMixin:
                 "此操作不可撤销。"):
             return
         # 先固化 id 列表：_delete_saved_backtest 会就地改这个字典。
+        failed = []
         for result_id in list(self._saved_backtests):
-            self._delete_saved_backtest(result_id)
+            snapshot = self._saved_backtests[result_id]
+            if self._delete_saved_backtest(result_id) is None:
+                failed.append(snapshot)
         self._refresh_saved_pool_tree()
         self._refresh_saved_comparison_view()
+        if failed:
+            messagebox.showerror(
+                "结果池未能清空",
+                f"以下结果的文件删不掉（可能是目录只读，或文件正被别的程序"
+                f"占用），已原样留在结果池里：\n\n"
+                f"{ComparisonMixin._saved_pool_name_digest(failed)}")
+            self._set_status(
+                f"结果池未清空  |  删除 {total - len(failed)} 条，"
+                f"{len(failed)} 条删不掉")
+            return
         self._set_status(f"已清空结果池  |  删除 {total} 条已保留结果")
 
     def _selected_saved_backtests(self):

@@ -3731,7 +3731,11 @@ def test_real_sources_always_delegate_bar_count_to_backend(
         gui_app.HedgeBacktest, factory_name, staticmethod(fake_factory))
     state = {
         "cfg": {"build": lambda subtype, params: SimpleNamespace()},
-        "cls_name": "test", "subtype": "test", "params": {},
+        # params 里必须带剩余期限：_build_backtest 现在在数据来源分流之前
+        # 统一校验它（此前只有 wind 分支会走到，simulate / csv 绕过去，T=0
+        # 会被悄悄兜成 20 天）。本用例只关心 bar 数怎么委派给后端，期限取
+        # 一个合法值即可。
+        "cls_name": "test", "subtype": "test", "params": {"T_days": 20},
         "source": source, "tc_rate": 0.0, "position": position,
         "quantity": 1.0, "multiplier": 0.0, "slippage_bps": 0.0,
         "force_day_close_hedge": True,
@@ -3747,6 +3751,36 @@ def test_real_sources_always_delegate_bar_count_to_backend(
     assert captured["position"] == position
     assert isinstance(captured["strategy"], CloseToCloseStrategy)
     assert captured["force_day_close_hedge"] is True
+
+
+@pytest.mark.parametrize("source", ["simulate", "csv", "wind"])
+@pytest.mark.parametrize("maturity", [0, -5])
+def test_build_backtest_rejects_non_positive_maturity(source, maturity):
+    """三条数据来源共用同一把剩余期限的尺子。
+
+    此前校验只写在 Wind 分支（resolve_single_wind_state ->
+    maturity_days_from_params），simulate / csv 直接绕过去，而
+    ``params.get("T_days") or params.get("T") or 20`` 里 0 是假值、会被悄悄兜
+    成 20：一个已到期的期权照样跑出 20 个回测日，期权价值逐日随价格跳动（那
+    是内在价值）、Delta 恒 0、PnL 恒 0——报告看着完全正常，实际没有意义。
+    """
+    state = {
+        "cfg": {"build": lambda subtype, params: SimpleNamespace()},
+        "cls_name": "test", "subtype": "test",
+        "params": {"s0": 100.0, "T_days": maturity, "sigma": 0.2},
+        "source": source, "tc_rate": 0.0, "position": 1,
+        "quantity": 1.0, "multiplier": 5.0, "slippage_bps": 0.0,
+        "force_day_close_hedge": True, "seed": 42, "real_vol": "",
+        "steps_per_day": 1, "strategy_name": "close_to_close",
+        "csv_path": "prices.csv", "csv_col": "close",
+        "wind_code": "510050.SH", "wind_start": "2026-01-01",
+        "wind_end": "2026-02-01", "wind_bar_size": "日频",
+    }
+    fake_app = SimpleNamespace(
+        _validate_fixed_time_source_state=lambda _state: None)
+
+    with pytest.raises(ValueError, match="剩余期限必须大于 0"):
+        BacktestApp._build_backtest(fake_app, state)
 
 
 def test_resolved_wind_dates_and_bar_size_flow_to_build_meta_and_label(

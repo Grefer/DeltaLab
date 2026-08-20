@@ -1152,7 +1152,8 @@ class HedgeBacktest:
     multiplier : float
         合约乘数（每手对应的标的数量），用于取整到整数手。
         手数 = round(持仓 / multiplier)，实际持仓 = 手数 * multiplier。
-        0 表示不取整（连续对冲）。默认 5，与 GUI 默认保持一致。
+        只接受 0 或有限正数：0 表示不取整（连续对冲），负数 / inf / nan 一律
+        在构造时报错。默认 5，与 GUI 默认保持一致。
         例：quantity=10, multiplier=10 → 最多 1 手。
     evaluation_days : int | None
         本次回测的评估窗口 H（交易日）。默认 None 表示沿用期权完整剩余
@@ -1195,6 +1196,7 @@ class HedgeBacktest:
             并在结果中给出理论 Δ 手数与离散化误差分项。
         contract_multiplier : float
             期货合约乘数（每张合约对应的标的数量），`is_future=True` 时生效。
+            必须为有限正数；不合法的值不会退化成非期货模式，而是直接报错。
         force_day_close_hedge : bool
             公共的每日收盘兜底开关。开启后，非到期交易日的最后一根 bar
             至少执行一次 Delta 对齐；若当前策略已在同一 bar 触发，引擎
@@ -1221,7 +1223,19 @@ class HedgeBacktest:
         source_index = getattr(external_path, "index", None)
         self._detrend = bool(detrend)  # 占位，本 Phase 不使用
         self.is_future = bool(is_future)
-        self.contract_multiplier = float(contract_multiplier)
+        # 期货合约乘数必须是有限正数。放行 0 / 负数 / nan 不会报错，只会让
+        # 下面 ``_compute_target`` 的 ``if is_fut and cmult > 0`` 判否，**静默
+        # 退回非期货取整分支**——一次期货回测于是悄悄地不是期货回测，而结果
+        # 里 is_future 仍写着 True。inf 更糟：理论张数 raw/inf 归零、实际持仓
+        # 变成 0*inf = NaN，整条 PnL 跟着 NaN。
+        try:
+            contract_multiplier_value = float(contract_multiplier)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError("contract_multiplier 必须为有限正数") from exc
+        if (not np.isfinite(contract_multiplier_value)
+                or contract_multiplier_value <= 0):
+            raise ValueError("contract_multiplier 必须为有限正数")
+        self.contract_multiplier = contract_multiplier_value
 
         # ---- 价格来源分流 ----
         if self._path_source == "historical":
@@ -1281,10 +1295,25 @@ class HedgeBacktest:
         if not np.isfinite(slippage_bps_value) or slippage_bps_value < 0:
             raise ValueError("slippage_bps 必须为有限非负数")
 
+        # 取整粒度只有两种合法形态：0（不取整、连续对冲）或有限正数。
+        # 负数会走进 ``_round_to_lots`` 的 ``mult <= 0`` 分支，于是 -5 与 0
+        # 给出**逐位相同**的持仓和 PnL——用户以为设了 5 手一档，实际在做连续
+        # 对冲，界面上没有任何区别可看。inf 会让 int(target/inf)*inf 变成
+        # 0*inf = NaN，整条持仓和 PnL 全 NaN 却照样返回结果。nan 则一路漏到
+        # int() 才炸，报的是 "cannot convert float NaN to integer"，与输入项
+        # 对不上。归一化那边（normalization_reasons）虽然已经拦了这几种值，
+        # 但它只把归一化标成不可用，不影响金额 PnL —— 拦不住上面的 NaN。
+        try:
+            multiplier_value = float(multiplier)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError("multiplier 必须为 0 或有限正数") from exc
+        if not np.isfinite(multiplier_value) or multiplier_value < 0:
+            raise ValueError("multiplier 必须为 0 或有限正数")
+
         self.tc_rate = tc_rate_value
         self.position = int(position_value)
         self.quantity = quantity_value
-        self.multiplier = float(multiplier)
+        self.multiplier = multiplier_value
         # 日内 intraday 支持：每个交易日切分成 steps_per_day 个 bar。
         # steps_per_day=1 时行为与旧代码一致。
         self.steps_per_day = max(1, int(steps_per_day))
@@ -1502,7 +1531,9 @@ class HedgeBacktest:
                 实际期货张数（仅 is_future=True 时有意义，否则为 0）
             """
             raw = pos * delta_val * qty
-            if is_fut and cmult > 0:
+            # cmult 已在 __init__ 校验为有限正数，这里不再兼有"乘数不合法就
+            # 当成非期货"的隐含兜底——那条路只会让模式静默变样。
+            if is_fut:
                 # 期货：按合约张数取整（round to nearest）
                 theo = raw / cmult
                 real = int(np.rint(theo))
@@ -1737,7 +1768,16 @@ class HedgeBacktest:
         rolling_realized = np.full(n + 1, np.nan)
         for i in range(win, n + 1):
             window_ret = log_ret[i - win:i]
-            rolling_realized[i] = np.std(window_ret, ddof=1) * np.sqrt(ann_factor)
+            # 一个收益算不出样本标准差：np.std(ddof=1) 会返回 NaN，外加两条
+            # RuntimeWarning（"Degrees of freedom <= 0" + "invalid value
+            # encountered in scalar divide"）。n=1 时 win 也是 1，这一格必然
+            # 撞上，于是整条曲线是 [0, nan]。这不是构造出来的边界：严格历史
+            # 拆分会留下一日残段（见 _strict_lookback_segment_lengths 的
+            # L=243, T=22 -> (1, 22x11)）。与上面 realized_vol 的 n > 1 判据
+            # 取齐，样本不足时统一给 0.0。
+            rolling_realized[i] = (
+                np.std(window_ret, ddof=1) * np.sqrt(ann_factor)
+                if window_ret.size > 1 else 0.0)
         # 前 win 个 bar 用累计已实现波动率填充
         for i in range(1, min(win, n + 1)):
             rolling_realized[i] = np.std(log_ret[:i], ddof=1) * np.sqrt(ann_factor) if i > 1 else 0.0
@@ -1781,15 +1821,25 @@ class HedgeBacktest:
                 if remaining_days_at_end > 0 else "expiry"
             )
 
-        normalization_schema = "s0_x_multiplier_x_abs_quantity_v1"
+        # 归一化分母 = 名义敞口 = S0 * |quantity|。
+        #
+        # v1 的分母是 S0 * multiplier * |quantity|，与 multiplier 的实际作用
+        # 对不上：持仓 = round(pos*Δ*quantity / multiplier) * multiplier，
+        # multiplier 在里面约掉了，它只决定**取整到整手**的粒度，量级完全由
+        # quantity 定。所以 PnL 只随 quantity 线性放大，分母却随 multiplier
+        # 线性放大——实测同一份持仓（quantity=10000、持仓 5088.5、PnL≈4340）
+        # 在 multiplier=0.01/0.02/0.05 下归一化结果依次是 4.34e-1、2.17e-1、
+        # 8.68e-2，差 5 倍，而这三次的成交和盈亏几乎逐位相同。
+        #
+        # multiplier 不再进分母，因此也不再是归一化的前置条件：0（连续对冲）
+        # 是完全合法的输入，它此前会让整个归一化 fail closed。构造函数已经
+        # 把 multiplier 校验为 0 或有限正数，这里无需重复。
+        normalization_schema = "s0_x_abs_quantity_v2"
         normalization_s0 = float(S[0])
-        normalization_notional = (
-            normalization_s0 * self.multiplier * abs(self.quantity))
+        normalization_notional = normalization_s0 * abs(self.quantity)
         normalization_reasons = []
         if not np.isfinite(normalization_s0) or normalization_s0 <= 0:
             normalization_reasons.append("S0 必须为有限正数")
-        if not np.isfinite(self.multiplier) or self.multiplier <= 0:
-            normalization_reasons.append("multiplier 必须为有限正数且不能为 0")
         if not np.isfinite(self.quantity) or self.quantity == 0:
             normalization_reasons.append("quantity 必须为有限非零数")
         if (not np.isfinite(normalization_notional)

@@ -9,6 +9,7 @@ import threading
 from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
+from typing import NamedTuple
 
 import numpy as np
 import pandas as pd
@@ -583,17 +584,20 @@ def _history_normalization_metadata(result):
         validation_errors.append("归一化 schema 为空")
     if not np.isfinite(s0) or s0 <= 0:
         validation_errors.append("S0 必须为有限正数")
-    if not np.isfinite(multiplier) or multiplier <= 0:
-        validation_errors.append("multiplier 必须为有限正数且不能为 0")
+    # multiplier 只决定取整粒度、不进分母（见 HedgeBacktest 里 v2 schema 那
+    # 段），因此这里也不再要求它为正——0 表示连续对冲，是合法输入。它仍作为
+    # 元数据原样带出，供排查"这批结果是按几手取整跑的"。
+    if not np.isfinite(multiplier) or multiplier < 0:
+        validation_errors.append("multiplier 必须为 0 或有限正数")
     if not np.isfinite(quantity) or quantity <= 0:
         validation_errors.append("quantity 必须为有限正数")
-    expected = s0 * multiplier * quantity
+    expected = s0 * quantity
     if not np.isfinite(notional) or notional <= 0:
         validation_errors.append("归一化分母必须为有限正数")
     elif (not np.isfinite(expected)
           or not np.isclose(notional, expected, rtol=1e-12, atol=0.0)):
         validation_errors.append(
-            "归一化分母不等于 S0 * multiplier * quantity")
+            "归一化分母不等于 S0 * quantity")
     if not available and not reason:
         validation_errors.append("回测结果标记归一化不可用")
     if validation_errors:
@@ -1434,6 +1438,53 @@ def _strict_lookback_segment_lengths(evidence_days, maturity_days):
     return tuple(lengths)
 
 
+class SelectionProgress(NamedTuple):
+    """一次进度上报。
+
+    ``done`` / ``total`` 是**单元数**（一次 HedgeBacktest.run），用来显示
+    「第几个 / 共几个」；``done_weight`` / ``total_weight`` 是**成本权重**，
+    用来算进度条份额与剩余时间。两者不能混用——单元之间的工作量能差二十倍。
+    """
+
+    done: int
+    total: int
+    done_weight: float
+    total_weight: float
+    label: str
+    case_name: str
+
+    @property
+    def fraction(self):
+        """已完成的成本份额，0~1。总权重为 0 时返回 0，不抛。"""
+        if self.total_weight <= 0:
+            return 0.0
+        return min(1.0, self.done_weight / self.total_weight)
+
+
+def segment_cost_weight(segment_days, maturity_days):
+    """一个分段的相对成本，用作进度权重。
+
+    **不能按段数、也不能只按段长。** 一段跑 L 个交易日，每天要重算一遍
+    Greeks，而单次 MC 定价的成本 ∝ nPath × 剩余期限；期权每过一天剩余期限
+    就少一天，所以整段成本 ∝ Σ(T, T−1, …, T−L+1) = L·(T − (L−1)/2)。
+
+    实测（雪球 T=243，逐段计时，相对最短段归一）：
+
+        段长 L        5      20      61     122     243
+        实测        1.00    3.40    9.24   16.06   21.13
+        按段长      1.00    4.00   12.20   24.40   48.60   ← 长档错 130%
+        本式        1.00    3.88   10.78   18.48   24.60   ← 误差恒 +15%
+
+    本式的误差是一个近乎恒定的比例，而进度条只看相对份额，常数会被归一化
+    掉；按段长加权则在长档上系统性高估一倍以上。按段数（此前的做法）更糟：
+    ``_strict_lookback_segment_lengths`` 在 L ≤ T 时恒返回一段，于是 T=243
+    的五档各占进度条 1/5，而真实成本比是 1 : 3.4 : 9.2 : 16.1 : 21.1。
+    """
+    length = max(1, int(segment_days))
+    maturity = max(length, int(maturity_days))
+    return float(length * (maturity - (length - 1) / 2.0))
+
+
 class SelectionCancelled(Exception):
     """用户中止了策略优选。
 
@@ -1457,9 +1508,10 @@ class _ProgressReporter:
     自己做单调过滤。
     """
 
-    __slots__ = ("_callback", "_cancel_event", "_lock", "total", "done")
+    __slots__ = ("_callback", "_cancel_event", "_lock",
+                 "total", "done", "total_weight", "done_weight")
 
-    def __init__(self, callback, total, cancel_event=None):
+    def __init__(self, callback, total, cancel_event=None, total_weight=None):
         self._callback = callback
         self._cancel_event = cancel_event
         # 分段并行跑，done 的自增是读—改—写。当前 CPython（3.13，带 GIL）
@@ -1473,6 +1525,11 @@ class _ProgressReporter:
         self._lock = threading.Lock()
         self.total = int(total)
         self.done = 0
+        # 单元数用来显示「第几个 / 共几个」，权重用来算进度条的份额与剩余
+        # 时间——两者不能混用：单元之间的工作量能差二十倍（见
+        # segment_cost_weight）。拿不到权重时退回按单元数计，行为与从前一致。
+        self.total_weight = float(total_weight if total_weight else total)
+        self.done_weight = 0.0
 
     def raise_if_cancelled(self):
         """在单元边界检查中止请求。
@@ -1484,18 +1541,23 @@ class _ProgressReporter:
         if self._cancel_event is not None and self._cancel_event.is_set():
             raise SelectionCancelled("策略优选已被用户中止")
 
-    def _bump(self, count, label, case_name):
+    def _bump(self, count, label, case_name, weight=None):
         with self._lock:
             self.done += count
+            self.done_weight += float(count if weight is None else weight)
             if self._callback is None:
                 return
+            progress = SelectionProgress(
+                done=self.done, total=self.total,
+                done_weight=self.done_weight, total_weight=self.total_weight,
+                label=label, case_name=case_name)
             try:
-                self._callback(self.done, self.total, label, case_name)
+                self._callback(progress)
             except Exception:                          # noqa: BLE001
                 # 进度回调只是显示用；它出问题不该把整轮优选带下水。
                 self._callback = None
 
-    def skip(self, count, label=None):
+    def skip(self, count, label=None, weight=None):
         """跳过 ``count`` 个不会真正跑的单元。
 
         分母是按"分段计划里的段数 × 候选数"预算的，但有两类段会在进入候选
@@ -1505,12 +1567,12 @@ class _ProgressReporter:
         """
         count = int(count)
         if count > 0:
-            self._bump(count, label, "")
+            self._bump(count, label, "", weight)
 
-    def advance(self, label, case_name):
+    def advance(self, label, case_name, weight=None):
         """开始处理一个单元。先自增再上报，显示的是"正在跑第 N 个"。"""
         self.raise_if_cancelled()
-        self._bump(1, label, case_name)
+        self._bump(1, label, case_name, weight)
 
 
 def _map_segments(run_one, plans, option):
@@ -1593,15 +1655,18 @@ def _rolling_progress_total(windows, maturity_days, n_history_groups, n_cases):
     段数恒等——两边任何一边改了规则，另一边必须同步。
     """
     total = 0
+    weight = 0.0
     for label, days_value in windows.items():
         # 与主循环用同一个 _positive_int：非法输入两边一样地炸，
         # 不能在这里吞掉异常，否则分母会比实际跑的段数少。
         days = _positive_int(days_value, f"lookbacks[{label!r}]")
         if n_history_groups - days - 1 < 0:
             continue          # 证据不足：这一档不会跑任何段
-        total += len(
-            _strict_lookback_segment_lengths(days, maturity_days)) * n_cases
-    return total
+        lengths = _strict_lookback_segment_lengths(days, maturity_days)
+        total += len(lengths) * n_cases
+        weight += n_cases * sum(
+            segment_cost_weight(length, maturity_days) for length in lengths)
+    return total, weight
 
 
 def _legacy_target_endpoint_value(target_endpoints, label):
@@ -1730,12 +1795,10 @@ def recommend_by_rolling_history(
     n_history_groups = len(group_ids)
     available_scored_days = max(0, n_history_groups - 1)
 
+    _units, _weight = _rolling_progress_total(
+        windows, maturity_days, n_history_groups, len(cases))
     progress = _ProgressReporter(
-        progress_callback,
-        _rolling_progress_total(
-            windows, maturity_days, n_history_groups, len(cases)),
-        cancel_event,
-    )
+        progress_callback, _units, cancel_event, total_weight=_weight)
 
     rows = []
     window_results = {}
@@ -1814,6 +1877,9 @@ def recommend_by_rolling_history(
             strategy_types 的后写覆盖、两个 reasons 列表的顺序、
             label_results 的插入顺序都与串行执行完全一致。
             """
+            # 本段的成本权重：进度条与 ETA 按它分份额，而不是按段数。
+            _segment_weight = segment_cost_weight(
+                plan["evaluation_days"], maturity_days)
             label_results = {}
             collected = {case.name: {} for case in cases}
             observed_days = {case.name: {} for case in cases}
@@ -1875,7 +1941,7 @@ def recommend_by_rolling_history(
                         },
                     }
                     # 这一段不会进入候选循环；补记单元数，否则进度走不满。
-                    progress.skip(len(cases), label)
+                    progress.skip(len(cases), label, _segment_weight * len(cases))
                     return _record()
 
             replay_option = None
@@ -1886,7 +1952,7 @@ def recommend_by_rolling_history(
             # Greeks）。作用域内记忆化，数值不变，段结束即释放。
             with price_memo():
                 for case in cases:
-                    progress.advance(label, case.name)
+                    progress.advance(label, case.name, _segment_weight)
                     case_warmup_days = _realized_sigma_window_days(case.strategy)
                     if case_warmup_days and warmup_error:
                         case_failures[case.name] += 1
@@ -2278,12 +2344,16 @@ def _recommend_from_explicit_history_plans(
     """运行已经按具体合约边界切好的严格连续历史分段计划。"""
     batch_position = _backtest_batch_position(
         kwargs, context="跨合约历史择优")
-    # 分段计划此时已完全定好，分母直接由它数出来。
+    # 分段计划此时已完全定好，分母直接由它数出来。段长逐 entry 不同
+    # （换月会切出短段），所以权重也要逐 entry 算，不能按段数摊平。
+    _units = sum(len(plan["entries"]) for plan in plans) * len(cases)
+    _weight = len(cases) * sum(
+        segment_cost_weight(
+            entry.get("evaluation_days") or plan["maturity_days"],
+            plan["maturity_days"])
+        for plan in plans for entry in plan["entries"])
     progress = _ProgressReporter(
-        progress_callback,
-        sum(len(plan["entries"]) for plan in plans) * len(cases),
-        cancel_event,
-    )
+        progress_callback, _units, cancel_event, total_weight=_weight)
     rows = []
     window_results = {}
     for plan in plans:
@@ -2298,6 +2368,9 @@ def _recommend_from_explicit_history_plans(
         contract_by_window = {}
 
         for entry in plan["entries"]:
+            _entry_weight = segment_cost_weight(
+                entry.get("evaluation_days") or plan["maturity_days"],
+                plan["maturity_days"])
             progress.raise_if_cancelled()
             window_id = entry["window_id"]
             contract_code = str(entry.get("contract_code", ""))
@@ -2316,7 +2389,8 @@ def _recommend_from_explicit_history_plans(
                 }
                 # 历史不足的档会被合成这样一条 error entry；分母算了它，
                 # 主循环却直接跳过，不补记进度就永远到不了 100%。
-                progress.skip(len(cases), label)
+                progress.skip(len(cases), label,
+                              _entry_weight * len(cases))
                 continue
 
             path = entry["path"]
@@ -2344,7 +2418,8 @@ def _recommend_from_explicit_history_plans(
                         "position": batch_position,
                     },
                 }
-                progress.skip(len(cases), label)
+                progress.skip(len(cases), label,
+                              _entry_weight * len(cases))
                 continue
 
             replay_option = None
@@ -2355,7 +2430,7 @@ def _recommend_from_explicit_history_plans(
             # Greeks）。作用域内记忆化，数值不变，段结束即释放。
             with price_memo():
                 for case in cases:
-                    progress.advance(label, case.name)
+                    progress.advance(label, case.name, _entry_weight)
                     case_warmup_days = _realized_sigma_window_days(case.strategy)
                     warmup_error = str(entry.get("warmup_error", "") or "")
                     if case_warmup_days and warmup_error:

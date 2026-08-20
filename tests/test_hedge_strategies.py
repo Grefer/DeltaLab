@@ -1171,7 +1171,7 @@ def test_history_window_summary_preserves_strategy_and_endpoint_failures():
 def _normalizable_history_result(
         strategy_name, *, s0=100.0, multiplier=5.0, quantity=2.0,
         position=None, normalization_available=True, normalization_reason=""):
-    notional = s0 * multiplier * quantity
+    notional = s0 * quantity          # v2：分母 = 名义敞口，不含取整粒度
     result = {
         "net_daily": np.array([0.0, -10.0, 20.0]),
         "tc_paid": np.array([0.0, 1.0, 2.0]),
@@ -1180,7 +1180,7 @@ def _normalizable_history_result(
         "timestamps": pd.bdate_range("2026-01-05", periods=3),
         "quantity": quantity,
         "multiplier": multiplier,
-        "normalization_schema": "s0_x_multiplier_x_abs_quantity_v1",
+        "normalization_schema": "s0_x_abs_quantity_v2",
         "normalization_s0": s0,
         "normalization_notional": notional,
         "normalization_available": normalization_available,
@@ -1200,22 +1200,24 @@ def test_history_window_summary_normalizes_signed_curves_by_initial_notional():
 
     row = summary.loc["candidate"]
     assert row["normalization_available"]
-    assert row["normalization_notional"] == pytest.approx(1000.0)
+    # 分母 = S0 * |quantity| = 100 * 2 = 200（v1 是 1000，多乘了一个
+    # multiplier=5）。multiplier 仍作为元数据带出，只是不再进分母。
+    assert row["normalization_notional"] == pytest.approx(200.0)
     assert row["normalization_s0"] == pytest.approx(100.0)
     assert row["normalization_multiplier"] == pytest.approx(5.0)
     assert row["normalization_quantity"] == pytest.approx(2.0)
     np.testing.assert_allclose(
-        row["normalized_daily_net_pnl"], [-0.01, 0.02])
+        row["normalized_daily_net_pnl"], [-0.05, 0.10])
     np.testing.assert_allclose(
-        row["normalized_daily_gross_pnl"], [-0.009, 0.022])
+        row["normalized_daily_gross_pnl"], [-0.045, 0.11])
     np.testing.assert_allclose(
-        row["normalized_daily_tc"], [0.001, 0.002])
+        row["normalized_daily_tc"], [0.005, 0.010])
     np.testing.assert_allclose(
-        row["normalized_cumulative_net_pnl"], [-0.01, 0.01])
+        row["normalized_cumulative_net_pnl"], [-0.05, 0.05])
     np.testing.assert_allclose(
-        row["normalized_cumulative_gross_pnl"], [-0.009, 0.013])
+        row["normalized_cumulative_gross_pnl"], [-0.045, 0.065])
     np.testing.assert_allclose(
-        row["normalized_cumulative_tc"], [0.001, 0.003])
+        row["normalized_cumulative_tc"], [0.005, 0.015])
 
 
 def test_history_window_summary_rejects_mismatched_pair_denominators():
@@ -1294,7 +1296,13 @@ def test_lookback_rejects_mixed_known_positions_but_allows_legacy_missing():
         recommend_by_lookback(mixed, lookbacks={"sample": 2})
 
 
-def test_backtest_normalization_zero_multiplier_fails_closed():
+def test_backtest_normalization_survives_zero_multiplier():
+    """multiplier=0（连续对冲）不再让归一化 fail closed。
+
+    v1 的分母含 multiplier，于是"不取整"这个完全合法的选项会把分母算成 0、
+    整个归一化判为不可用——而连续对冲恰恰是最干净的一组基准。v2 的分母只有
+    S0 * |quantity|，与取整粒度无关，所以这里必须可用。
+    """
     result = HedgeBacktest(
         _option(days=2), np.array([100.0, 101.0, 102.0]),
         strategy=CloseToCloseStrategy(),
@@ -1304,12 +1312,10 @@ def test_backtest_normalization_zero_multiplier_fails_closed():
         contract_multiplier=1000.0,
     ).run()
 
-    assert not result["normalization_available"]
-    assert result["normalization_notional"] == pytest.approx(0.0)
-    assert result["normalization_reason"]
-    assert result["normalization_invalid_reason"] == (
-        result["normalization_reason"])
-    # contract_multiplier 不能被拿来替换无效的 multiplier。
+    assert result["normalization_available"]
+    assert result["normalization_reason"] == ""
+    assert result["normalization_notional"] == pytest.approx(200.0)
+    # 期货合约乘数是另一回事，绝不能混进归一化分母。
     assert result["normalization_notional"] != 100.0 * 1000.0 * 2.0
 
 
@@ -1349,11 +1355,12 @@ def test_backtest_normalization_snapshot_uses_positive_quantity_formula():
     assert result["quantity"] == pytest.approx(2.0)
     assert result["multiplier"] == pytest.approx(5.0)
     assert result["normalization_s0"] == pytest.approx(100.0)
-    assert result["normalization_notional"] == pytest.approx(1000.0)
+    # 分母只看名义敞口：100 * 2 = 200。multiplier=5 只决定取整到整手的粒度，
+    # 不放大也不缩小这次交易的规模，因此不进分母。
+    assert result["normalization_notional"] == pytest.approx(200.0)
     assert result["normalization_available"]
     assert result["normalization_reason"] == ""
-    assert result["normalization_schema"] == (
-        "s0_x_multiplier_x_abs_quantity_v1")
+    assert result["normalization_schema"] == "s0_x_abs_quantity_v2"
 
 
 def test_summarize_strategy_result_returns_comparison_compatible_metrics():
@@ -4066,3 +4073,96 @@ def test_rolling_history_ranking_uses_the_rms_column_names():
     assert "baseline_daily_net_pnl_rms" in ranking.columns
     assert "rms_delta_vs_c2c" in ranking.columns
     assert not [column for column in ranking.columns if "score" in column]
+
+
+# --------------------------------------------------------------------------
+#  取整粒度与合约乘数的输入校验（回归）
+# --------------------------------------------------------------------------
+
+@pytest.mark.parametrize("multiplier", [-5.0, -0.001, np.inf, -np.inf, np.nan])
+def test_backtest_rejects_invalid_multiplier(multiplier):
+    """非法取整粒度必须在构造期报错，而不是静默改变行为。
+
+    ``-5`` 会走进 ``_round_to_lots`` 的 ``mult <= 0`` 分支，与 ``0`` 给出逐位
+    相同的持仓和 PnL——用户以为设了 5 手一档，实际在做连续对冲；``inf`` 让
+    ``int(target/inf)*inf`` 变成 ``0*inf = NaN``，整条持仓与 PnL 全 NaN 却照样
+    返回结果。两种都不报错才是最坏的形态。
+    """
+    with pytest.raises(ValueError, match="multiplier 必须为 0 或有限正数"):
+        HedgeBacktest(
+            _option(days=2), np.array([100.0, 101.0, 102.0]),
+            strategy=CloseToCloseStrategy(), multiplier=multiplier)
+
+
+@pytest.mark.parametrize("multiplier", [0.0, 0.5, 5.0])
+def test_backtest_accepts_zero_and_positive_multiplier(multiplier):
+    """0（连续对冲）与任意有限正数都是合法取整粒度。"""
+    result = HedgeBacktest(
+        _option(days=2), np.array([100.0, 101.0, 102.0]),
+        strategy=CloseToCloseStrategy(), multiplier=multiplier).run()
+    assert np.all(np.isfinite(result["shares"]))
+    assert np.isfinite(result["total_pnl"])
+
+
+@pytest.mark.parametrize("contract_multiplier", [0.0, -2.0, np.inf, np.nan])
+def test_backtest_rejects_invalid_contract_multiplier(contract_multiplier):
+    """非法合约乘数不能退化成非期货模式。
+
+    ``_compute_target`` 旧写法是 ``if is_fut and cmult > 0``，于是 0 / 负数 /
+    nan 会静默走非期货分支：一次期货回测悄悄地不是期货回测，而结果里
+    ``is_future`` 仍写着 True，从输出上完全看不出来。
+    """
+    with pytest.raises(ValueError, match="contract_multiplier 必须为有限正数"):
+        HedgeBacktest(
+            _option(days=2), np.array([100.0, 101.0, 102.0]),
+            strategy=CloseToCloseStrategy(), is_future=True,
+            contract_multiplier=contract_multiplier)
+
+
+def test_normalization_denominator_ignores_lot_size():
+    """取整粒度不得改变归一化分母。
+
+    分母是名义敞口 ``S0 * |quantity|``。取整粒度远小于持仓时，三种粒度的成交
+    与盈亏几乎逐位相同，归一化结果就必须同样相同——v1 的分母含 multiplier，
+    这三次会差 5 倍。
+    """
+    prices = HedgeBacktest.simulate_prices(
+        100.0, 0.18, 20, r=0.03, q=0.03, seed=42)
+    runs = [
+        HedgeBacktest(
+            _option(days=20), prices, strategy=CloseToCloseStrategy(),
+            quantity=10000.0, multiplier=mult).run()
+        for mult in (0.01, 0.02, 0.05)
+    ]
+
+    for result in runs:
+        assert result["normalization_schema"] == "s0_x_abs_quantity_v2"
+        assert result["normalization_notional"] == pytest.approx(
+            result["normalization_s0"] * 10000.0)
+    denominators = {r["normalization_notional"] for r in runs}
+    assert len(denominators) == 1, "分母随取整粒度变了"
+    # 上面那句"分母不该变"要成立，前提是这三次跑的确实是同一份持仓。粒度远
+    # 小于持仓时，取整落点只在最后一位上抖（5112.70 / 5112.71），量级一致。
+    day0 = [r["shares"][0] for r in runs]
+    assert np.allclose(day0, day0[0], rtol=1e-5), day0
+    pnls = [float(r["total_pnl"]) for r in runs]
+    assert np.allclose(pnls, pnls[0], rtol=1e-3), pnls
+
+
+def test_single_bar_rolling_realized_is_zero_not_nan():
+    """一日残段的滚动已实现波动率必须是 0 而不是 NaN。
+
+    窗口只有一个收益时 ``np.std(ddof=1)`` 返回 NaN 并抛两条 RuntimeWarning。
+    严格历史拆分本来就会留下一日残段（见
+    ``_strict_lookback_segment_lengths`` 的 L=243, T=22 -> (1, 22x11)），
+    所以这不是构造出来的边界。
+    """
+    with np.errstate(all="raise"):
+        result = HedgeBacktest(
+            _option(days=1), np.array([100.0, 101.0]),
+            strategy=CloseToCloseStrategy(), multiplier=0).run()
+
+    assert np.all(np.isfinite(result["rolling_realized"]))
+    np.testing.assert_allclose(result["rolling_realized"], [0.0, 0.0])
+    # 与同一段里 realized_vol 的 n > 1 判据保持一致。
+    assert result["realized_vol"] == pytest.approx(0.0)
