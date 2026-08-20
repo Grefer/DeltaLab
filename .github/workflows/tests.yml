@@ -20,6 +20,11 @@ jobs:
   test:
     name: pytest (ubuntu, py${{ matrix.python-version }})
     runs-on: ubuntu-latest
+    # 正常一轮 2~4 分钟。不设上限的话，任何一步卡住都会一直烧到 GitHub 的
+    # 6 小时 job 上限——实测发生过三次（305 / 38 / 362 分钟），全都停在
+    # apt 那一步，而日志里只有一行「操作已取消」，看不出卡在哪。
+    # 20 分钟给足余量，又能让卡死在十几分钟内暴露成一条明确的超时失败。
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
@@ -36,9 +41,21 @@ jobs:
       # 否则连收集阶段都会 ModuleNotFoundError: No module named '_tkinter'。
       # xvfb 用于给建真实 Tk 根窗口的 GUI 测试提供虚拟显示。
       - name: Install Tk and virtual display
+        # apt 默认会无限等一个不响应的镜像。实测卡在 archive.ubuntu.com 的
+        # 一次 InRelease 抓取上，六小时没有再输出一行。给它显式超时与重试，
+        # 步骤级上限再兜一道——失败要快，且要指得出是这一步。
+        timeout-minutes: 6
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends tk-dev python3-tk xvfb
+          set -euo pipefail
+          apt_get() {
+            sudo apt-get \
+              -o Acquire::Retries=3 \
+              -o Acquire::http::Timeout=20 \
+              -o Acquire::https::Timeout=20 \
+              "$@"
+          }
+          apt_get update
+          apt_get install -y --no-install-recommends tk-dev python3-tk xvfb
 
       - name: Setup Python
         uses: actions/setup-python@v6
