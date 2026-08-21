@@ -43,6 +43,7 @@ from pricing.hedge_backtest import (
     _infer_intraday_steps,
     _rescale_option_to_real_s0,
     _rescale_strategy_to_real_s0,
+    format_band_value,
 )
 
 from deltalab_ui import formatting, snapshot_detail, wind_resolve
@@ -238,9 +239,9 @@ class SnapshotStoreMixin:
                     float(params["sigma"]),
                 )
                 equivalents = (
-                    f"绝对 {converted['absolute']:.6g} / "
+                    f"绝对 {format_band_value(converted['absolute'])} / "
                     f"相对 {converted['relative']:.4%} / "
-                    f"{converted['sigma']:.4g}σ"
+                    f"{format_band_value(converted['sigma'])}σ"
                 )
                 return "固定间隔", _with_fallback(
                     f"{primary}；等价 {equivalents}")

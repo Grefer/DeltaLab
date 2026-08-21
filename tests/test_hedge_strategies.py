@@ -33,7 +33,12 @@ from pricing.hedge_analysis import (
     _daily_metrics,
     _strict_lookback_segment_lengths,
 )
-from pricing.hedge_backtest import _infer_intraday_steps, _trading_day_groups
+from pricing.hedge_backtest import (
+    BAND_DISPLAY_TOLERANCE,
+    _infer_intraday_steps,
+    _trading_day_groups,
+    format_band_value,
+)
 
 
 def _segment_end_offsets(lengths):
@@ -616,6 +621,45 @@ def test_unified_hedge_band_supports_all_threshold_types():
     zero_sigma = {**base, "sigma_impl": 0.0, "S": 102.0}
     assert HedgeBandStrategy("absolute", threshold=2).should_hedge(zero_sigma)
     assert HedgeBandStrategy("relative", threshold=0.02).should_hedge(zero_sigma)
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        (1.0, "1"),
+        (0.01, "0.01"),
+        # 1 元绝对带宽在 S0=100、年化 σ=18% 下换算出的 sqrt(3)/2，正是
+        # 三框联动里最容易冒出来的那串长小数。
+        (0.8660254037844387, "0.866"),
+        (0.7794228634059948, "0.7794"),
+        (0.011547005383792516, "0.011547"),
+        # 收缩只在容差内进行：末位真的有信息时一位都不能少。
+        (1.23456789, "1.2346"),
+        (0.040414518882273806, "0.040415"),
+    ],
+)
+def test_format_band_value_keeps_the_shortest_text_within_tolerance(
+        value, expected):
+    text = format_band_value(value)
+    assert text == expected
+    assert abs(float(text) - value) <= BAND_DISPLAY_TOLERANCE * abs(value)
+
+
+def test_format_band_value_never_reports_a_band_as_zero_or_nan():
+    """非有限值退回 .10g：带宽为 0 会被上游当成合法阈值，不能被格式化掩盖。"""
+    assert format_band_value(0.0) == "0"
+    assert format_band_value(float("nan")) == "nan"
+    assert format_band_value(float("inf")) == "inf"
+
+
+def test_format_band_value_round_trips_between_units():
+    """短表示再换算回去仍落在同一档：三个输入框来回编辑不会漂移。"""
+    exact = HedgeBandStrategy.convert_threshold(1.0, "absolute", 100.0, 0.18)
+    short_sigma = float(format_band_value(exact["sigma"]))
+    back = HedgeBandStrategy.convert_threshold(
+        short_sigma, "sigma", 100.0, 0.18)
+    assert format_band_value(back["absolute"]) == "1"
+    assert format_band_value(back["relative"]) == "0.01"
 
 
 def test_strict_realized_sigma_uses_independent_warmup_without_moving_path():

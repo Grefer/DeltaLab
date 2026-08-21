@@ -28,8 +28,8 @@ import numpy as np
 # pyplot，但 theme 的 import 仍然要留着——本文件是 GUI 的入口，后端必须在
 # 任何画图模块之前定下来。
 from deltalab_ui.theme import (
-    FORM_ENTRY_CHARS, FORM_HINT_GAP, FORM_ROW_PADY, FORM_SECTION_GAP,
-    FORM_SECTION_PAD,
+    FORM_ENTRY_CHARS, FORM_HINT_GAP, FORM_INPUT_W, FORM_ROW_PADY,
+    FORM_SECTION_GAP, FORM_SECTION_PAD,
     PALETTE,
     _MONO_FONT_FAMILY, _SYSTEM, _UI_FONT_FAMILY,
     _form_grid, _form_hint, _form_input, _form_label, _form_separator,
@@ -757,14 +757,34 @@ class BacktestApp(panel_form.FormPanelMixin,
         self._csv_path_var = tk.StringVar()
         _form_input(ttk.Entry(self._csv_frame, textvariable=self._csv_path_var,
                               width=FORM_ENTRY_CHARS), 0)
-        ttk.Button(self._csv_frame, text="浏览…", width=6,
-                   style="Field.TButton", command=self._browse_csv).grid(
-            row=0, column=2, sticky="w",
-            padx=(FORM_HINT_GAP, 0), pady=FORM_ROW_PADY)
+        # 「浏览…」旁边再挂一个「模板…」: CSV 是三个数据源里唯一要用户自备
+        # 文件的, 没有样例就只能照着文档猜列名, 猜错还得跑一趟回测才知道。
+        csv_buttons = ttk.Frame(self._csv_frame, style="Surface.TFrame")
+        csv_buttons.grid(row=0, column=2, sticky="w",
+                         padx=(FORM_HINT_GAP, 0), pady=FORM_ROW_PADY)
+        ttk.Button(csv_buttons, text="浏览…", width=6,
+                   style="Field.TButton",
+                   command=self._browse_csv).pack(side="left")
+        ttk.Button(csv_buttons, text="模板…", width=6,
+                   style="Field.TButton",
+                   command=self._save_csv_template).pack(side="left",
+                                                         padx=(6, 0))
         _form_label(self._csv_frame, "价格列:", 1)
         self._csv_col_var = tk.StringVar(value="close")
-        _form_input(ttk.Entry(self._csv_frame, textvariable=self._csv_col_var,
-                              width=FORM_ENTRY_CHARS), 1)
+        # 可编辑下拉: 选完文件后 _sync_csv_columns 会把表头灌成候选, 手填也照旧。
+        self._csv_col_combo = ttk.Combobox(
+            self._csv_frame, textvariable=self._csv_col_var,
+            state="normal", width=FORM_ENTRY_CHARS)
+        _form_input(self._csv_col_combo, 1)
+        _form_hint(self._csv_frame, 1, "选文件后自动列出表头")
+        _form_label(self._csv_frame, "格式:", 2)
+        ttk.Label(
+            self._csv_frame,
+            text="第一列为日期索引；日内数据写完整时间戳，每日 bar 数自动推导",
+            style="SurfaceMuted.TLabel", wraplength=FORM_INPUT_W * 2,
+            justify="left",
+        ).grid(row=2, column=1, columnspan=2, sticky="w",
+               pady=FORM_ROW_PADY)
 
         # Wind 参数
         self._wind_frame = ttk.Frame(sec3, style="Surface.TFrame")
@@ -948,7 +968,7 @@ class BacktestApp(panel_form.FormPanelMixin,
         _form_input(self._band_rel_entry, 1)
         _form_hint(self._band_frame, 1, "0.01 = 1%")
         _form_label(self._band_frame, "日波动率倍数:", 2)
-        self._band_sigma_var = tk.StringVar(value="0.779423")
+        self._band_sigma_var = tk.StringVar(value="0.7794")
         self._band_sigma_entry = ttk.Entry(
             self._band_frame, textvariable=self._band_sigma_var,
             width=FORM_ENTRY_CHARS)

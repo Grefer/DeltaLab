@@ -18,7 +18,7 @@ from pricing.hedge_analysis import (
     LOOKBACK_DAYS,
     STRICT_LOOKBACK_SELECTION_METRIC,
 )
-from pricing.hedge_backtest import _infer_intraday_steps
+from pricing.hedge_backtest import _infer_intraday_steps, format_band_value
 
 # 历史周期的唯一 GUI 顺序与中文标签。每个周期都表示截至分析日、严格
 # 连续回放的最近 L 个交易日；交易日长度继续由后端常量维护。
@@ -231,7 +231,9 @@ def band_cases(gs):
     if include_current:
         current_equivalents = HedgeBandStrategy.convert_threshold(
             threshold, band_type, reference_price, sigma_annual)
-        current_key = f"{current_equivalents['sigma']:.10g}"
+        # 换算出来的 σ 倍数直接当候选名与去重键用，必须先收成短表示，
+        # 否则「绝对 1」会在排名表里显示成 固定间隔(0.8660254038σ·当前)。
+        current_key = format_band_value(current_equivalents['sigma'])
 
     preset_values = parse_band_candidate_sigmas(
         gs.get("band_candidate_sigmas"))
@@ -259,9 +261,10 @@ def band_cases(gs):
         )
         marker = "·当前" if is_current else ""
         description = (
-            f"{origin}；期初等价绝对 {equivalents['absolute']:.6g} / "
+            f"{origin}；期初等价绝对 "
+            f"{format_band_value(equivalents['absolute'])} / "
             f"相对 {equivalents['relative']:.4%} / "
-            f"{candidate_sigma:.6g} 倍波动率；收盘保底"
+            f"{key} 倍波动率；收盘保底"
             f"{'开启' if force_day_close_hedge else '关闭'}"
         )
         cases.append(StrategyCase(

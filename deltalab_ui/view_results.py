@@ -30,7 +30,7 @@ from tkinter import ttk, filedialog, messagebox
 
 import numpy as np
 
-from pricing import HedgeBandStrategy
+from pricing import HedgeBandStrategy, format_band_value
 from pricing.constants import ANNUAL_DAYS
 from pricing.hedge_backtest import histogram_bin_edges, padded_histogram_range
 
@@ -119,8 +119,11 @@ class ResultsMixin:
                     float(r["implied_vol"]),
                 )
                 strategy_lines.extend([
-                    f"  期初等价绝对/相对 :  {converted['absolute']:.6g} / {converted['relative']:.6g}",
-                    f"  期初等价日波动率倍数 :  {converted['sigma']:.6g}",
+                    f"  期初等价绝对/相对 :  "
+                    f"{format_band_value(converted['absolute'])} / "
+                    f"{format_band_value(converted['relative'])}",
+                    f"  期初等价日波动率倍数 :  "
+                    f"{format_band_value(converted['sigma'])}",
                 ])
             except (TypeError, ValueError):
                 pass

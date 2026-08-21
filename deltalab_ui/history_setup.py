@@ -29,7 +29,12 @@ from history_selection import (
     DEFAULT_FIXED_TIMES,
     HISTORY_PERIOD_DEFS,
 )
-from pricing import CloseToCloseStrategy, FixedTimeStrategy, HedgeBandStrategy
+from pricing import (
+    CloseToCloseStrategy,
+    FixedTimeStrategy,
+    HedgeBandStrategy,
+    format_band_value,
+)
 from pricing.hedge_analysis import (
     DEFAULT_SELECTION_OBJECTIVE,
     SELECTION_OBJECTIVES,
@@ -1328,7 +1333,8 @@ class HistorySetupMixin:
             }
             source_label = kind_labels.get(self._band_last_edited, "当前")
             variable.set(
-                f"加入当前回测带宽：{sigma_multiple:.6g}σ（{source_label}输入换算）")
+                f"加入当前回测带宽：{format_band_value(sigma_multiple)}σ"
+                f"（{source_label}输入换算）")
         except (AttributeError, TypeError, ValueError):
             variable.set("加入当前回测带宽（编辑完成后自动换算）")
 

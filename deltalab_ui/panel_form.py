@@ -17,8 +17,10 @@
 （由 ``HistorySetupMixin`` 提供）。
 """
 
+import csv
+import io
 import tkinter as tk
-from tkinter import ttk, filedialog
+from tkinter import ttk, filedialog, messagebox
 
 import numpy as np
 
@@ -31,7 +33,11 @@ from pricing import (
     HedgeBandStrategy,
 )
 from pricing.constants import ANNUAL_DAYS
-from pricing.hedge_backtest import _infer_intraday_steps, _validate_fixed_time_data
+from pricing.hedge_backtest import (
+    _infer_intraday_steps,
+    _validate_fixed_time_data,
+    format_band_value,
+)
 
 from deltalab_ui import wind_resolve
 from deltalab_ui.constants import (
@@ -53,6 +59,87 @@ from deltalab_ui.theme import (
     _form_input,
     _form_label,
 )
+
+
+# ---- CSV 行情模板 ----
+# 界面上「CSV」一栏此前只有文件框和价格列两个空格子，格式规则全写在
+# docs/GUI_USAGE.md 里——用户拿不到样例，只能靠猜列名，猜错还要等点了「运行」
+# 才从 from_csv 里收到「列 X 不在 CSV 中」。这份模板与 from_csv 的默认口径
+# （``parse_dates=[0]`` 取第一列作日期索引 + ``price_col='close'``）严格对齐，
+# 用户替换掉示例数据行即可直接跑通。
+CSV_TEMPLATE_HEADER = ("date", "open", "high", "low", "close", "volume")
+
+# 示例行是 26 个连续交易日（1/2 至 2/6，跨过五个周末）：一眼能看出这一列要的
+# 是交易日序列而不是自然日，长度也压过界面默认的 22 交易日期限——模板存下来
+# 不改任何期权参数就能直接跑完，不会撞上「价格序列交易日组不足」。
+CSV_TEMPLATE_ROWS = (
+    ("2024-01-02", "2.416", "2.425", "2.375", "2.384", "1235989"),
+    ("2024-01-03", "2.391", "2.437", "2.382", "2.424", "1290644"),
+    ("2024-01-04", "2.427", "2.434", "2.388", "2.396", "1344030"),
+    ("2024-01-05", "2.396", "2.405", "2.360", "2.361", "1336478"),
+    ("2024-01-08", "2.364", "2.365", "2.352", "2.360", "1009658"),
+    ("2024-01-09", "2.372", "2.413", "2.370", "2.407", "1229294"),
+    ("2024-01-10", "2.398", "2.443", "2.393", "2.433", "1188657"),
+    ("2024-01-11", "2.433", "2.441", "2.414", "2.419", "1156216"),
+    ("2024-01-12", "2.418", "2.430", "2.399", "2.401", "1201179"),
+    ("2024-01-15", "2.399", "2.407", "2.339", "2.355", "1363792"),
+    ("2024-01-16", "2.350", "2.350", "2.320", "2.332", "1274673"),
+    ("2024-01-17", "2.329", "2.383", "2.319", "2.376", "1260674"),
+    ("2024-01-18", "2.373", "2.385", "2.341", "2.344", "1205869"),
+    ("2024-01-19", "2.348", "2.357", "2.347", "2.350", "1119127"),
+    ("2024-01-22", "2.353", "2.364", "2.353", "2.359", "1056270"),
+    ("2024-01-23", "2.354", "2.373", "2.343", "2.354", "1126157"),
+    ("2024-01-24", "2.353", "2.355", "2.342", "2.348", "1106479"),
+    ("2024-01-25", "2.342", "2.398", "2.330", "2.387", "1170820"),
+    ("2024-01-26", "2.385", "2.412", "2.379", "2.405", "1053804"),
+    ("2024-01-29", "2.408", "2.416", "2.361", "2.365", "1345763"),
+    ("2024-01-30", "2.360", "2.361", "2.312", "2.329", "1107576"),
+    ("2024-01-31", "2.334", "2.338", "2.303", "2.311", "1103955"),
+    ("2024-02-01", "2.301", "2.332", "2.298", "2.332", "1059540"),
+    ("2024-02-02", "2.332", "2.336", "2.287", "2.293", "1350695"),
+    ("2024-02-05", "2.286", "2.300", "2.271", "2.296", "1125730"),
+    ("2024-02-06", "2.302", "2.319", "2.290", "2.312", "1119019"),
+)
+
+
+def csv_template_text():
+    """模板文件的完整文本。
+
+    不写注释行：``pd.read_csv`` 默认不跳 ``#``，加了注释这份模板自己就读不进来。
+    格式说明因此只放在界面提示与文档里。
+    """
+    lines = [",".join(CSV_TEMPLATE_HEADER)]
+    lines.extend(",".join(row) for row in CSV_TEMPLATE_ROWS)
+    return "\n".join(lines) + "\n"
+
+
+def write_csv_template(path):
+    """把模板写到 ``path``。utf-8-sig 与结果导出同口径，Excel 打开不乱码。"""
+    with io.open(path, "w", encoding="utf-8-sig", newline="") as handle:
+        handle.write(csv_template_text())
+    return path
+
+
+def read_csv_header(path):
+    """只读第一行，返回**可作价格列**的列名。
+
+    第一列是日期索引（``index_col=0``），不会出现在 ``df.columns`` 里，因此从
+    候选中剔除。编码按 utf-8-sig → gbk 顺序试：前者顺带吃掉 BOM，后者兜住从
+    国内终端导出的 GBK 文件。读不出来一律返回空列表，交给调用方提示，不抛。
+    """
+    for encoding in ("utf-8-sig", "gbk"):
+        try:
+            with io.open(path, "r", encoding=encoding, newline="") as handle:
+                first = handle.readline()
+        except UnicodeDecodeError:
+            continue
+        except OSError:
+            return []
+        if not first.strip():
+            return []
+        columns = [name.strip() for name in next(csv.reader([first]), [])]
+        return [name for name in columns[1:] if name]
+    return []
 
 
 class FormPanelMixin:
@@ -381,11 +468,18 @@ class FormPanelMixin:
             if not np.isfinite(sigma) or sigma <= 0:
                 raise ValueError("年化波动率 sigma 必须大于 0")
             converted = HedgeBandStrategy.convert_threshold(value, source_type, s0, sigma)
+            # 用户键入的那一档按原值回显——它就是后台真正跑的阈值，四舍五入
+            # 会让框里的数字和执行值对不上；另外两档纯属换算产物，取短表示。
+            texts = {
+                kind: (f"{value:.10g}" if kind == source_type
+                       else format_band_value(converted[kind]))
+                for kind in ("absolute", "relative", "sigma")
+            }
             self._band_syncing = True
             try:
-                self._band_abs_var.set(f"{converted['absolute']:.10g}")
-                self._band_rel_var.set(f"{converted['relative']:.10g}")
-                self._band_sigma_var.set(f"{converted['sigma']:.10g}")
+                self._band_abs_var.set(texts["absolute"])
+                self._band_rel_var.set(texts["relative"])
+                self._band_sigma_var.set(texts["sigma"])
                 self._band_last_edited = source_type
                 self._interval_type_var.set(source_type)
                 # 后端阈值始终使用最后编辑项的原始单位与数值。
@@ -408,9 +502,77 @@ class FormPanelMixin:
 
     def _browse_csv(self):
         path = filedialog.askopenfilename(
+            title="选择行情 CSV",
             filetypes=[("CSV files", "*.csv"), ("All files", "*.*")])
-        if path:
-            self._csv_path_var.set(path)
+        if not path:
+            return
+        self._csv_path_var.set(path)
+        FormPanelMixin._sync_csv_columns(self, path)
+
+    def _save_csv_template(self):
+        """写一份可直接跑通的行情模板，顺手把它选成当前文件。
+
+        选中是有意的：模板存下来之后接着填数据、直接点运行是最短路径。示例价
+        格是假的，因此弹窗把「替换成真实行情」说在明面上。
+        """
+        path = filedialog.asksaveasfilename(
+            title="保存行情模板", defaultextension=".csv",
+            initialfile="行情模板.csv",
+            filetypes=[("CSV files", "*.csv")])
+        if not path:
+            return
+        try:
+            write_csv_template(path)
+        except OSError as exc:
+            messagebox.showerror("保存模板失败", str(exc))
+            return
+        self._csv_path_var.set(path)
+        FormPanelMixin._sync_csv_columns(self, path, quiet=True)
+        self._set_status(f"已生成行情模板：{path}")
+        messagebox.showinfo(
+            "模板已保存",
+            f"{path}\n\n"
+            "格式要求：\n"
+            "· 第一列是日期索引，日频写 2024-01-02，日内写完整时间戳\n"
+            "  （2024-01-02 09:31:00），每日 bar 数由时间戳自动推导\n"
+            "· 其余列任取，「价格列」选哪列就用哪列，默认 close\n"
+            "· 至少 2 行数据，按时间正序\n\n"
+            "模板里的示例价格是编的，请替换成真实行情后再运行。")
+
+    def _sync_csv_columns(self, path, quiet=False):
+        """读表头刷新「价格列」候选，让列名错误在选文件时就暴露。
+
+        改这里之前，列名填错要等点了「运行」、拉完数据才在 ``from_csv`` 里报
+        「列 X 不在 CSV 中」——反馈隔了一整趟回测。
+        """
+        columns = read_csv_header(path)
+        if not columns:
+            self._set_status(
+                "CSV 表头读不出可用价格列：第一列须为日期，其后至少一列价格")
+            return None
+        previous = self._csv_col_var.get().strip()
+        chosen = FormPanelMixin._apply_csv_columns(self, columns)
+        available = "、".join(columns)
+        if chosen != previous:
+            was = previous or "空"
+            self._set_status(
+                f"价格列已切到 {chosen}（原 {was} 不在表头）"
+                f"  |  可用列：{available}")
+        elif not quiet:
+            self._set_status(f"CSV 可用价格列：{available}")
+        return chosen
+
+    def _apply_csv_columns(self, columns):
+        """把候选列灌进「价格列」下拉，并在当前值失效时挑一个可用的。"""
+        combo = getattr(self, "_csv_col_combo", None)
+        if combo is not None:
+            combo.configure(values=list(columns))
+        current = self._csv_col_var.get().strip()
+        if current in columns:
+            return current
+        chosen = "close" if "close" in columns else columns[0]
+        self._csv_col_var.set(chosen)
+        return chosen
 
     def _prepare_active_strategy_inputs(self, *, include_band=False):
         """在主线程对当前活动策略做最终同步与校验。"""

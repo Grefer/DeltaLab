@@ -731,6 +731,29 @@ class SigmaBandStrategy(HedgeStrategy):
         return triggered
 
 
+# 换算出来的等价带宽只保留"看得出是同一档"的位数。1e-4 的相对偏差在任何
+# 一档带宽上都改不动触发次数（100 元标的上是 1 厘），却能把 sqrt(243) 这类
+# 无理比值从 0.8660254038 收成 0.866。5 位有效数字已足够覆盖该容差，循环
+# 上限只是给更严容差留的余地。
+BAND_DISPLAY_TOLERANCE = 1e-4
+
+
+def format_band_value(value, *, tolerance=BAND_DISPLAY_TOLERANCE):
+    """把换算得到的带宽渲染成相对误差不超过 tolerance 的最短小数。
+
+    只用于**换算结果**：用户亲手键入的那一档始终按原值回显，否则等于把他
+    写下的数字悄悄改掉，而后台跑的又是原值。
+    """
+    number = float(value)
+    if not np.isfinite(number) or number == 0.0:
+        return f"{number:.10g}"
+    for digits in range(1, 11):
+        text = f"{number:.{digits}g}"
+        if abs(float(text) - number) <= tolerance * abs(number):
+            return text
+    return f"{number:.10g}"
+
+
 class HedgeBandStrategy(HedgeStrategy):
     """同一价格带宽的三种等价表达：绝对值、相对值或日波动 σ 倍数。"""
 

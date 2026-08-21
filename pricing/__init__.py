@@ -16,6 +16,7 @@ from .hedge_backtest import (
     PriceIntervalStrategy,
     SigmaBandStrategy,
     HedgeBandStrategy,
+    format_band_value,
 )
 from .hedge_analysis import (
     SelectionCancelled,

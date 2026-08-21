@@ -33,6 +33,7 @@ from pricing import (
     StrategyCase,
 )
 from pricing.constants import ANNUAL_DAYS
+from pricing.hedge_backtest import BAND_DISPLAY_TOLERANCE
 
 
 # 本文件多处直接构造真实 BacktestApp（内部是 tk.Tk 子类），拿不到窗口服务器
@@ -507,6 +508,31 @@ def test_band_sync_uses_visible_last_edited_value_and_updates_hidden_state():
     assert converted["absolute"] == pytest.approx(2.0)
     assert float(fake._price_interval_var.get()) == pytest.approx(0.02)
     assert fake._interval_type_var.get() == "relative"
+
+
+def test_band_sync_shortens_converted_units_but_keeps_the_typed_one():
+    """换算出来的两档取短表示，用户键入的那一档必须逐字保留。
+
+    键入档同时写进 ``_price_interval_var``，也就是回测真正跑的阈值；一旦对它
+    四舍五入，框里显示的和后台执行的就是两个数了。
+    """
+    fake = _fake_band_gui()
+    fake._param_entries["sigma"][0].set("0.18")
+    fake._band_abs_var.set("1")
+    BacktestApp._sync_band_inputs(fake, "absolute", strict=True)
+
+    assert fake._band_abs_var.get() == "1"
+    assert fake._band_rel_var.get() == "0.01"
+    assert fake._band_sigma_var.get() == "0.866"
+
+    # 换到 σ 档手输一串长小数：这次轮到 σ 原样保留，另外两档收短。
+    fake._band_sigma_var.set("0.8660254038")
+    BacktestApp._sync_band_inputs(fake, "sigma", strict=True)
+
+    assert fake._band_sigma_var.get() == "0.8660254038"
+    assert fake._price_interval_var.get() == "0.8660254038"
+    assert fake._band_abs_var.get() == "1"
+    assert fake._band_rel_var.get() == "0.01"
 
 
 def test_band_sync_strict_rejects_invalid_visible_value():
@@ -1283,8 +1309,11 @@ def test_current_band_units_normalize_to_same_sigma_candidate(
 
     assert len(cases) == 1
     assert cases[0].strategy.band_type == "sigma"
+    # 候选值取的是换算后的短表示（见 format_band_value），三种输入单位必须
+    # 落到同一档；容差就是显示容差，再紧会把这条断言绑死在浮点尾数上。
     assert cases[0].strategy.threshold == pytest.approx(
-        0.01 / (0.2 / (ANNUAL_DAYS ** 0.5)))
+        0.01 / (0.2 / (ANNUAL_DAYS ** 0.5)), rel=BAND_DISPLAY_TOLERANCE)
+    assert cases[0].name == "固定间隔(0.7794σ·当前)"
     assert cases[0].metadata["is_current_band"] is True
 
 
@@ -3464,7 +3493,7 @@ def test_failed_band_recommendation_rolls_back_the_history_band_label():
             fake._band_last_edited) == band_before
     label = fake._history_current_band_label_var.get()
     assert "编辑完成后自动换算" not in label
-    assert label == "加入当前回测带宽：0.779423σ（绝对输入换算）"
+    assert label == "加入当前回测带宽：0.7794σ（绝对输入换算）"
 
 
 def test_successfully_started_backtest_reports_true_to_auto_retain_caller(
